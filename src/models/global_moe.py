@@ -1,178 +1,158 @@
 """
-Global MoE: a single shared pool of 2048 experts used by ALL layers.
+Global MoE — minimal subclasses on top of Qwen3MoE.
 
-Architecture is identical to StandardMoEModel except:
-  - One top-level `GlobalExpertPool` (2048 experts) instead of per-layer pools.
-  - Each layer's router selects top-8 from the global 2048, not its own 128.
-  - `GlobalMoELayer` receives `global_experts` at forward-time (not as a submodule)
-    so FSDP/DDP wraps the expert pool exactly once at the model root.
+The only changes vs standard Qwen3MoE:
+  1. GlobalMoEConfig: num_experts=2048 (the global pool size)
+  2. GlobalSparseMoeBlock: router only — no expert weights stored here
+  3. GlobalMoEDecoderLayer: uses GlobalSparseMoeBlock; forward accepts global_experts kwarg
+  4. GlobalMoEModel: owns one shared Qwen3MoeExperts(2048); injects it into every layer call
+  5. GlobalMoEForCausalLM: wraps GlobalMoEModel
 
-Gradient flow:
-  - Same expert receives gradients from ALL 16 layers simultaneously → effective
-    per-expert batch size is ~16× larger than in standard MoE → expert updates are
-    much more frequent, potentially accelerating specialization.
+Everything else (GQA, QK-norm, RoPE, RMSNorm, KV cache, flash-attn dispatch,
+gradient checkpointing, load-balancing loss, generation) is inherited from Qwen3.
 
-Same total parameter count as StandardMoEModel (2048 experts either way).
+Memory note: GlobalMoEDecoderLayer.__init__ passes a dummy config with
+mlp_only_layers set to avoid allocating a per-layer 2048-expert pool that
+would immediately be thrown away.
 """
-import torch
+import copy
+
 import torch.nn as nn
-import torch.nn.functional as F
-
-from .qwen3_components import (
-    Qwen3MoEConfig,
-    RMSNorm,
-    RotaryEmbedding,
-    GQAttention,
-    DenseMLP,
-    ExpertPool,
-    TopKRouter,
-    load_balancing_loss,
+from transformers import Qwen3MoeConfig
+from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+    Qwen3MoeDecoderLayer,
+    Qwen3MoeExperts,
+    Qwen3MoeForCausalLM,
+    Qwen3MoeModel,
+    Qwen3MoeTopKRouter,
 )
-from dataclasses import dataclass
 
 
-@dataclass
-class GlobalMoEConfig(Qwen3MoEConfig):
+class GlobalMoEConfig(Qwen3MoeConfig):
     """
-    Drop-in extension of Qwen3MoEConfig for Global MoE.
-    `num_experts` is reinterpreted as the **global pool size** (2048 by default).
-    Each layer routes top-`num_experts_per_tok` from this shared pool.
+    Same as Qwen3MoeConfig but num_experts refers to the global shared pool
+    (2048 by default, matching 16 layers × 128 per-layer experts).
     """
-    num_experts: int = 2048          # global pool (= 16 layers × 128 per-layer)
-    num_experts_per_tok: int = 8
+    model_type = "global_moe"
+
+    def __init__(self, num_experts: int = 2048, **kwargs):
+        super().__init__(num_experts=num_experts, **kwargs)
 
 
-class GlobalMoEBlock(nn.Module):
+class GlobalSparseMoeBlock(nn.Module):
     """
-    MoE FFN block that routes into a globally shared expert pool.
-
-    The expert pool is NOT stored here — it is passed into forward() by the
-    top-level model.  This ensures there is exactly one registration of the
-    expert weights in the module tree (at GlobalMoEModel.global_experts),
-    which is required for correct FSDP parameter sharding.
+    Router-only MoE block.  No expert weights live here.
+    The global expert pool is passed in at forward() time from GlobalMoEModel.
+    This ensures Qwen3MoeExperts is registered exactly once in the module tree.
     """
 
     def __init__(self, config: GlobalMoEConfig):
         super().__init__()
-        self.router = TopKRouter(config.hidden_size, config.num_experts, config)
+        self.gate = Qwen3MoeTopKRouter(config)  # same router as Qwen3
 
-    def forward(
-        self,
-        x: torch.Tensor,             # [B, T, H]
-        global_experts: ExpertPool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        B, T, H = x.shape
-        flat = x.view(B * T, H)
-        router_logits, scores, indices = self.router(flat)
-        out = global_experts(flat, indices, scores)
-        return out.view(B, T, H), router_logits
+    def forward(self, hidden_states, global_experts: Qwen3MoeExperts):
+        B, T, H = hidden_states.shape
+        flat = hidden_states.view(-1, H)
+        # gate returns (router_logits, routing_weights, selected_experts)
+        # OutputRecorder hook on Qwen3MoeTopKRouter captures router_logits[0]
+        # automatically for the aux loss — nothing extra needed here.
+        _, routing_weights, selected_experts = self.gate(flat)
+        out = global_experts(flat, selected_experts, routing_weights)
+        return out.reshape(B, T, H)
 
 
-class GlobalMoELayer(nn.Module):
-    """Pre-norm transformer block that routes into the global expert pool."""
+class GlobalMoEDecoderLayer(Qwen3MoeDecoderLayer):
+    """
+    Decoder layer that routes into the global expert pool instead of its own.
+
+    Inherits everything from Qwen3MoeDecoderLayer (attention, norms,
+    gradient-checkpointing support) and only changes the mlp.
+    """
 
     def __init__(self, config: GlobalMoEConfig, layer_idx: int):
-        super().__init__()
-        self.input_layernorm          = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.self_attn                = GQAttention(config)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.mlp                      = GlobalMoEBlock(config)
+        # Trick: tell the parent to build a cheap dense MLP so it doesn't
+        # allocate a 2048-expert Qwen3MoeExperts that we'd immediately discard.
+        init_cfg = copy.deepcopy(config)
+        init_cfg.mlp_only_layers = list(range(config.num_hidden_layers))
+        super().__init__(init_cfg, layer_idx)
+
+        # Now replace the dense MLP with our router-only block.
+        self.mlp = GlobalSparseMoeBlock(config)
 
     def forward(
         self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        global_experts: ExpertPool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin)
-        normed = self.post_attention_layernorm(x)
-        ffn_out, router_logits = self.mlp(normed, global_experts)
-        x = x + ffn_out
-        return x, router_logits
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=False,
+        cache_position=None,
+        position_embeddings=None,
+        global_experts=None,   # injected by GlobalMoEModel
+        **kwargs,
+    ):
+        # Attention sub-layer — identical to Qwen3MoeDecoderLayer
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+
+        # MoE FFN sub-layer — route into the globally shared expert pool
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states, global_experts)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
 
 
-class GlobalMoEModel(nn.Module):
+class GlobalMoEModel(Qwen3MoeModel):
     """
-    Global MoE pretraining model (Qwen3 architecture).
-
-    2048 experts shared across all 16 layers.  Each layer routes top-8
-    from the global pool independently — different layers may select
-    different sets of experts for the same token.
+    Qwen3MoeModel with a single shared expert pool across all layers.
     """
 
     def __init__(self, config: GlobalMoEConfig):
-        super().__init__()
-        self.config = config
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.rotary_emb   = RotaryEmbedding(config)
+        # Build parent with all-dense layers to avoid creating 16 × 2048-expert
+        # pools that would be immediately replaced (and would OOM during init).
+        init_cfg = copy.deepcopy(config)
+        init_cfg.mlp_only_layers = list(range(config.num_hidden_layers))
+        super().__init__(init_cfg)
+        self.config = config  # restore original config
 
-        # ── Single top-level expert pool (registered once) ──────────────
-        self.global_experts = ExpertPool(
-            config.num_experts,
-            config.hidden_size,
-            config.moe_intermediate_size,
-        )
+        # Single shared expert pool — registered once here at the model root.
+        # DDP/FSDP sees these parameters exactly once.
+        self.global_experts = Qwen3MoeExperts(config)
 
-        # ── Per-layer attention + router (no per-layer experts) ─────────
+        # Replace per-layer MoE blocks with router-only versions.
         self.layers = nn.ModuleList([
-            GlobalMoELayer(config, i) for i in range(config.num_hidden_layers)
+            GlobalMoEDecoderLayer(config, i) for i in range(config.num_hidden_layers)
         ])
+        self.post_init()
 
-        self.norm    = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    def forward(self, *args, **kwargs):
+        # Inject global_experts into kwargs; Qwen3MoeModel.forward passes
+        # **kwargs through to every decoder layer call.
+        kwargs["global_experts"] = self.global_experts
+        return super().forward(*args, **kwargs)
 
-        if config.tie_word_embeddings:
-            self.lm_head.weight = self.embed_tokens.weight
 
-        self._init_weights()
+class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
+    """
+    Causal LM head wrapping GlobalMoEModel.
+    Inherits loss computation, aux-loss, generation, etc. from Qwen3MoeForCausalLM.
+    """
 
-    def _init_weights(self) -> None:
-        std = self.config.initializer_range
-        nn.init.normal_(self.embed_tokens.weight, std=std)
-        if not self.config.tie_word_embeddings:
-            nn.init.normal_(self.lm_head.weight, std=std)
-        for name, p in self.named_parameters():
-            if p.dim() >= 2:
-                nn.init.normal_(p, std=std)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        labels: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, dict]:
-        B, T = input_ids.shape
-        position_ids = torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
-
-        x = self.embed_tokens(input_ids)
-        cos, sin = self.rotary_emb(x, position_ids)
-
-        all_router_logits = []
-        for layer in self.layers:
-            # global_experts passed at call time — not a submodule of layer
-            x, router_logits = layer(x, cos, sin, self.global_experts)
-            all_router_logits.append(router_logits)
-
-        x = self.norm(x)
-        logits = self.lm_head(x)
-
-        loss, metrics = None, {}
-        if labels is not None:
-            ce_loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
-                ignore_index=-100,
-            )
-            aux_loss = load_balancing_loss(
-                tuple(all_router_logits),
-                self.config.num_experts,
-                self.config.num_experts_per_tok,
-            )
-            loss = ce_loss + self.config.router_aux_loss_coef * aux_loss
-            metrics = {
-                "ce_loss":    ce_loss.detach(),
-                "aux_loss":   aux_loss.detach(),
-                "total_loss": loss.detach(),
-            }
-
-        return logits, loss, metrics
+    def __init__(self, config: GlobalMoEConfig):
+        super().__init__(config)
+        self.model = GlobalMoEModel(config)
+        self.num_experts = config.num_experts
+        self.post_init()

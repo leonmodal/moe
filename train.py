@@ -34,14 +34,18 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from src.data.parquet_dataset import DataConfig, StatefulParquetDataset
-from src.models import Qwen3MoEConfig, StandardMoEModel, GlobalMoEModel, GlobalMoEConfig
+from src.models import Qwen3MoeConfig, StandardMoEModel, GlobalMoEConfig, GlobalMoEForCausalLM
 from src.utils.training import (
     TrainingConfig,
     build_lr_scheduler,
     build_optimizer,
     count_parameters,
     get_grad_norm,
+    estimate_active_flops_per_token,
+    compute_mfu,
+    B200_PEAK_FLOPS_BF16,
 )
+from src.utils.routing_stats import compute_routing_stats
 
 
 # --------------------------------------------------------------------------- #
@@ -78,11 +82,11 @@ def build_model(cfg: dict):
     )
 
     if mtype == "standard_moe":
-        config = Qwen3MoEConfig(num_experts=mcfg["num_experts"], **common)
+        config = Qwen3MoeConfig(num_experts=mcfg["num_experts"], **common)
         return StandardMoEModel(config), config
     elif mtype == "global_moe":
         config = GlobalMoEConfig(num_experts=mcfg["num_experts"], **common)
-        return GlobalMoEModel(config), config
+        return GlobalMoEForCausalLM(config), config
     else:
         raise ValueError(f"Unknown model type: {mtype}")
 
@@ -202,12 +206,20 @@ def main() -> None:
     params = count_parameters(model)
     expert_params = sum(
         p.numel() for n, p in model.named_parameters()
-        if "gate_up_proj" in n or ("down_proj" in n and "expert" in n)
+        if "gate_up_proj" in n or "down_proj" in n
     )
+    flops_per_token = estimate_active_flops_per_token(model_cfg)
+    is_global = cfg["model"]["type"] == "global_moe"
+
     accelerator.print(
-        f"\nModel: {cfg['model']['type']}  |  "
-        f"Total: {params['total']/1e9:.2f}B params  |  "
-        f"Expert: {expert_params/1e9:.2f}B params\n"
+        f"\n{'='*60}\n"
+        f"  Model     : {cfg['model']['type']}\n"
+        f"  Params    : {params['total']/1e9:.3f}B total  |  {expert_params/1e9:.3f}B expert\n"
+        f"  FLOPs/tok : {flops_per_token/1e9:.1f}G  (training, 3× fwd)\n"
+        f"  Dist type : {accelerator.distributed_type}\n"
+        f"  Precision : {train_cfg.mixed_precision}\n"
+        f"  GPUs      : {accelerator.num_processes}\n"
+        f"{'='*60}\n"
     )
 
     # --- Dataset ------------------------------------------------------------
@@ -215,7 +227,7 @@ def main() -> None:
         accelerator.print("Smoke test mode: using synthetic random data")
         dataset = SyntheticDataset(
             vocab_size=model_cfg.vocab_size,
-            seq_len=model_cfg.max_seq_len,
+            seq_len=min(model_cfg.max_position_embeddings, 2048),
         )
         tokenizer = None
     else:
@@ -273,6 +285,7 @@ def main() -> None:
     data_iter = iter(dataloader)
     t0 = time.perf_counter()
     tokens_seen = 0
+    routing_log_every = tcfg_dict.get("routing_log_every", train_cfg.eval_every)
 
     accelerator.print(f"Starting training from step {global_step}")
 
@@ -288,7 +301,9 @@ def main() -> None:
         labels = batch["labels"]         # (B, T)
 
         with accelerator.accumulate(model):
-            _, loss, metrics = model(input_ids, labels)
+            # Qwen3MoeForCausalLM returns MoeCausalLMOutputWithPast
+            output = model(input_ids=input_ids, labels=labels, output_router_logits=True)
+            loss = output.loss
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:
@@ -304,32 +319,64 @@ def main() -> None:
             global_step += 1
             tokens_seen += input_ids.numel() * accelerator.num_processes
 
-            # Logging
+            # ── Per-step logging ────────────────────────────────────────
             if global_step % train_cfg.log_every == 0 and accelerator.is_main_process:
                 elapsed = time.perf_counter() - t0
                 tok_per_sec = tokens_seen / elapsed
                 lr = scheduler.get_last_lr()[0]
+                aux   = output.aux_loss.item() if output.aux_loss is not None else 0.0
+                total = loss.item()
+                ce    = total - accelerator.unwrap_model(model).router_aux_loss_coef * aux
+                mfu   = compute_mfu(flops_per_token, tok_per_sec, accelerator.num_processes)
+
+                mem_alloc = torch.cuda.memory_allocated() / 1e9
+                mem_res   = torch.cuda.memory_reserved()  / 1e9
+
                 log_dict = {
-                    "train/loss": metrics["total_loss"].item(),
-                    "train/ce_loss": metrics["ce_loss"].item(),
-                    "train/aux_loss": metrics["aux_loss"].item(),
-                    "train/grad_norm": grad_norm,
-                    "train/lr": lr,
+                    "train/loss":           total,
+                    "train/ce_loss":        ce,
+                    "train/aux_loss":       aux,
+                    "train/grad_norm":      grad_norm,
+                    "train/lr":             lr,
+                    "train/mfu":            mfu,
                     "train/tokens_per_sec": tok_per_sec,
-                    "train/tokens_seen_B": tokens_seen / 1e9,
+                    "train/tokens_seen_B":  tokens_seen / 1e9,
+                    "sys/gpu_mem_alloc_GB": mem_alloc,
+                    "sys/gpu_mem_res_GB":   mem_res,
                     "step": global_step,
                 }
                 accelerator.print(
                     f"step {global_step:6d}  "
-                    f"loss={metrics['total_loss'].item():.4f}  "
-                    f"ce={metrics['ce_loss'].item():.4f}  "
-                    f"aux={metrics['aux_loss'].item():.4f}  "
-                    f"lr={lr:.2e}  "
-                    f"tok/s={tok_per_sec/1e3:.1f}k  "
-                    f"|g|={grad_norm:.3f}"
+                    f"loss={total:.4f}  ce={ce:.4f}  aux={aux:.4f}  "
+                    f"lr={lr:.2e}  mfu={mfu:.1%}  "
+                    f"tok/s={tok_per_sec/1e3:.1f}k  |g|={grad_norm:.3f}  "
+                    f"mem={mem_alloc:.1f}GB"
                 )
                 if log_with:
                     accelerator.log(log_dict, step=global_step)
+
+            # ── Routing stats (per-layer + cross-layer for Global MoE) ──
+            if global_step % routing_log_every == 0 and accelerator.is_main_process:
+                if output.router_logits is not None:
+                    rstats = compute_routing_stats(
+                        output.router_logits,
+                        num_experts_per_tok=model_cfg.num_experts_per_tok,
+                        is_global=is_global,
+                    )
+                    # Separate histogram data from scalar metrics
+                    hist_data   = {k: v for k, v in rstats.items() if k.startswith("_hist/")}
+                    scalar_stats = {k: v for k, v in rstats.items() if not k.startswith("_hist/")}
+
+                    if log_with:
+                        accelerator.log(scalar_stats, step=global_step)
+                        # Log histograms via wandb directly
+                        try:
+                            import wandb
+                            for key, values in hist_data.items():
+                                name = key.replace("_hist/", "hist/")
+                                wandb.log({name: wandb.Histogram(values)}, step=global_step)
+                        except Exception:
+                            pass
 
             # Checkpoint
             if global_step % train_cfg.save_every == 0:

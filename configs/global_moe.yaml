@@ -38,10 +38,10 @@ training:
   max_steps: 100000
   min_lr_ratio: 0.1
   batch_size: 4
-  gradient_accumulation: 4
+  gradient_accumulation: 1
   mixed_precision: bf16
   gradient_checkpointing: false
-  log_every: 10
+  log_every: 1
   eval_every: 1000
   save_every: 5000
   output_dir: ./outputs/global_moe
