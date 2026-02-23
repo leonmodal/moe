@@ -1,0 +1,59 @@
+experiment_name: standard_moe
+
+model:
+  type: standard_moe
+  # ── Vocabulary ──────────────────────────────────────────────────────────────
+  vocab_size: 151936
+  # ── Dimensions (Qwen3-style, ~1B non-expert params) ─────────────────────────
+  hidden_size: 2048
+  num_hidden_layers: 16
+  head_dim: 128
+  num_attention_heads: 16        # 16 × 128 = 2048 hidden_size
+  num_key_value_heads: 4         # GQA: 4 KV heads → 4 queries per KV pair
+  # ── MoE ──────────────────────────────────────────────────────────────────────
+  num_experts: 128               # per layer; 16 × 128 = 2048 total
+  num_experts_per_tok: 8         # top-k
+  moe_intermediate_size: 768     # each expert's FFN width (matches Qwen3-30B-A3B)
+  intermediate_size: 6144        # dense fallback layers (unused when decoder_sparse_step=1)
+  norm_topk_prob: true
+  router_aux_loss_coef: 0.001
+  # ── Attention ────────────────────────────────────────────────────────────────
+  attention_bias: false
+  attention_dropout: 0.0
+  # ── Misc ─────────────────────────────────────────────────────────────────────
+  rms_norm_eps: 1.0e-6
+  rope_theta: 1000000.0
+  max_position_embeddings: 32768
+  tie_word_embeddings: false
+  output_router_logits: true
+
+training:
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 2000
+  max_steps: 100000
+  min_lr_ratio: 0.1
+  batch_size: 4                  # per GPU; global = 4 × 8 GPUs × 4 accum = 128
+  gradient_accumulation: 4
+  mixed_precision: bf16
+  gradient_checkpointing: false
+  log_every: 10
+  eval_every: 1000
+  save_every: 5000
+  output_dir: ./outputs/standard_moe
+  wandb_project: moe-experiments
+  wandb_run_name: standard_moe
+
+data:
+  data_dir: ./data/parquet
+  text_column: text
+  seq_len: 2048
+  tokenizer_name: Qwen/Qwen3-0.6B   # or any HF tokenizer with vocab_size=151936
+  num_workers: 4
+
+checkpoint:
+  resume_from: null

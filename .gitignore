@@ -1,0 +1,7 @@
+.claude/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+outputs/
+wandb/
