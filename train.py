@@ -26,8 +26,16 @@ import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv()  # loads .env from cwd or any parent directory
+
 import torch
 import yaml
+
+# cuBLAS on Blackwell (B200, sm_100) has a bug where bf16 Linear(bias=False)
+# fails with CUBLAS_STATUS_INVALID_VALUE via the default GEMM_DEFAULT_TENSOR_OP
+# path. cuBLASlt uses different algorithm selection and handles this correctly.
+torch.backends.cuda.preferred_blas_library("cublaslt")
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from torch.utils.data import DataLoader

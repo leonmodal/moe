@@ -149,6 +149,36 @@ configure_node() {
   npm i -g @openai/codex
 }
 
+load_api_keys() {
+  local env_file
+  env_file="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.env"
+
+  log "Checking for .env at ${env_file}"
+
+  if [[ ! -f "$env_file" ]]; then
+    log ".env not found — copy .env.example to .env and fill in your keys, then re-run"
+    return
+  fi
+
+  # Source the .env file to validate it has the expected keys
+  # shellcheck disable=SC1090
+  set +u
+  source "$env_file"
+  set -u
+
+  if [[ -z "${HF_TOKEN:-}" || "$HF_TOKEN" == "hf_..." ]]; then
+    log "WARNING: HF_TOKEN not set or still placeholder in .env"
+  fi
+  if [[ -z "${WANDB_API_KEY:-}" || "$WANDB_API_KEY" == "..." ]]; then
+    log "WARNING: WANDB_API_KEY not set or still placeholder in .env"
+  fi
+
+  # Persist sourcing of the .env file into ~/.bashrc so it's available in all shells
+  local source_line="[ -f \"${env_file}\" ] && source \"${env_file}\""
+  append_if_missing "$HOME/.bashrc" "$source_line"
+  log "API keys: .env will be sourced automatically from ~/.bashrc"
+}
+
 fix_ssh_perms() {
   log "Setting ~/.ssh permissions"
   if [[ -d "$HOME/.ssh" ]]; then
@@ -178,6 +208,7 @@ main() {
   configure_node
   fix_ssh_perms
   write_gitconfig
+  load_api_keys
 
   log "Done."
   log "If you want the new env vars in your current terminal, run: source ~/.bashrc"
