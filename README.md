@@ -1,210 +1,103 @@
 # MoE Pretraining: Standard vs Global Mixture of Experts
 
-Pretraining experiment comparing two MoE routing strategies at multiple scales.
-Architecture base: **Qwen3-MoE** (GQA + QK-norm + SwiGLU + RoPE).
+## Setup
 
----
-
-## The Experiment
-
-### Standard MoE
-Each layer owns its own independent pool of experts.
-A token at layer `l` routes top-k from **layer `l`'s 128 experts only**.
-
-```
-Layer 0 : Router_0  →  top-8 from {E_0_0 … E_0_127}
-Layer 1 : Router_1  →  top-8 from {E_1_0 … E_1_127}
-...
-Layer 15: Router_15 →  top-8 from {E_15_0 … E_15_127}
-
-Total experts: 16 × 128 = 2048 (all distinct)
+```bash
+uv sync
 ```
 
-### Global MoE
-All layers share one expert pool.
-A token at layer `l` routes top-k from the **global 2048 experts**.
+Add HF and wandb keys to `.env`:
 
 ```
-Shared pool: {E_0 … E_2047}
-
-Layer 0 : Router_0  →  top-8 from {E_0 … E_2047}
-Layer 1 : Router_1  →  top-8 from {E_0 … E_2047}
-...
-Layer 15: Router_15 →  top-8 from {E_0 … E_2047}
-
-Total experts: 2048 (shared)
+HF_TOKEN=hf_...
+WANDB_API_KEY=wandb_...
 ```
 
-Same total expert parameter count. Same number of routers.
-Router width: Standard = `[128, H]` per layer; Global = `[2048, H]` per layer.
+## Download Data
 
----
+```bash
+# All 8192 shards (~3.4TB)
+uv run python scripts/download_data.py
 
-## Architecture (Qwen3-MoE base)
+# Or limit shards for testing
+uv run python scripts/download_data.py --max_shards 64
+```
 
-| Component | Detail |
-|---|---|
-| Attention | Grouped-Query Attention (GQA) |
-| QK-Norm | Per-head RMSNorm on Q and K before RoPE (training stability) |
-| Activation | SwiGLU (gate_proj × silu + up_proj → down_proj) |
-| Norm | RMSNorm with fp32 upcast, eps=1e-6 |
-| Position | RoPE, θ=1,000,000 |
-| Router | Softmax → top-k → renorm (norm_topk_prob=True) |
-| Aux loss | Switch-Transformer load-balancing, coef=0.001 |
+## Model Configs
 
----
+| | XS (~50M) | S (~300M) | M (~10B) |
+|---|---|---|---|
+| `hidden_size` | 512 | 1024 | 2048 |
+| `num_hidden_layers` | 8 | 12 | 16 |
+| `num_attention_heads` | 8 | 16 | 16 |
+| `num_key_value_heads` | 2 | 4 | 4 |
+| `head_dim` | 64 | 64 | 128 |
+| `moe_intermediate_size` | 256 | 512 | 768 |
+| Standard `num_experts` | 8/layer (64 total) | 32/layer (384 total) | 128/layer (2048 total) |
+| Global `num_experts` | 64 shared | 384 shared | 2048 shared |
+| `num_experts_per_tok` | 2 | 4 | 8 |
 
-## Model Scales
+All scales: `lr=1e-3`, `batch_size=16/gpu`, `warmup=100k`, `max_steps=1M`, `cosine decay`, `bf16`.
 
-### XS — ~50M total params
+Config files: `configs/scaling/{xs,s,m}_{standard,global}.yaml`
 
-| Field | Value |
-|---|---|
-| `hidden_size` | 512 |
-| `num_hidden_layers` | 8 |
-| `num_attention_heads` | 8 |
-| `num_key_value_heads` | 2 (GQA: 4 queries per KV) |
-| `head_dim` | 64 |
-| `moe_intermediate_size` | 256 (per expert) |
-| **Standard** `num_experts` | 8 per layer → 64 total |
-| **Global** `num_experts` | 64 shared |
-| `num_experts_per_tok` | 2 (top-k active) |
-| `max_position_embeddings` | 4096 |
+## Run
 
-Config: `configs/scaling/xs_standard.yaml` / `xs_global.yaml`
+```bash
+# Smoke test (synthetic data, no download needed)
+./scripts/train.sh xs standard --smoke_test
+./scripts/train.sh xs global --smoke_test
 
----
+# XS
+./scripts/train.sh xs standard
+./scripts/train.sh xs global
 
-### S — ~300M total params
+# S
+./scripts/train.sh s standard
+./scripts/train.sh s global
 
-| Field | Value |
-|---|---|
-| `hidden_size` | 1024 |
-| `num_hidden_layers` | 12 |
-| `num_attention_heads` | 16 |
-| `num_key_value_heads` | 4 (GQA: 4 queries per KV) |
-| `head_dim` | 64 |
-| `moe_intermediate_size` | 512 (per expert) |
-| **Standard** `num_experts` | 32 per layer → 384 total |
-| **Global** `num_experts` | 384 shared |
-| `num_experts_per_tok` | 4 (top-k active) |
-| `max_position_embeddings` | 8192 |
+# M
+./scripts/train.sh m standard
+./scripts/train.sh m global
 
-Config: `configs/scaling/s_standard.yaml` / `s_global.yaml`
-
----
-
-### M — ~9.7B total params (original target)
-
-| Field | Value |
-|---|---|
-| `hidden_size` | 2048 |
-| `num_hidden_layers` | 16 |
-| `num_attention_heads` | 16 |
-| `num_key_value_heads` | 4 (GQA: 4 queries per KV) |
-| `head_dim` | 128 |
-| `moe_intermediate_size` | 768 (per expert) |
-| **Standard** `num_experts` | 128 per layer → 2048 total |
-| **Global** `num_experts` | 2048 shared |
-| `num_experts_per_tok` | 8 (top-k active) |
-| `max_position_embeddings` | 32768 |
-
-Config: `configs/scaling/m_standard.yaml` / `m_global.yaml`
-
----
-
-## Training Setup
-
-| Setting | Value |
-|---|---|
-| Hardware | 8× NVIDIA B200 (183 GB each), single node |
-| Distribution | DDP (`accelerate_configs/ddp_8gpu.yaml`) |
-| Precision | BF16 |
-| Gradient accumulation | 1 |
-| Optimizer | AdamW (β₁=0.9, β₂=0.95) |
-| LR schedule | Cosine decay with warmup, min_lr = 10% peak |
-| Tokenizer | Qwen3 (vocab=151936) |
-| Data | Stateful Parquet dataset (resumable) |
-
----
+# Resume from checkpoint
+./scripts/train.sh m global --resume outputs/m_global_moe/checkpoint-5000
+```
 
 ## Logging
 
-Every step:
-
-| Metric | Description |
-|---|---|
-| `train/loss` | Total loss (CE + aux) |
-| `train/ce_loss` | Cross-entropy only |
-| `train/aux_loss` | Load-balancing auxiliary loss |
-| `train/grad_norm` | Gradient L2 norm |
-| `train/lr` | Learning rate |
-| `train/mfu` | Model FLOP utilization vs B200 BF16 peak (2.25 PFLOPS) |
-| `train/tokens_per_sec` | Throughput |
-| `train/tokens_seen_B` | Cumulative tokens |
-| `sys/gpu_mem_alloc_GB` | GPU memory allocated |
-| `sys/gpu_mem_res_GB` | GPU memory reserved |
-
-Every `routing_log_every` steps (free — from `output.router_logits`):
-
-| Metric | Description |
-|---|---|
-| `routing/layer_NN_entropy` | Normalised routing entropy [0=collapsed, 1=uniform] |
-| `routing/layer_NN_utilization` | Fraction of experts receiving ≥1 token |
-| `routing/layer_NN_top_expert` | Most-used expert index |
-| `routing/cross_layer_sim_mean` | **Global only** — cosine similarity between layers' routing distributions; high = no depth specialisation |
-| `routing/expert_depth_coverage_mean` | **Global only** — avg layers each expert is active in |
-| `hist/expert_depth_coverage` | **Global only** — wandb histogram of per-expert depth coverage |
-
----
-
-## Usage
-
-```bash
-# Install
-uv sync
-
-# Smoke test (synthetic data, no parquet needed)
-accelerate launch --config_file accelerate_configs/ddp_8gpu.yaml \
-    train.py --config configs/scaling/xs_standard.yaml --smoke_test
-
-# Standard MoE (M scale)
-accelerate launch --config_file accelerate_configs/ddp_8gpu.yaml \
-    train.py --config configs/scaling/m_standard.yaml
-
-# Global MoE (M scale)
-accelerate launch --config_file accelerate_configs/ddp_8gpu.yaml \
-    train.py --config configs/scaling/m_global.yaml
-
-# Resume
-accelerate launch --config_file accelerate_configs/ddp_8gpu.yaml \
-    train.py --config configs/scaling/m_global.yaml \
-    --resume outputs/m_global_moe/checkpoint-5000
-```
-
----
-
-## File Structure
+### Per-step metrics
 
 ```
-configs/
-  scaling/
-    xs_standard.yaml / xs_global.yaml
-    s_standard.yaml  / s_global.yaml
-    m_standard.yaml  / m_global.yaml
-accelerate_configs/
-  ddp_8gpu.yaml
-  fsdp_8gpu.yaml           # use if model outgrows DDP memory budget
-src/
-  models/
-    standard_moe.py        # = Qwen3MoeForCausalLM (alias)
-    global_moe.py          # GlobalMoEForCausalLM — ~90 lines on top of Qwen3
-    modeling_qwen3_moe.py  # copied from transformers (reference)
-    configuration_qwen3_moe.py
-  data/
-    parquet_dataset.py     # stateful, resumable parquet streaming
-  utils/
-    training.py            # MFU, optimizer, scheduler
-    routing_stats.py       # per-layer entropy, utilization, cross-layer similarity
-train.py
+step    182  loss=10.3080  ce=10.3059  aux=2.0113  lr=1.46e-05  tok/s=446.9k  |g|=1.841
 ```
+
+**`loss`** — Total loss = `ce + 0.1 × aux`. What the optimizer minimizes.
+
+**`ce`** — Cross-entropy loss. The language modeling objective. At init ~11.93 (`ln(151936)`, uniform over vocab). Below ~3.0 is decent.
+
+**`aux`** — Switch Transformer load-balancing loss = `num_experts × Σ(f_i × p_i)` where `f_i` = fraction of tokens routed to expert `i`, `p_i` = mean router probability for expert `i`. Perfect balance = 1.0. Values near `num_experts_per_tok` mean the router hasn't differentiated yet.
+
+**`lr`** — Learning rate. Linear warmup 0 → 1e-3 over 100k steps, then cosine decay to 1e-4 (10% of peak).
+
+**`tok/s`** — Tokens per second across all 8 GPUs.
+
+**`|g|`** — Gradient L2 norm before clipping (threshold = 1.0). Spikes to 100+ = instability. Steady <10 = healthy.
+
+### Routing stats (per layer, logged every `routing_log_every` steps to wandb)
+
+**`load_imbalance`** — `max(expert_token_count) / ideal_count`. 1.0 = every expert got the same number of tokens. 5.0 = busiest expert got 5× ideal. Watch for this growing — means router is collapsing.
+
+**`load_cv`** — Coefficient of variation = `std(token_counts) / mean(token_counts)`. 0.0 = perfectly uniform. Smoother signal than `load_imbalance`.
+
+**`utilization`** — Fraction of experts that received ≥1 token. 1.0 = all active. If 0.5, half your experts are dead weight with no gradients.
+
+**`entropy`** — Normalized entropy of mean routing probs, scaled to [0,1]. 1.0 = uniform. 0.0 = collapsed. Should start near 1.0. Some drop is fine (specialization), below 0.5 is a red flag.
+
+**`top_expert`** — Index of the most-loaded expert. Same index across many layers/steps = "sink" expert absorbing too many tokens.
+
+### Global MoE only
+
+**`cross_layer_sim_mean`** — Cosine similarity between each pair of layers' expert-load vectors. High (>0.8) = all layers picking the same experts, no depth specialization. Low (<0.3) = different layers prefer different experts, good.
+
+**`expert_depth_coverage_mean`** — For each expert, count how many layers use it above uniform threshold, averaged across all experts. If this equals `num_hidden_layers`, every expert is used by every layer — no specialization. Lower = experts are specializing by depth.

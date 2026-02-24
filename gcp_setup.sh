@@ -66,19 +66,6 @@ install_cmake() {
   rm -f "$sh"
 }
 
-install_uv() {
-  log "Installing uv"
-  require_cmd curl
-
-  if command -v uv >/dev/null 2>&1; then
-    log "uv already installed ($(uv --version)); skipping"
-    return
-  fi
-
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  append_if_missing "$HOME/.bashrc" 'export PATH="$HOME/.local/bin:$PATH"'
-}
-
 install_neovim() {
   local tar="nvim-linux-x86_64.tar.gz"
   local url="https://github.com/neovim/neovim/releases/latest/download/${tar}"
@@ -129,6 +116,18 @@ install_packages() {
   sudo dnf -y install ninja-build numactl-devel ripgrep
 }
 
+install_uv() {
+  log "Installing uv"
+  require_cmd curl
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+}
+
+install_claude() {
+  log "Installing Claude Code"
+  require_cmd curl
+  curl -fsSL https://claude.ai/install.sh | bash
+}
+
 configure_node() {
   log "Configuring npm prefix and installing @openai/codex"
   require_cmd node
@@ -147,36 +146,6 @@ configure_node() {
   esac
 
   npm i -g @openai/codex
-}
-
-load_api_keys() {
-  local env_file
-  env_file="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.env"
-
-  log "Checking for .env at ${env_file}"
-
-  if [[ ! -f "$env_file" ]]; then
-    log ".env not found — copy .env.example to .env and fill in your keys, then re-run"
-    return
-  fi
-
-  # Source the .env file to validate it has the expected keys
-  # shellcheck disable=SC1090
-  set +u
-  source "$env_file"
-  set -u
-
-  if [[ -z "${HF_TOKEN:-}" || "$HF_TOKEN" == "hf_..." ]]; then
-    log "WARNING: HF_TOKEN not set or still placeholder in .env"
-  fi
-  if [[ -z "${WANDB_API_KEY:-}" || "$WANDB_API_KEY" == "..." ]]; then
-    log "WARNING: WANDB_API_KEY not set or still placeholder in .env"
-  fi
-
-  # Persist sourcing of the .env file into ~/.bashrc so it's available in all shells
-  local source_line="[ -f \"${env_file}\" ] && source \"${env_file}\""
-  append_if_missing "$HOME/.bashrc" "$source_line"
-  log "API keys: .env will be sourced automatically from ~/.bashrc"
 }
 
 fix_ssh_perms() {
@@ -202,13 +171,13 @@ main() {
 
   install_packages
   install_cmake
-  install_uv
   install_neovim
   configure_bashrc
   configure_node
   fix_ssh_perms
   write_gitconfig
-  load_api_keys
+  install_uv
+  install_claude
 
   log "Done."
   log "If you want the new env vars in your current terminal, run: source ~/.bashrc"

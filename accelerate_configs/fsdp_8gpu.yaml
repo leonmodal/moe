@@ -11,8 +11,7 @@ fsdp_config:
   fsdp_state_dict_type: SHARDED_STATE_DICT
   fsdp_sync_module_states: true
   fsdp_use_orig_params: true
-  # Set to your transformer layer class name
-  fsdp_transformer_layer_cls_to_wrap: StandardMoELayer
+  fsdp_transformer_layer_cls_to_wrap: Qwen3MoeLayer
 machine_rank: 0
 main_training_function: main
 mixed_precision: bf16

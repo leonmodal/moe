@@ -37,12 +37,13 @@ training:
   warmup_steps: 2000
   max_steps: 100000
   min_lr_ratio: 0.1
-  batch_size: 4
+  batch_size: 16                 # per GPU; global = 16 × 8 GPUs × 1 accum = 128
   gradient_accumulation: 1
   mixed_precision: bf16
   gradient_checkpointing: false
   log_every: 1
   eval_every: 1000
+  routing_log_every: 50
   save_every: 5000
   output_dir: ./outputs/global_moe
   wandb_project: moe-experiments

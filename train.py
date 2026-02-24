@@ -49,9 +49,6 @@ from src.utils.training import (
     build_optimizer,
     count_parameters,
     get_grad_norm,
-    estimate_active_flops_per_token,
-    compute_mfu,
-    B200_PEAK_FLOPS_BF16,
 )
 from src.utils.routing_stats import compute_routing_stats
 
@@ -216,7 +213,6 @@ def main() -> None:
         p.numel() for n, p in model.named_parameters()
         if "gate_up_proj" in n or "down_proj" in n
     )
-    flops_per_token = estimate_active_flops_per_token(model_cfg)
     is_global = cfg["model"]["type"] == "global_moe"
 
     accelerator.print(
@@ -337,28 +333,21 @@ def main() -> None:
                 ce    = total - accelerator.unwrap_model(model).router_aux_loss_coef * aux
                 mfu   = compute_mfu(flops_per_token, tok_per_sec, accelerator.num_processes)
 
-                mem_alloc = torch.cuda.memory_allocated() / 1e9
-                mem_res   = torch.cuda.memory_reserved()  / 1e9
-
                 log_dict = {
                     "train/loss":           total,
                     "train/ce_loss":        ce,
                     "train/aux_loss":       aux,
                     "train/grad_norm":      grad_norm,
                     "train/lr":             lr,
-                    "train/mfu":            mfu,
                     "train/tokens_per_sec": tok_per_sec,
                     "train/tokens_seen_B":  tokens_seen / 1e9,
-                    "sys/gpu_mem_alloc_GB": mem_alloc,
-                    "sys/gpu_mem_res_GB":   mem_res,
                     "step": global_step,
                 }
                 accelerator.print(
                     f"step {global_step:6d}  "
                     f"loss={total:.4f}  ce={ce:.4f}  aux={aux:.4f}  "
-                    f"lr={lr:.2e}  mfu={mfu:.1%}  "
-                    f"tok/s={tok_per_sec/1e3:.1f}k  |g|={grad_norm:.3f}  "
-                    f"mem={mem_alloc:.1f}GB"
+                    f"lr={lr:.2e}  "
+                    f"tok/s={tok_per_sec/1e3:.1f}k  |g|={grad_norm:.3f}"
                 )
                 if log_with:
                     accelerator.log(log_dict, step=global_step)

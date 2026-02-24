@@ -12,6 +12,7 @@ at the start of a resumed training run.
 import glob
 import json
 import os
+import random
 from dataclasses import dataclass, field
 from typing import Iterator
 
@@ -45,6 +46,7 @@ class StatefulParquetDataset(IterableDataset):
         tokenizer,
         rank: int = 0,
         world_size: int = 1,
+        seed: int = 42,
     ):
         self.config = config
         self.tokenizer = tokenizer
@@ -57,6 +59,10 @@ class StatefulParquetDataset(IterableDataset):
         )
         if not all_files:
             raise FileNotFoundError(f"No parquet files found in {config.data_dir}")
+
+        # Shuffle with fixed seed — deterministic across runs for resumability
+        rng = random.Random(seed)
+        rng.shuffle(all_files)
 
         # Shard files across ranks deterministically
         self.files = [f for i, f in enumerate(all_files) if i % world_size == rank]
