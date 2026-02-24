@@ -113,7 +113,7 @@ install_packages() {
 
   sudo dnf -y install python3.12 python3.12-devel
   sudo dnf -y module install nodejs:24
-  sudo dnf -y install ninja-build numactl-devel ripgrep
+  sudo dnf -y install ninja-build numactl-devel ripgrep tmux
 }
 
 install_uv() {

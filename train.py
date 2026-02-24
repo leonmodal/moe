@@ -219,7 +219,6 @@ def main() -> None:
         f"\n{'='*60}\n"
         f"  Model     : {cfg['model']['type']}\n"
         f"  Params    : {params['total']/1e9:.3f}B total  |  {expert_params/1e9:.3f}B expert\n"
-        f"  FLOPs/tok : {flops_per_token/1e9:.1f}G  (training, 3× fwd)\n"
         f"  Dist type : {accelerator.distributed_type}\n"
         f"  Precision : {train_cfg.mixed_precision}\n"
         f"  GPUs      : {accelerator.num_processes}\n"
