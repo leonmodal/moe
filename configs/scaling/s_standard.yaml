@@ -36,7 +36,6 @@ training:
   mixed_precision: bf16
   gradient_checkpointing: false
   log_every: 1
-  eval_every: 1000
   routing_log_every: 1
   save_every: 5000
   output_dir: ./outputs/s_standard_moe

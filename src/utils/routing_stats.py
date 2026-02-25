@@ -14,7 +14,11 @@ Per-layer (both standard and global):
   routing/layer_NN_utilization      — fraction of experts that received ≥1 token
   routing/layer_NN_entropy          — normalised entropy of mean routing probs [0,1]
                                       1.0 = uniform, 0.0 = collapsed
+  routing/layer_NN_num_active_experts — count of experts that received ≥1 token
   routing/layer_NN_top_expert       — index of most-loaded expert this batch
+  routing/layer_NN_router_margin_mean — mean gap between k-th and (k+1)-th prob
+                                        large = confident routing, ~0 = random
+  routing/layer_NN_router_margin_min  — min margin (worst-case token)
 
   _hist/layer_NN_expert_load_frac   — per-expert fraction of total routing slots
                                       (list of E floats, log as wandb.Histogram)
@@ -24,9 +28,10 @@ Global MoE only:
   routing/cross_layer_sim_mean      — mean cosine-sim between per-layer load vectors
                                       high → layers select same experts (bad specialisation)
   routing/cross_layer_sim_min       — minimum pairwise similarity
-  routing/expert_depth_coverage_mean — avg # of layers each expert is active in
-  routing/expert_depth_coverage_max
-  _hist/expert_depth_coverage       — histogram across all experts
+  routing/cross_layer_sim_max       — maximum pairwise similarity
+
+  routing/layer_NN_global_experts_used — how many unique experts layer NN selected
+  _hist/global_expert_layer_count      — per-expert: how many layers use it (0=dead, L=everywhere)
 """
 import math
 from typing import Sequence
@@ -71,7 +76,9 @@ def compute_routing_stats(
         stats[f"{tag}_load_cv"] = (counts.std() / counts.mean()).item() if counts.mean() > 0 else 0.0
 
         # Fraction of experts that received ≥1 token
-        stats[f"{tag}_utilization"] = (counts > 0).float().mean().item()
+        active = (counts > 0).sum().item()
+        stats[f"{tag}_utilization"] = active / E
+        stats[f"{tag}_num_active_experts"] = int(active)
 
         # Index of most-loaded expert
         stats[f"{tag}_top_expert"] = int(counts.argmax().item())
@@ -85,6 +92,15 @@ def compute_routing_stats(
         mean_p  = probs.mean(dim=0)                     # [E]
         entropy = -(mean_p * (mean_p + 1e-10).log()).sum().item()
         stats[f"{tag}_entropy"] = entropy / math.log(E)
+
+        # ── Router confidence: gap between k-th and (k+1)-th prob ─────
+        # Large margin → router is confident in its choices
+        # Near zero → routing is essentially random
+        if E > num_experts_per_tok:
+            sorted_probs, _ = probs.sort(dim=-1, descending=True)  # [T, E]
+            margin = sorted_probs[:, num_experts_per_tok - 1] - sorted_probs[:, num_experts_per_tok]  # [T]
+            stats[f"{tag}_router_margin_mean"] = margin.mean().item()
+            stats[f"{tag}_router_margin_min"]  = margin.min().item()
 
         load_vecs.append(counts)
 
@@ -103,10 +119,17 @@ def compute_routing_stats(
         stats["routing/cross_layer_sim_min"]  = off.min().item()
         stats["routing/cross_layer_sim_max"]  = off.max().item()
 
-        # Per-expert: how many layers activated it above uniform threshold
-        depth_coverage = (mat > (mat.sum(dim=1, keepdim=True) / E)).float().sum(dim=0)  # [E]
-        stats["routing/expert_depth_coverage_mean"] = depth_coverage.mean().item()
-        stats["routing/expert_depth_coverage_max"]  = depth_coverage.max().item()
-        stats["_hist/expert_depth_coverage"]        = depth_coverage.cpu().tolist()
+        # ── Per-expert layer usage (raw: got ≥1 token from that layer) ──
+        E = mat.shape[1]
+        used_mask = mat > 0                                    # [L, E] bool
+        layer_count = used_mask.float().sum(dim=0)             # [E] how many layers use each expert
+
+        # Per-layer: how many unique experts from the global pool
+        for layer_idx in range(L):
+            n_used = int(used_mask[layer_idx].sum().item())
+            stats[f"routing/layer_{layer_idx:02d}_global_experts_used"] = n_used
+
+        # Histogram: for each expert, how many layers use it (0 = dead, L = everywhere)
+        stats["_hist/global_expert_layer_count"] = layer_count.cpu().tolist()
 
     return stats

@@ -1,0 +1,57 @@
+# L scale — Qwen3-30B-A3B architecture (global shared expert pool)
+# ~30B total params, ~3B active per token
+# Same backbone as Qwen3-30B-A3B but with a single global expert pool
+experiment_name: l_global_moe
+
+model:
+  type: global_moe
+  vocab_size: 151936
+  hidden_size: 2048
+  num_hidden_layers: 48
+  head_dim: 128
+  num_attention_heads: 32           # 32 × 128 = 4096 attn dim (decoupled from hidden_size)
+  num_key_value_heads: 4            # GQA: 8 queries per KV head
+  num_experts: 6144                 # global pool (= 48 layers × 128 per-layer)
+  num_experts_per_tok: 8            # top-8 from the shared 6144
+  moe_intermediate_size: 768        # each expert FFN width
+  intermediate_size: 6144           # dense fallback
+  norm_topk_prob: true
+  router_aux_loss_coef: 0.01
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-6
+  rope_theta: 1000000.0
+  max_position_embeddings: 32768
+  tie_word_embeddings: false
+  output_router_logits: true
+
+training:
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 2000
+  max_steps: 100000
+  min_lr_ratio: 0.1
+  batch_size: 4                     # smaller batch — 30B model is memory-heavy
+  gradient_accumulation: 8          # effective batch = 4 × 8 × num_gpus
+  mixed_precision: bf16
+  gradient_checkpointing: true      # required for 30B-scale model
+  log_every: 1
+  routing_log_every: 50
+  save_every: 5000
+  output_dir: ./outputs/l_global_moe
+  wandb_project: moe-scaling
+  wandb_run_name: l_global
+
+data:
+  data_dir: ./data/parquet
+  text_column: text
+  seq_len: 2048
+  tokenizer_name: Qwen/Qwen3-0.6B
+  num_workers: 4
+
+checkpoint:
+  resume_from: null

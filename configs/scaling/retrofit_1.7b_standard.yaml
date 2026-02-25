@@ -1,0 +1,59 @@
+# Retrofit Qwen3-1.7B dense → standard per-layer MoE
+# Backbone matches Qwen3-1.7B exactly (hidden=2048, 28 layers)
+# FFN upcycled: dense intermediate_size=6144 → 64 experts × top-8 × 768 = 6144 active
+# ~17B total params, ~1.7B active per token
+# This is essentially a "28-layer Qwen3-30B-A3B" — same expert config, shorter backbone
+experiment_name: retrofit_1.7b_standard_moe
+
+model:
+  type: standard_moe
+  vocab_size: 151936
+  hidden_size: 2048
+  num_hidden_layers: 28
+  head_dim: 128
+  num_attention_heads: 16           # 16 × 128 = 2048 (matches Qwen3-1.7B, hidden = attn dim)
+  num_key_value_heads: 8            # GQA (matches Qwen3-1.7B)
+  num_experts: 64                   # per layer; 64 × 28 = 1792 total
+  num_experts_per_tok: 8            # top-8; active FFN = 8 × 768 = 6144 = dense intermediate
+  moe_intermediate_size: 768        # matches Qwen3-30B-A3B expert size
+  intermediate_size: 6144           # dense fallback (= Qwen3-1.7B intermediate_size)
+  norm_topk_prob: true
+  router_aux_loss_coef: 0.01
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-6
+  rope_theta: 1000000.0
+  max_position_embeddings: 32768
+  tie_word_embeddings: false
+  output_router_logits: true
+
+training:
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 2000
+  max_steps: 100000
+  min_lr_ratio: 0.1
+  batch_size: 8
+  gradient_accumulation: 2          # effective batch = 8 × 2 × num_gpus
+  mixed_precision: bf16
+  gradient_checkpointing: true      # 17B params needs checkpointing
+  log_every: 1
+  routing_log_every: 50
+  save_every: 5000
+  output_dir: ./outputs/retrofit_1.7b_standard_moe
+  wandb_project: moe-scaling
+  wandb_run_name: retrofit_1.7b_standard
+
+data:
+  data_dir: ./data/parquet
+  text_column: text
+  seq_len: 2048
+  tokenizer_name: Qwen/Qwen3-0.6B
+  num_workers: 4
+
+checkpoint:
+  resume_from: null

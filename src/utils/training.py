@@ -1,4 +1,4 @@
-"""Training utilities: LR scheduler, grad norm, parameter counting, MFU."""
+"""Training utilities: LR scheduler, grad norm, parameter counting."""
 import math
 from dataclasses import dataclass
 
@@ -30,7 +30,6 @@ class TrainingConfig:
     gradient_checkpointing: bool = False
     # Logging
     log_every: int = 10
-    eval_every: int = 1000
     save_every: int = 5000
     output_dir: str = "./outputs"
     wandb_project: str | None = "moe-experiments"
@@ -71,54 +70,6 @@ def get_grad_norm(model: nn.Module) -> float:
             total_norm += p.grad.detach().pow(2).sum().item()
     return total_norm ** 0.5
 
-
-# ------------------------------------------------------------------ #
-#  MFU                                                                 #
-# ------------------------------------------------------------------ #
-
-# B200 BF16 tensor-core peak (non-sparse dense matmuls)
-B200_PEAK_FLOPS_BF16: float = 2.25e15   # FLOPS/s per GPU
-
-
-def estimate_active_flops_per_token(config) -> float:
-    """
-    Estimate FLOPs for one forward pass per token for an MoE model.
-
-    For MoE the key insight is that only top-k experts fire per token,
-    so expert FLOPs scale with top_k, not total num_experts.
-
-    Formula follows PaLM / Chinchilla counting:
-      attention projections : 2 × L × (4 H²)   [Q K V O, GQA ≈ dense for large H]
-      expert FFN            : 2 × L × top_k × 3 × H × I
-      router                : 2 × L × H × E    [usually tiny]
-      embed + lm_head       : 2 × 2 × H × V    [×2 if not tied]
-
-    Multiply by 3 for training (backward ≈ 2× forward).
-    """
-    L  = config.num_hidden_layers
-    H  = config.hidden_size
-    I  = config.moe_intermediate_size
-    K  = config.num_experts_per_tok
-    E  = config.num_experts
-    V  = config.vocab_size
-
-    attn   = 2 * L * 4 * H * H
-    expert = 2 * L * K * 3 * H * I
-    router = 2 * L * H * E          # negligible but correct
-    embed  = 2 * 2 * H * V          # embed + lm_head
-
-    return 3 * (attn + expert + router + embed)   # ×3 for training
-
-
-def compute_mfu(
-    flops_per_token: float,
-    tokens_per_sec: float,
-    num_gpus: int,
-    peak_flops_per_gpu: float = B200_PEAK_FLOPS_BF16,
-) -> float:
-    """MFU = achieved FLOPS / (num_gpus × peak_FLOPS_per_gpu)."""
-    achieved = flops_per_token * tokens_per_sec          # total FLOPS/s across all GPUs
-    return achieved / (num_gpus * peak_flops_per_gpu)
 
 
 def build_optimizer(model: nn.Module, config: TrainingConfig) -> torch.optim.AdamW:

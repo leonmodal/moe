@@ -2,21 +2,9 @@
 Pretraining script: Standard MoE vs Global MoE.
 
 Usage:
-  # DDP (default, works well on 8× B200):
-  accelerate launch --config_file accelerate_configs/ddp_8gpu.yaml \
-      train.py --config configs/standard_moe.yaml
-
-  # Global MoE:
-  accelerate launch --config_file accelerate_configs/ddp_8gpu.yaml \
-      train.py --config configs/global_moe.yaml
-
-  # Resume from checkpoint:
-  accelerate launch ... train.py --config configs/standard_moe.yaml \
-      --resume outputs/standard_moe/checkpoint-5000
-
-  # Quick smoke-test (tiny model, no data required):
-  accelerate launch --config_file accelerate_configs/ddp_8gpu.yaml \
-      train.py --config configs/standard_moe.yaml --smoke_test
+  ./scripts/train.sh configs/scaling/xs_standard.yaml
+  ./scripts/train.sh configs/scaling/xs_global.yaml
+  ./scripts/train.sh configs/scaling/l_standard.yaml --resume outputs/l_standard_moe/checkpoint-5000
 """
 import argparse
 import json
@@ -97,22 +85,6 @@ def build_model(cfg: dict):
 
 
 # --------------------------------------------------------------------------- #
-#  Smoke-test dataset (random tokens, no files needed)                        #
-# --------------------------------------------------------------------------- #
-
-class SyntheticDataset(torch.utils.data.IterableDataset):
-    def __init__(self, vocab_size: int, seq_len: int, num_samples: int = 10_000):
-        self.vocab_size = vocab_size
-        self.seq_len = seq_len
-        self.num_samples = num_samples
-
-    def __iter__(self):
-        for _ in range(self.num_samples):
-            ids = torch.randint(0, self.vocab_size, (self.seq_len + 1,))
-            yield {"input_ids": ids[:-1], "labels": ids[1:]}
-
-
-# --------------------------------------------------------------------------- #
 #  Checkpointing                                                               #
 # --------------------------------------------------------------------------- #
 
@@ -157,7 +129,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--resume", default=None, help="Path to checkpoint directory")
-    parser.add_argument("--smoke_test", action="store_true", help="Run with synthetic data")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -182,7 +153,6 @@ def main() -> None:
         mixed_precision=tcfg_dict["mixed_precision"],
         gradient_checkpointing=tcfg_dict.get("gradient_checkpointing", False),
         log_every=tcfg_dict["log_every"],
-        eval_every=tcfg_dict["eval_every"],
         save_every=tcfg_dict["save_every"],
         output_dir=tcfg_dict["output_dir"],
         wandb_project=tcfg_dict.get("wandb_project"),
@@ -226,36 +196,28 @@ def main() -> None:
     )
 
     # --- Dataset ------------------------------------------------------------
-    if args.smoke_test:
-        accelerator.print("Smoke test mode: using synthetic random data")
-        dataset = SyntheticDataset(
-            vocab_size=model_cfg.vocab_size,
-            seq_len=min(model_cfg.max_position_embeddings, 2048),
-        )
-        tokenizer = None
-    else:
-        data_cfg = DataConfig(
-            data_dir=dcfg_dict["data_dir"],
-            text_column=dcfg_dict.get("text_column", "text"),
-            seq_len=dcfg_dict.get("seq_len", 2048),
-            tokenizer_name=dcfg_dict.get("tokenizer_name", "gpt2"),
-            num_workers=dcfg_dict.get("num_workers", 4),
-        )
-        tokenizer = AutoTokenizer.from_pretrained(data_cfg.tokenizer_name)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+    data_cfg = DataConfig(
+        data_dir=dcfg_dict["data_dir"],
+        text_column=dcfg_dict.get("text_column", "text"),
+        seq_len=dcfg_dict.get("seq_len", 2048),
+        tokenizer_name=dcfg_dict.get("tokenizer_name", "gpt2"),
+        num_workers=dcfg_dict.get("num_workers", 4),
+    )
+    tokenizer = AutoTokenizer.from_pretrained(data_cfg.tokenizer_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-        dataset = StatefulParquetDataset(
-            config=data_cfg,
-            tokenizer=tokenizer,
-            rank=accelerator.process_index,
-            world_size=accelerator.num_processes,
-        )
+    dataset = StatefulParquetDataset(
+        config=data_cfg,
+        tokenizer=tokenizer,
+        rank=accelerator.process_index,
+        world_size=accelerator.num_processes,
+    )
 
     dataloader = DataLoader(
         dataset,
         batch_size=train_cfg.batch_size,
-        num_workers=train_cfg.gradient_accumulation if not args.smoke_test else 0,
+        num_workers=train_cfg.gradient_accumulation,
         pin_memory=True,
     )
 
@@ -274,7 +236,7 @@ def main() -> None:
     if resume_from:
         global_step, dataset_state = load_checkpoint(accelerator, resume_from)
         accelerator.print(f"Resumed from step {global_step}")
-        if dataset_state and not args.smoke_test:
+        if dataset_state:
             dataset.set_state(dataset_state)
 
     # Advance scheduler to match resumed step (no-op if global_step==0)
@@ -288,7 +250,7 @@ def main() -> None:
     data_iter = iter(dataloader)
     t0 = time.perf_counter()
     tokens_seen = 0
-    routing_log_every = tcfg_dict.get("routing_log_every", train_cfg.eval_every)
+    routing_log_every = tcfg_dict.get("routing_log_every", 50)
 
     accelerator.print(f"Starting training from step {global_step}")
 
@@ -330,17 +292,13 @@ def main() -> None:
                 aux   = output.aux_loss.item() if output.aux_loss is not None else 0.0
                 total = loss.item()
                 ce    = total - accelerator.unwrap_model(model).router_aux_loss_coef * aux
-                mfu   = compute_mfu(flops_per_token, tok_per_sec, accelerator.num_processes)
-
                 log_dict = {
-                    "train/loss":           total,
                     "train/ce_loss":        ce,
                     "train/aux_loss":       aux,
                     "train/grad_norm":      grad_norm,
                     "train/lr":             lr,
                     "train/tokens_per_sec": tok_per_sec,
                     "train/tokens_seen_B":  tokens_seen / 1e9,
-                    "step": global_step,
                 }
                 accelerator.print(
                     f"step {global_step:6d}  "
@@ -376,7 +334,7 @@ def main() -> None:
 
             # Checkpoint
             if global_step % train_cfg.save_every == 0:
-                ds_state = dataset.get_state() if not args.smoke_test else None
+                ds_state = dataset.get_state()
                 save_checkpoint(
                     accelerator, model, optimizer, scheduler,
                     global_step, train_cfg.output_dir, ds_state
@@ -386,7 +344,7 @@ def main() -> None:
     save_checkpoint(
         accelerator, model, optimizer, scheduler,
         global_step, train_cfg.output_dir,
-        dataset.get_state() if not args.smoke_test else None,
+        dataset.get_state(),
     )
     accelerator.end_training()
     accelerator.print("Training complete.")
