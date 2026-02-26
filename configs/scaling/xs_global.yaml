@@ -26,14 +26,14 @@ model:
   output_router_logits: true
 
 training:
-  learning_rate: 5.0e-4
-  weight_decay: 0.1
+  learning_rate: 1.0e-3
+  weight_decay: 0.01
   beta1: 0.9
   beta2: 0.95
   max_grad_norm: 1.0
   lr_scheduler: cosine
-  warmup_steps: 2000
-  max_steps: 100000
+  warmup_steps: 1000
+  max_steps: 1000000
   min_lr_ratio: 0.1
   batch_size: 32
   gradient_accumulation: 1
