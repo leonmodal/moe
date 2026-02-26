@@ -6,10 +6,10 @@ The only changes vs standard Qwen3MoE:
   2. GlobalSparseMoeBlock: router only — no expert weights stored here
   3. GlobalMoEDecoderLayer: uses GlobalSparseMoeBlock; forward accepts global_experts kwarg
   4. GlobalMoEModel: owns one shared Qwen3MoeExperts(2048); injects it into every layer call
-  5. GlobalMoEForCausalLM: wraps GlobalMoEModel
+  5. GlobalMoEForCausalLM: wraps GlobalMoEModel, uses fixed load-balancing loss
 
 Everything else (GQA, QK-norm, RoPE, RMSNorm, KV cache, flash-attn dispatch,
-gradient checkpointing, load-balancing loss, generation) is inherited from Qwen3.
+gradient checkpointing, generation) is inherited from Qwen3.
 
 Memory note: GlobalMoEDecoderLayer.__init__ passes a dummy config with
 mlp_only_layers set to avoid allocating a per-layer 2048-expert pool that
@@ -17,7 +17,6 @@ would immediately be thrown away.
 """
 import copy
 
-import torch
 import torch.nn as nn
 from transformers import Qwen3MoeConfig
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
@@ -26,8 +25,9 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeForCausalLM,
     Qwen3MoeModel,
     Qwen3MoeTopKRouter,
-    load_balancing_loss_func,
 )
+
+from .load_balancing import load_balancing_loss_func
 
 
 class GlobalMoEConfig(Qwen3MoeConfig):
@@ -150,7 +150,7 @@ class GlobalMoEModel(Qwen3MoeModel):
 class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
     """
     Causal LM head wrapping GlobalMoEModel.
-    Inherits loss computation, aux-loss, generation, etc. from Qwen3MoeForCausalLM.
+    Uses fixed load-balancing loss (no double softmax, global-batch f_i).
     """
 
     def __init__(self, config: GlobalMoEConfig):
@@ -158,3 +158,20 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
         self.model = GlobalMoEModel(config)
         self.num_experts = config.num_experts
         self.post_init()
+
+    def forward(self, **kwargs):
+        output = super().forward(**kwargs)
+
+        # Recompute aux loss with our fixed loss function
+        if output.router_logits is not None and output.aux_loss is not None:
+            old_aux = output.aux_loss
+            new_aux = load_balancing_loss_func(
+                output.router_logits,
+                self.num_experts,
+                self.num_experts_per_tok,
+            )
+            if output.loss is not None:
+                output.loss = output.loss - self.router_aux_loss_coef * old_aux + self.router_aux_loss_coef * new_aux
+            output.aux_loss = new_aux
+
+        return output

@@ -1,0 +1,87 @@
+"""
+Fixed load-balancing loss for MoE training.
+
+Fixes vs the HuggingFace transformers implementation:
+  1. No double softmax — router already returns softmax probabilities,
+     the HF loss applies softmax again which flattens the distribution
+     and makes the loss blind to imbalance.
+  2. Global-batch balance (Qwen3-style) — synchronizes f_i across all
+     DDP ranks so the loss sees the true global token distribution.
+"""
+import torch
+import torch.nn.functional as F
+
+
+def load_balancing_loss_func(
+    gate_logits: torch.Tensor | tuple[torch.Tensor] | None,
+    num_experts: int | None = None,
+    top_k: int = 2,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor | int:
+    """
+    Computes auxiliary load balancing loss (Switch Transformer).
+
+    Args:
+        gate_logits: Tuple of [T, E] softmax-probability tensors, one per layer.
+                     These are ALREADY softmax probabilities from the router.
+        num_experts: Total number of experts.
+        top_k: Number of experts selected per token.
+        attention_mask: Optional [batch_size, seq_len] mask.
+
+    Returns:
+        Scalar load-balancing loss.
+    """
+    if gate_logits is None or not isinstance(gate_logits, tuple):
+        return 0
+
+    compute_device = gate_logits[0].device
+    concatenated_gate_logits = torch.cat(
+        [layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0
+    )
+
+    # gate_logits are already softmax probabilities from the router — use directly.
+    routing_weights = concatenated_gate_logits
+
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+
+    expert_mask = F.one_hot(selected_experts, num_experts)
+
+    if attention_mask is None:
+        # f_i: fraction of tokens routed to each expert (hard assignment)
+        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+
+        # Global-batch balance (Qwen3-style): synchronize f_i across all ranks
+        # so the loss sees the true global token distribution, not noisy per-GPU splits.
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(tokens_per_expert, op=torch.distributed.ReduceOp.AVG)
+
+        # p_i: average router probability per expert (soft, differentiable)
+        router_prob_per_expert = torch.mean(routing_weights, dim=0)
+    else:
+        batch_size, sequence_length = attention_mask.shape
+        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
+
+        expert_attention_mask = (
+            attention_mask[None, :, :, None, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
+            .reshape(-1, top_k, num_experts)
+            .to(compute_device)
+        )
+
+        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
+            expert_attention_mask, dim=0
+        )
+
+        router_per_expert_attention_mask = (
+            attention_mask[None, :, :, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
+            .reshape(-1, num_experts)
+            .to(compute_device)
+        )
+
+        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
+            router_per_expert_attention_mask, dim=0
+        )
+
+    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+    return overall_loss * num_experts
