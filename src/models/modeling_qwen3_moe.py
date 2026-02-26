@@ -582,6 +582,12 @@ def load_balancing_loss_func(
         # Compute the percentage of tokens routed to each experts
         tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
 
+        # Global-batch balance (Qwen3-style): synchronize f_i across all ranks
+        # so the loss sees the true global token distribution, not noisy per-GPU splits.
+        # p_i stays local — only the hard assignment fraction is synchronized.
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(tokens_per_expert, op=torch.distributed.ReduceOp.AVG)
+
         # Compute the average probability of routing to these experts
         router_prob_per_expert = torch.mean(routing_weights, dim=0)
     else:
