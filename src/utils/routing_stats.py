@@ -30,7 +30,6 @@ Global MoE only:
   routing/cross_layer_sim_min       — minimum pairwise similarity
   routing/cross_layer_sim_max       — maximum pairwise similarity
 
-  routing/layer_NN_global_experts_used — how many unique experts layer NN selected
   _hist/global_expert_layer_count      — per-expert: how many layers use it (0=dead, L=everywhere)
 """
 import math
@@ -123,11 +122,6 @@ def compute_routing_stats(
         E = mat.shape[1]
         used_mask = mat > 0                                    # [L, E] bool
         layer_count = used_mask.float().sum(dim=0)             # [E] how many layers use each expert
-
-        # Per-layer: how many unique experts from the global pool
-        for layer_idx in range(L):
-            n_used = int(used_mask[layer_idx].sum().item())
-            stats[f"routing/layer_{layer_idx:02d}_global_experts_used"] = n_used
 
         # Histogram: for each expert, how many layers use it (0 = dead, L = everywhere)
         stats["_hist/global_expert_layer_count"] = layer_count.cpu().tolist()
