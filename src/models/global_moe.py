@@ -17,6 +17,7 @@ would immediately be thrown away.
 """
 import copy
 
+import torch
 import torch.nn as nn
 from transformers import Qwen3MoeConfig
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
@@ -25,6 +26,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeForCausalLM,
     Qwen3MoeModel,
     Qwen3MoeTopKRouter,
+    load_balancing_loss_func,
 )
 
 

@@ -572,7 +572,9 @@ def load_balancing_loss_func(
         compute_device = gate_logits[0].device
         concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
 
-    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+    # gate_logits are already softmax probabilities from the router,
+    # so we use them directly (no second softmax).
+    routing_weights = concatenated_gate_logits
 
     _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
 
