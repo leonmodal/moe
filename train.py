@@ -168,6 +168,11 @@ def main() -> None:
     )
     set_seed(args.seed + accelerator.process_index)
 
+    # Accelerate counts scheduler steps per device, not per optimizer update.
+    # Scale warmup/max steps so configs stay in real optimizer steps.
+    train_cfg.warmup_steps = train_cfg.warmup_steps * accelerator.num_processes
+    train_cfg.max_steps = train_cfg.max_steps * accelerator.num_processes
+
     if log_with and accelerator.is_main_process:
         accelerator.init_trackers(
             project_name=train_cfg.wandb_project,
@@ -276,11 +281,11 @@ def main() -> None:
                 accelerator.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
 
             optimizer.step()
-            scheduler.step()
             optimizer.zero_grad()
 
         # Only count steps at actual optimizer updates
         if accelerator.sync_gradients:
+            scheduler.step()
             global_step += 1
             tokens_seen += input_ids.numel() * accelerator.num_processes
 
