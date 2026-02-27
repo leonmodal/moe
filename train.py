@@ -29,6 +29,9 @@ from accelerate.utils import set_seed
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
+from liger_kernel.transformers import apply_liger_kernel_to_qwen3_moe
+apply_liger_kernel_to_qwen3_moe()  # monkey-patches RMSNorm, SwiGLU, RoPE, CrossEntropy before model init
+
 from src.data.parquet_dataset import DataConfig, StatefulParquetDataset
 from src.models import Qwen3MoeConfig, StandardMoEModel, GlobalMoEConfig, GlobalMoEForCausalLM
 from src.utils.training import (
