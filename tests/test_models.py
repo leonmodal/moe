@@ -156,16 +156,21 @@ def test_global_no_duplicate_expert_params():
     cfg = tiny_global_config()
     model = GlobalMoEForCausalLM(cfg)
 
-    # Count expert parameters
-    expert_param_names = [n for n, _ in model.named_parameters()
-                          if "gate_up_proj" in n or "down_proj" in n]
-
-    # In standard MoE with L=2, E=4 experts per layer we'd have 2×4=8 gate_up_proj tensors
-    # In global MoE with E=8 in one pool we should have exactly 8 (not 16)
-    gate_up_names = [n for n in expert_param_names if "gate_up_proj" in n]
-    assert len(gate_up_names) == cfg.num_experts, (
-        f"Expected {cfg.num_experts} gate_up_proj tensors (one per expert), "
-        f"got {len(gate_up_names)}"
+    # HF Qwen3MoeExperts uses a single fused gate_up_proj tensor [num_experts, H, 2*I].
+    # Global MoE should have exactly 1 gate_up_proj (under model.global_experts),
+    # NOT L copies (one per layer).
+    gate_up_names = [n for n, _ in model.named_parameters() if "gate_up_proj" in n]
+    assert len(gate_up_names) == 1, (
+        f"Expected exactly 1 fused gate_up_proj tensor (in global_experts), "
+        f"got {len(gate_up_names)}: {gate_up_names}"
+    )
+    assert "global_experts" in gate_up_names[0], (
+        f"gate_up_proj should be under global_experts, got: {gate_up_names[0]}"
+    )
+    # Verify it has the right shape: [num_experts, hidden_size, 2*moe_intermediate_size]
+    gup = dict(model.named_parameters())[gate_up_names[0]]
+    assert gup.shape[0] == cfg.num_experts, (
+        f"gate_up_proj dim 0 is {gup.shape[0]}, expected {cfg.num_experts}"
     )
 
 

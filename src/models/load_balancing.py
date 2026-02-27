@@ -5,8 +5,8 @@ Fixes vs the HuggingFace transformers implementation:
   1. No double softmax — router already returns softmax probabilities,
      the HF loss applies softmax again which flattens the distribution
      and makes the loss blind to imbalance.
-  2. Global-batch balance (Qwen3-style) — synchronizes f_i across all
-     DDP ranks so the loss sees the true global token distribution.
+  2. f_i is kept local per rank (no all_reduce) to preserve the
+     theoretical minimum of the load-balancing loss.
 """
 import torch
 import torch.nn.functional as F
@@ -48,12 +48,9 @@ def load_balancing_loss_func(
 
     if attention_mask is None:
         # f_i: fraction of tokens routed to each expert (hard assignment)
+        # Kept local per rank — no all_reduce — to preserve the theoretical
+        # minimum of the load-balancing loss.
         tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
-
-        # Global-batch balance (Qwen3-style): synchronize f_i across all ranks
-        # so the loss sees the true global token distribution, not noisy per-GPU splits.
-        if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(tokens_per_expert, op=torch.distributed.ReduceOp.AVG)
 
         # p_i: average router probability per expert (soft, differentiable)
         router_prob_per_expert = torch.mean(routing_weights, dim=0)
