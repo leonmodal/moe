@@ -39,13 +39,77 @@ Global MoE only:
 
   _hist/global_pool_expert_load_frac   — per-expert fraction of total routing slots across all layers
 
-  _table/layer_NN_expert_tokens     — list of (expert_index, token_count) per layer
+Cumulative tables (via accumulate_expert_counts + expert_counts_to_tables):
+  _table/layer_NN_expert_tokens     — list of (expert_index, token_count) per layer,
+                                      accumulated over routing_log_every steps, all-reduced across ranks
   _table/global_pool_expert_tokens  — list of (expert_index, token_count) summed across all layers
 """
 import math
 from typing import Sequence
 
 import torch
+
+
+def accumulate_expert_counts(
+    router_logits: Sequence[torch.Tensor],
+    num_experts_per_tok: int,
+    accumulator: dict[int, torch.Tensor] | None = None,
+) -> dict[int, torch.Tensor]:
+    """
+    Add per-layer expert token counts from one batch into an accumulator.
+
+    Args:
+        router_logits: tuple of [T, E] prob tensors, one per layer.
+        num_experts_per_tok: top-k value.
+        accumulator: existing {layer_idx: [E] counts} dict, or None to create new.
+
+    Returns:
+        Updated accumulator dict.
+    """
+    if accumulator is None:
+        accumulator = {}
+    for layer_idx, probs in enumerate(router_logits):
+        probs = probs.detach().float()
+        T, E = probs.shape
+        _, top_k_idx = torch.topk(probs, num_experts_per_tok, dim=-1)
+        counts = torch.bincount(top_k_idx.reshape(-1), minlength=E).float()
+        if layer_idx in accumulator:
+            accumulator[layer_idx] += counts
+        else:
+            accumulator[layer_idx] = counts
+    return accumulator
+
+
+def expert_counts_to_tables(
+    accumulator: dict[int, torch.Tensor],
+    is_global: bool = False,
+) -> dict:
+    """
+    Convert accumulated expert counts into _table/ entries for logging.
+
+    Args:
+        accumulator: {layer_idx: [E] token counts} accumulated over multiple steps/ranks.
+        is_global: whether to also emit a global pool table.
+
+    Returns:
+        Dict with _table/ keys.
+    """
+    stats = {}
+    for layer_idx in sorted(accumulator):
+        counts = accumulator[layer_idx]
+        E = counts.shape[0]
+        counts_list = counts.cpu().tolist()
+        tag = f"routing/layer_{layer_idx:02d}"
+        stats[f"_table/{tag}_expert_tokens"] = list(zip(range(E), counts_list))
+
+    if is_global and len(accumulator) > 1:
+        all_counts = torch.stack([accumulator[i] for i in sorted(accumulator)])
+        pool_counts = all_counts.sum(dim=0)
+        E = pool_counts.shape[0]
+        pool_list = pool_counts.cpu().tolist()
+        stats["_table/global_pool_expert_tokens"] = list(zip(range(E), pool_list))
+
+    return stats
 
 
 def compute_routing_stats(
@@ -60,8 +124,7 @@ def compute_routing_stats(
         is_global:           whether to compute cross-layer metrics.
 
     Returns:
-        Flat dict of scalar metrics + '_hist/*' lists for wandb.Histogram
-        + '_table/*' lists of (expert_index, token_count) for wandb.Table bar charts.
+        Flat dict of scalar metrics + '_hist/*' lists for wandb.Histogram.
     """
     stats: dict = {}
     load_vecs: list[torch.Tensor] = []   # [E] integer counts per layer, for cross-layer sim
@@ -95,10 +158,6 @@ def compute_routing_stats(
         # ideal = 1/E for every expert; logged as histogram
         load_frac = (counts / total_slots).cpu().tolist()   # list of E floats
         stats[f"_hist/{tag}_expert_load_frac"] = load_frac
-
-        # Raw per-expert token counts indexed by expert ID
-        counts_list = counts.cpu().tolist()
-        stats[f"_table/{tag}_expert_tokens"] = list(zip(range(E), counts_list))
 
         # ── Entropy of mean routing probabilities ────────────────────────
         mean_p  = probs.mean(dim=0)                     # [E]
@@ -153,10 +212,6 @@ def compute_routing_stats(
 
         pool_frac = (pool_counts / pool_total).cpu()
         stats["_hist/global_pool_expert_load_frac"] = pool_frac.tolist()
-
-        # Raw per-expert token counts across all layers
-        pool_counts_list = pool_counts.cpu().tolist()
-        stats["_table/global_pool_expert_tokens"] = list(zip(range(E), pool_counts_list))
 
         pool_entropy = -(pool_frac * (pool_frac + 1e-10).log()).sum().item()
         stats["routing/global_pool_entropy"] = pool_entropy / math.log(E)

@@ -1,6 +1,10 @@
 """
 Fixed load-balancing loss for MoE training.
 
+Two variants:
+  1. load_balancing_loss_func — standard batch-level Switch Transformer loss
+  2. seq_load_balancing_loss_func — DeepSeek V2/V3 sequence-level loss
+
 Fixes vs the HuggingFace transformers implementation:
   1. No double softmax — router already returns softmax probabilities,
      the HF loss applies softmax again which flattens the distribution
@@ -82,3 +86,62 @@ def load_balancing_loss_func(
 
     overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
     return overall_loss * num_experts
+
+
+def seq_load_balancing_loss_func(
+    gate_logits: torch.Tensor | tuple[torch.Tensor] | None,
+    num_experts: int | None = None,
+    top_k: int = 2,
+    batch_size: int = 1,
+) -> torch.Tensor | int:
+    """
+    Sequence-level load balancing loss (DeepSeek V2/V3).
+
+    Instead of computing load balance across all tokens in a batch, this
+    reshapes each layer's (bsz*seq_len, E) → (seq_len, bsz*E) to compute
+    balance per sequence, then averages across the batch.
+
+    This prevents large batches from washing out per-sequence imbalance:
+    a single sequence hoarding one expert gets penalized even if other
+    sequences in the batch spread evenly.
+
+    Args:
+        gate_logits: Tuple of [T, E] probability tensors, one per layer.
+                     T = batch_size * seq_len.
+        num_experts: Total number of experts.
+        top_k: Number of experts selected per token.
+        batch_size: Batch size (needed to reshape T → seq_len).
+
+    Returns:
+        Scalar load-balancing loss.
+    """
+    if gate_logits is None or not isinstance(gate_logits, tuple):
+        return 0
+
+    total_loss = gate_logits[0].new_zeros(())
+    num_virtual_experts = batch_size * num_experts
+    virtual_top_k = batch_size * top_k
+
+    for layer_gate in gate_logits:
+        T, E = layer_gate.shape
+        seq_len = T // batch_size
+
+        # Reshape: (bsz * seq_len, E) → (seq_len, bsz * E)
+        # Each sequence's experts become independent "virtual experts"
+        probs = layer_gate.reshape(batch_size, seq_len, E)     # (B, S, E)
+        probs = probs.permute(1, 0, 2).reshape(seq_len, -1)    # (S, B*E)
+
+        # Standard Switch loss on reshaped tensor
+        _, selected = torch.topk(probs, virtual_top_k, dim=-1)
+        expert_mask = F.one_hot(selected, num_virtual_experts)
+
+        # f_i: fraction of tokens routed to each virtual expert
+        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+        # p_i: average probability per virtual expert
+        router_prob_per_expert = torch.mean(probs, dim=0)
+
+        layer_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+        total_loss = total_loss + layer_loss * num_virtual_experts
+
+    # Average across batch and layers
+    return total_loss / (batch_size * len(gate_logits))

@@ -46,6 +46,7 @@ from src.models import (
     DeepSeekGlobalMoEForCausalLM,
 )
 from src.models.router import DeepSeekRouter
+from src.models.load_balancing import seq_load_balancing_loss_func
 from src.utils.training import (
     TrainingConfig,
     build_lr_scheduler,
@@ -53,7 +54,7 @@ from src.utils.training import (
     count_parameters,
     get_grad_norm,
 )
-from src.utils.routing_stats import compute_routing_stats
+from src.utils.routing_stats import compute_routing_stats, accumulate_expert_counts, expert_counts_to_tables
 
 
 # --------------------------------------------------------------------------- #
@@ -349,6 +350,11 @@ def main() -> None:
     )
     is_global = cfg["model"]["type"] in ("global_moe", "deepseek_global_moe")
     bias_update_rate = cfg["model"].get("bias_update_rate", 0.0)
+    seq_aux_loss_coef = cfg["model"].get("seq_aux_loss_coef", 0.0)
+
+    # Attach seq_aux_loss_coef to model (read by forward methods)
+    if seq_aux_loss_coef > 0:
+        model._seq_aux_loss_coef = seq_aux_loss_coef
 
     accelerator.print(
         f"\n{'='*60}\n"
@@ -416,6 +422,7 @@ def main() -> None:
     t0 = time.perf_counter()
     tokens_seen = 0
     routing_log_every = tcfg_dict.get("routing_log_every", 50)
+    expert_count_accum = None  # accumulated per-layer expert token counts
 
     accelerator.print(f"Starting training from step {global_step}")
 
@@ -465,9 +472,23 @@ def main() -> None:
                 aux   = output.aux_loss.item() if output.aux_loss is not None else 0.0
                 total = loss.item()
                 ce    = total - accelerator.unwrap_model(model).router_aux_loss_coef * aux
+
+                # Compute seq_aux_loss for logging
+                seq_aux = 0.0
+                if seq_aux_loss_coef > 0 and output.router_logits is not None:
+                    seq_aux_val = seq_load_balancing_loss_func(
+                        output.router_logits,
+                        model_cfg.num_experts,
+                        model_cfg.num_experts_per_tok,
+                        batch_size=input_ids.shape[0],
+                    )
+                    seq_aux = seq_aux_val.item() if isinstance(seq_aux_val, torch.Tensor) else seq_aux_val
+                    ce -= seq_aux_loss_coef * seq_aux
+
                 log_dict = {
                     "train/ce_loss":        ce,
                     "train/aux_loss":       aux,
+                    "train/seq_aux_loss":   seq_aux,
                     "train/grad_norm":      grad_norm,
                     "train/lr":             lr,
                     "train/tokens_per_sec": tok_per_sec,
@@ -475,7 +496,7 @@ def main() -> None:
                 }
                 accelerator.print(
                     f"step {global_step:6d}  "
-                    f"loss={total:.4f}  ce={ce:.4f}  aux={aux:.4f}  "
+                    f"loss={total:.4f}  ce={ce:.4f}  aux={aux:.4f}  seq_aux={seq_aux:.4f}  "
                     f"lr={lr:.2e}  "
                     f"tok/s={tok_per_sec/1e3:.1f}k  |g|={grad_norm:.3f}"
                 )
@@ -484,19 +505,37 @@ def main() -> None:
                 if log_with:
                     accelerator.log(log_dict, step=global_step)
 
+            # ── Accumulate expert token counts every step (all ranks) ──
+            if output.router_logits is not None:
+                expert_count_accum = accumulate_expert_counts(
+                    output.router_logits,
+                    num_experts_per_tok=model_cfg.num_experts_per_tok,
+                    accumulator=expert_count_accum,
+                )
+
             # ── Routing stats (per-layer + cross-layer for Global MoE) ──
-            if global_step % routing_log_every == 0 and accelerator.is_main_process:
-                if output.router_logits is not None:
+            if global_step % routing_log_every == 0:
+                # All-reduce accumulated counts across ranks
+                if expert_count_accum is not None and accelerator.num_processes > 1:
+                    for k in expert_count_accum:
+                        torch.distributed.all_reduce(
+                            expert_count_accum[k], op=torch.distributed.ReduceOp.SUM,
+                        )
+
+                if accelerator.is_main_process and output.router_logits is not None:
                     rstats = compute_routing_stats(
                         output.router_logits,
                         num_experts_per_tok=model_cfg.num_experts_per_tok,
                         is_global=is_global,
                     )
-                    # Separate histogram, table, and scalar data
+                    # Separate histogram and scalar data
                     hist_data    = {k: v for k, v in rstats.items() if k.startswith("_hist/")}
-                    table_data   = {k: v for k, v in rstats.items() if k.startswith("_table/")}
-                    scalar_stats = {k: v for k, v in rstats.items()
-                                    if not k.startswith("_hist/") and not k.startswith("_table/")}
+                    scalar_stats = {k: v for k, v in rstats.items() if not k.startswith("_hist/")}
+
+                    # Build table data from accumulated counts (cumulative, cross-rank)
+                    table_data = {}
+                    if expert_count_accum is not None:
+                        table_data = expert_counts_to_tables(expert_count_accum, is_global=is_global)
 
                     if log_with:
                         accelerator.log(scalar_stats, step=global_step)
@@ -518,6 +557,9 @@ def main() -> None:
                                 }, step=global_step)
                         except Exception:
                             pass
+
+                # Reset accumulator on all ranks
+                expert_count_accum = None
 
             # Checkpoint
             if global_step % train_cfg.save_every == 0:

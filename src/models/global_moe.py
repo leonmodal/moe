@@ -27,7 +27,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeTopKRouter,
 )
 
-from .load_balancing import load_balancing_loss_func
+from .load_balancing import load_balancing_loss_func, seq_load_balancing_loss_func
 from .router import DeepSeekRouter
 
 
@@ -179,6 +179,19 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
             if output.loss is not None:
                 output.loss = output.loss - self.router_aux_loss_coef * old_aux + self.router_aux_loss_coef * new_aux
             output.aux_loss = new_aux
+
+        # Sequence-level aux loss (DeepSeek V2/V3)
+        seq_coef = getattr(self, "_seq_aux_loss_coef", 0.0)
+        if seq_coef > 0 and output.router_logits is not None and output.loss is not None:
+            input_ids = kwargs.get("input_ids")
+            bsz = input_ids.shape[0] if input_ids is not None else 1
+            seq_aux = seq_load_balancing_loss_func(
+                output.router_logits,
+                self.num_experts,
+                self.num_experts_per_tok,
+                batch_size=bsz,
+            )
+            output.loss = output.loss + seq_coef * seq_aux
 
         return output
 
