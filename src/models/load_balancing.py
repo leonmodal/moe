@@ -97,13 +97,13 @@ def seq_load_balancing_loss_func(
     """
     Sequence-level load balancing loss (DeepSeek V2/V3).
 
-    Instead of computing load balance across all tokens in a batch, this
-    reshapes each layer's (bsz*seq_len, E) → (seq_len, bsz*E) to compute
-    balance per sequence, then averages across the batch.
+    Computes the Switch Transformer load-balancing loss independently per
+    sequence, then averages across the batch and layers. This prevents
+    large batches from washing out per-sequence imbalance: a single
+    sequence hoarding one expert gets penalized even if other sequences
+    in the batch spread evenly.
 
-    This prevents large batches from washing out per-sequence imbalance:
-    a single sequence hoarding one expert gets penalized even if other
-    sequences in the batch spread evenly.
+    For uniform routing this gives ~top_k (same baseline as batch-level).
 
     Args:
         gate_logits: Tuple of [T, E] probability tensors, one per layer.
@@ -119,29 +119,29 @@ def seq_load_balancing_loss_func(
         return 0
 
     total_loss = gate_logits[0].new_zeros(())
-    num_virtual_experts = batch_size * num_experts
-    virtual_top_k = batch_size * top_k
 
     for layer_gate in gate_logits:
         T, E = layer_gate.shape
         seq_len = T // batch_size
 
-        # Reshape: (bsz * seq_len, E) → (seq_len, bsz * E)
-        # Each sequence's experts become independent "virtual experts"
-        probs = layer_gate.reshape(batch_size, seq_len, E)     # (B, S, E)
-        probs = probs.permute(1, 0, 2).reshape(seq_len, -1)    # (S, B*E)
+        # Reshape: (B*S, E) → (B, S, E) — per-sequence view
+        probs = layer_gate.reshape(batch_size, seq_len, E)           # (B, S, E)
 
-        # Standard Switch loss on reshaped tensor
-        _, selected = torch.topk(probs, virtual_top_k, dim=-1)
-        expert_mask = F.one_hot(selected, num_virtual_experts)
+        # Per-sequence topk selection
+        _, selected = torch.topk(probs, top_k, dim=-1)              # (B, S, K)
+        expert_mask = F.one_hot(selected, num_experts)               # (B, S, K, E)
 
-        # f_i: fraction of tokens routed to each virtual expert
-        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
-        # p_i: average probability per virtual expert
-        router_prob_per_expert = torch.mean(probs, dim=0)
+        # f_i per sequence: fraction of tokens routed to each expert
+        tokens_per_expert = torch.mean(expert_mask.float(), dim=1)   # (B, K, E)
+        # P_i per sequence: average probability per expert
+        router_prob_per_expert = torch.mean(probs, dim=1)            # (B, E)
 
-        layer_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
-        total_loss = total_loss + layer_loss * num_virtual_experts
+        # Per-sequence loss: E * sum_i(f_i * P_i)
+        per_seq_loss = torch.sum(
+            tokens_per_expert * router_prob_per_expert.unsqueeze(1),
+            dim=(1, 2),
+        ) * num_experts                                              # (B,)
 
-    # Average across batch and layers
-    return total_loss / (batch_size * len(gate_logits))
+        total_loss = total_loss + per_seq_loss.mean()
+
+    return total_loss / len(gate_logits)
