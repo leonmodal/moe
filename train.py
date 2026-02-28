@@ -10,12 +10,16 @@ import argparse
 import json
 import math
 import os
+import re
+import shutil
+import socket
 import sys
 import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv()  # loads .env from cwd or any parent directory
+load_dotenv(Path(__file__).parent / ".env")  # also check script directory
 
 import torch
 import yaml
@@ -99,6 +103,7 @@ def save_checkpoint(
     step: int,
     output_dir: str,
     dataset_state: dict | None = None,
+    wandb_run_id: str | None = None,
 ) -> None:
     ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
     accelerator.save_state(ckpt_dir)
@@ -106,6 +111,8 @@ def save_checkpoint(
         meta = {"step": step}
         if dataset_state:
             meta["dataset_state"] = dataset_state
+        if wandb_run_id:
+            meta["wandb_run_id"] = wandb_run_id
         with open(os.path.join(ckpt_dir, "meta.json"), "w") as f:
             json.dump(meta, f)
     accelerator.print(f"Saved checkpoint to {ckpt_dir}")
@@ -124,6 +131,42 @@ def load_checkpoint(
     return 0, None
 
 
+def find_latest_checkpoint(output_dir: str) -> str | None:
+    """Scan output_dir for checkpoint-N directories and return path of latest."""
+    if not os.path.isdir(output_dir):
+        return None
+    pattern = re.compile(r"^checkpoint-(\d+)$")
+    checkpoints = []
+    for entry in os.listdir(output_dir):
+        m = pattern.match(entry)
+        if m:
+            path = os.path.join(output_dir, entry)
+            if os.path.isdir(path):
+                checkpoints.append((int(m.group(1)), path))
+    if not checkpoints:
+        return None
+    checkpoints.sort(key=lambda x: x[0])
+    return checkpoints[-1][1]
+
+
+def cleanup_checkpoints(output_dir: str, max_keep: int) -> None:
+    """Keep only the most recent max_keep checkpoints, delete the rest."""
+    if max_keep <= 0:
+        return
+    pattern = re.compile(r"^checkpoint-(\d+)$")
+    checkpoints = []
+    for entry in os.listdir(output_dir):
+        m = pattern.match(entry)
+        if m:
+            path = os.path.join(output_dir, entry)
+            if os.path.isdir(path):
+                checkpoints.append((int(m.group(1)), path))
+    checkpoints.sort(key=lambda x: x[0])
+    while len(checkpoints) > max_keep:
+        _, path = checkpoints.pop(0)
+        shutil.rmtree(path)
+
+
 # --------------------------------------------------------------------------- #
 #  Main                                                                        #
 # --------------------------------------------------------------------------- #
@@ -133,11 +176,26 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--resume", default=None, help="Path to checkpoint directory")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--auto_resume", action="store_true",
+                        help="Auto-find and resume from latest checkpoint in output_dir")
+    parser.add_argument("--data_dir", default=None,
+                        help="Override data.data_dir from config")
+    parser.add_argument("--output_dir", default=None,
+                        help="Override training.output_dir from config")
+    parser.add_argument("--max_checkpoints", type=int, default=0,
+                        help="Max checkpoints to keep (0 = unlimited)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     tcfg_dict = cfg["training"]
     dcfg_dict = cfg.get("data", {})
+
+    # --- CLI overrides -------------------------------------------------------
+    if args.data_dir:
+        dcfg_dict["data_dir"] = args.data_dir
+    if args.output_dir:
+        tcfg_dict["output_dir"] = args.output_dir
+
     resume_from = args.resume or cfg.get("checkpoint", {}).get("resume_from")
 
     # --- Accelerator --------------------------------------------------------
@@ -162,6 +220,24 @@ def main() -> None:
         wandb_run_name=tcfg_dict.get("wandb_run_name"),
     )
 
+    # --- Auto-resume: find latest checkpoint --------------------------------
+    if args.auto_resume and not resume_from:
+        resume_from = find_latest_checkpoint(train_cfg.output_dir)
+
+    # Read wandb run ID from checkpoint meta (for WandB resume)
+    wandb_run_id = None
+    if resume_from:
+        meta_path = os.path.join(resume_from, "meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            wandb_run_id = meta.get("wandb_run_id")
+
+    # --- Accelerator --------------------------------------------------------
+    # Set CUDA device early — required for NCCL init in multi-node torchrun
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+
     log_with = "wandb" if train_cfg.wandb_project else None
     accelerator = Accelerator(
         mixed_precision=train_cfg.mixed_precision,
@@ -171,17 +247,46 @@ def main() -> None:
     )
     set_seed(args.seed + accelerator.process_index)
 
+    # --- Multi-node diagnostics (every rank prints) --------------------------
+    print(
+        f"[rank {accelerator.process_index}] "
+        f"host={socket.gethostname()} "
+        f"local_rank={accelerator.local_process_index} "
+        f"num_processes={accelerator.num_processes} "
+        f"device={accelerator.device}",
+        flush=True,
+    )
+    if accelerator.is_main_process:
+        accelerator.print(f"=== Accelerator state ===")
+        accelerator.print(accelerator.state)
+
+    if resume_from:
+        accelerator.print(f"Will resume from: {resume_from}")
+
     # Accelerate counts scheduler steps per device, not per optimizer update.
     # Scale warmup/max steps so configs stay in real optimizer steps.
     train_cfg.warmup_steps = train_cfg.warmup_steps * accelerator.num_processes
     train_cfg.max_steps = train_cfg.max_steps * accelerator.num_processes
 
     if log_with and accelerator.is_main_process:
+        tracker_kwargs = {"wandb": {"name": train_cfg.wandb_run_name}}
+        if wandb_run_id:
+            tracker_kwargs["wandb"]["id"] = wandb_run_id
+            tracker_kwargs["wandb"]["resume"] = "must"
         accelerator.init_trackers(
             project_name=train_cfg.wandb_project,
             config={**cfg["model"], **tcfg_dict},
-            init_kwargs={"wandb": {"name": train_cfg.wandb_run_name}},
+            init_kwargs=tracker_kwargs,
         )
+
+    # Capture wandb run ID for checkpoint saving (new runs)
+    if log_with and accelerator.is_main_process and not wandb_run_id:
+        try:
+            import wandb
+            if wandb.run:
+                wandb_run_id = wandb.run.id
+        except Exception:
+            pass
 
     # --- Model --------------------------------------------------------------
     model, model_cfg = build_model(cfg)
@@ -345,15 +450,21 @@ def main() -> None:
                 ds_state = dataset.get_state()
                 save_checkpoint(
                     accelerator, model, optimizer, scheduler,
-                    global_step, train_cfg.output_dir, ds_state
+                    global_step, train_cfg.output_dir, ds_state,
+                    wandb_run_id=wandb_run_id,
                 )
+                if args.max_checkpoints > 0 and accelerator.is_main_process:
+                    cleanup_checkpoints(train_cfg.output_dir, args.max_checkpoints)
 
     # Final checkpoint
     save_checkpoint(
         accelerator, model, optimizer, scheduler,
         global_step, train_cfg.output_dir,
         dataset.get_state(),
+        wandb_run_id=wandb_run_id,
     )
+    if args.max_checkpoints > 0 and accelerator.is_main_process:
+        cleanup_checkpoints(train_cfg.output_dir, args.max_checkpoints)
     accelerator.end_training()
     accelerator.print("Training complete.")
 
