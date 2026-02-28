@@ -7,3 +7,4 @@ outputs/
 wandb/
 data/*
 .env
+Megatron-LM/

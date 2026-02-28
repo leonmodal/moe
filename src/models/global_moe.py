@@ -28,6 +28,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 )
 
 from .load_balancing import load_balancing_loss_func
+from .router import DeepSeekRouter
 
 
 class GlobalMoEConfig(Qwen3MoeConfig):
@@ -48,9 +49,11 @@ class GlobalSparseMoeBlock(nn.Module):
     This ensures Qwen3MoeExperts is registered exactly once in the module tree.
     """
 
-    def __init__(self, config: GlobalMoEConfig):
+    def __init__(self, config: GlobalMoEConfig, router_class=None):
         super().__init__()
-        self.gate = Qwen3MoeTopKRouter(config)  # same router as Qwen3
+        if router_class is None:
+            router_class = Qwen3MoeTopKRouter
+        self.gate = router_class(config)
 
     def forward(self, hidden_states, global_experts: Qwen3MoeExperts):
         B, T, H = hidden_states.shape
@@ -71,7 +74,7 @@ class GlobalMoEDecoderLayer(Qwen3MoeDecoderLayer):
     gradient-checkpointing support) and only changes the mlp.
     """
 
-    def __init__(self, config: GlobalMoEConfig, layer_idx: int):
+    def __init__(self, config: GlobalMoEConfig, layer_idx: int, router_class=None):
         # Trick: tell the parent to build a cheap dense MLP so it doesn't
         # allocate a 2048-expert Qwen3MoeExperts that we'd immediately discard.
         init_cfg = copy.deepcopy(config)
@@ -79,7 +82,7 @@ class GlobalMoEDecoderLayer(Qwen3MoeDecoderLayer):
         super().__init__(init_cfg, layer_idx)
 
         # Now replace the dense MLP with our router-only block.
-        self.mlp = GlobalSparseMoeBlock(config)
+        self.mlp = GlobalSparseMoeBlock(config, router_class=router_class)
 
     def forward(
         self,
@@ -122,7 +125,7 @@ class GlobalMoEModel(Qwen3MoeModel):
     Qwen3MoeModel with a single shared expert pool across all layers.
     """
 
-    def __init__(self, config: GlobalMoEConfig):
+    def __init__(self, config: GlobalMoEConfig, router_class=None):
         # Build parent with all-dense layers to avoid creating 16 × 2048-expert
         # pools that would be immediately replaced (and would OOM during init).
         init_cfg = copy.deepcopy(config)
@@ -136,7 +139,8 @@ class GlobalMoEModel(Qwen3MoeModel):
 
         # Replace per-layer MoE blocks with router-only versions.
         self.layers = nn.ModuleList([
-            GlobalMoEDecoderLayer(config, i) for i in range(config.num_hidden_layers)
+            GlobalMoEDecoderLayer(config, i, router_class=router_class)
+            for i in range(config.num_hidden_layers)
         ])
         self.post_init()
 
@@ -153,9 +157,11 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
     Uses fixed load-balancing loss (no double softmax, global-batch f_i).
     """
 
+    _router_class = None  # Override in subclasses
+
     def __init__(self, config: GlobalMoEConfig):
         super().__init__(config)
-        self.model = GlobalMoEModel(config)
+        self.model = GlobalMoEModel(config, router_class=self._router_class)
         self.num_experts = config.num_experts
         self.post_init()
 
@@ -175,3 +181,9 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
             output.aux_loss = new_aux
 
         return output
+
+
+class DeepSeekGlobalMoEForCausalLM(GlobalMoEForCausalLM):
+    """Global MoE with DeepSeek V3 sigmoid + expert-bias routing."""
+
+    _router_class = DeepSeekRouter

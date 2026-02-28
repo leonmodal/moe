@@ -11,7 +11,6 @@ Per-layer (both standard and global):
                                       1.0 = perfect, >1 = overloaded experts
   routing/layer_NN_load_cv          — std(token_counts) / mean(token_counts)
                                       0.0 = perfectly uniform
-  routing/layer_NN_utilization      — fraction of experts that received ≥1 token
   routing/layer_NN_entropy          — normalised entropy of mean routing probs [0,1]
                                       1.0 = uniform, 0.0 = collapsed
   routing/layer_NN_num_active_experts — count of experts that received ≥1 token
@@ -34,12 +33,14 @@ Global MoE only:
 
   routing/global_pool_load_imbalance   — max expert total tokens / ideal across all layers
   routing/global_pool_load_cv          — CV of total token counts across the shared expert pool
-  routing/global_pool_utilization      — fraction of experts that received ≥1 token across all layers
   routing/global_pool_num_active       — count of experts used by at least one layer
   routing/global_pool_top_expert       — index of most-loaded expert across all layers
   routing/global_pool_entropy          — normalised entropy of aggregate load distribution
 
   _hist/global_pool_expert_load_frac   — per-expert fraction of total routing slots across all layers
+
+  _table/layer_NN_expert_tokens     — list of (expert_index, token_count) per layer
+  _table/global_pool_expert_tokens  — list of (expert_index, token_count) summed across all layers
 """
 import math
 from typing import Sequence
@@ -59,7 +60,8 @@ def compute_routing_stats(
         is_global:           whether to compute cross-layer metrics.
 
     Returns:
-        Flat dict of scalar metrics + '_hist/*' lists for wandb.Histogram.
+        Flat dict of scalar metrics + '_hist/*' lists for wandb.Histogram
+        + '_table/*' lists of (expert_index, token_count) for wandb.Table bar charts.
     """
     stats: dict = {}
     load_vecs: list[torch.Tensor] = []   # [E] integer counts per layer, for cross-layer sim
@@ -83,9 +85,7 @@ def compute_routing_stats(
         # Coefficient of variation of loads (0.0 = perfect)
         stats[f"{tag}_load_cv"] = (counts.std() / counts.mean()).item() if counts.mean() > 0 else 0.0
 
-        # Fraction of experts that received ≥1 token
         active = (counts > 0).sum().item()
-        stats[f"{tag}_utilization"] = active / E
         stats[f"{tag}_num_active_experts"] = int(active)
 
         # Index of most-loaded expert
@@ -95,6 +95,10 @@ def compute_routing_stats(
         # ideal = 1/E for every expert; logged as histogram
         load_frac = (counts / total_slots).cpu().tolist()   # list of E floats
         stats[f"_hist/{tag}_expert_load_frac"] = load_frac
+
+        # Raw per-expert token counts indexed by expert ID
+        counts_list = counts.cpu().tolist()
+        stats[f"_table/{tag}_expert_tokens"] = list(zip(range(E), counts_list))
 
         # ── Entropy of mean routing probabilities ────────────────────────
         mean_p  = probs.mean(dim=0)                     # [E]
@@ -144,12 +148,15 @@ def compute_routing_stats(
         stats["routing/global_pool_load_cv"] = (pool_counts.std() / pool_counts.mean()).item() if pool_counts.mean() > 0 else 0.0
 
         pool_active = (pool_counts > 0).sum().item()
-        stats["routing/global_pool_utilization"] = pool_active / E
         stats["routing/global_pool_num_active"] = int(pool_active)
         stats["routing/global_pool_top_expert"] = int(pool_counts.argmax().item())
 
         pool_frac = (pool_counts / pool_total).cpu()
         stats["_hist/global_pool_expert_load_frac"] = pool_frac.tolist()
+
+        # Raw per-expert token counts across all layers
+        pool_counts_list = pool_counts.cpu().tolist()
+        stats["_table/global_pool_expert_tokens"] = list(zip(range(E), pool_counts_list))
 
         pool_entropy = -(pool_frac * (pool_frac + 1e-10).log()).sum().item()
         stats["routing/global_pool_entropy"] = pool_entropy / math.log(E)

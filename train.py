@@ -37,7 +37,15 @@ from liger_kernel.transformers import apply_liger_kernel_to_qwen3_moe
 apply_liger_kernel_to_qwen3_moe()  # monkey-patches RMSNorm, SwiGLU, RoPE, CrossEntropy before model init
 
 from src.data.parquet_dataset import DataConfig, StatefulParquetDataset
-from src.models import Qwen3MoeConfig, StandardMoEModel, GlobalMoEConfig, GlobalMoEForCausalLM
+from src.models import (
+    Qwen3MoeConfig,
+    StandardMoEModel,
+    DeepSeekStandardMoEModel,
+    GlobalMoEConfig,
+    GlobalMoEForCausalLM,
+    DeepSeekGlobalMoEForCausalLM,
+)
+from src.models.router import DeepSeekRouter
 from src.utils.training import (
     TrainingConfig,
     build_lr_scheduler,
@@ -46,6 +54,43 @@ from src.utils.training import (
     get_grad_norm,
 )
 from src.utils.routing_stats import compute_routing_stats
+
+
+# --------------------------------------------------------------------------- #
+#  Expert bias update (DeepSeek V3 aux-loss-free routing)                      #
+# --------------------------------------------------------------------------- #
+
+def update_expert_biases(model, update_rate: float, accelerator) -> dict:
+    """
+    Walk all DeepSeekRouter modules, all-reduce token counts across DDP ranks,
+    then update expert_bias: bias += sign(avg - tokens) * rate.
+
+    Returns dict of bias stats for logging (empty if no DeepSeekRouters found).
+    """
+    stats = {}
+    routers = [m for m in model.modules() if isinstance(m, DeepSeekRouter)]
+    if not routers:
+        return stats
+
+    all_bias_vals = []
+    for i, router in enumerate(routers):
+        counts = router.local_tokens_per_expert.clone()
+        # All-reduce across DDP ranks so bias update sees global token counts
+        if accelerator.num_processes > 1:
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+        avg = counts.mean()
+        router.expert_bias += torch.sign(avg - counts) * update_rate
+        # Reset token counts for next step
+        router.local_tokens_per_expert.zero_()
+        all_bias_vals.append(router.expert_bias)
+
+    # Aggregate bias stats across all routers
+    all_bias = torch.cat(all_bias_vals)
+    stats["routing/expert_bias_mean"] = all_bias.mean().item()
+    stats["routing/expert_bias_std"] = all_bias.std().item()
+    stats["routing/expert_bias_min"] = all_bias.min().item()
+    stats["routing/expert_bias_max"] = all_bias.max().item()
+    return stats
 
 
 # --------------------------------------------------------------------------- #
@@ -84,9 +129,15 @@ def build_model(cfg: dict):
     if mtype == "standard_moe":
         config = Qwen3MoeConfig(num_experts=mcfg["num_experts"], **common)
         return StandardMoEModel(config), config
+    elif mtype == "deepseek_standard_moe":
+        config = Qwen3MoeConfig(num_experts=mcfg["num_experts"], **common)
+        return DeepSeekStandardMoEModel(config), config
     elif mtype == "global_moe":
         config = GlobalMoEConfig(num_experts=mcfg["num_experts"], **common)
         return GlobalMoEForCausalLM(config), config
+    elif mtype == "deepseek_global_moe":
+        config = GlobalMoEConfig(num_experts=mcfg["num_experts"], **common)
+        return DeepSeekGlobalMoEForCausalLM(config), config
     else:
         raise ValueError(f"Unknown model type: {mtype}")
 
@@ -296,7 +347,8 @@ def main() -> None:
         p.numel() for n, p in model.named_parameters()
         if "gate_up_proj" in n or "down_proj" in n
     )
-    is_global = cfg["model"]["type"] == "global_moe"
+    is_global = cfg["model"]["type"] in ("global_moe", "deepseek_global_moe")
+    bias_update_rate = cfg["model"].get("bias_update_rate", 0.0)
 
     accelerator.print(
         f"\n{'='*60}\n"
@@ -393,6 +445,14 @@ def main() -> None:
 
         # Only count steps at actual optimizer updates
         if accelerator.sync_gradients:
+            # Update expert biases (no-op if rate=0 or no DeepSeekRouters)
+            if bias_update_rate > 0:
+                bias_stats = update_expert_biases(
+                    accelerator.unwrap_model(model), bias_update_rate, accelerator,
+                )
+            else:
+                bias_stats = {}
+
             scheduler.step()
             global_step += 1
             tokens_seen += input_ids.numel() * accelerator.num_processes
@@ -419,6 +479,8 @@ def main() -> None:
                     f"lr={lr:.2e}  "
                     f"tok/s={tok_per_sec/1e3:.1f}k  |g|={grad_norm:.3f}"
                 )
+                if bias_stats:
+                    log_dict.update(bias_stats)
                 if log_with:
                     accelerator.log(log_dict, step=global_step)
 
@@ -430,18 +492,30 @@ def main() -> None:
                         num_experts_per_tok=model_cfg.num_experts_per_tok,
                         is_global=is_global,
                     )
-                    # Separate histogram data from scalar metrics
-                    hist_data   = {k: v for k, v in rstats.items() if k.startswith("_hist/")}
-                    scalar_stats = {k: v for k, v in rstats.items() if not k.startswith("_hist/")}
+                    # Separate histogram, table, and scalar data
+                    hist_data    = {k: v for k, v in rstats.items() if k.startswith("_hist/")}
+                    table_data   = {k: v for k, v in rstats.items() if k.startswith("_table/")}
+                    scalar_stats = {k: v for k, v in rstats.items()
+                                    if not k.startswith("_hist/") and not k.startswith("_table/")}
 
                     if log_with:
                         accelerator.log(scalar_stats, step=global_step)
-                        # Log histograms via wandb directly
                         try:
                             import wandb
+                            # Log histograms
                             for key, values in hist_data.items():
                                 name = key.replace("_hist/", "hist/")
                                 wandb.log({name: wandb.Histogram(values)}, step=global_step)
+                            # Log per-expert token count tables (bar charts)
+                            for key, rows in table_data.items():
+                                name = key.replace("_table/", "table/")
+                                table = wandb.Table(
+                                    data=[[idx, count] for idx, count in rows],
+                                    columns=["expert_index", "token_count"],
+                                )
+                                wandb.log({
+                                    name: wandb.plot.bar(table, "expert_index", "token_count", title=name)
+                                }, step=global_step)
                         except Exception:
                             pass
 

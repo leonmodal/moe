@@ -7,10 +7,12 @@ Uses our local load_balancing_loss_func instead of the HF one
 from transformers import Qwen3MoeConfig
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeForCausalLM,
+    Qwen3MoeSparseMoeBlock,
     MoeCausalLMOutputWithPast,
 )
 
 from .load_balancing import load_balancing_loss_func
+from .router import DeepSeekRouter
 
 StandardMoEConfig = Qwen3MoeConfig
 
@@ -32,3 +34,15 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
             output.aux_loss = new_aux
 
         return output
+
+
+class DeepSeekStandardMoEModel(StandardMoEModel):
+    """Standard MoE with DeepSeek V3 sigmoid + expert-bias routing."""
+
+    def __init__(self, config: Qwen3MoeConfig):
+        super().__init__(config)
+        # Replace each MoE layer's softmax router with DeepSeekRouter
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, Qwen3MoeSparseMoeBlock):
+                layer.mlp.gate = DeepSeekRouter(config)
+        self.post_init()
