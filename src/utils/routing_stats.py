@@ -31,6 +31,15 @@ Global MoE only:
   routing/cross_layer_sim_max       — maximum pairwise similarity
 
   _hist/global_expert_layer_count      — per-expert: how many layers use it (0=dead, L=everywhere)
+
+  routing/global_pool_load_imbalance   — max expert total tokens / ideal across all layers
+  routing/global_pool_load_cv          — CV of total token counts across the shared expert pool
+  routing/global_pool_utilization      — fraction of experts that received ≥1 token across all layers
+  routing/global_pool_num_active       — count of experts used by at least one layer
+  routing/global_pool_top_expert       — index of most-loaded expert across all layers
+  routing/global_pool_entropy          — normalised entropy of aggregate load distribution
+
+  _hist/global_pool_expert_load_frac   — per-expert fraction of total routing slots across all layers
 """
 import math
 from typing import Sequence
@@ -125,5 +134,24 @@ def compute_routing_stats(
 
         # Histogram: for each expert, how many layers use it (0 = dead, L = everywhere)
         stats["_hist/global_expert_layer_count"] = layer_count.cpu().tolist()
+
+        # ── Pool-level aggregate stats (sum across all layers) ────────────
+        pool_counts = mat.sum(dim=0)                           # [E] total tokens per expert
+        pool_total  = pool_counts.sum().item()                 # total routing slots across all layers
+        pool_ideal  = pool_total / E
+
+        stats["routing/global_pool_load_imbalance"] = (pool_counts.max() / pool_ideal).item()
+        stats["routing/global_pool_load_cv"] = (pool_counts.std() / pool_counts.mean()).item() if pool_counts.mean() > 0 else 0.0
+
+        pool_active = (pool_counts > 0).sum().item()
+        stats["routing/global_pool_utilization"] = pool_active / E
+        stats["routing/global_pool_num_active"] = int(pool_active)
+        stats["routing/global_pool_top_expert"] = int(pool_counts.argmax().item())
+
+        pool_frac = (pool_counts / pool_total).cpu()
+        stats["_hist/global_pool_expert_load_frac"] = pool_frac.tolist()
+
+        pool_entropy = -(pool_frac * (pool_frac + 1e-10).log()).sum().item()
+        stats["routing/global_pool_entropy"] = pool_entropy / math.log(E)
 
     return stats
