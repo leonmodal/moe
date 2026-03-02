@@ -4,9 +4,9 @@ version = "0.1.0"
 description = "Standard vs Global MoE pretraining experiments"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.3.0",
+    "torch>=2.9.0",
     "accelerate>=0.30.0",
-    "transformers>=4.40.0",
+    "transformers>=5.0.0",
     "datasets>=2.19.0",
     "pyarrow>=15.0.0",
     "pandas>=2.0.0",

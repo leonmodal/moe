@@ -17,7 +17,7 @@ model:
   intermediate_size: 3072
   norm_topk_prob: true
   router_aux_loss_coef: 0.0         # no batch-level aux loss
-  seq_aux_loss_coef: 0.01           # sequence-level aux loss (DeepSeek V2/V3)
+  seq_aux_loss_coef: 0.0001         # sequence-level aux loss (DeepSeek V3: α=0.0001)
   bias_update_rate: 0.001           # expert bias update rate (DeepSeek V3)
   topk_scaling_factor: 2.5          # routing weight scaling (DeepSeek V3)
   num_groups: 8                     # group-limited routing: num expert groups

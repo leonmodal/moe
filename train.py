@@ -155,20 +155,30 @@ def build_model(cfg: dict):
 
     if mtype == "standard_moe":
         config = Qwen3MoeConfig(num_experts=mcfg["num_experts"], **common)
-        return StandardMoEModel(config), config
+        model = StandardMoEModel(config)
     elif mtype == "deepseek_standard_moe":
         config = Qwen3MoeConfig(num_experts=mcfg["num_experts"], **common)
         _set_deepseek_router_params(config, mcfg)
-        return DeepSeekStandardMoEModel(config), config
+        model = DeepSeekStandardMoEModel(config)
     elif mtype == "global_moe":
         config = GlobalMoEConfig(num_experts=mcfg["num_experts"], **common)
-        return GlobalMoEForCausalLM(config), config
+        model = GlobalMoEForCausalLM(config)
     elif mtype == "deepseek_global_moe":
         config = GlobalMoEConfig(num_experts=mcfg["num_experts"], **common)
         _set_deepseek_router_params(config, mcfg)
-        return DeepSeekGlobalMoEForCausalLM(config), config
+        model = DeepSeekGlobalMoEForCausalLM(config)
     else:
         raise ValueError(f"Unknown model type: {mtype}")
+
+    # Use transformers v5 grouped_mm expert backend (requires PyTorch 2.9+)
+    # Falls back to batched_mm if grouped_mm is unavailable
+    experts_impl = mcfg.get("experts_implementation", "grouped_mm")
+    try:
+        model.set_experts_implementation(experts_impl)
+    except Exception:
+        model.set_experts_implementation("eager")
+
+    return model, config
 
 
 # --------------------------------------------------------------------------- #
