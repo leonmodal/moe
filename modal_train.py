@@ -75,6 +75,7 @@ image = (
         "liger-kernel>=0.7.0",
         "pydantic>=2.0.0",
         "huggingface-hub>=0.20.0",
+        "matplotlib>=3.8.0",
     )
     .add_local_file(str(moe_dir / "train.py"), remote_path="/root/moe/train.py")
     .add_local_file(str(moe_dir / ".env"), remote_path="/root/moe/.env")

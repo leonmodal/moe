@@ -19,6 +19,9 @@ model:
   router_aux_loss_coef: 0.0         # no batch-level aux loss
   seq_aux_loss_coef: 0.01           # sequence-level aux loss (DeepSeek V2/V3)
   bias_update_rate: 0.001           # expert bias update rate (DeepSeek V3)
+  topk_scaling_factor: 2.5          # routing weight scaling (DeepSeek V3)
+  num_groups: 8                     # group-limited routing: num expert groups
+  group_topk: 4                     # group-limited routing: groups selected per token
   attention_bias: false
   attention_dropout: 0.0
   rms_norm_eps: 1.0e-6

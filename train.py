@@ -54,17 +54,25 @@ from src.utils.training import (
     count_parameters,
     get_grad_norm,
 )
-from src.utils.routing_stats import compute_routing_stats, accumulate_expert_counts, expert_counts_to_tables
+from src.utils.routing_stats import compute_routing_stats, accumulate_expert_counts
+from src.utils.routing_plots import plot_routing_snapshot
 
 
 # --------------------------------------------------------------------------- #
 #  Expert bias update (DeepSeek V3 aux-loss-free routing)                      #
 # --------------------------------------------------------------------------- #
 
-def update_expert_biases(model, update_rate: float, accelerator) -> dict:
+def update_expert_biases(model, update_rate: float, accelerator, is_global: bool = False) -> dict:
     """
     Walk all DeepSeekRouter modules, all-reduce token counts across DDP ranks,
     then update expert_bias: bias += sign(avg - tokens) * rate.
+
+    For global MoE (is_global=True): all layers share the same expert pool, so
+    the bias update uses the *total* token counts summed across all layers.
+    Every router gets the same correction — balancing the shared pool's actual load.
+
+    For standard MoE (is_global=False): each layer's router is updated
+    independently based on its own token counts (original DeepSeek V3 behavior).
 
     Returns dict of bias stats for logging (empty if no DeepSeekRouters found).
     """
@@ -73,20 +81,32 @@ def update_expert_biases(model, update_rate: float, accelerator) -> dict:
     if not routers:
         return stats
 
-    all_bias_vals = []
-    for i, router in enumerate(routers):
+    # Step 1: All-reduce each router's token counts across DDP ranks
+    per_router_counts = []
+    for router in routers:
         counts = router.local_tokens_per_expert.clone()
-        # All-reduce across DDP ranks so bias update sees global token counts
         if accelerator.num_processes > 1:
             torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
-        avg = counts.mean()
-        router.expert_bias += torch.sign(avg - counts) * update_rate
-        # Reset token counts for next step
+        per_router_counts.append(counts)
         router.local_tokens_per_expert.zero_()
-        all_bias_vals.append(router.expert_bias)
+
+    if is_global:
+        # Step 2 (global): Sum across all layers → total load on shared experts
+        global_counts = torch.stack(per_router_counts).sum(dim=0)  # [E]
+        avg = global_counts.mean()
+        bias_delta = torch.sign(avg - global_counts) * update_rate
+
+        # Apply the same global correction to every router
+        for router in routers:
+            router.expert_bias += bias_delta
+    else:
+        # Step 2 (standard): Each router updates independently
+        for router, counts in zip(routers, per_router_counts):
+            avg = counts.mean()
+            router.expert_bias += torch.sign(avg - counts) * update_rate
 
     # Aggregate bias stats across all routers
-    all_bias = torch.cat(all_bias_vals)
+    all_bias = torch.cat([r.expert_bias for r in routers])
     stats["routing/expert_bias_mean"] = all_bias.mean().item()
     stats["routing/expert_bias_std"] = all_bias.std().item()
     stats["routing/expert_bias_min"] = all_bias.min().item()
@@ -127,17 +147,25 @@ def build_model(cfg: dict):
         output_router_logits=True,
     )
 
+    def _set_deepseek_router_params(config, mcfg):
+        """Attach DeepSeek V3 router params that Qwen3MoeConfig doesn't have natively."""
+        config.topk_scaling_factor = mcfg.get("topk_scaling_factor", None)
+        config.num_groups = mcfg.get("num_groups", None)
+        config.group_topk = mcfg.get("group_topk", None)
+
     if mtype == "standard_moe":
         config = Qwen3MoeConfig(num_experts=mcfg["num_experts"], **common)
         return StandardMoEModel(config), config
     elif mtype == "deepseek_standard_moe":
         config = Qwen3MoeConfig(num_experts=mcfg["num_experts"], **common)
+        _set_deepseek_router_params(config, mcfg)
         return DeepSeekStandardMoEModel(config), config
     elif mtype == "global_moe":
         config = GlobalMoEConfig(num_experts=mcfg["num_experts"], **common)
         return GlobalMoEForCausalLM(config), config
     elif mtype == "deepseek_global_moe":
         config = GlobalMoEConfig(num_experts=mcfg["num_experts"], **common)
+        _set_deepseek_router_params(config, mcfg)
         return DeepSeekGlobalMoEForCausalLM(config), config
     else:
         raise ValueError(f"Unknown model type: {mtype}")
@@ -456,6 +484,7 @@ def main() -> None:
             if bias_update_rate > 0:
                 bias_stats = update_expert_biases(
                     accelerator.unwrap_model(model), bias_update_rate, accelerator,
+                    is_global=is_global,
                 )
             else:
                 bias_stats = {}
@@ -528,35 +557,46 @@ def main() -> None:
                         num_experts_per_tok=model_cfg.num_experts_per_tok,
                         is_global=is_global,
                     )
-                    # Separate histogram and scalar data
-                    hist_data    = {k: v for k, v in rstats.items() if k.startswith("_hist/")}
+                    # Only log lightweight scalar summaries to wandb
                     scalar_stats = {k: v for k, v in rstats.items() if not k.startswith("_hist/")}
-
-                    # Build table data from accumulated counts (cumulative, cross-rank)
-                    table_data = {}
-                    if expert_count_accum is not None:
-                        table_data = expert_counts_to_tables(expert_count_accum, is_global=is_global)
-
                     if log_with:
                         accelerator.log(scalar_stats, step=global_step)
-                        try:
-                            import wandb
-                            # Log histograms
-                            for key, values in hist_data.items():
-                                name = key.replace("_hist/", "hist/")
-                                wandb.log({name: wandb.Histogram(values)}, step=global_step)
-                            # Log per-expert token count tables (bar charts)
-                            for key, rows in table_data.items():
-                                name = key.replace("_table/", "table/")
-                                table = wandb.Table(
-                                    data=[[idx, count] for idx, count in rows],
-                                    columns=["expert_index", "token_count"],
-                                )
-                                wandb.log({
-                                    name: wandb.plot.bar(table, "expert_index", "token_count", title=name)
-                                }, step=global_step)
-                        except Exception:
-                            pass
+
+                    # Save detailed per-expert data as JSON (to output_dir on Modal volume)
+                    routing_dir = os.path.join(train_cfg.output_dir, "routing_logs")
+                    os.makedirs(routing_dir, exist_ok=True)
+                    snapshot = {"step": global_step, "layers": {}, "global_pool": None}
+
+                    for layer_idx in sorted(expert_count_accum or {}):
+                        counts = expert_count_accum[layer_idx]
+                        total = counts.sum().item()
+                        fracs = (counts / total).cpu().tolist() if total > 0 else [0.0] * counts.shape[0]
+                        snapshot["layers"][layer_idx] = {
+                            "token_counts": counts.cpu().tolist(),
+                            "token_fracs": fracs,
+                        }
+
+                    if is_global and expert_count_accum and len(expert_count_accum) > 1:
+                        all_counts = torch.stack([expert_count_accum[i] for i in sorted(expert_count_accum)])
+                        pool_counts = all_counts.sum(dim=0)  # [E]
+                        pool_total = pool_counts.sum().item()
+                        pool_fracs = (pool_counts / pool_total).cpu().tolist() if pool_total > 0 else []
+
+                        # Per-expert: how many layers use it (> 0 tokens)
+                        layer_usage = (all_counts > 0).float().sum(dim=0).cpu().tolist()  # [E]
+
+                        snapshot["global_pool"] = {
+                            "token_counts": pool_counts.cpu().tolist(),
+                            "token_fracs": pool_fracs,
+                            "layer_usage_count": layer_usage,
+                            "num_layers": all_counts.shape[0],
+                        }
+
+                    json_path = os.path.join(routing_dir, f"step_{global_step:08d}.json")
+                    with open(json_path, "w") as f:
+                        json.dump(snapshot, f)
+
+                    plot_routing_snapshot(snapshot, routing_dir, global_step)
 
                 # Reset accumulator on all ranks
                 expert_count_accum = None
