@@ -1,7 +1,7 @@
 # XS scale — Qwen3-0.6B backbone, DeepSeek V3 aux-loss-free standard MoE
 # 16 layers, 16 experts/layer, top-4, tied embeddings
 # Hybrid: sigmoid routing with expert bias + sequence-level aux loss
-experiment_name: xs_deepseek_standard_moe
+experiment_name: new_deepseek_standard_moe
 
 model:
   type: deepseek_standard_moe
@@ -38,7 +38,7 @@ training:
   max_grad_norm: 1.0
   lr_scheduler: cosine
   warmup_steps: 1000
-  max_steps: 1000000
+  max_steps: 100000
   min_lr_ratio: 0.1
   batch_size: 64
   gradient_accumulation: 1
@@ -46,10 +46,10 @@ training:
   gradient_checkpointing: false
   log_every: 1
   routing_log_every: 50
-  save_every: 5000
-  output_dir: ./outputs/xs_deepseek_standard_moe
+  save_every: 1000
+  output_dir: ./outputs/new_deepseek_standard_moe
   wandb_project: moe-scaling
-  wandb_run_name: xs_deepseek_standard
+  wandb_run_name: new_deepseek_standard
 
 data:
   data_dir: ./data/parquet

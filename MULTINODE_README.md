@@ -34,6 +34,8 @@ modal run modal_train.py::download_data                       # full dataset
 modal run --detach modal_train.py
 modal run --detach modal_train.py --config configs/scaling/xs_standard.yaml
 modal run --detach modal_train.py --config configs/scaling/xs_global.yaml
+modal run --detach modal_train.py --config configs/scaling/xs_deepseek_global.yaml
+modal run --detach modal_train.py --config configs/scaling/xs_deepseek_standard.yaml
 
 
 

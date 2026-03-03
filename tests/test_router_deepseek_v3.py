@@ -557,3 +557,110 @@ class TestGlobalPoolBiasUpdate:
 
         for router in model.routers:
             assert router.local_tokens_per_expert.sum() == 0
+
+
+# ---------------------------------------------------------------------------
+#  Test 9: Interpolated bias update (per-layer ↔ global blend)
+# ---------------------------------------------------------------------------
+
+class TestInterpolatedBiasUpdate:
+    """Blended per-layer + global bias update with alpha interpolation."""
+
+    def _make_model_with_counts(self):
+        model = _FakeModel(num_layers=3, num_experts=4, hidden_size=64)
+        # Layer 0 overloads expert 0, layer 1 overloads expert 1, layer 2 balanced
+        model.routers[0].local_tokens_per_expert = torch.tensor([30.0, 10.0, 10.0, 10.0])
+        model.routers[1].local_tokens_per_expert = torch.tensor([10.0, 30.0, 10.0, 10.0])
+        model.routers[2].local_tokens_per_expert = torch.tensor([15.0, 15.0, 15.0, 15.0])
+        return model
+
+    def test_alpha_zero_matches_global(self):
+        """alpha=0 should give identical results to the old purely-global path."""
+        from train import update_expert_biases
+
+        model = self._make_model_with_counts()
+        acc = _FakeAccelerator()
+
+        update_expert_biases(model, 0.001, acc, is_global=True, alpha=0.0)
+
+        # Global totals: [55, 55, 35, 35] → avg=45
+        expected = torch.tensor([-0.001, -0.001, 0.001, 0.001])
+        for router in model.routers:
+            assert torch.allclose(router.expert_bias, expected), (
+                f"Expected {expected}, got {router.expert_bias}"
+            )
+
+    def test_alpha_one_matches_per_layer(self):
+        """alpha=1 should give identical results to independent per-layer updates."""
+        from train import update_expert_biases
+
+        model = self._make_model_with_counts()
+        acc = _FakeAccelerator()
+
+        update_expert_biases(model, 0.001, acc, is_global=True, alpha=1.0)
+
+        # Layer 0: avg=15, sign(15-[30,10,10,10]) = [-1,+1,+1,+1]
+        expected_0 = torch.tensor([-0.001, 0.001, 0.001, 0.001])
+        assert torch.allclose(model.routers[0].expert_bias, expected_0)
+
+        # Layer 1: avg=15, sign(15-[10,30,10,10]) = [+1,-1,+1,+1]
+        expected_1 = torch.tensor([0.001, -0.001, 0.001, 0.001])
+        assert torch.allclose(model.routers[1].expert_bias, expected_1)
+
+        # Layer 2: avg=15, sign(15-[15,15,15,15]) = [0,0,0,0]
+        expected_2 = torch.tensor([0.0, 0.0, 0.0, 0.0])
+        assert torch.allclose(model.routers[2].expert_bias, expected_2)
+
+    def test_alpha_half_blends(self):
+        """alpha=0.5 should average the per-layer and global deltas."""
+        from train import update_expert_biases
+
+        model = self._make_model_with_counts()
+        acc = _FakeAccelerator()
+
+        update_expert_biases(model, 0.001, acc, is_global=True, alpha=0.5)
+
+        # Global delta: [-0.001, -0.001, +0.001, +0.001]
+        # Layer 0 delta: [-0.001, +0.001, +0.001, +0.001]
+        # Blend: 0.5*[-0.001,+0.001,+0.001,+0.001] + 0.5*[-0.001,-0.001,+0.001,+0.001]
+        #      = [-0.001, 0.0, +0.001, +0.001]
+        expected_0 = torch.tensor([-0.001, 0.0, 0.001, 0.001])
+        assert torch.allclose(model.routers[0].expert_bias, expected_0)
+
+        # Layer 1 delta: [+0.001, -0.001, +0.001, +0.001]
+        # Blend: 0.5*[+0.001,-0.001,+0.001,+0.001] + 0.5*[-0.001,-0.001,+0.001,+0.001]
+        #      = [0.0, -0.001, +0.001, +0.001]
+        expected_1 = torch.tensor([0.0, -0.001, 0.001, 0.001])
+        assert torch.allclose(model.routers[1].expert_bias, expected_1)
+
+        # Layer 2 delta: [0, 0, 0, 0]
+        # Blend: 0.5*[0,0,0,0] + 0.5*[-0.001,-0.001,+0.001,+0.001]
+        #      = [-0.0005, -0.0005, +0.0005, +0.0005]
+        expected_2 = torch.tensor([-0.0005, -0.0005, 0.0005, 0.0005])
+        assert torch.allclose(model.routers[2].expert_bias, expected_2)
+
+
+class TestBiasAlphaSchedule:
+    """Cosine decay schedule for bias alpha: 1 → 0."""
+
+    def test_start_is_one(self):
+        from train import bias_alpha_schedule
+        assert bias_alpha_schedule(0, 1000) == pytest.approx(1.0)
+
+    def test_end_is_zero(self):
+        from train import bias_alpha_schedule
+        assert bias_alpha_schedule(1000, 1000) == pytest.approx(0.0, abs=1e-9)
+
+    def test_midpoint_is_half(self):
+        from train import bias_alpha_schedule
+        assert bias_alpha_schedule(500, 1000) == pytest.approx(0.5, abs=1e-9)
+
+    def test_quarter_point(self):
+        from train import bias_alpha_schedule
+        import math
+        expected = 0.5 * (1 + math.cos(math.pi * 0.25))
+        assert bias_alpha_schedule(250, 1000) == pytest.approx(expected, abs=1e-9)
+
+    def test_beyond_max_steps_clamps_to_zero(self):
+        from train import bias_alpha_schedule
+        assert bias_alpha_schedule(2000, 1000) == pytest.approx(0.0, abs=1e-9)

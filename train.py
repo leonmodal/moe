@@ -62,17 +62,33 @@ from src.utils.routing_plots import plot_routing_snapshot
 #  Expert bias update (DeepSeek V3 aux-loss-free routing)                      #
 # --------------------------------------------------------------------------- #
 
-def update_expert_biases(model, update_rate: float, accelerator, is_global: bool = False) -> dict:
+def bias_alpha_schedule(step: int, max_steps: int) -> float:
+    """Cosine decay from 1 → 0 over training. No warmup.
+
+    Returns alpha ∈ [0, 1] that interpolates between per-layer (alpha=1)
+    and global (alpha=0) bias updates.
+    """
+    progress = min(step / max(1, max_steps), 1.0)
+    return 0.5 * (1 + math.cos(math.pi * progress))
+
+
+def update_expert_biases(
+    model, update_rate: float, accelerator,
+    is_global: bool = False, alpha: float = 0.0,
+) -> dict:
     """
     Walk all DeepSeekRouter modules, all-reduce token counts across DDP ranks,
     then update expert_bias: bias += sign(avg - tokens) * rate.
 
-    For global MoE (is_global=True): all layers share the same expert pool, so
-    the bias update uses the *total* token counts summed across all layers.
-    Every router gets the same correction — balancing the shared pool's actual load.
+    For global MoE (is_global=True): blends per-layer and global bias deltas
+    using alpha ∈ [0, 1]:
+      delta = alpha * per_layer_delta + (1 - alpha) * global_delta
+    alpha=0 → purely global (all routers get same correction from pooled load).
+    alpha=1 → purely per-layer (each router corrects from its own counts).
 
     For standard MoE (is_global=False): each layer's router is updated
     independently based on its own token counts (original DeepSeek V3 behavior).
+    alpha is ignored.
 
     Returns dict of bias stats for logging (empty if no DeepSeekRouters found).
     """
@@ -91,14 +107,19 @@ def update_expert_biases(model, update_rate: float, accelerator, is_global: bool
         router.local_tokens_per_expert.zero_()
 
     if is_global:
-        # Step 2 (global): Sum across all layers → total load on shared experts
+        # Global delta: sum across all layers → total load on shared experts
         global_counts = torch.stack(per_router_counts).sum(dim=0)  # [E]
-        avg = global_counts.mean()
-        bias_delta = torch.sign(avg - global_counts) * update_rate
+        global_avg = global_counts.mean()
+        global_delta = torch.sign(global_avg - global_counts) * update_rate
 
-        # Apply the same global correction to every router
-        for router in routers:
-            router.expert_bias += bias_delta
+        # Blend per-layer and global deltas for each router
+        for router, counts in zip(routers, per_router_counts):
+            if alpha > 0:
+                layer_avg = counts.mean()
+                layer_delta = torch.sign(layer_avg - counts) * update_rate
+                router.expert_bias += alpha * layer_delta + (1 - alpha) * global_delta
+            else:
+                router.expert_bias += global_delta
     else:
         # Step 2 (standard): Each router updates independently
         for router, counts in zip(routers, per_router_counts):
@@ -355,6 +376,7 @@ def main() -> None:
 
     # Accelerate counts scheduler steps per device, not per optimizer update.
     # Scale warmup/max steps so configs stay in real optimizer steps.
+    real_max_steps = train_cfg.max_steps  # unscaled, for our own schedules
     train_cfg.warmup_steps = train_cfg.warmup_steps * accelerator.num_processes
     train_cfg.max_steps = train_cfg.max_steps * accelerator.num_processes
 
@@ -388,6 +410,7 @@ def main() -> None:
     )
     is_global = cfg["model"]["type"] in ("global_moe", "deepseek_global_moe")
     bias_update_rate = cfg["model"].get("bias_update_rate", 0.0)
+    bias_interpolation = cfg["model"].get("bias_interpolation", False)
     seq_aux_loss_coef = cfg["model"].get("seq_aux_loss_coef", 0.0)
 
     # Attach seq_aux_loss_coef to model (read by forward methods)
@@ -492,10 +515,12 @@ def main() -> None:
         if accelerator.sync_gradients:
             # Update expert biases (no-op if rate=0 or no DeepSeekRouters)
             if bias_update_rate > 0:
+                alpha = bias_alpha_schedule(global_step, real_max_steps) if (is_global and bias_interpolation) else 0.0
                 bias_stats = update_expert_biases(
                     accelerator.unwrap_model(model), bias_update_rate, accelerator,
-                    is_global=is_global,
+                    is_global=is_global, alpha=alpha,
                 )
+                bias_stats["routing/bias_alpha"] = alpha
             else:
                 bias_stats = {}
 

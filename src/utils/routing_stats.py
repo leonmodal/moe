@@ -162,7 +162,7 @@ def compute_routing_stats(
         # ── Entropy of mean routing probabilities ────────────────────────
         mean_p  = probs.mean(dim=0)                     # [E]
         entropy = -(mean_p * (mean_p + 1e-10).log()).sum().item()
-        stats[f"{tag}_entropy"] = entropy / math.log(E)
+        stats[f"{tag}_entropy"] = entropy / math.log(E) if E > 1 else 0.0
 
         # ── Router confidence: gap between k-th and (k+1)-th prob ─────
         # Large margin → router is confident in its choices
@@ -214,6 +214,6 @@ def compute_routing_stats(
         stats["_hist/global_pool_expert_load_frac"] = pool_frac.tolist()
 
         pool_entropy = -(pool_frac * (pool_frac + 1e-10).log()).sum().item()
-        stats["routing/global_pool_entropy"] = pool_entropy / math.log(E)
+        stats["routing/global_pool_entropy"] = pool_entropy / math.log(E) if E > 1 else 0.0
 
     return stats

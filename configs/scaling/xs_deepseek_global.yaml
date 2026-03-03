@@ -1,7 +1,7 @@
 # XS scale — Qwen3-0.6B backbone, DeepSeek V3 aux-loss-free global shared MoE
 # 16 layers, 256 global experts, top-4, tied embeddings
 # Hybrid: sigmoid routing with expert bias + sequence-level aux loss
-experiment_name: xs_deepseek_global_moe
+experiment_name: new_deepseek_global_moe
 
 model:
   type: deepseek_global_moe
@@ -19,6 +19,7 @@ model:
   router_aux_loss_coef: 0.0         # no batch-level aux loss
   seq_aux_loss_coef: 0.0001         # sequence-level aux loss (DeepSeek V3: α=0.0001)
   bias_update_rate: 0.001           # expert bias update rate (DeepSeek V3)
+  bias_interpolation: true          # cosine decay from per-layer → global bias
   topk_scaling_factor: 2.5          # routing weight scaling (DeepSeek V3)
   num_groups: 8                     # group-limited routing: num expert groups
   group_topk: 4                     # group-limited routing: groups selected per token
@@ -38,7 +39,7 @@ training:
   max_grad_norm: 1.0
   lr_scheduler: cosine
   warmup_steps: 1000
-  max_steps: 1000000
+  max_steps: 100000
   min_lr_ratio: 0.1
   batch_size: 64
   gradient_accumulation: 1
@@ -46,10 +47,10 @@ training:
   gradient_checkpointing: false
   log_every: 1
   routing_log_every: 50
-  save_every: 5000
-  output_dir: ./outputs/xs_deepseek_global_moe
+  save_every: 1000
+  output_dir: ./outputs/new_deepseek_global_moe
   wandb_project: moe-scaling
-  wandb_run_name: xs_deepseek_global
+  wandb_run_name: new_deepseek_global
 
 data:
   data_dir: ./data/parquet
