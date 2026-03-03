@@ -95,25 +95,28 @@ def seq_load_balancing_loss_func(
     batch_size: int = 1,
 ) -> torch.Tensor | int:
     """
-    Sequence-level load balancing loss (DeepSeek V2/V3).
+    Sequence-level load balancing loss (DeepSeek V3, arxiv 2412.19437 Eqs. 17-20).
 
-    Computes the Switch Transformer load-balancing loss independently per
-    sequence, then averages across the batch and layers. This prevents
-    large batches from washing out per-sequence imbalance: a single
-    sequence hoarding one expert gets penalized even if other sequences
-    in the batch spread evenly.
+    Matches the paper and Megatron-LM:
+      Eq. 19: s'_{i,t} = s_{i,t} / Σ_j s_{j,t}    (normalize scores to sum-to-1)
+      Eq. 18: f_i = (E / (K * T)) * Σ_t 1[expert i in topK]
+      Eq. 20: P_i = (1/T) * Σ_t s'_{i,t}
+      Eq. 17: L_Bal = Σ_i f_i * P_i
 
-    For uniform routing this gives ~top_k (same baseline as batch-level).
+    For softmax routers the normalization is a no-op (already sums to 1).
+    For sigmoid routers it converts raw scores to a proper distribution.
+    At uniform routing the loss equals 1.0.
 
     Args:
-        gate_logits: Tuple of [T, E] probability tensors, one per layer.
-                     T = batch_size * seq_len.
-        num_experts: Total number of experts.
-        top_k: Number of experts selected per token.
+        gate_logits: Tuple of [T, E] score tensors, one per layer.
+                     T = batch_size * seq_len.  May be softmax probs
+                     (sum-to-1) or raw sigmoid scores (will be normalized).
+        num_experts: Total number of experts (E).
+        top_k: Number of experts selected per token (K).
         batch_size: Batch size (needed to reshape T → seq_len).
 
     Returns:
-        Scalar load-balancing loss.
+        Scalar load-balancing loss (without coefficient — multiply by alpha outside).
     """
     if gate_logits is None or not isinstance(gate_logits, tuple):
         return 0
@@ -124,23 +127,27 @@ def seq_load_balancing_loss_func(
         T, E = layer_gate.shape
         seq_len = T // batch_size
 
+        # Eq. 19: normalize scores to sum-to-1 per token
+        # (no-op for softmax routers, necessary for sigmoid routers)
+        scores = layer_gate.float()
+        scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+
         # Reshape: (B*S, E) → (B, S, E) — per-sequence view
-        probs = layer_gate.reshape(batch_size, seq_len, E)           # (B, S, E)
+        scores = scores.reshape(batch_size, seq_len, E)               # (B, S, E)
 
-        # Per-sequence topk selection
-        _, selected = torch.topk(probs, top_k, dim=-1)              # (B, S, K)
-        expert_mask = F.one_hot(selected, num_experts)               # (B, S, K, E)
+        # Per-sequence topk selection (normalization is monotonic → same topk)
+        _, selected = torch.topk(scores, top_k, dim=-1)              # (B, S, K)
+        expert_mask = F.one_hot(selected, num_experts)                # (B, S, K, E)
 
-        # f_i per sequence: fraction of tokens routed to each expert
-        tokens_per_expert = torch.mean(expert_mask.float(), dim=1)   # (B, K, E)
-        # P_i per sequence: average probability per expert
-        router_prob_per_expert = torch.mean(probs, dim=1)            # (B, E)
+        # Eq. 18: f_i = (E / (K * T)) * Σ_t 1[expert i selected]
+        expert_counts = expert_mask.float().sum(dim=(1, 2))           # (B, E)
+        f_i = (num_experts / (top_k * seq_len)) * expert_counts       # (B, E)
 
-        # Per-sequence loss: E * sum_i(f_i * P_i)
-        per_seq_loss = torch.sum(
-            tokens_per_expert * router_prob_per_expert.unsqueeze(1),
-            dim=(1, 2),
-        ) * num_experts                                              # (B,)
+        # Eq. 20: P_i = (1/T) * Σ_t s'_{i,t}
+        P_i = scores.mean(dim=1)                                      # (B, E)
+
+        # Eq. 17: L_Bal = Σ_i f_i * P_i
+        per_seq_loss = (f_i * P_i).sum(dim=-1)                        # (B,)
 
         total_loss = total_loss + per_seq_loss.mean()
 

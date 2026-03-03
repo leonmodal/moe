@@ -53,10 +53,10 @@ class StatefulParquetDataset(IterableDataset):
         self.rank = rank
         self.world_size = world_size
 
-        all_files = sorted(
+        all_files = sorted(set(
             glob.glob(os.path.join(config.data_dir, "**/*.parquet"), recursive=True)
             + glob.glob(os.path.join(config.data_dir, "*.parquet"))
-        )
+        ))
         if not all_files:
             raise FileNotFoundError(f"No parquet files found in {config.data_dir}")
 

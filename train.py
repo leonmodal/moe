@@ -64,13 +64,15 @@ from src.utils.routing_plots import plot_routing_snapshot
 #  Expert bias update (DeepSeek V3 aux-loss-free routing)                      #
 # --------------------------------------------------------------------------- #
 
-def bias_alpha_schedule(step: int, max_steps: int) -> float:
-    """Cosine decay from 1 → 0 over training. No warmup.
+def bias_alpha_schedule(step: int, warmup_steps: int = 5000) -> float:
+    """Cosine decay from 1 → 0 over warmup_steps, then stays at 0.
 
     Returns alpha ∈ [0, 1] that interpolates between per-layer (alpha=1)
     and global (alpha=0) bias updates.
     """
-    progress = min(step / max(1, max_steps), 1.0)
+    if step >= warmup_steps:
+        return 0.0
+    progress = step / max(1, warmup_steps)
     return 0.5 * (1 + math.cos(math.pi * progress))
 
 
@@ -473,7 +475,7 @@ def main() -> None:
     dataloader = DataLoader(
         dataset,
         batch_size=train_cfg.batch_size,
-        num_workers=train_cfg.gradient_accumulation,
+        num_workers=0,       # must be 0 for IterableDataset state tracking
         pin_memory=True,
     )
 
@@ -495,9 +497,8 @@ def main() -> None:
         if dataset_state:
             dataset.set_state(dataset_state)
 
-    # Advance scheduler to match resumed step (no-op if global_step==0)
-    for _ in range(global_step):
-        scheduler.step()
+    # Note: scheduler state is already restored by accelerator.load_state().
+    # Do NOT manually advance — that would double-advance the LR schedule.
 
     # --- Training loop ------------------------------------------------------
     os.makedirs(train_cfg.output_dir, exist_ok=True)
@@ -538,7 +539,7 @@ def main() -> None:
         if accelerator.sync_gradients:
             # Update expert biases (no-op if rate=0 or no DeepSeekRouters)
             if bias_update_rate > 0:
-                alpha = bias_alpha_schedule(global_step, real_max_steps) if (is_global and bias_interpolation) else 0.0
+                alpha = bias_alpha_schedule(global_step) if (is_global and bias_interpolation) else 0.0
                 bias_stats = update_expert_biases(
                     accelerator.unwrap_model(model), bias_update_rate, accelerator,
                     is_global=is_global, alpha=alpha,
