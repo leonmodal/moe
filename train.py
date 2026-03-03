@@ -150,7 +150,28 @@ def build_model(cfg: dict):
     mtype = cfg["model"]["type"]
     mcfg = cfg["model"]
 
-    # Shared Qwen3MoEConfig fields (field names match the dataclass exactly)
+    # --- Dense (non-MoE) early return ---
+    if mtype == "dense":
+        config = Qwen3Config(
+            vocab_size=mcfg["vocab_size"],
+            hidden_size=mcfg["hidden_size"],
+            num_hidden_layers=mcfg["num_hidden_layers"],
+            head_dim=mcfg["head_dim"],
+            num_attention_heads=mcfg["num_attention_heads"],
+            num_key_value_heads=mcfg["num_key_value_heads"],
+            intermediate_size=mcfg["intermediate_size"],
+            max_position_embeddings=mcfg.get("max_position_embeddings", 32768),
+            rope_theta=mcfg.get("rope_theta", 1_000_000.0),
+            rms_norm_eps=mcfg.get("rms_norm_eps", 1e-6),
+            tie_word_embeddings=mcfg.get("tie_word_embeddings", False),
+        )
+        # Dense model has no MoE fields — set dummies for compatibility
+        config.num_experts = 0
+        config.num_experts_per_tok = 0
+        model = Qwen3ForCausalLM(config)
+        return model, config
+
+    # --- MoE models: shared Qwen3MoEConfig fields ---
     common = dict(
         vocab_size=mcfg["vocab_size"],
         hidden_size=mcfg["hidden_size"],
@@ -190,25 +211,6 @@ def build_model(cfg: dict):
         config = GlobalMoEConfig(num_experts=mcfg["num_experts"], **common)
         _set_deepseek_router_params(config, mcfg)
         model = DeepSeekGlobalMoEForCausalLM(config)
-    elif mtype == "dense":
-        config = Qwen3Config(
-            vocab_size=mcfg["vocab_size"],
-            hidden_size=mcfg["hidden_size"],
-            num_hidden_layers=mcfg["num_hidden_layers"],
-            head_dim=mcfg["head_dim"],
-            num_attention_heads=mcfg["num_attention_heads"],
-            num_key_value_heads=mcfg["num_key_value_heads"],
-            intermediate_size=mcfg["intermediate_size"],
-            max_position_embeddings=mcfg.get("max_position_embeddings", 32768),
-            rope_theta=mcfg.get("rope_theta", 1_000_000.0),
-            rms_norm_eps=mcfg.get("rms_norm_eps", 1e-6),
-            tie_word_embeddings=mcfg.get("tie_word_embeddings", False),
-        )
-        # Dense model has no MoE fields — set dummies for compatibility
-        config.num_experts = 0
-        config.num_experts_per_tok = 0
-        model = Qwen3ForCausalLM(config)
-        return model, config
     else:
         raise ValueError(f"Unknown model type: {mtype}")
 
