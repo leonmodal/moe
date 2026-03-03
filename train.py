@@ -39,6 +39,8 @@ apply_liger_kernel_to_qwen3_moe()  # monkey-patches RMSNorm, SwiGLU, RoPE, Cross
 from src.data.parquet_dataset import DataConfig, StatefulParquetDataset
 from src.models import (
     Qwen3MoeConfig,
+    Qwen3Config,
+    Qwen3ForCausalLM,
     StandardMoEModel,
     DeepSeekStandardMoEModel,
     GlobalMoEConfig,
@@ -188,6 +190,25 @@ def build_model(cfg: dict):
         config = GlobalMoEConfig(num_experts=mcfg["num_experts"], **common)
         _set_deepseek_router_params(config, mcfg)
         model = DeepSeekGlobalMoEForCausalLM(config)
+    elif mtype == "dense":
+        config = Qwen3Config(
+            vocab_size=mcfg["vocab_size"],
+            hidden_size=mcfg["hidden_size"],
+            num_hidden_layers=mcfg["num_hidden_layers"],
+            head_dim=mcfg["head_dim"],
+            num_attention_heads=mcfg["num_attention_heads"],
+            num_key_value_heads=mcfg["num_key_value_heads"],
+            intermediate_size=mcfg["intermediate_size"],
+            max_position_embeddings=mcfg.get("max_position_embeddings", 32768),
+            rope_theta=mcfg.get("rope_theta", 1_000_000.0),
+            rms_norm_eps=mcfg.get("rms_norm_eps", 1e-6),
+            tie_word_embeddings=mcfg.get("tie_word_embeddings", False),
+        )
+        # Dense model has no MoE fields — set dummies for compatibility
+        config.num_experts = 0
+        config.num_experts_per_tok = 0
+        model = Qwen3ForCausalLM(config)
+        return model, config
     else:
         raise ValueError(f"Unknown model type: {mtype}")
 
@@ -408,6 +429,7 @@ def main() -> None:
         p.numel() for n, p in model.named_parameters()
         if "gate_up_proj" in n or "down_proj" in n
     )
+    is_dense = cfg["model"]["type"] == "dense"
     is_global = cfg["model"]["type"] in ("global_moe", "deepseek_global_moe")
     bias_update_rate = cfg["model"].get("bias_update_rate", 0.0)
     bias_interpolation = cfg["model"].get("bias_interpolation", False)
@@ -499,8 +521,7 @@ def main() -> None:
         labels = batch["labels"]         # (B, T)
 
         with accelerator.accumulate(model):
-            # Qwen3MoeForCausalLM returns MoeCausalLMOutputWithPast
-            output = model(input_ids=input_ids, labels=labels, output_router_logits=True)
+            output = model(input_ids=input_ids, labels=labels, **({} if is_dense else {"output_router_logits": True}))
             loss = output.loss
             accelerator.backward(loss)
 
@@ -533,13 +554,15 @@ def main() -> None:
                 elapsed = time.perf_counter() - t0
                 tok_per_sec = tokens_seen / elapsed
                 lr = scheduler.get_last_lr()[0]
-                aux   = output.aux_loss.item() if output.aux_loss is not None else 0.0
+                aux   = getattr(output, "aux_loss", None)
+                aux   = aux.item() if aux is not None else 0.0
                 total = loss.item()
-                ce    = total - accelerator.unwrap_model(model).router_aux_loss_coef * aux
+                aux_coef = getattr(accelerator.unwrap_model(model), "router_aux_loss_coef", 0.0)
+                ce    = total - aux_coef * aux
 
                 # Compute seq_aux_loss for logging
                 seq_aux = 0.0
-                if seq_aux_loss_coef > 0 and output.router_logits is not None:
+                if seq_aux_loss_coef > 0 and getattr(output, "router_logits", None) is not None:
                     seq_aux_val = seq_load_balancing_loss_func(
                         output.router_logits,
                         model_cfg.num_experts,
@@ -570,7 +593,7 @@ def main() -> None:
                     accelerator.log(log_dict, step=global_step)
 
             # ── Accumulate expert token counts every step (all ranks) ──
-            if output.router_logits is not None:
+            if getattr(output, "router_logits", None) is not None:
                 expert_count_accum = accumulate_expert_counts(
                     output.router_logits,
                     num_experts_per_tok=model_cfg.num_experts_per_tok,
@@ -586,7 +609,7 @@ def main() -> None:
                             expert_count_accum[k], op=torch.distributed.ReduceOp.SUM,
                         )
 
-                if accelerator.is_main_process and output.router_logits is not None:
+                if accelerator.is_main_process and getattr(output, "router_logits", None) is not None:
                     rstats = compute_routing_stats(
                         output.router_logits,
                         num_experts_per_tok=model_cfg.num_experts_per_tok,

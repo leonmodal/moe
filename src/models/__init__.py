@@ -1,4 +1,4 @@
-from transformers import Qwen3MoeConfig
+from transformers import Qwen3MoeConfig, Qwen3Config, Qwen3ForCausalLM
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
 
 from .router import DeepSeekRouter
@@ -13,6 +13,8 @@ from .global_moe import (
 __all__ = [
     "Qwen3MoeConfig",
     "Qwen3MoeForCausalLM",
+    "Qwen3Config",
+    "Qwen3ForCausalLM",
     "StandardMoEConfig",
     "StandardMoEModel",
     "DeepSeekStandardMoEModel",
