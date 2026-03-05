@@ -159,9 +159,10 @@ def compute_routing_stats(
         load_frac = (counts / total_slots).cpu().tolist()   # list of E floats
         stats[f"_hist/{tag}_expert_load_frac"] = load_frac
 
-        # ── Entropy of mean routing probabilities ────────────────────────
-        mean_p  = probs.mean(dim=0)                     # [E]
-        entropy = -(mean_p * (mean_p + 1e-10).log()).sum().item()
+        # ── Entropy of expert assignment distribution ─────────────────────
+        # Use actual routing counts (proper distribution summing to 1)
+        load_dist = counts / (counts.sum() + 1e-10)     # [E], sums to 1
+        entropy = -(load_dist * (load_dist + 1e-10).log()).sum().item()
         stats[f"{tag}_entropy"] = entropy / math.log(E) if E > 1 else 0.0
 
         # ── Router confidence: gap between k-th and (k+1)-th prob ─────
