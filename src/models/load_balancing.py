@@ -93,6 +93,7 @@ def seq_load_balancing_loss_func(
     num_experts: int | None = None,
     top_k: int = 2,
     batch_size: int = 1,
+    selected_experts: tuple[torch.Tensor] | None = None,
 ) -> torch.Tensor | int:
     """
     Sequence-level load balancing loss (DeepSeek V3, arxiv 2412.19437 Eqs. 17-20).
@@ -114,6 +115,10 @@ def seq_load_balancing_loss_func(
         num_experts: Total number of experts (E).
         top_k: Number of experts selected per token (K).
         batch_size: Batch size (needed to reshape T → seq_len).
+        selected_experts: Optional tuple of actual routed expert indices from
+                          router forward, one tensor per layer of shape [T, K].
+                          If provided, f_i is computed from these assignments
+                          instead of top-k(scores).
 
     Returns:
         Scalar load-balancing loss (without coefficient — multiply by alpha outside).
@@ -123,7 +128,7 @@ def seq_load_balancing_loss_func(
 
     total_loss = gate_logits[0].new_zeros(())
 
-    for layer_gate in gate_logits:
+    for layer_idx, layer_gate in enumerate(gate_logits):
         T, E = layer_gate.shape
         seq_len = T // batch_size
 
@@ -135,8 +140,18 @@ def seq_load_balancing_loss_func(
         # Reshape: (B*S, E) → (B, S, E) — per-sequence view
         scores = scores.reshape(batch_size, seq_len, E)               # (B, S, E)
 
-        # Per-sequence topk selection (normalization is monotonic → same topk)
-        _, selected = torch.topk(scores, top_k, dim=-1)              # (B, S, K)
+        if selected_experts is not None and layer_idx < len(selected_experts):
+            selected = selected_experts[layer_idx]
+            if selected is not None and selected.shape == (T, top_k):
+                selected = selected.reshape(batch_size, seq_len, top_k).to(scores.device)
+            else:
+                selected = None
+        else:
+            selected = None
+
+        # Fall back to score top-k if actual routing indices aren't available.
+        if selected is None:
+            _, selected = torch.topk(scores, top_k, dim=-1)          # (B, S, K)
         expert_mask = F.one_hot(selected, num_experts)                # (B, S, K, E)
 
         # Eq. 18: f_i = (E / (K * T)) * Σ_t 1[expert i selected]

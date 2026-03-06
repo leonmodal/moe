@@ -96,6 +96,9 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
             torch.zeros(self.num_experts, dtype=torch.float32),
             persistent=False,
         )
+        # Last forward's selected experts (T, K). Used by seq aux loss
+        # so f_i matches actual biased routing assignments.
+        self._last_top_k_idx = None
 
     def forward(self, hidden_states: torch.Tensor):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
@@ -144,6 +147,9 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
                     minlength=self.num_experts,
                 ).float()
                 self.local_tokens_per_expert += counts
+                self._last_top_k_idx = top_k_idx.detach()
+        else:
+            self._last_top_k_idx = top_k_idx.detach()
 
         # Return sigmoid probs as router_logits (values in (0,1), don't sum to 1)
         return scores, router_top_value, top_k_idx

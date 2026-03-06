@@ -185,11 +185,28 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
         if seq_coef > 0 and output.router_logits is not None and output.loss is not None:
             input_ids = kwargs.get("input_ids")
             bsz = input_ids.shape[0] if input_ids is not None else 1
+            # For DeepSeekRouter, use actual routed expert assignments if available
+            # so f_i matches biased routing (scores + expert_bias).
+            selected_experts = None
+            try:
+                selected = []
+                for layer in self.model.layers:
+                    gate = getattr(getattr(layer, "mlp", None), "gate", None)
+                    idx = getattr(gate, "_last_top_k_idx", None)
+                    if idx is None:
+                        selected = None
+                        break
+                    selected.append(idx)
+                if selected is not None and len(selected) == len(output.router_logits):
+                    selected_experts = tuple(selected)
+            except Exception:
+                selected_experts = None
             seq_aux = seq_load_balancing_loss_func(
                 output.router_logits,
                 self.num_experts,
                 self.num_experts_per_tok,
                 batch_size=bsz,
+                selected_experts=selected_experts,
             )
             output.loss = output.loss + seq_coef * seq_aux
 
