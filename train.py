@@ -139,6 +139,26 @@ def update_expert_biases(
     return stats
 
 
+def get_selected_experts_for_seq_aux(model) -> tuple[torch.Tensor, ...] | None:
+    """Return the last biased top-k assignments from DeepSeek routers, if present."""
+    try:
+        layers = getattr(getattr(model, "model", None), "layers", None)
+        if layers is None:
+            return None
+
+        selected = []
+        for layer in layers:
+            gate = getattr(getattr(layer, "mlp", None), "gate", None)
+            idx = getattr(gate, "_last_top_k_idx", None)
+            if idx is None:
+                return None
+            selected.append(idx)
+
+        return tuple(selected) if selected else None
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------------- #
 #  Config helpers                                                              #
 # --------------------------------------------------------------------------- #
@@ -557,20 +577,23 @@ def main() -> None:
                 elapsed = time.perf_counter() - t0
                 tok_per_sec = tokens_seen / elapsed
                 lr = scheduler.get_last_lr()[0]
+                raw_model = accelerator.unwrap_model(model)
                 aux   = getattr(output, "aux_loss", None)
                 aux   = aux.item() if aux is not None else 0.0
                 total = loss.item()
-                aux_coef = getattr(accelerator.unwrap_model(model), "router_aux_loss_coef", 0.0)
+                aux_coef = getattr(raw_model, "router_aux_loss_coef", 0.0)
                 ce    = total - aux_coef * aux
 
                 # Compute seq_aux_loss for logging
                 seq_aux = 0.0
                 if seq_aux_loss_coef > 0 and getattr(output, "router_logits", None) is not None:
+                    selected_experts = get_selected_experts_for_seq_aux(raw_model)
                     seq_aux_val = seq_load_balancing_loss_func(
                         output.router_logits,
                         model_cfg.num_experts,
                         model_cfg.num_experts_per_tok,
                         batch_size=input_ids.shape[0],
+                        selected_experts=selected_experts,
                     )
                     seq_aux = seq_aux_val.item() if isinstance(seq_aux_val, torch.Tensor) else seq_aux_val
                     ce -= seq_aux_loss_coef * seq_aux
