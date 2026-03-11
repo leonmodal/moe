@@ -283,8 +283,6 @@ def test_optimizer_updates(batch):
     print("=" * 70)
 
     from train import build_model, load_config
-    from src.models.load_balancing import seq_load_balancing_loss_func
-
     for config_name, config_path in [
         ("Standard", "configs/scaling/xs_deepseek_standard.yaml"),
         ("Global", "configs/scaling/xs_deepseek_global.yaml"),
@@ -306,11 +304,6 @@ def test_optimizer_updates(batch):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model(input_ids=input_ids, labels=labels, output_router_logits=True)
             loss = out.loss
-            if out.router_logits is not None:
-                seq_aux = seq_load_balancing_loss_func(
-                    out.router_logits, model_cfg.num_experts, model_cfg.num_experts_per_tok,
-                    batch_size=input_ids.shape[0])
-                loss = loss + 0.0001 * seq_aux
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()

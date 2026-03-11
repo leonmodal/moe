@@ -15,7 +15,6 @@ from accelerate.utils import set_seed
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 from src.data.parquet_dataset import DataConfig, StatefulParquetDataset
-from src.models.load_balancing import seq_load_balancing_loss_func
 from train import build_model, load_config
 
 STEPS = 1000
@@ -70,11 +69,6 @@ def run(config_path):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             output = model(**kwargs)
             loss = output.loss
-            if not is_dense and seq_aux_loss_coef > 0 and getattr(output, "router_logits", None) is not None:
-                seq_aux = seq_load_balancing_loss_func(
-                    output.router_logits, model_cfg.num_experts,
-                    model_cfg.num_experts_per_tok, batch_size=input_ids.shape[0])
-                loss = loss + seq_aux_loss_coef * seq_aux
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

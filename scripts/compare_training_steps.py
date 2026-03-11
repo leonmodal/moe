@@ -19,7 +19,13 @@ from src.data.parquet_dataset import DataConfig, StatefulParquetDataset
 from src.models.load_balancing import seq_load_balancing_loss_func
 
 # Import the same build_model from train.py
-from train import build_model, load_config, update_expert_biases, bias_alpha_schedule
+from train import (
+    bias_alpha_schedule,
+    build_model,
+    get_selected_experts_for_seq_aux,
+    load_config,
+    update_expert_biases,
+)
 
 CONFIGS = [
     "configs/scaling/xs_deepseek_standard.yaml",
@@ -123,9 +129,13 @@ def run_config(config_path, steps=STEPS):
             aux_coef = getattr(model, "router_aux_loss_coef", 0.0)
             ce = total_loss - aux_coef * aux_val
             if seq_aux_loss_coef > 0 and output.router_logits is not None:
+                selected_experts = get_selected_experts_for_seq_aux(model)
                 seq_aux_val = seq_load_balancing_loss_func(
-                    output.router_logits, model_cfg.num_experts,
-                    model_cfg.num_experts_per_tok, batch_size=input_ids.shape[0],
+                    output.router_logits,
+                    model_cfg.num_experts,
+                    model_cfg.num_experts_per_tok,
+                    batch_size=input_ids.shape[0],
+                    selected_experts=selected_experts,
                 )
                 sav = seq_aux_val.item() if isinstance(seq_aux_val, torch.Tensor) else seq_aux_val
                 ce -= seq_aux_loss_coef * sav
