@@ -46,6 +46,8 @@ from src.models import (
     GlobalMoEConfig,
     GlobalMoEForCausalLM,
     DeepSeekGlobalMoEForCausalLM,
+    MoEverythingConfig,
+    MoEverythingForCausalLM,
 )
 from src.models.router import DeepSeekRouter
 from src.models.load_balancing import seq_load_balancing_loss_func
@@ -233,16 +235,27 @@ def build_model(cfg: dict):
         config = GlobalMoEConfig(num_experts=mcfg["num_experts"], **common)
         _set_deepseek_router_params(config, mcfg)
         model = DeepSeekGlobalMoEForCausalLM(config)
+    elif mtype == "moe_everything":
+        config = MoEverythingConfig(
+            num_experts=mcfg["num_experts"],
+            num_attn_experts=mcfg.get("num_attn_experts", 4),
+            num_attn_experts_per_tok=mcfg.get("num_attn_experts_per_tok", 1),
+            attn_expert_mode=mcfg.get("attn_expert_mode", "bundled"),
+            branch_router_aux_loss_coef=mcfg.get("branch_router_aux_loss_coef", 0.01),
+            **common,
+        )
+        model = MoEverythingForCausalLM(config)
     else:
         raise ValueError(f"Unknown model type: {mtype}")
 
     # Use transformers v5 grouped_mm expert backend (requires PyTorch 2.9+)
     # Falls back to batched_mm if grouped_mm is unavailable
-    experts_impl = mcfg.get("experts_implementation", "grouped_mm")
-    try:
-        model.set_experts_implementation(experts_impl)
-    except Exception:
-        model.set_experts_implementation("eager")
+    if hasattr(model, "set_experts_implementation"):
+        experts_impl = mcfg.get("experts_implementation", "grouped_mm")
+        try:
+            model.set_experts_implementation(experts_impl)
+        except Exception:
+            model.set_experts_implementation("eager")
 
     return model, config
 

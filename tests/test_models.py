@@ -216,3 +216,82 @@ def test_loss_decreases_with_gradient_step():
     loss2 = out2.loss
 
     assert loss2.item() < loss1.item(), "Loss did not decrease after one gradient step"
+
+
+# ── Mixture-of-Everything tests ─────────────────────────────────────────────
+
+from src.models.mixture_of_everything import MoEverythingConfig, MoEverythingForCausalLM
+
+
+def tiny_moe_everything_config(mode="bundled"):
+    return MoEverythingConfig(
+        vocab_size=256,
+        hidden_size=64,
+        num_hidden_layers=2,
+        head_dim=32,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        intermediate_size=128,
+        max_position_embeddings=128,
+        num_attn_experts=4,
+        num_attn_experts_per_tok=1,
+        attn_expert_mode=mode,
+        norm_topk_prob=True,
+        branch_router_aux_loss_coef=0.01,
+        router_aux_loss_coef=0.01,
+    )
+
+
+@pytest.mark.parametrize("mode", ["bundled", "qo_kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+def test_moe_everything_instantiates(mode):
+    model = MoEverythingForCausalLM(tiny_moe_everything_config(mode))
+    assert model is not None
+
+
+@pytest.mark.parametrize("mode", ["bundled", "qo_kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+def test_moe_everything_forward(mode):
+    model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).eval()
+    ids, labels = _dummy_batch()
+    with torch.no_grad():
+        out = model(input_ids=ids, labels=labels)
+    assert out.loss is not None
+    assert out.loss.item() > 0
+    assert out.logits.shape == (2, 16, 256)
+
+
+@pytest.mark.parametrize("mode", ["bundled", "qo_kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+def test_moe_everything_all_grads(mode):
+    """Every parameter must receive a gradient."""
+    model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).train()
+    ids, labels = _dummy_batch()
+    out = model(input_ids=ids, labels=labels)
+    out.loss.backward()
+    # precompute_kv computes fresh per-expert KV tables at each layer,
+    # so the initial KV projections from embedding aren't used.
+    skip = {"model.init_k_proj.weight", "model.init_v_proj.weight", "model.init_k_norm.weight"}
+    if mode == "precompute_kv":
+        no_grad = [n for n, p in model.named_parameters()
+                   if p.requires_grad and p.grad is None and n not in skip]
+    else:
+        no_grad = [n for n, p in model.named_parameters()
+                   if p.requires_grad and p.grad is None]
+    assert len(no_grad) == 0, f"Params without grad: {no_grad}"
+
+
+@pytest.mark.parametrize("mode", ["bundled", "qo_kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+def test_moe_everything_loss_decreases(mode):
+    model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).train()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    ids, labels = _dummy_batch()
+
+    out1 = model(input_ids=ids, labels=labels)
+    out1.loss.backward()
+    opt.step()
+    opt.zero_grad()
+
+    with torch.no_grad():
+        out2 = model(input_ids=ids, labels=labels)
+    assert out2.loss.item() < out1.loss.item(), f"{mode}: loss did not decrease"
