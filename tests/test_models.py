@@ -245,13 +245,13 @@ def tiny_moe_everything_config(mode="bundled"):
     )
 
 
-@pytest.mark.parametrize("mode", ["bundled", "qo_kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
 def test_moe_everything_instantiates(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode))
     assert model is not None
 
 
-@pytest.mark.parametrize("mode", ["bundled", "qo_kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
 def test_moe_everything_forward(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).eval()
     ids, labels = _dummy_batch()
@@ -262,7 +262,7 @@ def test_moe_everything_forward(mode):
     assert out.logits.shape == (2, 16, 256)
 
 
-@pytest.mark.parametrize("mode", ["bundled", "qo_kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
 def test_moe_everything_all_grads(mode):
     """Every parameter must receive a gradient."""
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).train()
@@ -281,7 +281,7 @@ def test_moe_everything_all_grads(mode):
     assert len(no_grad) == 0, f"Params without grad: {no_grad}"
 
 
-@pytest.mark.parametrize("mode", ["bundled", "qo_kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
 def test_moe_everything_loss_decreases(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).train()
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -295,3 +295,86 @@ def test_moe_everything_loss_decreases(mode):
     with torch.no_grad():
         out2 = model(input_ids=ids, labels=labels)
     assert out2.loss.item() < out1.loss.item(), f"{mode}: loss did not decrease"
+
+
+# ── MoE-Everything with DeepSeek routing ───────────────────────────────
+
+def tiny_moe_everything_deepseek_config(mode="bundled"):
+    return MoEverythingConfig(
+        vocab_size=256,
+        hidden_size=64,
+        num_hidden_layers=2,
+        head_dim=32,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        intermediate_size=128,
+        max_position_embeddings=128,
+        num_attn_experts=4,
+        num_attn_experts_per_tok=1,
+        attn_expert_mode=mode,
+        norm_topk_prob=True,
+        branch_router_aux_loss_coef=0.01,
+        router_aux_loss_coef=0.01,
+        use_deepseek_routing=True,
+    )
+
+
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+def test_moe_everything_deepseek_forward(mode):
+    model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config(mode)).eval()
+    ids, labels = _dummy_batch()
+    with torch.no_grad():
+        out = model(input_ids=ids, labels=labels)
+    assert out.loss is not None
+    assert out.loss.item() > 0
+    assert out.logits.shape == (2, 16, 256)
+
+
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+def test_moe_everything_deepseek_all_grads(mode):
+    """Every parameter must receive a gradient with DeepSeek routing."""
+    model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config(mode)).train()
+    ids, labels = _dummy_batch()
+    out = model(input_ids=ids, labels=labels)
+    out.loss.backward()
+    skip = {"model.init_k_proj.weight", "model.init_v_proj.weight", "model.init_k_norm.weight"}
+    if mode == "precompute_kv":
+        no_grad = [n for n, p in model.named_parameters()
+                   if p.requires_grad and p.grad is None and n not in skip]
+    else:
+        no_grad = [n for n, p in model.named_parameters()
+                   if p.requires_grad and p.grad is None]
+    assert len(no_grad) == 0, f"Params without grad: {no_grad}"
+
+
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+def test_moe_everything_deepseek_loss_decreases(mode):
+    model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config(mode)).train()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    ids, labels = _dummy_batch()
+
+    out1 = model(input_ids=ids, labels=labels)
+    out1.loss.backward()
+    opt.step()
+    opt.zero_grad()
+
+    with torch.no_grad():
+        out2 = model(input_ids=ids, labels=labels)
+    assert out2.loss.item() < out1.loss.item(), f"{mode}: loss did not decrease"
+
+
+def test_moe_everything_deepseek_routers_found():
+    """DeepSeekRouter instances should be discoverable for bias updates."""
+    from src.models.router import DeepSeekRouter
+    model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config("bundled"))
+    ds_routers = [m for m in model.modules() if isinstance(m, DeepSeekRouter)]
+    # bundled: 1 attn router + 1 MLP gate = 2
+    assert len(ds_routers) == 2, f"Expected 2 DeepSeekRouters, got {len(ds_routers)}"
+
+    model_fi = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config("fully_independent"))
+    ds_routers_fi = [m for m in model_fi.modules() if isinstance(m, DeepSeekRouter)]
+    # fully_independent: 4 attn routers + 1 MLP gate = 5
+    assert len(ds_routers_fi) == 5, f"Expected 5 DeepSeekRouters, got {len(ds_routers_fi)}"

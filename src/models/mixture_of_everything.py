@@ -4,28 +4,29 @@ Mixture-of-Everything (Section 4.1) — hierarchical per-token routing.
 Each token at each depth chooses ATTENTION or MLP via a branch router,
 then selects expert weights within the chosen branch.
 
+Key design: ALL components are shared across depths.  The forward pass
+is a simple for loop over the same branch router, attention bank, and
+MLP bank — like a Universal Transformer with heterogeneous expert
+branches.  Only activations change per depth, not weights.
+
 Attention bank modes:
-  - "bundled"            : (Q,K,V,O) selected as one unit
-  - "qo_kv_paired"      : (Q,O) bank + (K,V) bank, independently routed
-  - "fully_independent"  : Q, K, V, O each from separate banks
-  - "precompute_kv"      : shared KV projections, routed Q and O (Section 4.1.2)
+  - "bundled"            : (Q,K,V,O) selected as one unit — 1 router
+  - "kv_paired"          : (K,V) paired + Q,O independent — 3 routers
+  - "qk_paired"          : (Q,K) paired + V,O independent — 3 routers
+  - "fully_independent"  : Q, K, V, O each from separate banks — 4 routers
+  - "precompute_kv"      : per-expert KV tables, routed Q and O — 1 router
 
 MLP bank: standard top-k MoE over SwiGLU experts (reuses Qwen3MoeExperts).
 
 Design notes:
-  - Token state is (E, K, V) as described in the doc.  K,V persist across
-    layers and are only refreshed when a token takes the attention branch.
-  - Training uses soft branch routing (both branches computed, weighted by
-    probability) so gradients flow through the router.  KV state is
+  - Token state is (E, K, V).  K,V persist across depths and are only
+    refreshed when a token takes the attention branch.
+  - Training uses soft branch routing (both branches computed, weighted
+    by probability) so gradients flow through the router.  KV state is
     soft-interpolated: K_out = p_attn * K_fresh + p_mlp * K_old.
-  - Pre-norm is shared: a single RMSNorm feeds whichever branch is selected.
-    Its parameters are tied to the layer (not duplicated per branch).
+  - Pre-norm is bundled with each bank: the attention bank and MLP bank
+    each include their own RMSNorm, applied before computation.
 """
-
-import copy
-import math
-from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -33,17 +34,15 @@ import torch.nn.functional as F
 from transformers import Qwen3MoeConfig
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeExperts,
-    Qwen3MoeForCausalLM,
-    Qwen3MoeModel,
     Qwen3MoeRMSNorm,
     Qwen3MoeRotaryEmbedding,
     Qwen3MoeTopKRouter,
     apply_rotary_pos_emb,
-    eager_attention_forward,
     repeat_kv,
 )
 
 from .load_balancing import load_balancing_loss_func
+from .router import DeepSeekRouter
 
 
 # ─── Config ────────────────────────────────────────────────────────────────── #
@@ -56,10 +55,11 @@ class MoEverythingConfig(Qwen3MoeConfig):
         # Attention expert bank
         num_attn_experts: int = 4,
         num_attn_experts_per_tok: int = 1,
-        attn_expert_mode: str = "bundled",  # bundled | qo_kv_paired | fully_independent | precompute_kv
-        # MLP experts (num_experts / num_experts_per_tok from parent)
+        attn_expert_mode: str = "bundled",
         # Branch router
         branch_router_aux_loss_coef: float = 0.01,
+        # Routing style
+        use_deepseek_routing: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -67,6 +67,7 @@ class MoEverythingConfig(Qwen3MoeConfig):
         self.num_attn_experts_per_tok = num_attn_experts_per_tok
         self.attn_expert_mode = attn_expert_mode
         self.branch_router_aux_loss_coef = branch_router_aux_loss_coef
+        self.use_deepseek_routing = use_deepseek_routing
 
 
 # ─── Branch router ─────────────────────────────────────────────────────────── #
@@ -83,12 +84,6 @@ class BranchRouter(nn.Module):
         self.gate = nn.Linear(hidden_size, 2, bias=False)
 
     def forward(self, hidden_states: torch.Tensor):
-        """
-        Args:
-            hidden_states: [B, T, H] or [N, H]
-        Returns:
-            branch_probs: same leading dims + [2], softmax probabilities
-        """
         logits = self.gate(hidden_states.float())
         probs = F.softmax(logits, dim=-1).to(hidden_states.dtype)
         return probs  # [..., 0] = attn, [..., 1] = mlp
@@ -99,8 +94,8 @@ class BranchRouter(nn.Module):
 class AttentionExpertBank(nn.Module):
     """Bank of attention weight sets with per-token expert routing.
 
-    Supports four modes for how Q, K, V, O projections are banked.
-    All modes share the same forward() signature.
+    Includes pre-norm (RMSNorm applied before routing/projection).
+    All weights are shared across depths.
     """
 
     def __init__(self, config: MoEverythingConfig):
@@ -118,90 +113,109 @@ class AttentionExpertBank(nn.Module):
         self.kv_dim = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.eps = config.rms_norm_eps
+        self.use_deepseek_routing = getattr(config, 'use_deepseek_routing', False)
 
-        # Build projection banks based on mode
-        # Each mode creates per-expert q/k norm weights tied to the projections.
-        _MODES = {"bundled", "qo_kv_paired", "qk_paired", "fully_independent", "precompute_kv"}
+        # Build projection banks based on mode (each _init_* creates its own norms)
+        _MODES = {"bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"}
         if self.mode not in _MODES:
             raise ValueError(f"Unknown attn_expert_mode: {self.mode}, must be one of {_MODES}")
         getattr(self, f"_init_{self.mode}")()
 
+    # ── Router factory ──
+
+    def _make_router(self, input_dim):
+        """Create a router for this bank — DeepSeek sigmoid or plain Linear."""
+        if self.use_deepseek_routing:
+            from types import SimpleNamespace
+            cfg = SimpleNamespace(
+                hidden_size=input_dim,
+                num_local_experts=self.num_experts,
+                num_experts=self.num_experts,  # alias used by HF attribute_map
+                num_experts_per_tok=self.top_k,
+                norm_topk_prob=True,
+                topk_scaling_factor=None,
+                num_groups=None,
+                group_topk=None,
+            )
+            return DeepSeekRouter(cfg)
+        else:
+            return nn.Linear(input_dim, self.num_experts, bias=False)
+
     # ── Initialization helpers ──
 
     def _init_bundled(self):
-        """(Q,K,V,O) all selected as one unit.  Single router."""
+        """(Q,K,V,O) all selected as one unit.  1 norm, 1 router."""
+        self.norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         E = self.num_experts
-        self.router = nn.Linear(self.hidden_size, E, bias=False)
+        self.router = self._make_router(self.hidden_size)
         self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_dim))
         self.k_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
         self.v_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
         self.o_proj = nn.Parameter(torch.empty(E, self.q_dim, self.hidden_size))
-        # Per-expert Q/K norms — tied to projection weights
         self.q_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
         self.k_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
         self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
 
-    def _init_qo_kv_paired(self):
-        """(Q,O) paired bank + (K,V) paired bank."""
+    def _init_kv_paired(self):
+        """(K,V) paired — memory coherence.  Q and O separate.  2 norms, 3 routers."""
+        self.kv_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
+        self.q_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         E = self.num_experts
-        self.qo_router = nn.Linear(self.hidden_size, E, bias=False)
-        self.kv_router = nn.Linear(self.hidden_size, E, bias=False)
+        self.kv_router = self._make_router(self.hidden_size)
+        self.q_router = self._make_router(self.hidden_size)
+        self.o_router = self._make_router(self.q_dim)
         self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_dim))
-        self.o_proj = nn.Parameter(torch.empty(E, self.q_dim, self.hidden_size))
         self.k_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
         self.v_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
-        # Per-expert norms: q_norm tied to QO bank, k_norm tied to KV bank
+        self.o_proj = nn.Parameter(torch.empty(E, self.q_dim, self.hidden_size))
+        # q_norm follows Q router, k_norm follows KV router
         self.q_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
         self.k_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
-        self._init_params([self.q_proj, self.o_proj, self.k_proj, self.v_proj])
+        self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
 
     def _init_qk_paired(self):
-        """(Q,K) paired — dot-product compatibility.  V and O separate."""
+        """(Q,K) paired — dot-product compatibility.  V and O separate.  2 norms, 3 routers."""
+        self.qk_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
+        self.v_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         E = self.num_experts
-        self.qk_router = nn.Linear(self.hidden_size, E, bias=False)
-        self.v_router = nn.Linear(self.hidden_size, E, bias=False)
-        self.o_router = nn.Linear(self.q_dim, E, bias=False)
+        self.qk_router = self._make_router(self.hidden_size)
+        self.v_router = self._make_router(self.hidden_size)
+        self.o_router = self._make_router(self.q_dim)
         self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_dim))
         self.k_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
         self.v_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
         self.o_proj = nn.Parameter(torch.empty(E, self.q_dim, self.hidden_size))
-        # Per-expert norms: q and k both tied to QK bank
         self.q_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
         self.k_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
         self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
 
     def _init_fully_independent(self):
-        """Q, K, V, O each from a separate bank with its own router."""
+        """Q, K, V, O each from a separate bank.  3 norms, 4 routers."""
+        self.q_pre_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
+        self.k_pre_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
+        self.v_pre_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         E = self.num_experts
-        self.q_router = nn.Linear(self.hidden_size, E, bias=False)
-        self.k_router = nn.Linear(self.hidden_size, E, bias=False)
-        self.v_router = nn.Linear(self.hidden_size, E, bias=False)
-        self.o_router = nn.Linear(self.q_dim, E, bias=False)
+        self.q_router = self._make_router(self.hidden_size)
+        self.k_router = self._make_router(self.hidden_size)
+        self.v_router = self._make_router(self.hidden_size)
+        self.o_router = self._make_router(self.q_dim)
         self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_dim))
         self.k_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
         self.v_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
         self.o_proj = nn.Parameter(torch.empty(E, self.q_dim, self.hidden_size))
-        # Per-expert norms: q_norm tied to Q bank, k_norm tied to K bank
         self.q_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
         self.k_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
         self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
 
     def _init_precompute_kv(self):
-        """Full KV table per expert (Section 4.1.2).
-
-        Route first → find active experts → compute K,V for all tokens
-        using only the active experts.  Each token's Q attends over its
-        expert's complete KV table, so cross-token subspace mismatch is
-        eliminated.  Q,O are bundled (same expert selection).
-        """
+        """Per-expert KV tables, routed Q and O.  1 norm, 1 router."""
+        self.norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         E = self.num_experts
-        self.router = nn.Linear(self.hidden_size, E, bias=False)
-        # All experts have Q, K, V, O (same as bundled)
+        self.router = self._make_router(self.hidden_size)
         self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_dim))
         self.k_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
         self.v_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
         self.o_proj = nn.Parameter(torch.empty(E, self.q_dim, self.hidden_size))
-        # Per-expert Q/K norms
         self.q_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
         self.k_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
         self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
@@ -214,57 +228,46 @@ class AttentionExpertBank(nn.Module):
     # ── Expert dispatch helpers ──
 
     def _apply_expert_head_norm(self, x, norm_weights, expert_idx, num_heads):
-        """Per-expert RMSNorm on head-organized vectors.
-
-        Args:
-            x: [N, num_heads * head_dim]
-            norm_weights: [E, head_dim] — per-expert learnable scale
-            expert_idx: [N] — which expert each token selected
-            num_heads: int
-        Returns:
-            [N, num_heads * head_dim]
-        """
+        """Per-expert RMSNorm on head-organized vectors."""
         N = x.shape[0]
         orig_dtype = x.dtype
         x = x.view(N, num_heads, self.head_dim).float()
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
-        w = norm_weights[expert_idx]          # [N, head_dim]
-        x = w.unsqueeze(1) * x               # [N, 1, hd] * [N, nh, hd]
+        w = norm_weights[expert_idx]
+        x = w.unsqueeze(1) * x
         return x.to(orig_dtype).view(N, num_heads * self.head_dim)
 
     def _route(self, router, x):
         """Compute routing: returns (expert_idx, expert_weights).
 
-        For top-1: idx [N], weights [N, 1]
-        For top-k: idx [N, K], weights [N, K]
+        Handles both plain Linear (softmax) and DeepSeekRouter (sigmoid + bias).
         """
-        logits = router(x.float())
-        probs = F.softmax(logits, dim=-1)
-
-        if self.top_k == 1:
-            idx = probs.argmax(dim=-1)                          # [N]
-            weights = probs.gather(1, idx.unsqueeze(-1))        # [N, 1]
+        if isinstance(router, DeepSeekRouter):
+            # DeepSeekRouter.forward returns (scores, weights, indices)
+            # where weights are already normalized and indices are [T, K]
+            _, weights, idx = router(x)
+            if self.top_k == 1:
+                return idx.squeeze(-1), weights
             return idx, weights
         else:
-            top_vals, top_idx = torch.topk(probs, self.top_k, dim=-1)
-            top_vals = top_vals / (top_vals.sum(dim=-1, keepdim=True) + 1e-20)
-            return top_idx, top_vals                            # [N, K] each
+            logits = router(x.float())
+            probs = F.softmax(logits, dim=-1)
+            if self.top_k == 1:
+                idx = probs.argmax(dim=-1)
+                weights = probs.gather(1, idx.unsqueeze(-1))
+                return idx, weights
+            else:
+                top_vals, top_idx = torch.topk(probs, self.top_k, dim=-1)
+                top_vals = top_vals / (top_vals.sum(dim=-1, keepdim=True) + 1e-20)
+                return top_idx, top_vals
 
     def _apply_projection(self, x, weight_bank, expert_idx, expert_weights,
                           head_norm_weights=None, num_heads_for_norm=None):
-        """Project x using given expert routing (no router call).
+        """Project x using given expert routing.
 
         Memory-efficient: loops over active experts with regular matmul
         instead of gathering a [N, H_in, H_out] tensor.
-
-        Args:
-            x: [N, H_in]
-            weight_bank: [E, H_in, H_out]
-            expert_idx: [N] (top-1) or [N, K] (top-k)
-            expert_weights: [N, 1] (top-1) or [N, K] (top-k)
-            head_norm_weights: Optional [E, head_dim]
-            num_heads_for_norm: int
         """
         N = x.shape[0]
         out = x.new_zeros(N, weight_bank.shape[2])
@@ -272,7 +275,7 @@ class AttentionExpertBank(nn.Module):
         if self.top_k == 1:
             for e in expert_idx.unique():
                 mask = (expert_idx == e)
-                proj = x[mask] @ weight_bank[e]                 # [n_e, H_out]
+                proj = x[mask] @ weight_bank[e]
                 if head_norm_weights is not None:
                     proj = self._apply_expert_head_norm(
                         proj, head_norm_weights,
@@ -294,22 +297,22 @@ class AttentionExpertBank(nn.Module):
 
     def _route_and_project(self, router, x, weight_bank,
                            head_norm_weights=None, num_heads_for_norm=None):
-        """Route + project in one call (convenience wrapper)."""
+        """Route + project in one call."""
         idx, weights = self._route(router, x)
         return self._apply_projection(x, weight_bank, idx, weights,
                                       head_norm_weights, num_heads_for_norm)
 
-    # ── Forward: split into project + attend for KV blending ──
+    # ── Forward: project + attend ──
 
     def project(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute Q, K_fresh, V_fresh via expert routing.
+        """Per-routing-group norm, then compute Q, K_fresh, V_fresh via expert routing.
 
-        Bundled projections share a single routing decision.
-        Saves routing info in self._last_*_routing for attend() to reuse.
+        Each routing group gets its own pre-norm (mirrors standard transformer
+        where the norm is part of the sublayer, not floating above it).
 
         Returns:
             Q: [B, n_heads, T, head_dim] with RoPE applied
@@ -317,10 +320,9 @@ class AttentionExpertBank(nn.Module):
             V_fresh: [B, n_kv_heads, T, head_dim]
         """
         B, T, H = hidden_states.shape
-        flat = hidden_states.reshape(B * T, H)
 
         if self.mode == "bundled":
-            # Route once — Q,K,V,O all use same expert
+            flat = self.norm(hidden_states).reshape(B * T, H)
             idx, w = self._route(self.router, flat)
             self._last_routing = (idx, w)
             Q = self._apply_projection(flat, self.q_proj, idx, w,
@@ -329,41 +331,39 @@ class AttentionExpertBank(nn.Module):
                                        self.k_norm_weight, self.num_kv_heads)
             V = self._apply_projection(flat, self.v_proj, idx, w)
 
-        elif self.mode == "qo_kv_paired":
-            # QO bank: route once, save for O
-            qo_idx, qo_w = self._route(self.qo_router, flat)
-            self._last_routing = (qo_idx, qo_w)
-            Q = self._apply_projection(flat, self.q_proj, qo_idx, qo_w,
-                                       self.q_norm_weight, self.num_heads)
-            # KV bank: route once, K and V share
-            kv_idx, kv_w = self._route(self.kv_router, flat)
-            K = self._apply_projection(flat, self.k_proj, kv_idx, kv_w,
+        elif self.mode == "kv_paired":
+            kv_flat = self.kv_norm(hidden_states).reshape(B * T, H)
+            q_flat = self.q_norm(hidden_states).reshape(B * T, H)
+            kv_idx, kv_w = self._route(self.kv_router, kv_flat)
+            K = self._apply_projection(kv_flat, self.k_proj, kv_idx, kv_w,
                                        self.k_norm_weight, self.num_kv_heads)
-            V = self._apply_projection(flat, self.v_proj, kv_idx, kv_w)
+            V = self._apply_projection(kv_flat, self.v_proj, kv_idx, kv_w)
+            Q = self._route_and_project(self.q_router, q_flat, self.q_proj,
+                                        self.q_norm_weight, self.num_heads)
 
         elif self.mode == "qk_paired":
-            # QK bank: route once, Q and K share (dot-product compatibility)
-            qk_idx, qk_w = self._route(self.qk_router, flat)
-            Q = self._apply_projection(flat, self.q_proj, qk_idx, qk_w,
+            qk_flat = self.qk_norm(hidden_states).reshape(B * T, H)
+            v_flat = self.v_norm(hidden_states).reshape(B * T, H)
+            qk_idx, qk_w = self._route(self.qk_router, qk_flat)
+            Q = self._apply_projection(qk_flat, self.q_proj, qk_idx, qk_w,
                                        self.q_norm_weight, self.num_heads)
-            K = self._apply_projection(flat, self.k_proj, qk_idx, qk_w,
+            K = self._apply_projection(qk_flat, self.k_proj, qk_idx, qk_w,
                                        self.k_norm_weight, self.num_kv_heads)
-            # V and O are independently routed
-            V = self._route_and_project(self.v_router, flat, self.v_proj)
+            V = self._route_and_project(self.v_router, v_flat, self.v_proj)
 
         elif self.mode == "fully_independent":
-            Q = self._route_and_project(self.q_router, flat, self.q_proj,
+            q_flat = self.q_pre_norm(hidden_states).reshape(B * T, H)
+            k_flat = self.k_pre_norm(hidden_states).reshape(B * T, H)
+            v_flat = self.v_pre_norm(hidden_states).reshape(B * T, H)
+            Q = self._route_and_project(self.q_router, q_flat, self.q_proj,
                                         self.q_norm_weight, self.num_heads)
-            K = self._route_and_project(self.k_router, flat, self.k_proj,
+            K = self._route_and_project(self.k_router, k_flat, self.k_proj,
                                         self.k_norm_weight, self.num_kv_heads)
-            V = self._route_and_project(self.v_router, flat, self.v_proj)
+            V = self._route_and_project(self.v_router, v_flat, self.v_proj)
 
         elif self.mode == "precompute_kv":
-            # Route first, then compute per-expert KV tables.
-            # Handled entirely in project_and_attend_precompute_kv().
             raise RuntimeError("precompute_kv should use project_and_attend_precompute_kv()")
 
-        # Reshape to [B, n_heads, T, head_dim] — norms already applied
         Q = Q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         K = K.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         V = V.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -378,22 +378,12 @@ class AttentionExpertBank(nn.Module):
         Q: torch.Tensor,
         K: torch.Tensor,
         V: torch.Tensor,
-        hidden_states_flat: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run attention and O projection.
 
-        For bundled/paired modes, O reuses the expert selection saved by project().
-
-        Args:
-            Q: [B, n_heads, T, head_dim]
-            K: [B, n_kv_heads, T, head_dim] — already blended with cache
-            V: [B, n_kv_heads, T, head_dim] — already blended with cache
-            hidden_states_flat: [N, H] — unused (kept for API consistency)
-            attention_mask: [B, 1, T, T]
-
-        Returns:
-            attn_out: [B, T, H]
+        For bundled/precompute_kv, O reuses routing saved by project().
+        For kv_paired/qk_paired/fully_independent, O has its own router.
         """
         B = Q.shape[0]
         T = Q.shape[2]
@@ -409,13 +399,10 @@ class AttentionExpertBank(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).reshape(B * T, self.q_dim)
 
-        # O projection — bundled modes reuse saved routing from project()
-        if self.mode in ("bundled", "qo_kv_paired", "precompute_kv"):
+        if self.mode in ("bundled", "precompute_kv"):
             idx, w = self._last_routing
             attn_output = self._apply_projection(attn_output, self.o_proj, idx, w)
-        elif self.mode == "qk_paired":
-            attn_output = self._route_and_project(self.o_router, attn_output, self.o_proj)
-        elif self.mode == "fully_independent":
+        elif self.mode in ("kv_paired", "qk_paired", "fully_independent"):
             attn_output = self._route_and_project(self.o_router, attn_output, self.o_proj)
 
         return attn_output.view(B, T, self.hidden_size)
@@ -426,57 +413,47 @@ class AttentionExpertBank(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Section 4.1.2: route first, compute per-expert KV tables, attend.
-
-        1. Route to decide each token's expert (Q,O bundled).
-        2. Find active experts.
-        3. For each active expert: compute K,V for ALL tokens using that expert.
-        4. Each token's Q attends over its expert's full KV table.
-        5. O projection reuses same expert selection.
+        """Section 4.1.2: apply norm, route first, compute per-expert KV tables, attend.
 
         Returns:
             attn_out: [B, T, H]
-            K_fresh: [B, n_kv_heads, T, head_dim] — per-token K (from selected expert)
-            V_fresh: [B, n_kv_heads, T, head_dim] — per-token V (from selected expert)
+            K_fresh: [B, n_kv_heads, T, head_dim]
+            V_fresh: [B, n_kv_heads, T, head_dim]
         """
         B, T, H = hidden_states.shape
+        normed = self.norm(hidden_states)
         N = B * T
-        flat = hidden_states.reshape(N, H)
+        flat = normed.reshape(N, H)
 
-        # 1. Route first — decide each token's expert
+        # 1. Route
         idx, w = self._route(self.router, flat)
         self._last_routing = (idx, w)
 
-        # For top-1: idx is [N], w is [N, 1]
-        # For top-k: idx is [N, K], w is [N, K] — we handle top-1 path for clarity
         if self.top_k == 1:
-            token_expert = idx                  # [N]
+            token_expert = idx
         else:
-            token_expert = idx[:, 0]            # primary expert for KV table selection
+            token_expert = idx[:, 0]
 
-        # 2. Find active experts
         active_experts = token_expert.unique()
 
-        # 3. Compute Q for each token using its expert
+        # 2. Q for each token
         Q = self._apply_projection(flat, self.q_proj, idx, w,
                                    self.q_norm_weight, self.num_heads)
         Q = Q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = position_embeddings
 
-        # 4. For each active expert: compute K,V for ALL tokens, run full
-        #    attention, then keep only results for tokens assigned to that expert.
+        # 3. Per-expert KV tables + attention
         attn_output = flat.new_zeros(B, self.num_heads, T, self.head_dim)
         K_per_token = flat.new_zeros(N, self.kv_dim)
         V_per_token = flat.new_zeros(N, self.kv_dim)
 
         for e in active_experts:
-            mask_e = (token_expert == e)                        # [N]
-            mask_2d = mask_e.view(B, T)                         # [B, T]
+            mask_e = (token_expert == e)
+            mask_2d = mask_e.view(B, T)
 
-            # K,V for ALL tokens using expert e's projections
-            K_e = flat @ self.k_proj[e]                         # [N, kv_dim]
-            V_e = flat @ self.v_proj[e]                         # [N, kv_dim]
+            K_e = flat @ self.k_proj[e]
+            V_e = flat @ self.v_proj[e]
 
             # Per-expert k_norm
             K_e_normed = K_e.view(N, self.num_kv_heads, self.head_dim).float()
@@ -484,41 +461,34 @@ class AttentionExpertBank(nn.Module):
             K_e_normed = K_e_normed * torch.rsqrt(var_k + self.eps)
             K_e_normed = (self.k_norm_weight[e].unsqueeze(0) * K_e_normed).to(flat.dtype)
 
-            # Reshape, RoPE, GQA expand
             K_e_heads = K_e_normed.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
             V_e_heads = V_e.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
             _, K_e_rope = apply_rotary_pos_emb(Q, K_e_heads, cos, sin)
-            K_e_exp = repeat_kv(K_e_rope, self.num_kv_groups)  # [B, n_heads, T, hd]
+            K_e_exp = repeat_kv(K_e_rope, self.num_kv_groups)
             V_e_exp = repeat_kv(V_e_heads, self.num_kv_groups)
 
-            # Full attention: all Q against expert e's KV table
             scores = torch.matmul(Q, K_e_exp.transpose(2, 3)) * self.scaling
             if attention_mask is not None:
                 scores = scores + attention_mask
             scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
-            attn_e = torch.matmul(scores, V_e_exp)             # [B, n_heads, T, hd]
+            attn_e = torch.matmul(scores, V_e_exp)
 
-            # Keep only results for tokens assigned to this expert
-            mask_head = mask_2d.unsqueeze(1).unsqueeze(-1)      # [B, 1, T, 1]
+            mask_head = mask_2d.unsqueeze(1).unsqueeze(-1)
             attn_output = attn_output + attn_e * mask_head
 
-            # Save per-token K,V from selected expert (for KV state)
             K_per_token[mask_e] = K_e[mask_e]
             V_per_token[mask_e] = V_e[mask_e]
 
-        # Reshape attention output
+        # 4. O projection
         attn_output = attn_output.transpose(1, 2).reshape(N, self.q_dim)
-
-        # 5. O projection — reuse same routing
         attn_output = self._apply_projection(attn_output, self.o_proj, idx, w)
         attn_output = attn_output.view(B, T, H)
 
-        # 6. Per-token K,V for state update (from each token's selected expert)
-        #    Apply per-expert k_norm + RoPE
+        # 5. Per-token K,V for state update
         K_normed = K_per_token.view(N, self.num_kv_heads, self.head_dim).float()
         var_k = K_normed.pow(2).mean(-1, keepdim=True)
         K_normed = K_normed * torch.rsqrt(var_k + self.eps)
-        kw = self.k_norm_weight[token_expert]                   # [N, head_dim]
+        kw = self.k_norm_weight[token_expert]
         K_normed = (kw.unsqueeze(1) * K_normed).to(flat.dtype)
 
         K_fresh = K_normed.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -528,97 +498,29 @@ class AttentionExpertBank(nn.Module):
         return attn_output, K_fresh, V_fresh
 
 
-# ─── MoE-Everything decoder layer ─────────────────────────────────────────── #
+# ─── MLP expert bank ──────────────────────────────────────────────────────── #
 
-class MoEverythingLayer(nn.Module):
-    """Single decoder layer with branch routing between attention and MLP.
+class MlpExpertBank(nn.Module):
+    """MLP expert bank with pre-norm. Shared across all depths."""
 
-    Uses a single pre-norm (tied to the layer, not per-branch).
-    Token state is (E, K, V); K,V persist and are only refreshed on ATTN.
-    """
-
-    def __init__(self, config: MoEverythingConfig, layer_idx: int):
+    def __init__(self, config: MoEverythingConfig):
         super().__init__()
-        self.layer_idx = layer_idx
-        self.hidden_size = config.hidden_size
-
-        # Shared pre-norm
         self.norm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        # Branch router
-        self.branch_router = BranchRouter(config.hidden_size)
-
-        # Attention expert bank
-        self.attn_bank = AttentionExpertBank(config)
-
-        # MLP expert bank (reuses standard MoE block)
-        from transformers.models.qwen3_moe.modeling_qwen3_moe import (
-            Qwen3MoeSparseMoeBlock,
-        )
-        self.mlp_bank = Qwen3MoeSparseMoeBlock(config)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        kv_state: tuple[torch.Tensor, torch.Tensor],
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Args:
-            hidden_states: [B, T, H]
-            kv_state: (K, V) each [B, n_kv_heads, T, head_dim]
-            position_embeddings: (cos, sin)
-            attention_mask: [B, 1, T, T] causal mask
-
-        Returns:
-            hidden_states: [B, T, H] updated
-            kv_state: (K, V) updated
-        """
-        B, T, H = hidden_states.shape
-
-        # Pre-norm (shared)
-        normed = self.norm(hidden_states)
-
-        # Branch routing: [B, T, 2]
-        branch_probs = self.branch_router(normed)
-        p_attn = branch_probs[..., 0:1]  # [B, T, 1]
-        p_mlp = branch_probs[..., 1:2]   # [B, T, 1]
-
-        if self.attn_bank.mode == "precompute_kv":
-            # precompute_kv does its own per-expert attention internally
-            attn_out, K_fresh, V_fresh = self.attn_bank.project_and_attend_precompute_kv(
-                normed, position_embeddings, attention_mask
-            )
+        if getattr(config, 'use_deepseek_routing', False):
+            self.gate = DeepSeekRouter(config)
         else:
-            # ── Attention branch: project Q, K_fresh, V_fresh ──
-            Q, K_fresh, V_fresh = self.attn_bank.project(normed, position_embeddings)
+            self.gate = Qwen3MoeTopKRouter(config)
+        self.experts = Qwen3MoeExperts(config)
+        self.last_router_logits = None
 
-            # ── Blend KV: soft "attn tokens refresh, mlp tokens keep cache" ──
-            K_old, V_old = kv_state
-            p_attn_kv = p_attn.unsqueeze(1)  # [B, 1, T, 1]
-            p_mlp_kv = p_mlp.unsqueeze(1)
-            K_blend = p_attn_kv * K_fresh + p_mlp_kv * K_old
-            V_blend = p_attn_kv * V_fresh + p_mlp_kv * V_old
-
-            # ── Attention using blended KV (cache flows into scores) ──
-            flat = normed.reshape(B * T, H)
-            attn_out = self.attn_bank.attend(Q, K_blend, V_blend, flat, attention_mask)
-
-        # ── MLP branch ──
-        mlp_out = self.mlp_bank(normed)  # [B, T, H]
-
-        # ── Combine via soft routing ──
-        hidden_states = hidden_states + p_attn * attn_out + p_mlp * mlp_out
-
-        # ── KV state update ──
-        K_old, V_old = kv_state
-        p_attn_kv = p_attn.unsqueeze(1)
-        p_mlp_kv = p_mlp.unsqueeze(1)
-        K_out = p_attn_kv * K_fresh + p_mlp_kv * K_old
-        V_out = p_attn_kv * V_fresh + p_mlp_kv * V_old
-
-        return hidden_states, (K_out, V_out)
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        B, T, H = hidden_states.shape
+        normed = self.norm(hidden_states)
+        flat = normed.view(-1, H)
+        router_logits, routing_weights, selected_experts = self.gate(flat)
+        out = self.experts(flat, selected_experts, routing_weights)
+        self.last_router_logits = router_logits
+        return out.view(B, T, H)
 
 
 # ─── Full model ────────────────────────────────────────────────────────────── #
@@ -626,9 +528,9 @@ class MoEverythingLayer(nn.Module):
 class MoEverythingModel(nn.Module):
     """Mixture-of-Everything transformer backbone.
 
-    Token state (E, K, V) is initialized from the embedding and flows
-    through all layers.  K,V persist and are refreshed only when the
-    branch router selects attention.
+    All components (branch router, attention bank, MLP bank) are shared
+    across depths.  The forward is a simple for loop — only activations
+    change per depth, not weights.
     """
 
     def __init__(self, config: MoEverythingConfig):
@@ -637,6 +539,7 @@ class MoEverythingModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
+        self.num_depths = config.num_hidden_layers
 
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_kv_heads = config.num_key_value_heads
@@ -654,14 +557,17 @@ class MoEverythingModel(nn.Module):
         # RoPE
         self.rotary_emb = Qwen3MoeRotaryEmbedding(config=config)
 
-        # Decoder layers
-        self.layers = nn.ModuleList([
-            MoEverythingLayer(config, i)
-            for i in range(config.num_hidden_layers)
-        ])
+        # Shared components — one instance each, reused at every depth
+        self.branch_router = BranchRouter(config.hidden_size)
+        self.attn_bank = AttentionExpertBank(config)
+        self.mlp_bank = MlpExpertBank(config)
 
         # Final norm
         self.norm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Populated during forward for loss computation
+        self._all_mlp_router_logits = []
+        self._all_branch_probs = []
 
     def forward(
         self,
@@ -673,42 +579,73 @@ class MoEverythingModel(nn.Module):
         B, T = input_ids.shape
 
         # ── Embed ──
-        E = self.embed_tokens(input_ids)  # [B, T, H]
+        hidden_states = self.embed_tokens(input_ids)
 
         # ── Position embeddings ──
         if position_ids is None:
             position_ids = torch.arange(T, device=input_ids.device).unsqueeze(0)
-        position_embeddings = self.rotary_emb(E, position_ids=position_ids)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
         cos, sin = position_embeddings
 
         # ── Causal mask ──
-        # Standard causal: [1, 1, T, T]
         causal_mask = torch.triu(
-            torch.full((T, T), float("-inf"), device=E.device, dtype=E.dtype),
+            torch.full((T, T), float("-inf"), device=hidden_states.device, dtype=hidden_states.dtype),
             diagonal=1,
         ).unsqueeze(0).unsqueeze(0)
 
         # ── Initialize KV state (depth 0) ──
-        K_init = self.init_k_proj(E)  # [B, T, kv_dim]
-        V_init = self.init_v_proj(E)  # [B, T, kv_dim]
+        K_init = self.init_k_proj(hidden_states)
+        V_init = self.init_v_proj(hidden_states)
         K_init = self.init_k_norm(
             K_init.view(B, T, self.num_kv_heads, self.head_dim)
-        ).transpose(1, 2)  # [B, n_kv_heads, T, head_dim]
+        ).transpose(1, 2)
         V_init = V_init.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         # Apply RoPE to initial K
-        # cos/sin: [B, T, head_dim] — need to unsqueeze for [B, n_heads, T, head_dim]
-        cos_unsq = cos.unsqueeze(1)  # [B, 1, T, head_dim]
+        cos_unsq = cos.unsqueeze(1)
         sin_unsq = sin.unsqueeze(1)
         K_init = (K_init * cos_unsq) + (self._rotate_half(K_init) * sin_unsq)
 
         kv_state = (K_init, V_init)
 
-        # ── Decoder layers ──
-        hidden_states = E
-        for layer in self.layers:
-            hidden_states, kv_state = layer(
-                hidden_states, kv_state, position_embeddings, causal_mask
+        # ── Reset loss accumulators ──
+        self._all_mlp_router_logits = []
+        self._all_branch_probs = []
+
+        # ── Depth loop — all weights shared ──
+        for depth in range(self.num_depths):
+            # Branch routing
+            branch_probs = self.branch_router(hidden_states)
+            p_attn = branch_probs[..., 0:1]  # [B, T, 1]
+            p_mlp = branch_probs[..., 1:2]   # [B, T, 1]
+            self._all_branch_probs.append(branch_probs)
+
+            K_old, V_old = kv_state
+            p_attn_kv = p_attn.unsqueeze(1)  # [B, 1, T, 1]
+            p_mlp_kv = p_mlp.unsqueeze(1)
+
+            if self.attn_bank.mode == "precompute_kv":
+                attn_out, K_fresh, V_fresh = self.attn_bank.project_and_attend_precompute_kv(
+                    hidden_states, position_embeddings, causal_mask
+                )
+            else:
+                Q, K_fresh, V_fresh = self.attn_bank.project(hidden_states, position_embeddings)
+                # Blend KV: attn tokens refresh, mlp tokens keep old
+                K_blend = p_attn_kv * K_fresh + p_mlp_kv * K_old
+                V_blend = p_attn_kv * V_fresh + p_mlp_kv * V_old
+                attn_out = self.attn_bank.attend(Q, K_blend, V_blend, causal_mask)
+
+            # MLP branch (bank applies its own norm)
+            mlp_out = self.mlp_bank(hidden_states)
+            self._all_mlp_router_logits.append(self.mlp_bank.last_router_logits)
+
+            # Combine via soft routing
+            hidden_states = hidden_states + p_attn * attn_out + p_mlp * mlp_out
+
+            # Update KV state
+            kv_state = (
+                p_attn_kv * K_fresh + p_mlp_kv * K_old,
+                p_attn_kv * V_fresh + p_mlp_kv * V_old,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -735,7 +672,6 @@ class MoEverythingForCausalLM(nn.Module):
         self.model = MoEverythingModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # Tie embeddings if configured
         if getattr(config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
 
@@ -783,7 +719,7 @@ class MoEverythingForCausalLM(nn.Module):
             )
 
             # MLP expert load-balancing loss
-            mlp_router_logits = self._collect_mlp_router_logits()
+            mlp_router_logits = self.model._all_mlp_router_logits
             if mlp_router_logits:
                 mlp_aux = load_balancing_loss_func(
                     tuple(mlp_router_logits),
@@ -795,41 +731,18 @@ class MoEverythingForCausalLM(nn.Module):
                     loss = loss + self.router_aux_loss_coef * mlp_aux
 
             # Branch balance loss: encourage ~50/50 split
-            branch_aux = self._branch_balance_loss()
-            if branch_aux is not None:
+            branch_probs = self.model._all_branch_probs
+            if branch_probs:
+                cat_probs = torch.cat([p.reshape(-1, 2) for p in branch_probs], dim=0)
+                mean_probs = cat_probs.mean(dim=0)
+                branch_aux = 2.0 * (mean_probs ** 2).sum()
                 loss = loss + self.branch_router_aux_loss_coef * branch_aux
 
-        # Return a simple namespace-like object compatible with train.py
         return _MoEverythingOutput(
             loss=loss,
             logits=logits,
             aux_loss=aux_loss,
         )
-
-    def _collect_mlp_router_logits(self) -> list[torch.Tensor]:
-        """Collect router logits from MLP expert banks."""
-        logits = []
-        for layer in self.model.layers:
-            gate = layer.mlp_bank.gate
-            if hasattr(gate, '_last_logits'):
-                logits.append(gate._last_logits)
-        return logits
-
-    def _branch_balance_loss(self) -> torch.Tensor | None:
-        """Entropy-based loss to prevent branch collapse."""
-        all_probs = []
-        for layer in self.model.layers:
-            router = layer.branch_router
-            if hasattr(router, '_last_probs'):
-                all_probs.append(router._last_probs)
-        if not all_probs:
-            return None
-        # Mean branch probability across all tokens and layers
-        # Encourage balanced usage by penalizing deviation from uniform
-        cat_probs = torch.cat([p.reshape(-1, 2) for p in all_probs], dim=0)  # [N_total, 2]
-        mean_probs = cat_probs.mean(dim=0)  # [2]
-        # Loss = 2 * sum(mean_i^2) — minimized at uniform (0.5, 0.5) = 0.5
-        return 2.0 * (mean_probs ** 2).sum()
 
 
 class _MoEverythingOutput:
@@ -840,7 +753,6 @@ class _MoEverythingOutput:
         self.logits = logits
         self.aux_loss = aux_loss
         self.router_logits = router_logits
-        # For compatibility
         self.past_key_values = None
         self.hidden_states = None
         self.attentions = None
