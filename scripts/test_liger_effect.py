@@ -31,8 +31,8 @@ def run_pair(use_liger: bool, steps=30):
 
     results = {}
     for config_path in [
-        "configs/scaling/xs_deepseek_standard.yaml",
-        "configs/scaling/xs_deepseek_global.yaml",
+        "configs/standard_moe.yaml",
+        "configs/global_moe.yaml",
     ]:
         set_seed(42)
         name = Path(config_path).stem.replace("xs_deepseek_", "")

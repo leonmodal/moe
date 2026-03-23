@@ -55,8 +55,8 @@ def run(config_path, lr, seed=42):
 
 
 def main():
-    std_cfg = "configs/scaling/xs_deepseek_standard.yaml"
-    glb_cfg = "configs/scaling/xs_deepseek_global.yaml"
+    std_cfg = "configs/standard_moe.yaml"
+    glb_cfg = "configs/global_moe.yaml"
 
     for lr in [1e-3, 1e-2, 1e-1]:
         print(f"\n{'='*70}")

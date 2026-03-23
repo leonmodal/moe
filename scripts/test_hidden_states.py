@@ -71,11 +71,11 @@ def main():
 
     # === Run 1: Standard seed=42 vs Global seed=42 (diff arch, same seed) ===
     set_seed(42)
-    model_std, _ = build_model(load_config("configs/scaling/xs_deepseek_standard.yaml"))
+    model_std, _ = build_model(load_config("configs/standard_moe.yaml"))
     model_std = model_std.to(DEVICE).eval()
 
     set_seed(42)
-    model_glb, _ = build_model(load_config("configs/scaling/xs_deepseek_global.yaml"))
+    model_glb, _ = build_model(load_config("configs/global_moe.yaml"))
     model_glb = model_glb.to(DEVICE).eval()
 
     states_std, out_std = get_hidden_states(model_std, input_ids)
@@ -83,7 +83,7 @@ def main():
 
     # === Run 2: Standard seed=42 vs Standard seed=123 (same arch, diff seed) ===
     set_seed(123)
-    model_std2, _ = build_model(load_config("configs/scaling/xs_deepseek_standard.yaml"))
+    model_std2, _ = build_model(load_config("configs/standard_moe.yaml"))
     model_std2 = model_std2.to(DEVICE).eval()
 
     states_std2, out_std2 = get_hidden_states(model_std2, input_ids)

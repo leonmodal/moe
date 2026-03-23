@@ -74,8 +74,8 @@ def mean_abs_diff(a, b):
 
 
 def main():
-    std_cfg = "configs/scaling/xs_deepseek_standard.yaml"
-    glb_cfg = "configs/scaling/xs_deepseek_global.yaml"
+    std_cfg = "configs/standard_moe.yaml"
+    glb_cfg = "configs/global_moe.yaml"
 
     print("Running 4 experiments:")
     print("  A: Standard seed=42")

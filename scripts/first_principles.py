@@ -132,15 +132,15 @@ def main():
 
     # Each model on its own GPU
     set_seed(42)
-    m_std, c_std = build(load_cfg("configs/scaling/xs_deepseek_standard.yaml"))
+    m_std, c_std = build(load_cfg("configs/standard_moe.yaml"))
     m_std = m_std.to("cuda:0")
 
     set_seed(42)
-    m_glb, c_glb = build(load_cfg("configs/scaling/xs_deepseek_global.yaml"))
+    m_glb, c_glb = build(load_cfg("configs/global_moe.yaml"))
     m_glb = m_glb.to("cuda:2")
 
     set_seed(123)
-    m_std2, c_std2 = build(load_cfg("configs/scaling/xs_deepseek_standard.yaml"))
+    m_std2, c_std2 = build(load_cfg("configs/standard_moe.yaml"))
     m_std2 = m_std2.to("cuda:4")
 
     # AT INIT

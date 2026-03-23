@@ -28,9 +28,9 @@ from train import (
 )
 
 CONFIGS = [
-    "configs/scaling/xs_deepseek_standard.yaml",
-    "configs/scaling/xs_deepseek_global.yaml",
-    "configs/scaling/xs_deepseek_global_nointerp.yaml",
+    "configs/standard_moe.yaml",
+    "configs/global_moe.yaml",
+    "configs/global_moe_nointerp.yaml",
 ]
 
 STEPS = 50

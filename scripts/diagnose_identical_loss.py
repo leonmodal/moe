@@ -274,8 +274,8 @@ def main():
     print("DIAGNOSTIC: Why are standard vs global MoE losses identical?")
     print("=" * 70)
 
-    cfg_standard = load_cfg("configs/scaling/xs_deepseek_standard.yaml")
-    cfg_global = load_cfg("configs/scaling/xs_deepseek_global.yaml")
+    cfg_standard = load_cfg("configs/standard_moe.yaml")
+    cfg_global = load_cfg("configs/global_moe.yaml")
 
     # Create fake input
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")

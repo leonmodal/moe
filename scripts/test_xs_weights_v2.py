@@ -101,8 +101,8 @@ def main():
     print("=" * 80)
 
     configs = [
-        ("Standard", "configs/scaling/xs_deepseek_standard.yaml"),
-        ("Global", "configs/scaling/xs_deepseek_global.yaml"),
+        ("Standard", "configs/standard_moe.yaml"),
+        ("Global", "configs/global_moe.yaml"),
     ]
 
     all_losses = {}

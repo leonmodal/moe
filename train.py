@@ -9,6 +9,7 @@ Usage:
 import argparse
 import json
 import math
+from dataclasses import replace
 import os
 import re
 import shutil
@@ -144,21 +145,149 @@ def update_expert_biases(
 def get_selected_experts_for_seq_aux(model) -> tuple[torch.Tensor, ...] | None:
     """Return the last biased top-k assignments from DeepSeek routers, if present."""
     try:
-        layers = getattr(getattr(model, "model", None), "layers", None)
-        if layers is None:
-            return None
+        inner_model = getattr(model, "model", None)
+        layers = getattr(inner_model, "layers", None)
+        if layers is not None:
+            selected = []
+            for layer in layers:
+                gate = getattr(getattr(layer, "mlp", None), "gate", None)
+                idx = getattr(gate, "_last_top_k_idx", None)
+                if idx is None:
+                    return None
+                selected.append(idx)
+            return tuple(selected) if selected else None
 
-        selected = []
-        for layer in layers:
-            gate = getattr(getattr(layer, "mlp", None), "gate", None)
-            idx = getattr(gate, "_last_top_k_idx", None)
-            if idx is None:
-                return None
-            selected.append(idx)
-
-        return tuple(selected) if selected else None
+        selected = getattr(inner_model, "_all_mlp_selected_experts", None)
+        if selected:
+            return tuple(selected)
+        return None
     except Exception:
         return None
+
+
+def get_output_selected_experts(output, model) -> tuple[torch.Tensor, ...] | None:
+    selected = getattr(output, "selected_experts", None)
+    if selected:
+        return tuple(selected)
+    return get_selected_experts_for_seq_aux(model)
+
+
+def reduce_scalar(accelerator: Accelerator, value: float, reduction: str = "mean") -> float:
+    tensor = torch.tensor(value, device=accelerator.device, dtype=torch.float64)
+    if accelerator.num_processes > 1:
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+        if reduction == "mean":
+            tensor /= accelerator.num_processes
+    return tensor.item()
+
+
+def counts_accumulator_to_snapshot(
+    accumulator: dict[int, torch.Tensor] | None,
+    is_global: bool = False,
+) -> dict:
+    snapshot = {"layers": {}, "global_pool": None}
+    if not accumulator:
+        return snapshot
+
+    for layer_idx in sorted(accumulator):
+        counts = accumulator[layer_idx]
+        total = counts.sum().item()
+        fracs = (counts / total).cpu().tolist() if total > 0 else [0.0] * counts.shape[0]
+        snapshot["layers"][int(layer_idx)] = {
+            "token_counts": counts.cpu().tolist(),
+            "token_fracs": fracs,
+        }
+
+    if is_global and len(accumulator) > 1:
+        all_counts = torch.stack([accumulator[i] for i in sorted(accumulator)])
+        pool_counts = all_counts.sum(dim=0)
+        pool_total = pool_counts.sum().item()
+        pool_fracs = (pool_counts / pool_total).cpu().tolist() if pool_total > 0 else []
+        layer_usage = (all_counts > 0).float().sum(dim=0).cpu().tolist()
+        snapshot["global_pool"] = {
+            "token_counts": pool_counts.cpu().tolist(),
+            "token_fracs": pool_fracs,
+            "layer_usage_count": layer_usage,
+            "num_layers": all_counts.shape[0],
+        }
+
+    return snapshot
+
+
+def accumulate_branch_probs(branch_probs, accumulator=None):
+    if not branch_probs:
+        return accumulator
+    if accumulator is None:
+        accumulator = {}
+
+    for depth_idx, probs in enumerate(branch_probs):
+        probs = probs.detach().float()
+        entry = accumulator.get(depth_idx)
+        if entry is None:
+            entry = {
+                "sum": torch.zeros(2, device=probs.device, dtype=torch.float32),
+                "count": torch.zeros((), device=probs.device, dtype=torch.float32),
+            }
+            accumulator[depth_idx] = entry
+        entry["sum"] += probs.reshape(-1, 2).sum(dim=0)
+        entry["count"] += probs.shape[0] * probs.shape[1]
+
+    return accumulator
+
+
+def branch_accumulator_to_stats(accumulator) -> dict:
+    if not accumulator:
+        return {}
+
+    stats = {}
+    total_sum = None
+    total_count = 0.0
+    for depth_idx in sorted(accumulator):
+        entry = accumulator[depth_idx]
+        probs = entry["sum"] / entry["count"].clamp(min=1.0)
+        attn_frac = probs[0].item()
+        mlp_frac = probs[1].item()
+        ratio = attn_frac / max(mlp_frac, 1e-12)
+        stats[f"routing/branch_layer_{depth_idx:02d}_attn_frac"] = attn_frac
+        stats[f"routing/branch_layer_{depth_idx:02d}_mlp_frac"] = mlp_frac
+        stats[f"routing/branch_layer_{depth_idx:02d}_attn_to_mlp_ratio"] = ratio
+        total_sum = entry["sum"].clone() if total_sum is None else total_sum + entry["sum"]
+        total_count += entry["count"].item()
+
+    total_probs = total_sum / max(total_count, 1.0)
+    stats["routing/branch_total_attn_frac"] = total_probs[0].item()
+    stats["routing/branch_total_mlp_frac"] = total_probs[1].item()
+    stats["routing/branch_total_attn_to_mlp_ratio"] = total_probs[0].item() / max(total_probs[1].item(), 1e-12)
+    return stats
+
+
+def branch_accumulator_to_snapshot(accumulator) -> dict | None:
+    if not accumulator:
+        return None
+
+    snapshot = {"layers": {}, "total": {}}
+    total_sum = None
+    total_count = 0.0
+    for depth_idx in sorted(accumulator):
+        entry = accumulator[depth_idx]
+        probs = entry["sum"] / entry["count"].clamp(min=1.0)
+        attn_frac = probs[0].item()
+        mlp_frac = probs[1].item()
+        snapshot["layers"][int(depth_idx)] = {
+            "attn_frac": attn_frac,
+            "mlp_frac": mlp_frac,
+            "attn_to_mlp_ratio": attn_frac / max(mlp_frac, 1e-12),
+        }
+        total_sum = entry["sum"].clone() if total_sum is None else total_sum + entry["sum"]
+        total_count += entry["count"].item()
+
+    total_probs = total_sum / max(total_count, 1.0)
+    snapshot["total"] = {
+        "attn_frac": total_probs[0].item(),
+        "mlp_frac": total_probs[1].item(),
+        "attn_to_mlp_ratio": total_probs[0].item() / max(total_probs[1].item(), 1e-12),
+    }
+    return snapshot
 
 
 # --------------------------------------------------------------------------- #
@@ -242,6 +371,11 @@ def build_model(cfg: dict):
             num_attn_experts_per_tok=mcfg.get("num_attn_experts_per_tok", 1),
             attn_expert_mode=mcfg.get("attn_expert_mode", "bundled"),
             branch_router_aux_loss_coef=mcfg.get("branch_router_aux_loss_coef", 0.01),
+            use_deepseek_routing=mcfg.get("use_deepseek_routing", False),
+            topk_scaling_factor=mcfg.get("topk_scaling_factor", None),
+            num_groups=mcfg.get("num_groups", None),
+            group_topk=mcfg.get("group_topk", None),
+            seq_aux_loss_coef=mcfg.get("seq_aux_loss_coef", 0.0),
             **common,
         )
         model = MoEverythingForCausalLM(config)
@@ -432,11 +566,15 @@ def main() -> None:
     if resume_from:
         accelerator.print(f"Will resume from: {resume_from}")
 
-    # Accelerate counts scheduler steps per device, not per optimizer update.
-    # Scale warmup/max steps so configs stay in real optimizer steps.
-    real_max_steps = train_cfg.max_steps  # unscaled, for our own schedules
-    train_cfg.warmup_steps = train_cfg.warmup_steps * accelerator.num_processes
-    train_cfg.max_steps = train_cfg.max_steps * accelerator.num_processes
+    # Training config stays in real optimizer-step units for loop control, logging,
+    # checkpoint cadence, and WandB config. Accelerate's prepared scheduler, however,
+    # advances once per process when split_batches=False, so only the scheduler needs
+    # world-size-scaled warmup/total steps.
+    scheduler_cfg = replace(
+        train_cfg,
+        warmup_steps=train_cfg.warmup_steps * accelerator.num_processes,
+        max_steps=train_cfg.max_steps * accelerator.num_processes,
+    )
 
     if log_with and accelerator.is_main_process:
         tracker_kwargs = {"wandb": {"name": train_cfg.wandb_run_name}}
@@ -468,6 +606,8 @@ def main() -> None:
     )
     is_dense = cfg["model"]["type"] == "dense"
     is_global = cfg["model"]["type"] in ("global_moe", "deepseek_global_moe")
+    is_moe_everything = cfg["model"]["type"] == "moe_everything"
+    shared_mlp_pool = is_global or is_moe_everything
     bias_update_rate = cfg["model"].get("bias_update_rate", 0.0)
     bias_interpolation = cfg["model"].get("bias_interpolation", False)
     seq_aux_loss_coef = cfg["model"].get("seq_aux_loss_coef", 0.0)
@@ -475,6 +615,15 @@ def main() -> None:
     # Attach seq_aux_loss_coef to model (read by forward methods)
     if seq_aux_loss_coef > 0:
         model._seq_aux_loss_coef = seq_aux_loss_coef
+
+    if train_cfg.gradient_checkpointing:
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+            if hasattr(model, "config"):
+                model.config.use_cache = False
+            accelerator.print("Gradient checkpointing enabled.")
+        else:
+            accelerator.print("Gradient checkpointing requested, but this model does not expose gradient_checkpointing_enable().")
 
     accelerator.print(
         f"\n{'='*60}\n"
@@ -514,7 +663,7 @@ def main() -> None:
 
     # --- Optimizer & Scheduler ----------------------------------------------
     optimizer = build_optimizer(model, train_cfg)
-    scheduler = build_lr_scheduler(optimizer, train_cfg)
+    scheduler = build_lr_scheduler(optimizer, scheduler_cfg)
 
     # --- Accelerate prepare (wraps model in DDP/FSDP) -----------------------
     model, optimizer, dataloader, scheduler = accelerator.prepare(
@@ -539,26 +688,120 @@ def main() -> None:
 
     data_iter = iter(dataloader)
     t0 = time.perf_counter()
-    tokens_seen = 0
+    tokens_seen = 0.0
     routing_log_every = tcfg_dict.get("routing_log_every", 50)
-    expert_count_accum = None  # accumulated per-layer expert token counts
+    expert_count_accum = None
+    attention_expert_count_accum = {}
+    branch_prob_accum = None
+
+    loss_window_sum = 0.0
+    ce_window_sum = 0.0
+    aux_window_sum = 0.0
+    seq_aux_window_sum = 0.0
+    branch_aux_window_sum = 0.0
+    microbatches_in_step = 0
+    local_tokens_in_step = 0
 
     accelerator.print(f"Starting training from step {global_step}")
 
     while global_step < train_cfg.max_steps:
-        # Fetch batch (loop dataset if exhausted)
         try:
             batch = next(data_iter)
         except StopIteration:
             data_iter = iter(dataloader)
             batch = next(data_iter)
 
-        input_ids = batch["input_ids"]   # (B, T)
-        labels = batch["labels"]         # (B, T)
+        input_ids = batch["input_ids"]
+        labels = batch["labels"]
 
         with accelerator.accumulate(model):
-            output = model(input_ids=input_ids, labels=labels, **({} if is_dense else {"output_router_logits": True}))
+            output = model(
+                input_ids=input_ids,
+                labels=labels,
+                **({} if is_dense else {"output_router_logits": True}),
+            )
             loss = output.loss
+            raw_model = accelerator.unwrap_model(model)
+
+            aux = getattr(output, "aux_loss", None)
+            aux_value = aux.detach().float().item() if isinstance(aux, torch.Tensor) else float(aux or 0.0)
+            total_value = loss.detach().float().item()
+
+            ce_tensor = getattr(output, "ce_loss", None)
+            if isinstance(ce_tensor, torch.Tensor):
+                ce_value = ce_tensor.detach().float().item()
+            elif ce_tensor is not None:
+                ce_value = float(ce_tensor)
+            else:
+                ce_value = total_value - getattr(raw_model, "router_aux_loss_coef", 0.0) * aux_value
+
+            seq_aux = getattr(output, "seq_aux_loss", None)
+            if seq_aux is None and seq_aux_loss_coef > 0 and getattr(output, "router_logits", None) is not None:
+                selected_for_seq_aux = get_output_selected_experts(output, raw_model)
+                seq_aux = seq_load_balancing_loss_func(
+                    output.router_logits,
+                    model_cfg.num_experts,
+                    model_cfg.num_experts_per_tok,
+                    batch_size=input_ids.shape[0],
+                    selected_experts=selected_for_seq_aux,
+                )
+            if isinstance(seq_aux, torch.Tensor):
+                seq_aux_value = seq_aux.detach().float().item()
+            elif seq_aux is not None:
+                seq_aux_value = float(seq_aux)
+            else:
+                seq_aux_value = 0.0
+
+            branch_aux = getattr(output, "branch_aux_loss", None)
+            if isinstance(branch_aux, torch.Tensor):
+                branch_aux_value = branch_aux.detach().float().item()
+            elif branch_aux is not None:
+                branch_aux_value = float(branch_aux)
+            else:
+                branch_aux_value = 0.0
+
+            if ce_tensor is None:
+                ce_value -= seq_aux_loss_coef * seq_aux_value
+                ce_value -= getattr(raw_model, "branch_router_aux_loss_coef", 0.0) * branch_aux_value
+
+            loss_window_sum += total_value
+            ce_window_sum += ce_value
+            aux_window_sum += aux_value
+            seq_aux_window_sum += seq_aux_value
+            branch_aux_window_sum += branch_aux_value
+            microbatches_in_step += 1
+            local_tokens_in_step += input_ids.numel()
+
+            selected_experts = get_output_selected_experts(output, raw_model)
+            if getattr(output, "router_logits", None) is not None:
+                expert_count_accum = accumulate_expert_counts(
+                    output.router_logits,
+                    num_experts_per_tok=model_cfg.num_experts_per_tok,
+                    accumulator=expert_count_accum,
+                    selected_experts=selected_experts,
+                )
+
+            attention_router_info = getattr(output, "attention_router_info", None)
+            if attention_router_info is not None:
+                router_names = sorted({name for depth_info in attention_router_info for name in depth_info})
+                for router_name in router_names:
+                    router_logits = []
+                    router_selected = []
+                    for depth_info in attention_router_info:
+                        info = depth_info.get(router_name)
+                        if info is None:
+                            continue
+                        router_logits.append(info["router_logits"])
+                        router_selected.append(info["selected_experts"])
+                    attention_expert_count_accum[router_name] = accumulate_expert_counts(
+                        router_logits,
+                        num_experts_per_tok=model_cfg.num_attn_experts_per_tok,
+                        accumulator=attention_expert_count_accum.get(router_name),
+                        selected_experts=router_selected,
+                    )
+
+            branch_prob_accum = accumulate_branch_probs(getattr(output, "branch_probs", None), branch_prob_accum)
+
             accelerator.backward(loss)
 
             if accelerator.sync_gradients:
@@ -568,14 +811,15 @@ def main() -> None:
             optimizer.step()
             optimizer.zero_grad()
 
-        # Only count steps at actual optimizer updates
         if accelerator.sync_gradients:
-            # Update expert biases (no-op if rate=0 or no DeepSeekRouters)
             if bias_update_rate > 0:
                 alpha = bias_alpha_schedule(global_step) if (is_global and bias_interpolation) else 0.0
                 bias_stats = update_expert_biases(
-                    accelerator.unwrap_model(model), bias_update_rate, accelerator,
-                    is_global=is_global, alpha=alpha,
+                    accelerator.unwrap_model(model),
+                    bias_update_rate,
+                    accelerator,
+                    is_global=is_global,
+                    alpha=alpha,
                 )
                 bias_stats["routing/bias_alpha"] = alpha
             else:
@@ -583,111 +827,105 @@ def main() -> None:
 
             scheduler.step()
             global_step += 1
-            tokens_seen += input_ids.numel() * accelerator.num_processes
 
-            # ── Per-step logging ────────────────────────────────────────
+            tokens_this_step = reduce_scalar(accelerator, float(local_tokens_in_step), reduction="sum")
+            tokens_seen += tokens_this_step
+
+            avg_total = reduce_scalar(accelerator, loss_window_sum / max(1, microbatches_in_step))
+            avg_ce = reduce_scalar(accelerator, ce_window_sum / max(1, microbatches_in_step))
+            avg_aux = reduce_scalar(accelerator, aux_window_sum / max(1, microbatches_in_step))
+            avg_seq_aux = reduce_scalar(accelerator, seq_aux_window_sum / max(1, microbatches_in_step))
+            avg_branch_aux = reduce_scalar(accelerator, branch_aux_window_sum / max(1, microbatches_in_step))
+            avg_grad_norm = reduce_scalar(accelerator, grad_norm)
+
             if global_step % train_cfg.log_every == 0 and accelerator.is_main_process:
                 elapsed = time.perf_counter() - t0
-                tok_per_sec = tokens_seen / elapsed
+                tok_per_sec = tokens_seen / max(elapsed, 1e-6)
                 lr = scheduler.get_last_lr()[0]
-                raw_model = accelerator.unwrap_model(model)
-                aux   = getattr(output, "aux_loss", None)
-                aux   = aux.item() if aux is not None else 0.0
-                total = loss.item()
-                aux_coef = getattr(raw_model, "router_aux_loss_coef", 0.0)
-                ce    = total - aux_coef * aux
-
-                # Compute seq_aux_loss for logging
-                seq_aux = 0.0
-                if seq_aux_loss_coef > 0 and getattr(output, "router_logits", None) is not None:
-                    selected_experts = get_selected_experts_for_seq_aux(raw_model)
-                    seq_aux_val = seq_load_balancing_loss_func(
-                        output.router_logits,
-                        model_cfg.num_experts,
-                        model_cfg.num_experts_per_tok,
-                        batch_size=input_ids.shape[0],
-                        selected_experts=selected_experts,
-                    )
-                    seq_aux = seq_aux_val.item() if isinstance(seq_aux_val, torch.Tensor) else seq_aux_val
-                    ce -= seq_aux_loss_coef * seq_aux
-
                 log_dict = {
-                    "train/ce_loss":        ce,
-                    "train/aux_loss":       aux,
-                    "train/seq_aux_loss":   seq_aux,
-                    "train/grad_norm":      grad_norm,
-                    "train/lr":             lr,
+                    "train/loss": avg_total,
+                    "train/ce_loss": avg_ce,
+                    "train/aux_loss": avg_aux,
+                    "train/seq_aux_loss": avg_seq_aux,
+                    "train/branch_aux_loss": avg_branch_aux,
+                    "train/grad_norm": avg_grad_norm,
+                    "train/lr": lr,
                     "train/tokens_per_sec": tok_per_sec,
-                    "train/tokens_seen_B":  tokens_seen / 1e9,
+                    "train/tokens_seen_B": tokens_seen / 1e9,
                 }
                 accelerator.print(
                     f"step {global_step:6d}  "
-                    f"loss={total:.4f}  ce={ce:.4f}  aux={aux:.4f}  seq_aux={seq_aux:.4f}  "
-                    f"lr={lr:.2e}  "
-                    f"tok/s={tok_per_sec/1e3:.1f}k  |g|={grad_norm:.3f}"
+                    f"loss={avg_total:.4f}  ce={avg_ce:.4f}  aux={avg_aux:.4f}  "
+                    f"seq_aux={avg_seq_aux:.4f}  branch_aux={avg_branch_aux:.4f}  "
+                    f"lr={lr:.2e}  tok/s={tok_per_sec/1e3:.1f}k  |g|={avg_grad_norm:.3f}"
                 )
                 if bias_stats:
                     log_dict.update(bias_stats)
                 if log_with:
                     accelerator.log(log_dict, step=global_step)
 
-            # ── Accumulate expert token counts every step (all ranks) ──
-            if getattr(output, "router_logits", None) is not None:
-                expert_count_accum = accumulate_expert_counts(
-                    output.router_logits,
-                    num_experts_per_tok=model_cfg.num_experts_per_tok,
-                    accumulator=expert_count_accum,
-                )
-
-            # ── Routing stats (per-layer + cross-layer for Global MoE) ──
             if global_step % routing_log_every == 0:
-                # All-reduce accumulated counts across ranks
                 if expert_count_accum is not None and accelerator.num_processes > 1:
-                    for k in expert_count_accum:
-                        torch.distributed.all_reduce(
-                            expert_count_accum[k], op=torch.distributed.ReduceOp.SUM,
-                        )
+                    for layer_idx in expert_count_accum:
+                        torch.distributed.all_reduce(expert_count_accum[layer_idx], op=torch.distributed.ReduceOp.SUM)
 
-                if accelerator.is_main_process and getattr(output, "router_logits", None) is not None:
-                    rstats = compute_routing_stats(
-                        output.router_logits,
-                        num_experts_per_tok=model_cfg.num_experts_per_tok,
-                        is_global=is_global,
-                    )
-                    # Only log lightweight scalar summaries to wandb
-                    scalar_stats = {k: v for k, v in rstats.items() if not k.startswith("_hist/")}
-                    if log_with:
+                if attention_expert_count_accum and accelerator.num_processes > 1:
+                    for router_accum in attention_expert_count_accum.values():
+                        for layer_idx in router_accum:
+                            torch.distributed.all_reduce(router_accum[layer_idx], op=torch.distributed.ReduceOp.SUM)
+
+                if branch_prob_accum and accelerator.num_processes > 1:
+                    for entry in branch_prob_accum.values():
+                        torch.distributed.all_reduce(entry["sum"], op=torch.distributed.ReduceOp.SUM)
+                        torch.distributed.all_reduce(entry["count"], op=torch.distributed.ReduceOp.SUM)
+
+                if accelerator.is_main_process:
+                    scalar_stats = {}
+                    raw_model = accelerator.unwrap_model(model)
+                    selected_experts = get_output_selected_experts(output, raw_model)
+                    if getattr(output, "router_logits", None) is not None:
+                        rstats = compute_routing_stats(
+                            output.router_logits,
+                            num_experts_per_tok=model_cfg.num_experts_per_tok,
+                            is_global=shared_mlp_pool,
+                            selected_experts=selected_experts,
+                        )
+                        scalar_stats.update({k: v for k, v in rstats.items() if not k.startswith("_hist/")})
+
+                    attention_router_info = getattr(output, "attention_router_info", None)
+                    if attention_router_info is not None:
+                        router_names = sorted({name for depth_info in attention_router_info for name in depth_info})
+                        for router_name in router_names:
+                            router_logits = []
+                            router_selected = []
+                            for depth_info in attention_router_info:
+                                info = depth_info.get(router_name)
+                                if info is None:
+                                    continue
+                                router_logits.append(info["router_logits"])
+                                router_selected.append(info["selected_experts"])
+                            astats = compute_routing_stats(
+                                router_logits,
+                                num_experts_per_tok=model_cfg.num_attn_experts_per_tok,
+                                is_global=True,
+                                selected_experts=router_selected,
+                                prefix=f"routing/attention/{router_name}",
+                            )
+                            scalar_stats.update({k: v for k, v in astats.items() if not k.startswith("_hist/")})
+
+                    scalar_stats.update(branch_accumulator_to_stats(branch_prob_accum))
+                    if log_with and scalar_stats:
                         accelerator.log(scalar_stats, step=global_step)
 
-                    # Save detailed per-expert data as JSON (to output_dir on Modal volume)
                     routing_dir = os.path.join(train_cfg.output_dir, "routing_logs")
                     os.makedirs(routing_dir, exist_ok=True)
-                    snapshot = {"step": global_step, "layers": {}, "global_pool": None}
-
-                    for layer_idx in sorted(expert_count_accum or {}):
-                        counts = expert_count_accum[layer_idx]
-                        total = counts.sum().item()
-                        fracs = (counts / total).cpu().tolist() if total > 0 else [0.0] * counts.shape[0]
-                        snapshot["layers"][layer_idx] = {
-                            "token_counts": counts.cpu().tolist(),
-                            "token_fracs": fracs,
-                        }
-
-                    if is_global and expert_count_accum and len(expert_count_accum) > 1:
-                        all_counts = torch.stack([expert_count_accum[i] for i in sorted(expert_count_accum)])
-                        pool_counts = all_counts.sum(dim=0)  # [E]
-                        pool_total = pool_counts.sum().item()
-                        pool_fracs = (pool_counts / pool_total).cpu().tolist() if pool_total > 0 else []
-
-                        # Per-expert: how many layers use it (> 0 tokens)
-                        layer_usage = (all_counts > 0).float().sum(dim=0).cpu().tolist()  # [E]
-
-                        snapshot["global_pool"] = {
-                            "token_counts": pool_counts.cpu().tolist(),
-                            "token_fracs": pool_fracs,
-                            "layer_usage_count": layer_usage,
-                            "num_layers": all_counts.shape[0],
-                        }
+                    snapshot = {"step": global_step}
+                    snapshot.update(counts_accumulator_to_snapshot(expert_count_accum, is_global=shared_mlp_pool))
+                    snapshot["attention"] = {
+                        router_name: counts_accumulator_to_snapshot(router_accum, is_global=True)
+                        for router_name, router_accum in sorted(attention_expert_count_accum.items())
+                    }
+                    snapshot["branch"] = branch_accumulator_to_snapshot(branch_prob_accum)
 
                     json_path = os.path.join(routing_dir, f"step_{global_step:08d}.json")
                     with open(json_path, "w") as f:
@@ -695,10 +933,10 @@ def main() -> None:
 
                     plot_routing_snapshot(snapshot, routing_dir, global_step)
 
-                # Reset accumulator on all ranks
                 expert_count_accum = None
+                attention_expert_count_accum = {}
+                branch_prob_accum = None
 
-            # Checkpoint
             if global_step % train_cfg.save_every == 0:
                 ds_state = dataset.get_state()
                 save_checkpoint(
@@ -708,6 +946,14 @@ def main() -> None:
                 )
                 if args.max_checkpoints > 0 and accelerator.is_main_process:
                     cleanup_checkpoints(train_cfg.output_dir, args.max_checkpoints)
+
+            loss_window_sum = 0.0
+            ce_window_sum = 0.0
+            aux_window_sum = 0.0
+            seq_aux_window_sum = 0.0
+            branch_aux_window_sum = 0.0
+            microbatches_in_step = 0
+            local_tokens_in_step = 0
 
     # Final checkpoint
     save_checkpoint(

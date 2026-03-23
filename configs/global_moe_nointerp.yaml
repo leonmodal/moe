@@ -1,6 +1,6 @@
 # XS scale — DeepSeek V3 global MoE, global-only bias (no per-layer interpolation)
 # Same as xs_deepseek_global but bias_interpolation is off (alpha=0 always)
-experiment_name: new_deepseek_global_nointerp_moe
+experiment_name: global_moe_nointerp
 
 model:
   type: deepseek_global_moe
@@ -47,9 +47,9 @@ training:
   log_every: 1
   routing_log_every: 50
   save_every: 1000
-  output_dir: ./outputs/new_deepseek_global_nointerp_moe
+  output_dir: ./outputs/global_moe_nointerp
   wandb_project: moe-scaling
-  wandb_run_name: new_deepseek_global_nointerp
+  wandb_run_name: global_moe_nointerp
 
 data:
   data_dir: ./data/parquet

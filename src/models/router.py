@@ -15,6 +15,8 @@ not through gradient descent — this prevents the router from gaming the loss.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeTopKRouter
 
@@ -68,6 +70,22 @@ def group_limited_topk(
     masked_scores = scores.masked_fill(~score_mask.bool(), float('-inf'))
     top_scores, top_indices = torch.topk(masked_scores, k=topk, dim=-1)
     return top_scores, top_indices
+
+
+_CHECKPOINT_RECOMPUTE = ContextVar("checkpoint_recompute", default=False)
+
+
+@contextmanager
+def checkpoint_recompute_context(enabled: bool):
+    token = _CHECKPOINT_RECOMPUTE.set(enabled)
+    try:
+        yield
+    finally:
+        _CHECKPOINT_RECOMPUTE.reset(token)
+
+
+def is_checkpoint_recompute() -> bool:
+    return _CHECKPOINT_RECOMPUTE.get()
 
 
 class DeepSeekRouter(Qwen3MoeTopKRouter):
@@ -139,8 +157,10 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
 
         router_top_value = router_top_value.to(hidden_states.dtype)
 
-        # 6. Accumulate token counts (only during real forward, not recompute)
-        if torch.is_grad_enabled():
+        # 6. Accumulate token counts only on the real forward pass.
+        # With activation checkpointing, the backward recompute runs the router
+        # a second time; those passes must not update bias statistics.
+        if torch.is_grad_enabled() and not is_checkpoint_recompute():
             with torch.no_grad():
                 counts = torch.bincount(
                     top_k_idx.reshape(-1),

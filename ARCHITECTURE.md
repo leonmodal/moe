@@ -30,23 +30,24 @@ Attention is standard (not routed).
 │                         │  SwiGLU each  │               │
 │                         └──────────────┘                │
 │                         Per-layer experts               │
-│                         (128 experts × 16 layers)       │
+│                         (16 experts × 16 layers = 256 total) │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Key details:**
-- 16 layers, each with 128 MLP experts, top-8 per token
-- Attention: 16 heads, 4 KV heads (GQA 4:1), head_dim=128
+**Key details (current XS config):**
+- 16 layers, each with 16 MLP experts, top-4 per token
+- Attention: 16 heads, 8 KV heads (GQA 2:1), `head_dim=128`
 - Expert FFN: SwiGLU with `moe_intermediate_size=768`
-- Load balancing: Switch Transformer aux loss (`f_i × P_i`), coefficient 0.001
-- Fix vs HuggingFace: no double-softmax bug, f_i kept local per rank
+- Routing: DeepSeek V3 style sigmoid + expert bias + group-limited top-k
+- Load balancing: batch aux disabled (`router_aux_loss_coef=0.0`), sequence-level aux enabled (`seq_aux_loss_coef=0.0001`)
+- Fix vs HuggingFace: no double-softmax bug; sequence-level aux is also supported
 
 **Parameter structure:**
 ```
 Layer l:
   attention: Q[H,H], K[H,kv], V[H,kv], O[H,H]   (shared across tokens)
-  mlp:       router[H, 128]                        (per-layer)
-             128 × {gate_up[H, 2×I], down[I, H]}   (per-layer)
+  mlp:       router[H, 16]                         (per-layer)
+             16 × {gate_up[H, 2×I], down[I, H]}   (per-layer)
 ```
 
 ---
@@ -77,17 +78,17 @@ but routes into the same global set of expert weights.
 │                                 ▼                       │
 │                  ┌──────────────────────────┐           │
 │                  │   Global Expert Pool     │           │
-│                  │   2048 SwiGLU experts    │           │
-│                  │   (= 16 layers × 128)   │           │
-│                  │   gate_up_proj [2048,H,2I]│          │
-│                  │   down_proj   [2048,I,H] │           │
+│                  │   256 SwiGLU experts     │           │
+│                  │   (= 16 layers × 16)    │           │
+│                  │   gate_up_proj [256,H,2I]│           │
+│                  │   down_proj   [256,I,H]  │           │
 │                  └──────────────────────────┘           │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Key details:**
-- 16 layers, 2048 experts in one shared pool, top-8 per token per layer
-- Same total expert parameters as Standard MoE (16 × 128 = 2048)
+**Key details (current XS config):**
+- 16 layers, 256 experts in one shared pool, top-4 per token per layer
+- Same total expert parameters as Standard MoE at XS scale (`16 × 16 = 256`)
 - Per-layer routers allow each layer to specialize which experts it uses
 - Expert bias update (DeepSeek V3 variant): blends per-layer and global
   token counts with cosine-decaying alpha
@@ -95,11 +96,11 @@ but routes into the same global set of expert weights.
 **Parameter structure:**
 ```
 Global:
-  experts: gate_up[2048, H, 2×I], down[2048, I, H]   (shared)
+  experts: gate_up[256, H, 2×I], down[256, I, H]   (shared)
 
 Layer l:
   attention: Q[H,H], K[H,kv], V[H,kv], O[H,H]       (per-layer)
-  mlp:       router[H, 2048]                           (per-layer)
+  mlp:       router[H, 256]                            (per-layer)
 ```
 
 **Router variants:**
@@ -112,7 +113,7 @@ Layer l:
 ## 3. Mixture-of-Everything (MoE-Everything)
 
 **File:** `src/models/mixture_of_everything.py`
-**Config:** `configs/moe_everything.yaml`
+**Configs:** `configs/moe_everything_*.yaml`
 
 Both attention AND MLP are expert-routed, with a hierarchical branch router
 that decides which operation each token undergoes at each depth.
@@ -164,6 +165,7 @@ All weights are shared across depths — the forward is a plain for loop.
 - Soft routing during training: both branches always computed, weighted by
   branch probability, so gradients flow through the router
 - KV blending: `K_new = p_attn × K_fresh + p_mlp × K_old`
+- Current XS configs use 16 attention expert sets and 256 shared MLP experts
 
 **Parameter structure:**
 ```
@@ -177,10 +179,11 @@ Per-model (not per-depth):
   rotary_emb, final_norm, lm_head
 ```
 
-**Losses:**
+**Losses (current implementation):**
 1. Cross-entropy (next-token prediction)
-2. MLP load-balancing: Switch Transformer `f_i × P_i`, coefficient 0.01
-3. Branch balance: `2 × Σ(mean_prob²)`, minimized at 50/50, coefficient 0.01
+2. Optional MLP load-balancing aux from router logits, weighted by `router_aux_loss_coef`
+3. Optional sequence-level aux from selected experts, weighted by `seq_aux_loss_coef`
+4. Branch balance: `2 × Σ(mean_prob²)`, minimized at 50/50, weighted by `branch_router_aux_loss_coef`
 
 ---
 
@@ -317,14 +320,15 @@ might use expert 1 while B's K uses expert 2, creating a subspace mismatch.
 
 ## XS-Scale Comparison (Reference Configs)
 
-All three architectures are parameter-matched at XS scale using the configs in
-`configs/scaling/`.  Same backbone, same MLP sizing, same routing style.
+All three architectures are parameter-matched at XS scale using the canonical
+configs in `configs/`. Same backbone, same QKVO budget, same MLP expert budget,
+same DeepSeek-style MLP routing for the shipped XS comparison.
 
 **Reference configs:**
-- `configs/scaling/xs_deepseek_standard.yaml` — DeepSeek Standard MoE
-- `configs/scaling/xs_deepseek_global.yaml` — DeepSeek Global MoE (with bias interpolation)
-- `configs/scaling/xs_deepseek_global_nointerp.yaml` — DeepSeek Global MoE (global-only bias)
-- `configs/moe_everything*.yaml` — MoE-Everything (all 5 attention modes)
+- `configs/standard_moe.yaml` — DeepSeek Standard MoE
+- `configs/global_moe.yaml` — DeepSeek Global MoE (with bias interpolation)
+- `configs/global_moe_nointerp.yaml` — DeepSeek Global MoE (global-only bias)
+- `configs/moe_everything_*.yaml` — MoE-Everything (all 5 attention modes)
 
 ### Shared backbone (Qwen3-0.6B style)
 
@@ -344,7 +348,7 @@ All three architectures are parameter-matched at XS scale using the configs in
 
 | | DeepSeek Standard | DeepSeek Global | DeepSeek Global (no interp) | MoE-Everything |
 |---|---|---|---|---|
-| **Config** | `xs_deepseek_standard` | `xs_deepseek_global` | `xs_deepseek_global_nointerp` | `moe_everything*` |
+| **Config** | `standard_moe.yaml` | `global_moe.yaml` | `global_moe_nointerp.yaml` | `moe_everything_*.yaml` |
 | **Model class** | `DeepSeekStandardMoEModel` | `DeepSeekGlobalMoEForCausalLM` | `DeepSeekGlobalMoEForCausalLM` | `MoEverythingForCausalLM` |
 | **Layers / Depths** | 16 independent | 16 independent | 16 independent | 32 shared iterations |
 | **Attention** | Standard GQA (1 per layer) | Standard GQA (1 per layer) | Standard GQA (1 per layer) | Expert bank: 16 QKVO sets |
@@ -361,10 +365,11 @@ All three architectures are parameter-matched at XS scale using the configs in
 | **MLP router** | DeepSeek (sigmoid + bias) | DeepSeek (sigmoid + bias) | DeepSeek or Softmax |
 | **Attn router** | None (fixed per layer) | None (fixed per layer) | DeepSeek or Softmax |
 | **Branch router** | None | None | Softmax `Linear(H, 2)` |
-| **Scaling factor** | 2.5 | 2.5 | — |
-| **Group-limited top-k** | 8 groups, top-4 | 8 groups, top-4 | — |
-| **Batch aux loss** | 0 (disabled) | 0 (disabled) | 0.01 |
-| **Seq aux loss** | 0.0001 | 0.0001 | — |
+| **Scaling factor** | 2.5 | 2.5 | 2.5 when `use_deepseek_routing=true` |
+| **Group-limited top-k** | 8 groups, top-4 | 8 groups, top-4 | 8 groups, top-4 when `use_deepseek_routing=true` |
+| **Batch aux loss** | 0 (disabled) | 0 (disabled) | 0 for MLP aux in current XS configs |
+| **Seq aux loss** | 0.0001 | 0.0001 | 0.0001 in current XS configs |
+| **Branch balance aux** | — | — | 0.01 in current XS configs |
 | **Bias update rate** | 0.001 | 0.001 | 0.001 (when DeepSeek) |
 | **Bias interpolation** | N/A | Yes (cosine decay) | N/A |
 
@@ -378,6 +383,10 @@ Expert pool sizes are derived from a **16-layer equivalent**:
 | **MLP experts** | 16 × 16 = 256 | 256 shared | 256 shared |
 | **Attn QKVO shape** | `[H, q_dim]` etc. per layer | same | `[16, H, q_dim]` etc. in bank |
 | **MLP expert shape** | `[16, H, 2×I]` per layer | `[256, H, 2×I]` shared | `[256, H, 2×I]` shared |
+
+At current XS scale, the matched parameter budgets are:
+- QKVO weights: `100,663,296`
+- MLP expert weights: `603,979,776`
 
 ---
 
@@ -411,7 +420,7 @@ DeepSeek routing (from DeepSeek V3):
 | Router | What it decides | Type | Count per mode |
 |---|---|---|---|
 | **Branch router** | Attention vs MLP per token | Always softmax `Linear(H, 2)` | 1 (all modes) |
-| **Attention router(s)** | Which QKVO expert set | Softmax or DeepSeek | bundled: 1, kv/qk_paired: 3, fully_independent: 4 |
+| **Attention router(s)** | Which QKVO expert set | Softmax or DeepSeek | bundled/precompute_kv: 1, kv/qk_paired: 3, fully_independent: 4 |
 | **MLP router** | Which SwiGLU expert | Softmax or DeepSeek | 1 (all modes) |
 
 When `use_deepseek_routing=True`:

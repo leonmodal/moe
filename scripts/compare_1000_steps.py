@@ -86,8 +86,8 @@ def run(config_path):
 def main():
     configs = [
         ("dense", "configs/scaling/xs_dense_baseline.yaml"),
-        ("standard", "configs/scaling/xs_deepseek_standard.yaml"),
-        ("global", "configs/scaling/xs_deepseek_global.yaml"),
+        ("standard", "configs/standard_moe.yaml"),
+        ("global", "configs/global_moe.yaml"),
     ]
 
     all_losses = {}

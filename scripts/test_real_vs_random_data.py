@@ -74,8 +74,8 @@ def run(config_path, use_real_data, seed=42):
 
 
 def main():
-    std_cfg = "configs/scaling/xs_deepseek_standard.yaml"
-    glb_cfg = "configs/scaling/xs_deepseek_global.yaml"
+    std_cfg = "configs/standard_moe.yaml"
+    glb_cfg = "configs/global_moe.yaml"
 
     print("Running 4 experiments (50 steps each, lr=1e-3, no warmup)...")
     print()

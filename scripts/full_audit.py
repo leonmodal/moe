@@ -99,11 +99,11 @@ def test_model_construction():
     from train import build_model, load_config
 
     set_seed(42)
-    cfg_std = load_config("configs/scaling/xs_deepseek_standard.yaml")
+    cfg_std = load_config("configs/standard_moe.yaml")
     model_std, cfg_s = build_model(cfg_std)
 
     set_seed(42)
-    cfg_glb = load_config("configs/scaling/xs_deepseek_global.yaml")
+    cfg_glb = load_config("configs/global_moe.yaml")
     model_glb, cfg_g = build_model(cfg_glb)
 
     # Check expert structure
@@ -284,8 +284,8 @@ def test_optimizer_updates(batch):
 
     from train import build_model, load_config
     for config_name, config_path in [
-        ("Standard", "configs/scaling/xs_deepseek_standard.yaml"),
-        ("Global", "configs/scaling/xs_deepseek_global.yaml"),
+        ("Standard", "configs/standard_moe.yaml"),
+        ("Global", "configs/global_moe.yaml"),
     ]:
         set_seed(42)
         cfg = load_config(config_path)
@@ -336,7 +336,7 @@ def test_loss_computation():
     from train import build_model, load_config
 
     set_seed(42)
-    cfg = load_config("configs/scaling/xs_deepseek_standard.yaml")
+    cfg = load_config("configs/standard_moe.yaml")
     model, model_cfg = build_model(cfg)
     model = model.to(DEVICE).eval()
 

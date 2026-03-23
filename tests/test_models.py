@@ -378,3 +378,58 @@ def test_moe_everything_deepseek_routers_found():
     ds_routers_fi = [m for m in model_fi.modules() if isinstance(m, DeepSeekRouter)]
     # fully_independent: 4 attn routers + 1 MLP gate = 5
     assert len(ds_routers_fi) == 5, f"Expected 5 DeepSeekRouters, got {len(ds_routers_fi)}"
+
+
+
+def _expected_attn_router_keys(mode: str) -> set[str]:
+    if mode in ("bundled", "precompute_kv"):
+        return {"attn"}
+    if mode == "kv_paired":
+        return {"kv", "q", "o"}
+    if mode == "qk_paired":
+        return {"qk", "v", "o"}
+    if mode == "fully_independent":
+        return {"q", "k", "v", "o"}
+    raise ValueError(mode)
+
+
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+def test_moe_everything_output_router_fields(mode):
+    model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).eval()
+    ids, labels = _dummy_batch()
+    with torch.no_grad():
+        out = model(input_ids=ids, labels=labels, output_router_logits=True)
+
+    assert out.loss is not None
+    assert out.ce_loss is not None
+    assert out.branch_aux_loss is not None
+    assert out.router_logits is not None and len(out.router_logits) == 2
+    assert out.selected_experts is not None and len(out.selected_experts) == 2
+    assert out.branch_probs is not None and len(out.branch_probs) == 2
+    assert out.attention_router_info is not None and len(out.attention_router_info) == 2
+    assert set(out.attention_router_info[0].keys()) == _expected_attn_router_keys(mode)
+
+
+def test_moe_everything_deepseek_checkpointing_counts_once():
+    from src.models.router import DeepSeekRouter
+
+    model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config("bundled")).train()
+    model.gradient_checkpointing_enable()
+    ids, labels = _dummy_batch()
+
+    out = model(input_ids=ids, labels=labels, output_router_logits=True)
+    out.loss.backward()
+
+    routers = [m for m in model.modules() if isinstance(m, DeepSeekRouter)]
+    assert len(routers) == 2
+
+    num_tokens = ids.numel()
+    num_depths = model.model.num_depths
+    mlp_topk = model.config.num_experts_per_tok
+    attn_topk = model.config.num_attn_experts_per_tok
+
+    attn_count = model.model.attn_bank.router.local_tokens_per_expert.sum().item()
+    mlp_count = model.model.mlp_bank.gate.local_tokens_per_expert.sum().item()
+
+    assert attn_count == pytest.approx(num_tokens * num_depths * attn_topk)
+    assert mlp_count == pytest.approx(num_tokens * num_depths * mlp_topk)
