@@ -19,6 +19,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "matplotlib>=3.10.8",
     "liger-kernel>=0.7.0",
+    "pytest>=8.0.0",
 ]
 
 [build-system]

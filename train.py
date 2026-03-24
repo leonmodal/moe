@@ -29,7 +29,7 @@ import yaml
 # fails with CUBLAS_STATUS_INVALID_VALUE via the default GEMM_DEFAULT_TENSOR_OP
 # path. cuBLASlt uses different algorithm selection and handles this correctly.
 torch.backends.cuda.preferred_blas_library("cublaslt")
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
@@ -59,7 +59,12 @@ from src.utils.training import (
     count_parameters,
     get_grad_norm,
 )
-from src.utils.routing_stats import compute_routing_stats, accumulate_expert_counts
+from src.utils.routing_stats import (
+    accumulate_expert_counts,
+    accumulate_router_margins,
+    compute_routing_stats_from_counts,
+    router_margin_accumulator_to_stats,
+)
 from src.utils.routing_plots import plot_routing_snapshot
 
 
@@ -542,11 +547,18 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
 
     log_with = "wandb" if train_cfg.wandb_project else None
+    ddp_kwargs = []
+    if (
+        cfg["model"]["type"] == "moe_everything"
+        and cfg["model"].get("attn_expert_mode") == "precompute_kv"
+    ):
+        ddp_kwargs.append(DistributedDataParallelKwargs(static_graph=True))
     accelerator = Accelerator(
         mixed_precision=train_cfg.mixed_precision,
         gradient_accumulation_steps=train_cfg.gradient_accumulation,
         log_with=log_with,
         project_dir=train_cfg.output_dir,
+        kwargs_handlers=ddp_kwargs,
     )
     set_seed(args.seed + accelerator.process_index)
 
@@ -691,7 +703,9 @@ def main() -> None:
     tokens_seen = 0.0
     routing_log_every = tcfg_dict.get("routing_log_every", 50)
     expert_count_accum = None
+    expert_margin_accum = None
     attention_expert_count_accum = {}
+    attention_router_margin_accum = {}
     branch_prob_accum = None
 
     loss_window_sum = 0.0
@@ -780,6 +794,11 @@ def main() -> None:
                     accumulator=expert_count_accum,
                     selected_experts=selected_experts,
                 )
+                expert_margin_accum = accumulate_router_margins(
+                    output.router_logits,
+                    num_experts_per_tok=model_cfg.num_experts_per_tok,
+                    accumulator=expert_margin_accum,
+                )
 
             attention_router_info = getattr(output, "attention_router_info", None)
             if attention_router_info is not None:
@@ -798,6 +817,11 @@ def main() -> None:
                         num_experts_per_tok=model_cfg.num_attn_experts_per_tok,
                         accumulator=attention_expert_count_accum.get(router_name),
                         selected_experts=router_selected,
+                    )
+                    attention_router_margin_accum[router_name] = accumulate_router_margins(
+                        router_logits,
+                        num_experts_per_tok=model_cfg.num_attn_experts_per_tok,
+                        accumulator=attention_router_margin_accum.get(router_name),
                     )
 
             branch_prob_accum = accumulate_branch_probs(getattr(output, "branch_probs", None), branch_prob_accum)
@@ -869,10 +893,23 @@ def main() -> None:
                     for layer_idx in expert_count_accum:
                         torch.distributed.all_reduce(expert_count_accum[layer_idx], op=torch.distributed.ReduceOp.SUM)
 
+                if expert_margin_accum and accelerator.num_processes > 1:
+                    for entry in expert_margin_accum.values():
+                        torch.distributed.all_reduce(entry["sum"], op=torch.distributed.ReduceOp.SUM)
+                        torch.distributed.all_reduce(entry["count"], op=torch.distributed.ReduceOp.SUM)
+                        torch.distributed.all_reduce(entry["min"], op=torch.distributed.ReduceOp.MIN)
+
                 if attention_expert_count_accum and accelerator.num_processes > 1:
                     for router_accum in attention_expert_count_accum.values():
                         for layer_idx in router_accum:
                             torch.distributed.all_reduce(router_accum[layer_idx], op=torch.distributed.ReduceOp.SUM)
+
+                if attention_router_margin_accum and accelerator.num_processes > 1:
+                    for router_accum in attention_router_margin_accum.values():
+                        for entry in router_accum.values():
+                            torch.distributed.all_reduce(entry["sum"], op=torch.distributed.ReduceOp.SUM)
+                            torch.distributed.all_reduce(entry["count"], op=torch.distributed.ReduceOp.SUM)
+                            torch.distributed.all_reduce(entry["min"], op=torch.distributed.ReduceOp.MIN)
 
                 if branch_prob_accum and accelerator.num_processes > 1:
                     for entry in branch_prob_accum.values():
@@ -881,37 +918,27 @@ def main() -> None:
 
                 if accelerator.is_main_process:
                     scalar_stats = {}
-                    raw_model = accelerator.unwrap_model(model)
-                    selected_experts = get_output_selected_experts(output, raw_model)
-                    if getattr(output, "router_logits", None) is not None:
-                        rstats = compute_routing_stats(
-                            output.router_logits,
-                            num_experts_per_tok=model_cfg.num_experts_per_tok,
+                    if expert_count_accum is not None:
+                        rstats = compute_routing_stats_from_counts(
+                            expert_count_accum,
                             is_global=shared_mlp_pool,
-                            selected_experts=selected_experts,
                         )
                         scalar_stats.update({k: v for k, v in rstats.items() if not k.startswith("_hist/")})
+                    scalar_stats.update(router_margin_accumulator_to_stats(expert_margin_accum))
 
-                    attention_router_info = getattr(output, "attention_router_info", None)
-                    if attention_router_info is not None:
-                        router_names = sorted({name for depth_info in attention_router_info for name in depth_info})
-                        for router_name in router_names:
-                            router_logits = []
-                            router_selected = []
-                            for depth_info in attention_router_info:
-                                info = depth_info.get(router_name)
-                                if info is None:
-                                    continue
-                                router_logits.append(info["router_logits"])
-                                router_selected.append(info["selected_experts"])
-                            astats = compute_routing_stats(
-                                router_logits,
-                                num_experts_per_tok=model_cfg.num_attn_experts_per_tok,
-                                is_global=True,
-                                selected_experts=router_selected,
+                    for router_name, router_accum in sorted(attention_expert_count_accum.items()):
+                        astats = compute_routing_stats_from_counts(
+                            router_accum,
+                            is_global=True,
+                            prefix=f"routing/attention/{router_name}",
+                        )
+                        scalar_stats.update({k: v for k, v in astats.items() if not k.startswith("_hist/")})
+                        scalar_stats.update(
+                            router_margin_accumulator_to_stats(
+                                attention_router_margin_accum.get(router_name),
                                 prefix=f"routing/attention/{router_name}",
                             )
-                            scalar_stats.update({k: v for k, v in astats.items() if not k.startswith("_hist/")})
+                        )
 
                     scalar_stats.update(branch_accumulator_to_stats(branch_prob_accum))
                     if log_with and scalar_stats:
@@ -934,7 +961,9 @@ def main() -> None:
                     plot_routing_snapshot(snapshot, routing_dir, global_step)
 
                 expert_count_accum = None
+                expert_margin_accum = None
                 attention_expert_count_accum = {}
+                attention_router_margin_accum = {}
                 branch_prob_accum = None
 
             if global_step % train_cfg.save_every == 0:
