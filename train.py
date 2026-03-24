@@ -660,7 +660,7 @@ def main() -> None:
             f"[rank {accelerator.process_index}] Loading tokenizer {data_cfg.tokenizer_name}",
             flush=True,
         )
-    with accelerator.local_main_process_first():
+    with accelerator.main_process_first():
         tokenizer = AutoTokenizer.from_pretrained(data_cfg.tokenizer_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

@@ -55,6 +55,7 @@ image = (
         # Required for NCCL to use RDMA/InfiniBand instead of TCP sockets
         "libibverbs-dev",
         "libibverbs1",
+        "ibverbs-providers",
         "libhwloc15",
         "libnl-route-3-200",
     )
@@ -76,6 +77,9 @@ image = (
         "pydantic>=2.0.0",
         "huggingface-hub>=0.20.0",
         "matplotlib>=3.8.0",
+    )
+    .run_commands(
+        'python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained(\'Qwen/Qwen3-0.6B\')"'
     )
     .add_local_file(str(moe_dir / "train.py"), remote_path="/root/moe/train.py")
     .add_local_dir(str(moe_dir / "src"), remote_path="/root/moe/src")
