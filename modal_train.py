@@ -78,11 +78,14 @@ image = (
         "matplotlib>=3.8.0",
     )
     .add_local_file(str(moe_dir / "train.py"), remote_path="/root/moe/train.py")
-    .add_local_file(str(moe_dir / ".env"), remote_path="/root/moe/.env")
     .add_local_dir(str(moe_dir / "src"), remote_path="/root/moe/src")
     .add_local_dir(str(moe_dir / "configs"), remote_path="/root/moe/configs")
     .add_local_python_source("torchrun_util")
 )
+
+env_file = moe_dir / ".env"
+if env_file.exists():
+    image = image.add_local_file(str(env_file), remote_path="/root/moe/.env")
 
 # --------------------------------------------------------------------------- #
 #  Modal resources                                                             #
