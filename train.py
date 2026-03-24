@@ -655,9 +655,21 @@ def main() -> None:
         tokenizer_name=dcfg_dict.get("tokenizer_name", "gpt2"),
         num_workers=dcfg_dict.get("num_workers", 4),
     )
-    tokenizer = AutoTokenizer.from_pretrained(data_cfg.tokenizer_name)
+    if accelerator.local_process_index == 0:
+        print(
+            f"[rank {accelerator.process_index}] Loading tokenizer {data_cfg.tokenizer_name}",
+            flush=True,
+        )
+    with accelerator.local_main_process_first():
+        tokenizer = AutoTokenizer.from_pretrained(data_cfg.tokenizer_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    if accelerator.local_process_index == 0:
+        print(f"[rank {accelerator.process_index}] Tokenizer ready", flush=True)
+        print(
+            f"[rank {accelerator.process_index}] Building dataset from {data_cfg.data_dir}",
+            flush=True,
+        )
 
     dataset = StatefulParquetDataset(
         config=data_cfg,
@@ -665,6 +677,11 @@ def main() -> None:
         rank=accelerator.process_index,
         world_size=accelerator.num_processes,
     )
+    if accelerator.local_process_index == 0:
+        print(
+            f"[rank {accelerator.process_index}] Dataset ready: {len(dataset.files)} shard files",
+            flush=True,
+        )
 
     dataloader = DataLoader(
         dataset,
@@ -678,9 +695,11 @@ def main() -> None:
     scheduler = build_lr_scheduler(optimizer, scheduler_cfg)
 
     # --- Accelerate prepare (wraps model in DDP/FSDP) -----------------------
+    accelerator.print("Calling accelerator.prepare()")
     model, optimizer, dataloader, scheduler = accelerator.prepare(
         model, optimizer, dataloader, scheduler
     )
+    accelerator.print("accelerator.prepare() complete")
 
     # --- Resume -------------------------------------------------------------
     global_step = 0

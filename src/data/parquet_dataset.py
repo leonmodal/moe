@@ -66,6 +66,12 @@ class StatefulParquetDataset(IterableDataset):
 
         # Shard files across ranks deterministically
         self.files = [f for i, f in enumerate(all_files) if i % world_size == rank]
+        if not self.files:
+            raise RuntimeError(
+                f"Rank {rank} received 0 parquet files from {len(all_files)} total files "
+                f"with world_size={world_size}. Need at least {world_size} parquet files "
+                "or different data sharding."
+            )
 
         # Resumption state
         self._start_file_idx: int = 0
