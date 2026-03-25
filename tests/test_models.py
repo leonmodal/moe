@@ -245,13 +245,13 @@ def tiny_moe_everything_config(mode="bundled"):
     )
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
 def test_moe_everything_instantiates(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode))
     assert model is not None
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
 def test_moe_everything_forward(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).eval()
     ids, labels = _dummy_batch()
@@ -262,7 +262,7 @@ def test_moe_everything_forward(mode):
     assert out.logits.shape == (2, 16, 256)
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
 def test_moe_everything_all_grads(mode):
     """Every parameter must receive a gradient."""
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).train()
@@ -272,7 +272,7 @@ def test_moe_everything_all_grads(mode):
     # precompute_kv computes fresh per-expert KV tables at each layer,
     # so the initial KV projections from embedding aren't used.
     skip = {"model.init_k_proj.weight", "model.init_v_proj.weight", "model.init_k_norm.weight"}
-    if mode == "precompute_kv":
+    if mode in ("precompute_kv", "per_head_precompute_kv"):
         no_grad = [n for n, p in model.named_parameters()
                    if p.requires_grad and p.grad is None and n not in skip]
     else:
@@ -281,7 +281,7 @@ def test_moe_everything_all_grads(mode):
     assert len(no_grad) == 0, f"Params without grad: {no_grad}"
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
 def test_moe_everything_loss_decreases(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).train()
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -322,7 +322,7 @@ def tiny_moe_everything_deepseek_config(mode="bundled"):
     )
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
 def test_moe_everything_deepseek_forward(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config(mode)).eval()
     ids, labels = _dummy_batch()
@@ -333,7 +333,7 @@ def test_moe_everything_deepseek_forward(mode):
     assert out.logits.shape == (2, 16, 256)
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
 def test_moe_everything_deepseek_all_grads(mode):
     """Every parameter must receive a gradient with DeepSeek routing."""
     model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config(mode)).train()
@@ -341,7 +341,7 @@ def test_moe_everything_deepseek_all_grads(mode):
     out = model(input_ids=ids, labels=labels)
     out.loss.backward()
     skip = {"model.init_k_proj.weight", "model.init_v_proj.weight", "model.init_k_norm.weight"}
-    if mode == "precompute_kv":
+    if mode in ("precompute_kv", "per_head_precompute_kv"):
         no_grad = [n for n, p in model.named_parameters()
                    if p.requires_grad and p.grad is None and n not in skip]
     else:
@@ -350,7 +350,7 @@ def test_moe_everything_deepseek_all_grads(mode):
     assert len(no_grad) == 0, f"Params without grad: {no_grad}"
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
 def test_moe_everything_deepseek_loss_decreases(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config(mode)).train()
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -381,9 +381,11 @@ def test_moe_everything_deepseek_routers_found():
 
 
 
-def _expected_attn_router_keys(mode: str) -> set[str]:
+def _expected_attn_router_keys(mode: str, num_kv_heads: int = 1) -> set[str]:
     if mode in ("bundled", "precompute_kv"):
         return {"attn"}
+    if mode == "per_head_precompute_kv":
+        return {"q"} | {f"kv_head_{h}" for h in range(num_kv_heads)}
     if mode == "kv_paired":
         return {"kv", "q", "o"}
     if mode == "qk_paired":
@@ -393,7 +395,7 @@ def _expected_attn_router_keys(mode: str) -> set[str]:
     raise ValueError(mode)
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"])
+@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
 def test_moe_everything_output_router_fields(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).eval()
     ids, labels = _dummy_batch()

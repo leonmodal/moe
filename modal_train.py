@@ -55,7 +55,6 @@ image = (
         # Required for NCCL to use RDMA/InfiniBand instead of TCP sockets
         "libibverbs-dev",
         "libibverbs1",
-        "ibverbs-providers",
         "libhwloc15",
         "libnl-route-3-200",
     )
@@ -135,9 +134,12 @@ def train(config: str = CONFIG_FILE):
     experiment_name = cfg.get("experiment_name", "default")
     output_dir = f"/checkpoints/{experiment_name}"
 
-    # NCCL config
-    os.environ["NCCL_NVLS_ENABLE"] = "1"
+    # Force unbuffered stdout so logs appear in real time
+    os.environ["PYTHONUNBUFFERED"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+    # NVLS (NVLink SHARP) auto-enables on B200 and hangs — force disable
+    os.environ["NCCL_NVLS_ENABLE"] = "0"
+    os.environ["NCCL_DEBUG"] = "WARN"
 
     print(f"[Node {cluster_info.rank}/{N_NODES}] Starting MoE training")
     print(f"  Config     : {config}")

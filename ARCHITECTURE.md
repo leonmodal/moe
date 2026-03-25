@@ -189,7 +189,7 @@ Per-model (not per-depth):
 
 ### Attention Bank Modes
 
-The attention bank supports 5 modes controlling how Q, K, V, O projections
+The attention bank supports 6 modes controlling how Q, K, V, O projections
 are grouped for routing.  Each routing group carries its own pre-norm.
 
 #### `bundled` — 1 norm, 1 router
@@ -316,6 +316,46 @@ This mode ensures that when token A attends to token B, the K projection
 used for B comes from the same expert as A's Q.  In other modes, A's Q
 might use expert 1 while B's K uses expert 2, creating a subspace mismatch.
 
+#### `per_head_precompute_kv` — 1 norm, 1 Q router + 8 KV head routers
+
+Like `precompute_kv` but each KV head routes independently.  Head 0 might
+use expert 3's K,V while head 5 uses expert 14's K,V — each head gets its
+own "perspective" on the sequence.
+
+```
+  hidden ─→ norm ─→ Q Router ─→ e_q per token (bundled, all Q heads)
+                       │
+                    Q[e_q] · x ─→ q_norm ─→ RoPE
+
+             KV Head 0 Router ─→ e₀ per token
+             KV Head 1 Router ─→ e₁ per token
+                  ...
+             KV Head 7 Router ─→ e₇ per token
+
+        ┌──────────────────────────────────────────────────────┐
+        │   For each head h, for each active expert e:         │
+        │     K_table = K[h,e] · ALL_tokens   (head_dim)      │
+        │     V_table = V[h,e] · ALL_tokens   (head_dim)      │
+        │                                                      │
+        │     For tokens where e_h == e:                       │
+        │       Q heads [h×G : (h+1)×G] attend to K,V table   │
+        │                                                      │
+        │     RMSNorm per head group (normalize scale across   │
+        │     heads from different experts)                    │
+        └──────────────────────────────────────────────────────┘
+                       │
+                    O[e_q] · attn_out     (reuses Q routing)
+```
+
+Key differences from `precompute_kv`:
+- K,V projections are `(num_kv_heads, E, H, head_dim)` instead of `(E, H, kv_dim)` —
+  same total parameters, but each head selects independently
+- 8 additional routers (one per KV head) allow each head to specialize
+- Per-head output RMSNorm ensures compatible scales when concatenating
+  heads from different experts
+- Head attention output scaled by routing weight for differentiable KV
+  router training
+
 ---
 
 ## XS-Scale Comparison (Reference Configs)
@@ -328,7 +368,7 @@ same DeepSeek-style MLP routing for the shipped XS comparison.
 - `configs/standard_moe.yaml` — DeepSeek Standard MoE
 - `configs/global_moe.yaml` — DeepSeek Global MoE (with bias interpolation)
 - `configs/global_moe_nointerp.yaml` — DeepSeek Global MoE (global-only bias)
-- `configs/moe_everything_*.yaml` — MoE-Everything (all 5 attention modes)
+- `configs/moe_everything_*.yaml` — MoE-Everything (all 6 attention modes)
 
 ### Shared backbone (Qwen3-0.6B style)
 
@@ -420,7 +460,7 @@ DeepSeek routing (from DeepSeek V3):
 | Router | What it decides | Type | Count per mode |
 |---|---|---|---|
 | **Branch router** | Attention vs MLP per token | Always softmax `Linear(H, 2)` | 1 (all modes) |
-| **Attention router(s)** | Which QKVO expert set | Softmax or DeepSeek | bundled/precompute_kv: 1, kv/qk_paired: 3, fully_independent: 4 |
+| **Attention router(s)** | Which QKVO expert set | Softmax or DeepSeek | bundled/precompute_kv: 1, kv/qk_paired: 3, fully_independent: 4, per_head_precompute_kv: 1 Q + 8 KV |
 | **MLP router** | Which SwiGLU expert | Softmax or DeepSeek | 1 (all modes) |
 
 When `use_deepseek_routing=True`:
@@ -457,3 +497,4 @@ final norm [H]              — after all depths, before LM head
 | `qk_paired` | 2: `qk_norm`, `v_norm` | QK together, V separate |
 | `fully_independent` | 3: `q_pre_norm`, `k_pre_norm`, `v_pre_norm` | Each projection separate |
 | `precompute_kv` | 1: `norm` | All of Q, K, V |
+| `per_head_precompute_kv` | 1: `norm` + per-head output RMSNorm | Q,K,V input; per-head attn output |

@@ -550,7 +550,7 @@ def main() -> None:
     ddp_kwargs = []
     if (
         cfg["model"]["type"] == "moe_everything"
-        and cfg["model"].get("attn_expert_mode") == "precompute_kv"
+        and cfg["model"].get("attn_expert_mode") in ("precompute_kv", "per_head_precompute_kv")
     ):
         ddp_kwargs.append(DistributedDataParallelKwargs(static_graph=True))
     accelerator = Accelerator(
@@ -592,7 +592,10 @@ def main() -> None:
         tracker_kwargs = {"wandb": {"name": train_cfg.wandb_run_name}}
         if wandb_run_id:
             tracker_kwargs["wandb"]["id"] = wandb_run_id
-            tracker_kwargs["wandb"]["resume"] = "must"
+            # "allow" instead of "must": if the run logged steps beyond
+            # this checkpoint (e.g. a later run crashed), wandb won't
+            # reject the earlier steps — it starts a new run instead.
+            tracker_kwargs["wandb"]["resume"] = "allow"
         accelerator.init_trackers(
             project_name=train_cfg.wandb_project,
             config={**cfg["model"], **tcfg_dict},
@@ -600,7 +603,7 @@ def main() -> None:
         )
 
     # Capture wandb run ID for checkpoint saving (new runs)
-    if log_with and accelerator.is_main_process and not wandb_run_id:
+    if log_with and accelerator.is_main_process:
         try:
             import wandb
             if wandb.run:
