@@ -500,6 +500,136 @@ def test_per_layer_router_precompute_kv():
     out.loss.backward()
 
 
+# ── Per-layer attention router tests ──────────────────────────────────────
+
+PER_HEAD_MODES = ["per_head_fully_independent", "per_head_precompute_kv"]
+
+
+@pytest.mark.parametrize("mode", PER_HEAD_MODES)
+def test_per_layer_attn_router_creates_separate_routers(mode):
+    config = tiny_moe_everything_config(mode)
+    config.per_layer_attn_router = True
+    model = MoEverythingForCausalLM(config)
+    bank = model.model.attn_bank
+    if mode == "per_head_fully_independent":
+        assert hasattr(bank, "q_routers") and len(bank.q_routers) == config.num_hidden_layers
+        assert hasattr(bank, "k_routers") and len(bank.k_routers) == config.num_hidden_layers
+        assert hasattr(bank, "v_routers") and len(bank.v_routers) == config.num_hidden_layers
+        assert hasattr(bank, "o_routers") and len(bank.o_routers) == config.num_hidden_layers
+    elif mode == "per_head_precompute_kv":
+        assert hasattr(bank, "routers") and len(bank.routers) == config.num_hidden_layers
+
+
+@pytest.mark.parametrize("mode", PER_HEAD_MODES)
+def test_per_layer_attn_router_forward_and_grads(mode):
+    config = tiny_moe_everything_config(mode)
+    config.per_layer_attn_router = True
+    model = MoEverythingForCausalLM(config).train()
+    ids, labels = _dummy_batch()
+    out = model(input_ids=ids, labels=labels)
+    assert out.loss is not None
+    out.loss.backward()
+    # precompute_kv modes don't use init KV projections
+    skip = {"model.init_k_proj.weight", "model.init_v_proj.weight", "model.init_k_norm.weight"}
+    no_grad = [n for n, p in model.named_parameters()
+               if p.requires_grad and p.grad is None
+               and (mode not in PRECOMPUTE_KV_MODES or n not in skip)]
+    assert len(no_grad) == 0, f"Params without grad: {no_grad}"
+
+
+@pytest.mark.parametrize("mode", PER_HEAD_MODES)
+def test_per_layer_attn_router_loss_decreases(mode):
+    config = tiny_moe_everything_config(mode)
+    config.per_layer_attn_router = True
+    model = MoEverythingForCausalLM(config).train()
+    ids, labels = _dummy_batch()
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    first_loss = None
+    for _ in range(20):
+        out = model(input_ids=ids, labels=labels)
+        if first_loss is None:
+            first_loss = out.loss.item()
+        opt.zero_grad()
+        out.loss.backward()
+        opt.step()
+    assert out.loss.item() < first_loss
+
+
+# ── Routed norm tests ─────────────────────────────────────────────────────
+
+from src.models.mixture_of_everything import NormExpertBank
+
+
+@pytest.mark.parametrize("mode", PER_HEAD_MODES)
+def test_routed_norm_creates_norm_banks(mode):
+    config = tiny_moe_everything_config(mode)
+    config.routed_norm = True
+    model = MoEverythingForCausalLM(config)
+    attn_bank = model.model.attn_bank
+    mlp_bank = model.model.mlp_bank
+    # Attention: per_head_fully_independent gets attn_pre_norm, per_head_precompute_kv gets norm
+    if mode == "per_head_fully_independent":
+        assert isinstance(attn_bank.attn_pre_norm, NormExpertBank)
+        assert attn_bank.attn_pre_norm.num_experts == config.num_hidden_layers
+    elif mode == "per_head_precompute_kv":
+        assert isinstance(attn_bank.norm, NormExpertBank)
+        assert attn_bank.norm.num_experts == config.num_hidden_layers
+    # MLP always gets a NormExpertBank
+    assert isinstance(mlp_bank.norm, NormExpertBank)
+    assert mlp_bank.norm.num_experts == config.num_hidden_layers
+
+
+@pytest.mark.parametrize("mode", PER_HEAD_MODES)
+def test_routed_norm_forward_and_grads(mode):
+    config = tiny_moe_everything_config(mode)
+    config.routed_norm = True
+    model = MoEverythingForCausalLM(config).train()
+    ids, labels = _dummy_batch()
+    out = model(input_ids=ids, labels=labels)
+    assert out.loss is not None
+    out.loss.backward()
+    skip = {"model.init_k_proj.weight", "model.init_v_proj.weight", "model.init_k_norm.weight"}
+    no_grad = [n for n, p in model.named_parameters()
+               if p.requires_grad and p.grad is None
+               and (mode not in PRECOMPUTE_KV_MODES or n not in skip)]
+    assert len(no_grad) == 0, f"Params without grad: {no_grad}"
+
+
+@pytest.mark.parametrize("mode", PER_HEAD_MODES)
+def test_routed_norm_loss_decreases(mode):
+    config = tiny_moe_everything_config(mode)
+    config.routed_norm = True
+    model = MoEverythingForCausalLM(config).train()
+    ids, labels = _dummy_batch()
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    first_loss = None
+    for _ in range(20):
+        out = model(input_ids=ids, labels=labels)
+        if first_loss is None:
+            first_loss = out.loss.item()
+        opt.zero_grad()
+        out.loss.backward()
+        opt.step()
+    assert out.loss.item() < first_loss
+
+
+@pytest.mark.parametrize("mode", PER_HEAD_MODES)
+def test_routed_norm_combined_with_per_layer_attn_router(mode):
+    config = tiny_moe_everything_config(mode)
+    config.routed_norm = True
+    config.per_layer_attn_router = True
+    model = MoEverythingForCausalLM(config).train()
+    ids, labels = _dummy_batch()
+    out = model(input_ids=ids, labels=labels)
+    assert out.loss is not None
+    out.loss.backward()
+    skip = {"model.init_k_proj.weight", "model.init_v_proj.weight", "model.init_k_norm.weight"}
+    no_grad = [n for n, p in model.named_parameters()
+               if p.requires_grad and p.grad is None
+               and (mode not in PRECOMPUTE_KV_MODES or n not in skip)]
+    assert len(no_grad) == 0, f"Params without grad: {no_grad}"
+
+
 # ── Dynamic depth tests ───────────────────────────────────────────────────
 
 def test_dynamic_depth_training():

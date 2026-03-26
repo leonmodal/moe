@@ -73,6 +73,7 @@ from src.utils.routing_stats import (
     router_margin_accumulator_to_stats,
 )
 from src.utils.routing_plots import plot_routing_snapshot
+from src.models.mixture_of_everything import NormExpertBank
 
 
 # --------------------------------------------------------------------------- #
@@ -424,11 +425,12 @@ def save_checkpoint(
     output_dir: str,
     dataset_state: dict | None = None,
     wandb_run_id: str | None = None,
+    tokens_seen: float = 0.0,
 ) -> None:
     ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
     accelerator.save_state(ckpt_dir)
     if accelerator.is_main_process:
-        meta = {"step": step}
+        meta = {"step": step, "tokens_seen": tokens_seen}
         if dataset_state:
             meta["dataset_state"] = dataset_state
         if wandb_run_id:
@@ -441,14 +443,14 @@ def save_checkpoint(
 def load_checkpoint(
     accelerator: Accelerator,
     resume_from: str,
-) -> tuple[int, dict | None]:
+) -> tuple[int, dict | None, float]:
     accelerator.load_state(resume_from)
     meta_path = os.path.join(resume_from, "meta.json")
     if os.path.exists(meta_path):
         with open(meta_path) as f:
             meta = json.load(f)
-        return meta.get("step", 0), meta.get("dataset_state")
-    return 0, None
+        return meta.get("step", 0), meta.get("dataset_state"), meta.get("tokens_seen", 0.0)
+    return 0, None, 0.0
 
 
 def find_latest_checkpoint(output_dir: str) -> str | None:
@@ -724,9 +726,10 @@ def main() -> None:
     # --- Resume -------------------------------------------------------------
     global_step = 0
     dataset_state = None
+    tokens_seen = 0.0
     if resume_from:
-        global_step, dataset_state = load_checkpoint(accelerator, resume_from)
-        accelerator.print(f"Resumed from step {global_step}")
+        global_step, dataset_state, tokens_seen = load_checkpoint(accelerator, resume_from)
+        accelerator.print(f"Resumed from step {global_step}, tokens_seen={tokens_seen/1e9:.3f}B")
         if dataset_state:
             dataset.set_state(dataset_state)
 
@@ -739,7 +742,7 @@ def main() -> None:
 
     data_iter = iter(dataloader)
     t0 = time.perf_counter()
-    tokens_seen = 0.0
+    tokens_this_session = 0.0
     routing_log_every = tcfg_dict.get("routing_log_every", 50)
     expert_count_accum = None
     expert_margin_accum = None
@@ -893,6 +896,7 @@ def main() -> None:
 
             tokens_this_step = reduce_scalar(accelerator, float(local_tokens_in_step), reduction="sum")
             tokens_seen += tokens_this_step
+            tokens_this_session += tokens_this_step
 
             avg_total = reduce_scalar(accelerator, loss_window_sum / max(1, microbatches_in_step))
             avg_ce = reduce_scalar(accelerator, ce_window_sum / max(1, microbatches_in_step))
@@ -903,7 +907,7 @@ def main() -> None:
 
             if global_step % train_cfg.log_every == 0 and accelerator.is_main_process:
                 elapsed = time.perf_counter() - t0
-                tok_per_sec = tokens_seen / max(elapsed, 1e-6)
+                tok_per_sec = tokens_this_session / max(elapsed, 1e-6)
                 lr = scheduler.get_last_lr()[0]
                 log_dict = {
                     "train/loss": avg_total,
@@ -980,11 +984,36 @@ def main() -> None:
                         )
 
                     scalar_stats.update(branch_accumulator_to_stats(branch_prob_accum))
+
+                    # Collect norm bank counts
+                    norm_counts = {}
+                    for name, module in raw_model.named_modules():
+                        if isinstance(module, NormExpertBank):
+                            counts = module.local_tokens_per_expert.clone()
+                            if accelerator.num_processes > 1:
+                                torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+                            label = "attn_norm" if "attn" in name else "mlp_norm"
+                            norm_counts[label] = counts
+                            total = counts.sum().item()
+                            num_e = counts.shape[0]
+                            active = int((counts > 0).sum().item())
+                            scalar_stats[f"routing/{label}_global_active_experts"] = active
+                            module.local_tokens_per_expert.zero_()
+
+                    # Surface global active expert counts at top level for easy tracking
+                    if "routing/global_pool_num_active" in scalar_stats:
+                        scalar_stats["routing/mlp_global_active_experts"] = scalar_stats["routing/global_pool_num_active"]
+                    for rname in ("q", "k", "v", "o", "attn"):
+                        key = f"routing/attention/{rname}/global_pool_num_active"
+                        if key in scalar_stats:
+                            scalar_stats[f"routing/{rname}_global_active_experts"] = scalar_stats[key]
+
                     if log_with and scalar_stats:
                         accelerator.log(scalar_stats, step=global_step)
 
                     routing_dir = os.path.join(train_cfg.output_dir, "routing_logs")
-                    os.makedirs(routing_dir, exist_ok=True)
+                    step_dir = os.path.join(routing_dir, f"step_{global_step:08d}")
+                    os.makedirs(step_dir, exist_ok=True)
                     snapshot = {"step": global_step}
                     snapshot.update(counts_accumulator_to_snapshot(expert_count_accum, is_global=shared_mlp_pool))
                     snapshot["attention"] = {
@@ -992,12 +1021,19 @@ def main() -> None:
                         for router_name, router_accum in sorted(attention_expert_count_accum.items())
                     }
                     snapshot["branch"] = branch_accumulator_to_snapshot(branch_prob_accum)
+                    snapshot["norms"] = {
+                        label: {
+                            "token_counts": counts.cpu().tolist(),
+                            "token_fracs": (counts / max(counts.sum().item(), 1.0)).cpu().tolist(),
+                        }
+                        for label, counts in norm_counts.items()
+                    }
 
-                    json_path = os.path.join(routing_dir, f"step_{global_step:08d}.json")
+                    json_path = os.path.join(step_dir, "snapshot.json")
                     with open(json_path, "w") as f:
                         json.dump(snapshot, f)
 
-                    plot_routing_snapshot(snapshot, routing_dir, global_step)
+                    plot_routing_snapshot(snapshot, step_dir, global_step)
 
                 expert_count_accum = None
                 expert_margin_accum = None
@@ -1011,6 +1047,7 @@ def main() -> None:
                     accelerator, model, optimizer, scheduler,
                     global_step, train_cfg.output_dir, ds_state,
                     wandb_run_id=wandb_run_id,
+                    tokens_seen=tokens_seen,
                 )
                 if args.max_checkpoints > 0 and accelerator.is_main_process:
                     cleanup_checkpoints(train_cfg.output_dir, args.max_checkpoints)
@@ -1029,6 +1066,7 @@ def main() -> None:
         global_step, train_cfg.output_dir,
         dataset.get_state(),
         wandb_run_id=wandb_run_id,
+        tokens_seen=tokens_seen,
     )
     if args.max_checkpoints > 0 and accelerator.is_main_process:
         cleanup_checkpoints(train_cfg.output_dir, args.max_checkpoints)

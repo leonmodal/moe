@@ -375,6 +375,191 @@ Key differences from `precompute_kv`:
 
 ---
 
+### Per-Layer Attention Routers (`per_layer_attn_router`)
+
+By default, the attention expert routers are shared across all depths (Universal
+Transformer style).  With `per_layer_attn_router: true`, each depth gets its own
+set of routers while the weight banks (projections, QK-norms) remain shared.
+
+This is analogous to how Global MoE has per-layer MLP routers pointing into a
+shared expert pool — here each depth has its own attention routers pointing into
+the shared attention weight bank.
+
+| Mode | Shared routers | Per-layer routers |
+|---|---|---|
+| `per_head_fully_independent` | 4 (Q, K, V, O) | 4 × num_depths |
+| `per_head_precompute_kv` | 1 | 1 × num_depths |
+
+---
+
+### Routed Norms (`routed_norm`)
+
+In a standard transformer, each layer has its own pre-attention and pre-MLP
+RMSNorm (2 × num_layers = 32 norms for 16 layers).  The base MoE-Everything
+model shares one norm across all depths, which forces the same normalization
+regardless of how the activation distribution changes per depth.
+
+With `routed_norm: true`, the shared norms are replaced by **NormExpertBanks**:
+a bank of `num_depths` RMSNorm weight vectors with a top-1 router.  Each token
+at each depth routes to one norm expert.  This gives the same total parameter
+count as a standard transformer (num_depths attn norms + num_depths MLP norms)
+but with dynamic assignment instead of fixed depth-to-norm mapping.
+
+```
+  NormExpertBank (num_depths norm experts)
+  ┌──────────────────────────────────────────┐
+  │  hidden ─→ Router(H, num_depths)         │
+  │               │                          │
+  │            argmax → expert e              │
+  │               │                          │
+  │  RMSNorm:  x / rms(x) × weight[e]       │
+  │               │                          │
+  │  Scale by router_prob[e] (gradient flow) │
+  └──────────────────────────────────────────┘
+```
+
+| Component | Without `routed_norm` | With `routed_norm` |
+|---|---|---|
+| `per_head_fully_independent` attn | 3 shared RMSNorms (q, k, v) | 1 NormExpertBank (single norm for Q/K/V, like standard transformer) |
+| `per_head_precompute_kv` attn | 1 shared RMSNorm | 1 NormExpertBank |
+| MLP bank | 1 shared RMSNorm | 1 NormExpertBank |
+
+---
+
+### Full computation graph: `per_head_fully_independent` + `per_layer_attn_router` + `routed_norm`
+
+Config: `debug8_xs_deepseek_moe_everything_per_head_fully_independent_perlayer_routednorm.yaml`
+
+```
+input_ids → Embedding → init K,V projections + RoPE → (hidden, K₀, V₀)
+
+for depth d in range(num_depths):
+┌──────────────────────────────────────────────────────────────────────────┐
+│                                                                          │
+│  1. BRANCH ROUTING                                                       │
+│     BranchRouter[d](hidden) → (p_attn, p_mlp)   [per-layer branch]      │
+│                                                                          │
+│  2. ATTENTION BRANCH                                                     │
+│     a) Routed pre-norm:                                                  │
+│        NormExpertBank(hidden) → normed                                   │
+│        (router picks 1 of num_depths norm experts per token)             │
+│                                                                          │
+│     b) Per-layer head routing (4 routers at depth d):                    │
+│        Q_routers[d](normed) → pick num_heads experts from bank           │
+│        K_routers[d](normed) → pick num_heads experts from bank           │
+│        V_routers[d](normed) → pick num_heads experts from bank           │
+│        O_routers[d](normed) → pick num_heads experts from bank           │
+│                                                                          │
+│     c) Per-head projection (shared weight bank):                         │
+│        For each head h:                                                  │
+│          Q_h = q_proj[e_q_h] · normed × w_q_h  → QK-norm → RoPE        │
+│          K_h = k_proj[e_k_h] · normed × w_k_h  → QK-norm → RoPE        │
+│          V_h = v_proj[e_v_h] · normed × w_v_h                           │
+│                                                                          │
+│     d) KV blending:                                                      │
+│        K_blend = p_attn × K_fresh + p_mlp × K_old                       │
+│        V_blend = p_attn × V_fresh + p_mlp × V_old                       │
+│                                                                          │
+│     e) Attention + O projection:                                         │
+│        attn_out = softmax(Q · K_blend^T / √d) · V_blend                 │
+│        For each head h:                                                  │
+│          out_h = o_proj[e_o_h] · attn_head_h × w_o_h                    │
+│        attn_out = sum(out_h)                                             │
+│                                                                          │
+│  3. MLP BRANCH                                                           │
+│     a) Routed pre-norm:                                                  │
+│        NormExpertBank(hidden) → normed_mlp                               │
+│        (separate bank, router picks 1 of num_depths norm experts)        │
+│                                                                          │
+│     b) MLP expert routing:                                               │
+│        DeepSeekRouter(normed_mlp) → top-4 from 256 SwiGLU experts       │
+│                                                                          │
+│     c) Weighted expert output:                                           │
+│        mlp_out = Σ w_i × SwiGLU_i(normed_mlp)                           │
+│                                                                          │
+│  4. COMBINE                                                              │
+│     hidden += p_attn × attn_out + p_mlp × mlp_out                       │
+│     K_state = p_attn × K_fresh + p_mlp × K_old                          │
+│     V_state = p_attn × V_fresh + p_mlp × V_old                          │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+RMSNorm(hidden) → LM head → logits
+```
+
+**What is shared vs per-depth:**
+
+| Component | Shared across depths | Per-depth |
+|---|---|---|
+| Attention weight bank (Q,K,V,O proj, QK-norm weights) | Yes | — |
+| Attention expert routers (Q,K,V,O) | — | Yes (per_layer_attn_router) |
+| Attention pre-norm | — | Yes (routed_norm: bank of num_depths norms) |
+| MLP expert weights (256 SwiGLU) | Yes | — |
+| MLP expert router | Yes | — |
+| MLP pre-norm | — | Yes (routed_norm: bank of num_depths norms) |
+| Branch router | — | Yes (per_layer_router) |
+
+---
+
+### Full computation graph: `per_head_precompute_kv` + `per_layer_attn_router` + `routed_norm`
+
+Config: `debug8_xs_deepseek_moe_everything_per_head_precompute_kv_perlayer_routednorm.yaml`
+
+```
+input_ids → Embedding → init K,V projections + RoPE → (hidden, K₀, V₀)
+
+for depth d in range(num_depths):
+┌──────────────────────────────────────────────────────────────────────────┐
+│                                                                          │
+│  1. BRANCH ROUTING                                                       │
+│     BranchRouter[d](hidden) → (p_attn, p_mlp)   [per-layer branch]      │
+│                                                                          │
+│  2. ATTENTION BRANCH (precompute_kv)                                     │
+│     a) Routed pre-norm:                                                  │
+│        NormExpertBank(hidden) → normed                                   │
+│        (router picks 1 of num_depths norm experts per token)             │
+│                                                                          │
+│     b) Per-layer single router at depth d:                               │
+│        Router[d](normed) → pick num_heads experts per token              │
+│        (one routing decision binds Q, K, V, O for each head)             │
+│                                                                          │
+│     c) Q projection (shared weight bank):                                │
+│        For each head h:                                                  │
+│          Q_h = q_proj[e_h] · normed × w_h → QK-norm → RoPE              │
+│                                                                          │
+│     d) Precomputed KV + attention (per GQA group g):                     │
+│        KV expert = expert at rank g × num_kv_groups                      │
+│        For each active expert e:                                         │
+│          K_table = k_proj[e] · ALL_tokens  → QK-norm → RoPE             │
+│          V_table = v_proj[e] · ALL_tokens                                │
+│          For tokens where kv_expert == e:                                │
+│            Q_group attend to K_table, V_table                            │
+│                                                                          │
+│     e) O projection:                                                     │
+│        For each head h:                                                  │
+│          out_h = o_proj[e_h] · attn_head_h × w_h  (same expert as Q)    │
+│        attn_out = sum(out_h)                                             │
+│                                                                          │
+│  3. MLP BRANCH (same as per_head_fully_independent above)                │
+│                                                                          │
+│  4. COMBINE                                                              │
+│     hidden += p_attn × attn_out + p_mlp × mlp_out                       │
+│     K_state = p_attn × K_fresh + p_mlp × K_old                          │
+│     V_state = p_attn × V_fresh + p_mlp × V_old                          │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+RMSNorm(hidden) → LM head → logits
+```
+
+**Key difference from `per_head_fully_independent`:** One router per depth
+instead of four.  A single routing decision selects an expert for each head
+position, and that expert provides Q, K, V, and O for that head.  K and V are
+precomputed per-expert over all tokens, ensuring no subspace mismatch.  GQA is
+preserved (KV expert comes from the representative Q head in each group).
+
+---
+
 ## XS-Scale Comparison (Reference Configs)
 
 All three architectures are parameter-matched at XS scale using the canonical
@@ -514,5 +699,10 @@ final norm [H]              — after all depths, before LM head
 | `qk_paired` | 2: `qk_norm`, `v_norm` | QK together, V separate |
 | `fully_independent` | 3: `q_pre_norm`, `k_pre_norm`, `v_pre_norm` | Each projection separate |
 | `per_head_fully_independent` | 3: `q_pre_norm`, `k_pre_norm`, `v_pre_norm` | Each Q/K/V head separate; O routed per head |
+| `per_head_fully_independent` + `routed_norm` | 1: `NormExpertBank` (num_depths experts) | Single routed norm for all Q/K/V |
 | `precompute_kv` | 1: `norm` | All of Q, K, V |
 | `per_head_precompute_kv` | 1: `norm` | All of Q, K, V; Q/KV/O routed per head (K,V share router) |
+| `per_head_precompute_kv` + `routed_norm` | 1: `NormExpertBank` (num_depths experts) | Same, but norm is routed |
+
+With `routed_norm`, the MLP bank norm is also replaced by a `NormExpertBank`.
+Total norm parameters match a standard transformer: num_depths attn + num_depths MLP.
