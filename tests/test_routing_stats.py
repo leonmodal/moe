@@ -88,21 +88,6 @@ def test_collapsed_entropy_is_zero():
     assert stats["routing/layer_00_entropy"] < 0.01
 
 
-# ── histogram data ───────────────────────────────────────────────────────────
-
-def test_expert_load_frac_shape():
-    E = 8
-    stats = compute_routing_stats(_uniform_logits(T=32, E=E, K=2), num_experts_per_tok=2)
-    load_frac = stats["_hist/routing/layer_00_expert_load_frac"]
-    assert len(load_frac) == E
-
-
-def test_expert_load_frac_sums_to_one():
-    stats = compute_routing_stats(_uniform_logits(T=32, E=8, K=2), num_experts_per_tok=2, selected_experts=_uniform_selected_experts(T=32, E=8, K=2))
-    load_frac = stats["_hist/routing/layer_00_expert_load_frac"]
-    assert abs(sum(load_frac) - 1.0) < 1e-5
-
-
 # ── multi-layer ───────────────────────────────────────────────────────────────
 
 def test_multi_layer_has_entry_per_layer():
@@ -142,8 +127,6 @@ def test_depth_coverage_keys_present_for_global():
     stats = compute_routing_stats(logits, num_experts_per_tok=2, is_global=True)
     assert "routing/expert_depth_coverage_mean" in stats
     assert "routing/expert_depth_coverage_max" in stats
-    assert "_hist/expert_depth_coverage" in stats
-    assert len(stats["_hist/expert_depth_coverage"]) == 8
 
 
 # ── accumulated-count logging helpers ───────────────────────────────────────

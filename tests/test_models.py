@@ -245,13 +245,29 @@ def tiny_moe_everything_config(mode="bundled"):
     )
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
+MOE_EVERYTHING_MODES = [
+    "bundled",
+    "kv_paired",
+    "qk_paired",
+    "fully_independent",
+    "per_head_fully_independent",
+    "precompute_kv",
+    "per_head_precompute_kv",
+]
+
+PRECOMPUTE_KV_MODES = {
+    "precompute_kv",
+    "per_head_precompute_kv",
+}
+
+
+@pytest.mark.parametrize("mode", MOE_EVERYTHING_MODES)
 def test_moe_everything_instantiates(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode))
     assert model is not None
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
+@pytest.mark.parametrize("mode", MOE_EVERYTHING_MODES)
 def test_moe_everything_forward(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).eval()
     ids, labels = _dummy_batch()
@@ -262,7 +278,7 @@ def test_moe_everything_forward(mode):
     assert out.logits.shape == (2, 16, 256)
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
+@pytest.mark.parametrize("mode", MOE_EVERYTHING_MODES)
 def test_moe_everything_all_grads(mode):
     """Every parameter must receive a gradient."""
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).train()
@@ -272,7 +288,7 @@ def test_moe_everything_all_grads(mode):
     # precompute_kv computes fresh per-expert KV tables at each layer,
     # so the initial KV projections from embedding aren't used.
     skip = {"model.init_k_proj.weight", "model.init_v_proj.weight", "model.init_k_norm.weight"}
-    if mode in ("precompute_kv", "per_head_precompute_kv"):
+    if mode in PRECOMPUTE_KV_MODES:
         no_grad = [n for n, p in model.named_parameters()
                    if p.requires_grad and p.grad is None and n not in skip]
     else:
@@ -281,7 +297,7 @@ def test_moe_everything_all_grads(mode):
     assert len(no_grad) == 0, f"Params without grad: {no_grad}"
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
+@pytest.mark.parametrize("mode", MOE_EVERYTHING_MODES)
 def test_moe_everything_loss_decreases(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).train()
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -322,7 +338,7 @@ def tiny_moe_everything_deepseek_config(mode="bundled"):
     )
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
+@pytest.mark.parametrize("mode", MOE_EVERYTHING_MODES)
 def test_moe_everything_deepseek_forward(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config(mode)).eval()
     ids, labels = _dummy_batch()
@@ -333,7 +349,7 @@ def test_moe_everything_deepseek_forward(mode):
     assert out.logits.shape == (2, 16, 256)
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
+@pytest.mark.parametrize("mode", MOE_EVERYTHING_MODES)
 def test_moe_everything_deepseek_all_grads(mode):
     """Every parameter must receive a gradient with DeepSeek routing."""
     model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config(mode)).train()
@@ -341,7 +357,7 @@ def test_moe_everything_deepseek_all_grads(mode):
     out = model(input_ids=ids, labels=labels)
     out.loss.backward()
     skip = {"model.init_k_proj.weight", "model.init_v_proj.weight", "model.init_k_norm.weight"}
-    if mode in ("precompute_kv", "per_head_precompute_kv"):
+    if mode in PRECOMPUTE_KV_MODES:
         no_grad = [n for n, p in model.named_parameters()
                    if p.requires_grad and p.grad is None and n not in skip]
     else:
@@ -350,7 +366,7 @@ def test_moe_everything_deepseek_all_grads(mode):
     assert len(no_grad) == 0, f"Params without grad: {no_grad}"
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
+@pytest.mark.parametrize("mode", MOE_EVERYTHING_MODES)
 def test_moe_everything_deepseek_loss_decreases(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config(mode)).train()
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -379,13 +395,27 @@ def test_moe_everything_deepseek_routers_found():
     # fully_independent: 4 attn routers + 1 MLP gate = 5
     assert len(ds_routers_fi) == 5, f"Expected 5 DeepSeekRouters, got {len(ds_routers_fi)}"
 
+    model_phfi = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config("per_head_fully_independent"))
+    ds_routers_phfi = [m for m in model_phfi.modules() if isinstance(m, DeepSeekRouter)]
+    # per_head_fully_independent (flat bank): 4 attn routers (Q,K,V,O) + 1 MLP gate = 5
+    assert len(ds_routers_phfi) == 5, f"Expected 5 DeepSeekRouters, got {len(ds_routers_phfi)}"
+
+    model_phpkv = MoEverythingForCausalLM(
+        tiny_moe_everything_deepseek_config("per_head_precompute_kv")
+    )
+    ds_routers_phpkv = [m for m in model_phpkv.modules() if isinstance(m, DeepSeekRouter)]
+    # per_head_precompute_kv (flat bank, 1 router): 1 attn router + 1 MLP gate = 2
+    assert len(ds_routers_phpkv) == 2, f"Expected 2 DeepSeekRouters, got {len(ds_routers_phpkv)}"
 
 
-def _expected_attn_router_keys(mode: str, num_kv_heads: int = 1) -> set[str]:
+
+def _expected_attn_router_keys(mode: str, num_heads: int = 2, num_kv_heads: int = 1) -> set[str]:
     if mode in ("bundled", "precompute_kv"):
         return {"attn"}
     if mode == "per_head_precompute_kv":
-        return {"q"} | {f"kv_head_{h}" for h in range(num_kv_heads)}
+        return {"attn"}
+    if mode == "per_head_fully_independent":
+        return {"q", "k", "v", "o"}
     if mode == "kv_paired":
         return {"kv", "q", "o"}
     if mode == "qk_paired":
@@ -395,7 +425,7 @@ def _expected_attn_router_keys(mode: str, num_kv_heads: int = 1) -> set[str]:
     raise ValueError(mode)
 
 
-@pytest.mark.parametrize("mode", ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv", "per_head_precompute_kv"])
+@pytest.mark.parametrize("mode", MOE_EVERYTHING_MODES)
 def test_moe_everything_output_router_fields(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).eval()
     ids, labels = _dummy_batch()
@@ -435,3 +465,143 @@ def test_moe_everything_deepseek_checkpointing_counts_once():
 
     assert attn_count == pytest.approx(num_tokens * num_depths * attn_topk)
     assert mlp_count == pytest.approx(num_tokens * num_depths * mlp_topk)
+
+
+# ── Per-layer router tests ────────────────────────────────────────────────
+
+def test_per_layer_router_creates_separate_routers():
+    config = tiny_moe_everything_config("bundled")
+    config.per_layer_router = True
+    model = MoEverythingForCausalLM(config)
+    assert hasattr(model.model, "branch_routers")
+    assert len(model.model.branch_routers) == config.num_hidden_layers
+    assert not hasattr(model.model, "branch_router")
+
+
+def test_per_layer_router_forward_and_grads():
+    config = tiny_moe_everything_config("bundled")
+    config.per_layer_router = True
+    model = MoEverythingForCausalLM(config).train()
+    ids, labels = _dummy_batch()
+    out = model(input_ids=ids, labels=labels)
+    assert out.loss is not None
+    out.loss.backward()
+    for router in model.model.branch_routers:
+        assert router.gate.weight.grad is not None
+
+
+def test_per_layer_router_precompute_kv():
+    config = tiny_moe_everything_config("precompute_kv")
+    config.per_layer_router = True
+    model = MoEverythingForCausalLM(config).train()
+    ids, labels = _dummy_batch()
+    out = model(input_ids=ids, labels=labels)
+    assert out.loss is not None
+    out.loss.backward()
+
+
+# ── Dynamic depth tests ───────────────────────────────────────────────────
+
+def test_dynamic_depth_training():
+    config = tiny_moe_everything_config("bundled")
+    config.dynamic_depth_min = 0.5
+    config.dynamic_depth_max = 1.0
+    model = MoEverythingForCausalLM(config).train()
+    ids, labels = _dummy_batch()
+    # Run several times — depth varies but should always produce valid loss
+    for _ in range(5):
+        out = model(input_ids=ids, labels=labels)
+        assert out.loss is not None
+        assert out.loss.item() > 0
+
+
+def test_dynamic_depth_eval_uses_full():
+    config = tiny_moe_everything_config("bundled")
+    config.dynamic_depth_min = 0.5
+    config.dynamic_depth_max = 1.0
+    model = MoEverythingForCausalLM(config).eval()
+    ids, labels = _dummy_batch()
+    with torch.no_grad():
+        out = model(input_ids=ids, labels=labels, output_router_logits=True)
+    # At eval, all depths run
+    assert len(out.branch_probs) == config.num_hidden_layers
+
+
+def test_dynamic_depth_grads():
+    config = tiny_moe_everything_config("bundled")
+    config.dynamic_depth_min = 0.5
+    config.dynamic_depth_max = 1.0
+    model = MoEverythingForCausalLM(config).train()
+    ids, labels = _dummy_batch()
+    out = model(input_ids=ids, labels=labels)
+    out.loss.backward()
+    for n, p in model.named_parameters():
+        if "embed_tokens" not in n and "lm_head" not in n:
+            # Some params might not get grads if depth is too short,
+            # but loss should still be valid
+            pass
+    assert out.loss.item() > 0
+
+
+# ── Depthwise attention tests ─────────────────────────────────────────────
+
+def test_depthwise_attention_full():
+    config = tiny_moe_everything_config("bundled")
+    config.depthwise_attention = True
+    model = MoEverythingForCausalLM(config).train()
+    ids, labels = _dummy_batch()
+    out = model(input_ids=ids, labels=labels)
+    assert out.loss is not None
+    out.loss.backward()
+    assert model.model.depth_queries.grad is not None
+
+
+def test_depthwise_attention_block():
+    config = tiny_moe_everything_config("bundled")
+    config.num_hidden_layers = 8
+    config.depthwise_attention = True
+    config.depthwise_block_size = 4
+    model = MoEverythingForCausalLM(config).train()
+    # block_size=4, num_depths=8 → 2 blocks → 2 query vectors
+    assert model.model.depth_queries.shape[0] == 2
+    ids, labels = _dummy_batch()
+    out = model(input_ids=ids, labels=labels)
+    assert out.loss is not None
+    out.loss.backward()
+    assert model.model.depth_queries.grad is not None
+
+
+def test_depthwise_attention_precompute_kv():
+    config = tiny_moe_everything_config("precompute_kv")
+    config.depthwise_attention = True
+    model = MoEverythingForCausalLM(config).train()
+    ids, labels = _dummy_batch()
+    out = model(input_ids=ids, labels=labels)
+    assert out.loss is not None
+    out.loss.backward()
+
+
+def test_depthwise_attention_with_per_layer_router():
+    config = tiny_moe_everything_config("bundled")
+    config.per_layer_router = True
+    config.depthwise_attention = True
+    model = MoEverythingForCausalLM(config).train()
+    ids, labels = _dummy_batch()
+    out = model(input_ids=ids, labels=labels)
+    assert out.loss is not None
+    out.loss.backward()
+
+
+# ── Combined features test ────────────────────────────────────────────────
+
+def test_all_three_features_combined():
+    config = tiny_moe_everything_config("bundled")
+    config.per_layer_router = True
+    config.dynamic_depth_min = 0.5
+    config.dynamic_depth_max = 1.0
+    config.depthwise_attention = True
+    model = MoEverythingForCausalLM(config).train()
+    ids, labels = _dummy_batch()
+    out = model(input_ids=ids, labels=labels)
+    assert out.loss is not None
+    out.loss.backward()

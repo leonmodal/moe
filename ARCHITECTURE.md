@@ -189,7 +189,7 @@ Per-model (not per-depth):
 
 ### Attention Bank Modes
 
-The attention bank supports 6 modes controlling how Q, K, V, O projections
+The attention bank supports 8 modes controlling how Q, K, V, O projections
 are grouped for routing.  Each routing group carries its own pre-norm.
 
 #### `bundled` — 1 norm, 1 router
@@ -291,6 +291,28 @@ Each projection routed independently.  Maximum flexibility.
                                  attn_out → O Router → e_o → O[e_o]·attn_out
 ```
 
+#### `per_head_fully_independent` — 3 norms, head-wise routers
+
+Like `fully_independent`, but routing happens separately for each head.
+Each Q head, K head, V head, and O head gets its own router and expert bank.
+
+```
+  hidden ─→ q_norm ─→ Q Head 0 Router → e_q0 → Q[0,e_q0]·x → RoPE
+                     Q Head 1 Router → e_q1 → Q[1,e_q1]·x → RoPE
+                     ...
+
+  hidden ─→ k_norm ─→ K Head 0 Router → e_k0 → K[0,e_k0]·x → RoPE
+                     ...
+
+  hidden ─→ v_norm ─→ V Head 0 Router → e_v0 → V[0,e_v0]·x
+                     ...
+
+  per-head attention runs as usual after GQA expansion
+
+  attn_head_h ─→ O Head h Router → e_oh → O[h,e_oh]·attn_head_h
+  final output = sum_h projected_head_h
+```
+
 #### `precompute_kv` — 1 norm, 1 router
 
 Route first, then compute per-expert KV tables for ALL tokens.
@@ -316,45 +338,40 @@ This mode ensures that when token A attends to token B, the K projection
 used for B comes from the same expert as A's Q.  In other modes, A's Q
 might use expert 1 while B's K uses expert 2, creating a subspace mismatch.
 
-#### `per_head_precompute_kv` — 1 norm, 1 Q router + 8 KV head routers
+#### `per_head_precompute_kv` — 1 norm, per-head Q/KV/O routers
 
-Like `precompute_kv` but each KV head routes independently.  Head 0 might
-use expert 3's K,V while head 5 uses expert 14's K,V — each head gets its
-own "perspective" on the sequence.
+Per-head version of `precompute_kv`: each Q head, each KV head, and each O
+head routes independently to pick its expert.  K and V for the same KV head
+always share the same routing decision (same expert).
 
 ```
-  hidden ─→ norm ─→ Q Router ─→ e_q per token (bundled, all Q heads)
-                       │
-                    Q[e_q] · x ─→ q_norm ─→ RoPE
+  hidden ─→ norm ─→ Q Head 0 Router → e_q0 → Q[0,e_q0]·x ─→ q_norm
+                    Q Head 1 Router → e_q1 → Q[1,e_q1]·x ─→ q_norm
+                    ...
 
-             KV Head 0 Router ─→ e₀ per token
+             KV Head 0 Router ─→ e₀ per token  (K and V share)
              KV Head 1 Router ─→ e₁ per token
                   ...
-             KV Head 7 Router ─→ e₇ per token
 
         ┌──────────────────────────────────────────────────────┐
-        │   For each head h, for each active expert e:         │
+        │   For each KV head h, for each active expert e:      │
         │     K_table = K[h,e] · ALL_tokens   (head_dim)      │
         │     V_table = V[h,e] · ALL_tokens   (head_dim)      │
         │                                                      │
         │     For tokens where e_h == e:                       │
         │       Q heads [h×G : (h+1)×G] attend to K,V table   │
-        │                                                      │
-        │     RMSNorm per head group (normalize scale across   │
-        │     heads from different experts)                    │
         └──────────────────────────────────────────────────────┘
-                       │
-                    O[e_q] · attn_out     (reuses Q routing)
+
+  attn_head_h ─→ O Head h Router → e_oh → O[h,e_oh]·attn_head_h
+  final output = sum_h projected_head_h
 ```
 
 Key differences from `precompute_kv`:
-- K,V projections are `(num_kv_heads, E, H, head_dim)` instead of `(E, H, kv_dim)` —
-  same total parameters, but each head selects independently
-- 8 additional routers (one per KV head) allow each head to specialize
-- Per-head output RMSNorm ensures compatible scales when concatenating
-  heads from different experts
-- Head attention output scaled by routing weight for differentiable KV
-  router training
+- Q, K, V, O projections are per-head: `(num_heads, E, H, head_dim)` for Q/O,
+  `(num_kv_heads, E, H, head_dim)` for K/V
+- Each Q head, KV head, and O head has its own router
+- K and V share a single router per KV head — no pair iteration needed
+- Head attention output scaled by KV routing weight for gradient flow
 
 ---
 
@@ -368,7 +385,7 @@ same DeepSeek-style MLP routing for the shipped XS comparison.
 - `configs/standard_moe.yaml` — DeepSeek Standard MoE
 - `configs/global_moe.yaml` — DeepSeek Global MoE (with bias interpolation)
 - `configs/global_moe_nointerp.yaml` — DeepSeek Global MoE (global-only bias)
-- `configs/moe_everything_*.yaml` — MoE-Everything (all 6 attention modes)
+- `configs/moe_everything_*.yaml` — MoE-Everything (all 7 attention modes)
 
 ### Shared backbone (Qwen3-0.6B style)
 
@@ -460,7 +477,7 @@ DeepSeek routing (from DeepSeek V3):
 | Router | What it decides | Type | Count per mode |
 |---|---|---|---|
 | **Branch router** | Attention vs MLP per token | Always softmax `Linear(H, 2)` | 1 (all modes) |
-| **Attention router(s)** | Which QKVO expert set | Softmax or DeepSeek | bundled/precompute_kv: 1, kv/qk_paired: 3, fully_independent: 4, per_head_precompute_kv: 1 Q + 8 KV |
+| **Attention router(s)** | Which QKVO expert set | Softmax or DeepSeek | bundled/precompute_kv: 1, kv/qk_paired: 3, fully_independent: 4, per_head_fully_independent: Q+K+V+O per head, per_head_precompute_kv: Q+KV+O per head |
 | **MLP router** | Which SwiGLU expert | Softmax or DeepSeek | 1 (all modes) |
 
 When `use_deepseek_routing=True`:
@@ -496,5 +513,6 @@ final norm [H]              — after all depths, before LM head
 | `kv_paired` | 2: `kv_norm`, `q_norm` | KV together, Q separate |
 | `qk_paired` | 2: `qk_norm`, `v_norm` | QK together, V separate |
 | `fully_independent` | 3: `q_pre_norm`, `k_pre_norm`, `v_pre_norm` | Each projection separate |
+| `per_head_fully_independent` | 3: `q_pre_norm`, `k_pre_norm`, `v_pre_norm` | Each Q/K/V head separate; O routed per head |
 | `precompute_kv` | 1: `norm` | All of Q, K, V |
-| `per_head_precompute_kv` | 1: `norm` + per-head output RMSNorm | Q,K,V input; per-head attn output |
+| `per_head_precompute_kv` | 1: `norm` | All of Q, K, V; Q/KV/O routed per head (K,V share router) |

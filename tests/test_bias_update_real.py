@@ -5,13 +5,12 @@ using actual Accelerator, actual train.py functions, actual models on CUDA.
 import sys
 sys.path.insert(0, ".")
 
+import pytest
 import torch
-# Must happen before liger import
+# Must happen before any CUDA-heavy model setup
 torch.backends.cuda.preferred_blas_library("cublaslt")
 
 from accelerate import Accelerator
-from liger_kernel.transformers import apply_liger_kernel_to_qwen3_moe
-apply_liger_kernel_to_qwen3_moe()
 
 from src.models import (
     GlobalMoEConfig,
@@ -22,6 +21,13 @@ from src.models import (
 from src.models.router import DeepSeekRouter
 from src.models.load_balancing import seq_load_balancing_loss_func
 from train import update_expert_biases, bias_alpha_schedule
+
+
+@pytest.fixture
+def accelerator():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for tests/test_bias_update_real.py")
+    return Accelerator(mixed_precision="bf16")
 
 
 def make_global_config():

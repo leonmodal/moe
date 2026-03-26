@@ -34,8 +34,15 @@ from accelerate.utils import set_seed
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
-from liger_kernel.transformers import apply_liger_kernel_to_qwen3_moe
-apply_liger_kernel_to_qwen3_moe()  # monkey-patches RMSNorm, SwiGLU, RoPE, CrossEntropy before model init
+def enable_liger_kernels() -> None:
+    """Enable Liger monkey-patches only for real training entrypoints.
+
+    Import-time patching leaks into unrelated CPU-only tests that import train.py,
+    causing Triton kernels to run on CPU tensors.
+    """
+    from liger_kernel.transformers import apply_liger_kernel_to_qwen3_moe
+
+    apply_liger_kernel_to_qwen3_moe()
 
 from src.data.parquet_dataset import DataConfig, StatefulParquetDataset
 from src.models import (
@@ -381,6 +388,11 @@ def build_model(cfg: dict):
             num_groups=mcfg.get("num_groups", None),
             group_topk=mcfg.get("group_topk", None),
             seq_aux_loss_coef=mcfg.get("seq_aux_loss_coef", 0.0),
+            per_layer_router=mcfg.get("per_layer_router", False),
+            dynamic_depth_min=mcfg.get("dynamic_depth_min", 1.0),
+            dynamic_depth_max=mcfg.get("dynamic_depth_max", 1.0),
+            depthwise_attention=mcfg.get("depthwise_attention", False),
+            depthwise_block_size=mcfg.get("depthwise_block_size", 0),
             **common,
         )
         model = MoEverythingForCausalLM(config)
@@ -480,6 +492,8 @@ def cleanup_checkpoints(output_dir: str, max_keep: int) -> None:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
+    enable_liger_kernels()
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--resume", default=None, help="Path to checkpoint directory")
@@ -550,7 +564,10 @@ def main() -> None:
     ddp_kwargs = []
     if (
         cfg["model"]["type"] == "moe_everything"
-        and cfg["model"].get("attn_expert_mode") in ("precompute_kv", "per_head_precompute_kv")
+        and cfg["model"].get("attn_expert_mode") in (
+            "precompute_kv",
+            "per_head_precompute_kv",
+        )
     ):
         ddp_kwargs.append(DistributedDataParallelKwargs(static_graph=True))
     accelerator = Accelerator(

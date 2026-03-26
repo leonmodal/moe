@@ -1,7 +1,7 @@
-# XS scale — Qwen3-0.6B backbone, MoE-Everything with per-head precompute_kv attention routing
-# 32 shared depth iterations, 16 attn experts per head, 256 MLP experts, top-4
-# Q, KV, O heads route independently; K and V share the same router per head
-experiment_name: moe_everything_per_head_precompute_kv
+# XS scale — Qwen3-0.6B backbone, MoE-Everything with per-head fully independent attention routing
+# 32 shared depth iterations, 16 attn experts per routed head, 256 MLP experts, top-4
+# Each Q/K/V/O head independently routes to its own expert bank
+experiment_name: moe_everything_per_head_fully_independent
 
 model:
   type: moe_everything
@@ -23,10 +23,10 @@ model:
   topk_scaling_factor: 2.5          # routing weight scaling (DeepSeek V3)
   num_groups: 8                     # group-limited routing: num expert groups
   group_topk: 4                     # group-limited routing: groups selected per token
-  # -- Attention experts (16 per KV head, 8 heads = 8 routers) ----------------
-  num_attn_experts: 256
+  # -- Attention experts -------------------------------------------------------
+  num_attn_experts: 16
   num_attn_experts_per_tok: 1
-  attn_expert_mode: per_head_precompute_kv
+  attn_expert_mode: per_head_fully_independent
   # -- Routing -----------------------------------------------------------------
   use_deepseek_routing: true
   branch_router_aux_loss_coef: 0.01
@@ -56,9 +56,9 @@ training:
   log_every: 1
   routing_log_every: 50
   save_every: 1000
-  output_dir: ./outputs/moe_everything_per_head_precompute_kv
+  output_dir: ./outputs/moe_everything_per_head_fully_independent
   wandb_project: moe-scaling
-  wandb_run_name: moe_everything_per_head_precompute_kv
+  wandb_run_name: moe_everything_per_head_fully_independent
 
 data:
   data_dir: ./data/parquet

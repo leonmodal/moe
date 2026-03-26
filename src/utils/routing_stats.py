@@ -128,9 +128,6 @@ def _per_layer_stats_from_counts(counts: torch.Tensor, layer_idx: int, prefix: s
     stats[f"{tag}_utilization"] = active / max(1, num_experts)
     stats[f"{tag}_top_expert"] = int(counts.argmax().item())
 
-    load_frac = (counts / max(total_slots, 1.0)).cpu().tolist()
-    stats[f"_hist/{tag}_expert_load_frac"] = load_frac
-
     load_dist = counts / (counts.sum() + 1e-10)
     entropy = -(load_dist * (load_dist + 1e-10).log()).sum().item()
     stats[f"{tag}_entropy"] = entropy / math.log(num_experts) if num_experts > 1 else 0.0
@@ -174,9 +171,6 @@ def compute_routing_stats_from_counts(
         coverage_list = coverage.cpu().tolist()
         stats[f"{prefix}/expert_depth_coverage_mean"] = coverage.mean().item()
         stats[f"{prefix}/expert_depth_coverage_max"] = coverage.max().item()
-        stats[f"_hist/{prefix}/expert_depth_coverage"] = coverage_list
-        if prefix == "routing":
-            stats["_hist/expert_depth_coverage"] = coverage_list
 
         pool_counts = mat.sum(dim=0)
         pool_total = pool_counts.sum().item()
@@ -194,11 +188,6 @@ def compute_routing_stats_from_counts(
         stats[f"{prefix}/global_pool_top_expert"] = int(pool_counts.argmax().item())
 
         pool_frac = (pool_counts / max(pool_total, 1.0)).cpu()
-        stats[f"_hist/{prefix}/global_pool_expert_load_frac"] = pool_frac.tolist()
-        if prefix == "routing":
-            stats["_hist/global_pool_expert_load_frac"] = pool_frac.tolist()
-            stats["_hist/global_expert_layer_count"] = layer_count.cpu().tolist()
-
         pool_entropy = -(pool_frac * (pool_frac + 1e-10).log()).sum().item()
         stats[f"{prefix}/global_pool_entropy"] = pool_entropy / math.log(num_experts) if num_experts > 1 else 0.0
 
@@ -210,24 +199,8 @@ def expert_counts_to_tables(
     is_global: bool = False,
     prefix: str = "routing",
 ) -> dict:
-    """Convert accumulated expert counts into ``_table/`` entries for logging."""
-    stats = {}
-    for layer_idx in sorted(accumulator):
-        counts = accumulator[layer_idx]
-        num_experts = counts.shape[0]
-        counts_list = counts.cpu().tolist()
-        tag = f"{prefix}/layer_{layer_idx:02d}"
-        stats[f"_table/{tag}_expert_tokens"] = list(zip(range(num_experts), counts_list))
-
-    if is_global and len(accumulator) > 1:
-        all_counts = torch.stack([accumulator[i] for i in sorted(accumulator)])
-        pool_counts = all_counts.sum(dim=0)
-        num_experts = pool_counts.shape[0]
-        stats[f"_table/{prefix}/global_pool_expert_tokens"] = list(
-            zip(range(num_experts), pool_counts.cpu().tolist())
-        )
-
-    return stats
+    """Convert accumulated expert counts into ``_table/`` entries for logging (disabled)."""
+    return {}
 
 
 def compute_routing_stats(
@@ -273,9 +246,6 @@ def compute_routing_stats(
         stats[f"{tag}_utilization"] = active / max(1, num_experts)
         stats[f"{tag}_top_expert"] = int(counts.argmax().item())
 
-        load_frac = (counts / max(total_slots, 1.0)).cpu().tolist()
-        stats[f"_hist/{tag}_expert_load_frac"] = load_frac
-
         load_dist = counts / (counts.sum() + 1e-10)
         entropy = -(load_dist * (load_dist + 1e-10).log()).sum().item()
         stats[f"{tag}_entropy"] = entropy / math.log(num_experts) if num_experts > 1 else 0.0
@@ -308,9 +278,6 @@ def compute_routing_stats(
         coverage_list = coverage.cpu().tolist()
         stats[f"{prefix}/expert_depth_coverage_mean"] = coverage.mean().item()
         stats[f"{prefix}/expert_depth_coverage_max"] = coverage.max().item()
-        stats[f"_hist/{prefix}/expert_depth_coverage"] = coverage_list
-        if prefix == "routing":
-            stats["_hist/expert_depth_coverage"] = coverage_list
 
         pool_counts = mat.sum(dim=0)
         pool_total = pool_counts.sum().item()
@@ -328,11 +295,6 @@ def compute_routing_stats(
         stats[f"{prefix}/global_pool_top_expert"] = int(pool_counts.argmax().item())
 
         pool_frac = (pool_counts / max(pool_total, 1.0)).cpu()
-        stats[f"_hist/{prefix}/global_pool_expert_load_frac"] = pool_frac.tolist()
-        if prefix == "routing":
-            stats["_hist/global_pool_expert_load_frac"] = pool_frac.tolist()
-            stats["_hist/global_expert_layer_count"] = layer_count.cpu().tolist()
-
         pool_entropy = -(pool_frac * (pool_frac + 1e-10).log()).sum().item()
         stats[f"{prefix}/global_pool_entropy"] = pool_entropy / math.log(num_experts) if num_experts > 1 else 0.0
 
