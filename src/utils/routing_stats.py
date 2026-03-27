@@ -24,9 +24,17 @@ def _counts_from_router(
     probs: torch.Tensor,
     num_experts_per_tok: int,
     selected_experts: torch.Tensor | None = None,
+    token_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     probs = probs.detach().float()
     selected_experts = _normalize_selected_experts(selected_experts)
+    if token_mask is not None:
+        token_mask = token_mask.reshape(-1).bool().to(probs.device)
+        probs = probs[token_mask]
+        if selected_experts is not None:
+            selected_experts = selected_experts.reshape(-1, selected_experts.shape[-1])[token_mask]
+    if probs.numel() == 0:
+        return probs, torch.zeros(0 if probs.ndim == 0 else probs.shape[-1], device=probs.device)
     if selected_experts is None:
         _, selected_experts = torch.topk(probs, num_experts_per_tok, dim=-1)
     counts = torch.bincount(selected_experts.reshape(-1), minlength=probs.shape[1]).float()
@@ -38,6 +46,7 @@ def accumulate_expert_counts(
     num_experts_per_tok: int,
     accumulator: dict[int, torch.Tensor] | None = None,
     selected_experts: Sequence[torch.Tensor] | None = None,
+    token_masks: Sequence[torch.Tensor] | None = None,
 ) -> dict[int, torch.Tensor]:
     """Add per-layer expert token counts from one batch into an accumulator."""
     if accumulator is None:
@@ -47,7 +56,12 @@ def accumulate_expert_counts(
         selected = None
         if selected_experts is not None and layer_idx < len(selected_experts):
             selected = selected_experts[layer_idx]
-        probs, counts = _counts_from_router(probs, num_experts_per_tok, selected)
+        token_mask = None
+        if token_masks is not None and layer_idx < len(token_masks):
+            token_mask = token_masks[layer_idx]
+        probs, counts = _counts_from_router(probs, num_experts_per_tok, selected, token_mask)
+        if counts.numel() == 0:
+            counts = torch.zeros(probs.shape[1], device=probs.device)
         if layer_idx in accumulator:
             accumulator[layer_idx] += counts.to(accumulator[layer_idx].device)
         else:
@@ -59,6 +73,7 @@ def accumulate_router_margins(
     router_logits: Sequence[torch.Tensor],
     num_experts_per_tok: int,
     accumulator: dict[int, dict[str, torch.Tensor]] | None = None,
+    token_masks: Sequence[torch.Tensor] | None = None,
 ) -> dict[int, dict[str, torch.Tensor]]:
     """Accumulate router top-k margin stats across batches."""
     if accumulator is None:
@@ -66,6 +81,11 @@ def accumulate_router_margins(
 
     for layer_idx, probs in enumerate(router_logits):
         probs = probs.detach().float()
+        if token_masks is not None and layer_idx < len(token_masks) and token_masks[layer_idx] is not None:
+            layer_mask = token_masks[layer_idx].reshape(-1).bool().to(probs.device)
+            probs = probs[layer_mask]
+        if probs.numel() == 0:
+            continue
         if probs.shape[1] <= num_experts_per_tok:
             continue
 
@@ -208,6 +228,7 @@ def compute_routing_stats(
     num_experts_per_tok: int,
     is_global: bool = False,
     selected_experts: Sequence[torch.Tensor] | None = None,
+    token_masks: Sequence[torch.Tensor] | None = None,
     prefix: str = "routing",
 ) -> dict:
     """Compute scalar and histogram routing metrics.
@@ -227,7 +248,12 @@ def compute_routing_stats(
         selected = None
         if selected_experts is not None and layer_idx < len(selected_experts):
             selected = selected_experts[layer_idx]
-        probs, counts = _counts_from_router(probs, num_experts_per_tok, selected)
+        token_mask = None
+        if token_masks is not None and layer_idx < len(token_masks):
+            token_mask = token_masks[layer_idx]
+        probs, counts = _counts_from_router(probs, num_experts_per_tok, selected, token_mask)
+        if probs.numel() == 0:
+            continue
 
         total_slots = counts.sum().item()
         num_experts = probs.shape[1]

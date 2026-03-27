@@ -185,6 +185,22 @@ def get_output_selected_experts(output, model) -> tuple[torch.Tensor, ...] | Non
     return get_selected_experts_for_seq_aux(model)
 
 
+def get_output_router_token_masks(output) -> tuple[torch.Tensor | None, ...] | None:
+    masks = getattr(output, "router_token_masks", None)
+    if masks:
+        return tuple(masks)
+    return None
+
+
+def get_attention_router_topk(model_cfg, router_name: str) -> int:
+    attn_mode = getattr(model_cfg, "attn_expert_mode", None)
+    if attn_mode == "per_head_fully_independent":
+        return model_cfg.num_key_value_heads if router_name in ("k", "v") else model_cfg.num_attention_heads
+    if attn_mode == "per_head_precompute_kv":
+        return model_cfg.num_attention_heads
+    return model_cfg.num_attn_experts_per_tok
+
+
 def reduce_scalar(accelerator: Accelerator, value: float, reduction: str = "mean") -> float:
     tensor = torch.tensor(value, device=accelerator.device, dtype=torch.float64)
     if accelerator.num_processes > 1:
@@ -746,7 +762,10 @@ def main() -> None:
 
     data_iter = iter(dataloader)
     t0 = time.perf_counter()
+    log_t0 = t0
     tokens_this_session = 0.0
+    tokens_since_log = 0.0
+    steps_since_log = 0
     routing_log_every = tcfg_dict.get("routing_log_every", 50)
     expert_count_accum = None
     expert_margin_accum = None
@@ -798,12 +817,14 @@ def main() -> None:
             seq_aux = getattr(output, "seq_aux_loss", None)
             if seq_aux is None and seq_aux_loss_coef > 0 and getattr(output, "router_logits", None) is not None:
                 selected_for_seq_aux = get_output_selected_experts(output, raw_model)
+                router_token_masks = get_output_router_token_masks(output)
                 seq_aux = seq_load_balancing_loss_func(
                     output.router_logits,
                     model_cfg.num_experts,
                     model_cfg.num_experts_per_tok,
                     batch_size=input_ids.shape[0],
                     selected_experts=selected_for_seq_aux,
+                    token_masks=router_token_masks,
                 )
             if isinstance(seq_aux, torch.Tensor):
                 seq_aux_value = seq_aux.detach().float().item()
@@ -833,17 +854,20 @@ def main() -> None:
             local_tokens_in_step += input_ids.numel()
 
             selected_experts = get_output_selected_experts(output, raw_model)
+            router_token_masks = get_output_router_token_masks(output)
             if getattr(output, "router_logits", None) is not None:
                 expert_count_accum = accumulate_expert_counts(
                     output.router_logits,
                     num_experts_per_tok=model_cfg.num_experts_per_tok,
                     accumulator=expert_count_accum,
                     selected_experts=selected_experts,
+                    token_masks=router_token_masks,
                 )
                 expert_margin_accum = accumulate_router_margins(
                     output.router_logits,
                     num_experts_per_tok=model_cfg.num_experts_per_tok,
                     accumulator=expert_margin_accum,
+                    token_masks=router_token_masks,
                 )
 
             attention_router_info = getattr(output, "attention_router_info", None)
@@ -852,22 +876,27 @@ def main() -> None:
                 for router_name in router_names:
                     router_logits = []
                     router_selected = []
+                    router_masks = []
                     for depth_info in attention_router_info:
                         info = depth_info.get(router_name)
                         if info is None:
                             continue
                         router_logits.append(info["router_logits"])
                         router_selected.append(info["selected_experts"])
+                        router_masks.append(info.get("token_mask"))
+                    attn_topk = get_attention_router_topk(model_cfg, router_name)
                     attention_expert_count_accum[router_name] = accumulate_expert_counts(
                         router_logits,
-                        num_experts_per_tok=model_cfg.num_attn_experts_per_tok,
+                        num_experts_per_tok=attn_topk,
                         accumulator=attention_expert_count_accum.get(router_name),
                         selected_experts=router_selected,
+                        token_masks=router_masks,
                     )
                     attention_router_margin_accum[router_name] = accumulate_router_margins(
                         router_logits,
-                        num_experts_per_tok=model_cfg.num_attn_experts_per_tok,
+                        num_experts_per_tok=attn_topk,
                         accumulator=attention_router_margin_accum.get(router_name),
+                        token_masks=router_masks,
                     )
 
             branch_prob_accum = accumulate_branch_probs(getattr(output, "branch_probs", None), branch_prob_accum)
@@ -901,6 +930,8 @@ def main() -> None:
             tokens_this_step = reduce_scalar(accelerator, float(local_tokens_in_step), reduction="sum")
             tokens_seen += tokens_this_step
             tokens_this_session += tokens_this_step
+            tokens_since_log += tokens_this_step
+            steps_since_log += 1
 
             avg_total = reduce_scalar(accelerator, loss_window_sum / max(1, microbatches_in_step))
             avg_ce = reduce_scalar(accelerator, ce_window_sum / max(1, microbatches_in_step))
@@ -910,8 +941,12 @@ def main() -> None:
             avg_grad_norm = reduce_scalar(accelerator, grad_norm)
 
             if global_step % train_cfg.log_every == 0 and accelerator.is_main_process:
-                elapsed = time.perf_counter() - t0
-                tok_per_sec = tokens_this_session / max(elapsed, 1e-6)
+                now = time.perf_counter()
+                elapsed = now - t0
+                log_elapsed = now - log_t0
+                tok_per_sec = tokens_since_log / max(log_elapsed, 1e-6)
+                tok_per_sec_cumulative = tokens_this_session / max(elapsed, 1e-6)
+                ms_per_step = 1000.0 * log_elapsed / max(1, steps_since_log)
                 lr = scheduler.get_last_lr()[0]
                 log_dict = {
                     "train/loss": avg_total,
@@ -922,18 +957,25 @@ def main() -> None:
                     "train/grad_norm": avg_grad_norm,
                     "train/lr": lr,
                     "train/tokens_per_sec": tok_per_sec,
+                    "train/tokens_per_sec_cumulative": tok_per_sec_cumulative,
+                    "train/ms_per_step": ms_per_step,
                     "train/tokens_seen_B": tokens_seen / 1e9,
                 }
                 accelerator.print(
                     f"step {global_step:6d}  "
                     f"loss={avg_total:.4f}  ce={avg_ce:.4f}  aux={avg_aux:.4f}  "
                     f"seq_aux={avg_seq_aux:.4f}  branch_aux={avg_branch_aux:.4f}  "
-                    f"lr={lr:.2e}  tok/s={tok_per_sec/1e3:.1f}k  |g|={avg_grad_norm:.3f}"
+                    f"lr={lr:.2e}  tok/s={tok_per_sec/1e3:.1f}k  "
+                    f"tok/s(cum)={tok_per_sec_cumulative/1e3:.1f}k  "
+                    f"ms/step={ms_per_step:.0f}  |g|={avg_grad_norm:.3f}"
                 )
                 if bias_stats:
                     log_dict.update(bias_stats)
                 if log_with:
                     accelerator.log(log_dict, step=global_step)
+                log_t0 = now
+                tokens_since_log = 0.0
+                steps_since_log = 0
 
             if global_step % routing_log_every == 0:
                 if expert_count_accum is not None and accelerator.num_processes > 1:

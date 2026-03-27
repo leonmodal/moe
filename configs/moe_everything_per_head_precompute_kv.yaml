@@ -1,6 +1,6 @@
 # XS scale — Qwen3-0.6B backbone, MoE-Everything with per-head precompute_kv attention routing
-# 32 shared depth iterations, 16 attn experts per head, 256 MLP experts, top-4
-# Q, KV, O heads route independently; K and V share the same router per head
+# 32 shared depth iterations, 256 attention experts, 256 MLP experts, top-4
+# One flat attention router picks per-head experts; KV and O reuse that ranked routing
 experiment_name: moe_everything_per_head_precompute_kv
 
 model:
@@ -29,7 +29,6 @@ model:
   attn_expert_mode: per_head_precompute_kv
   # -- Routing -----------------------------------------------------------------
   use_deepseek_routing: true
-  branch_router_aux_loss_coef: 0.01
   # -- Misc --------------------------------------------------------------------
   attention_bias: false
   attention_dropout: 0.0

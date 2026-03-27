@@ -177,3 +177,44 @@ def test_router_margin_accumulator_matches_combined_batches():
     all_margin = torch.cat([margins(p1), margins(p2)])
     assert stats["routing/layer_00_router_margin_mean"] == pytest.approx(all_margin.mean().item())
     assert stats["routing/layer_00_router_margin_min"] == pytest.approx(all_margin.min().item())
+
+
+def test_accumulate_expert_counts_respects_token_masks():
+    probs = torch.full((4, 4), 0.25)
+    selected = torch.tensor([
+        [0, 1],
+        [1, 2],
+        [2, 3],
+        [0, 3],
+    ])
+    token_mask = torch.tensor([True, False, True, False])
+
+    accum = accumulate_expert_counts(
+        [probs],
+        num_experts_per_tok=2,
+        selected_experts=[selected],
+        token_masks=[token_mask],
+    )
+
+    torch.testing.assert_close(accum[0], torch.tensor([1.0, 1.0, 1.0, 1.0]))
+
+
+def test_compute_routing_stats_respects_token_masks():
+    probs = torch.tensor([
+        [1.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.0, 1.0],
+    ])
+    selected = torch.tensor([[0], [0], [1], [1]])
+    token_mask = torch.tensor([False, False, True, True])
+
+    stats = compute_routing_stats(
+        [probs],
+        num_experts_per_tok=1,
+        selected_experts=[selected],
+        token_masks=[token_mask],
+    )
+
+    assert stats["routing/layer_00_utilization"] == pytest.approx(0.5)
+    assert stats["routing/layer_00_load_imbalance"] == pytest.approx(2.0)

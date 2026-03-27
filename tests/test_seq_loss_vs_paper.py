@@ -217,3 +217,32 @@ def test_with_actual_config():
 if __name__ == "__main__":
     test_all_three()
     test_with_actual_config()
+
+
+def test_seq_loss_token_masks_match_active_token_subset():
+    gate_logits = torch.tensor([
+        [0.90, 0.10],
+        [0.80, 0.20],
+        [0.10, 0.90],
+        [0.20, 0.80],
+    ])
+    selected = torch.tensor([[0], [0], [1], [1]])
+    token_mask = torch.tensor([True, True, False, False])
+
+    masked_loss = seq_load_balancing_loss_func(
+        (gate_logits,),
+        num_experts=2,
+        top_k=1,
+        batch_size=1,
+        selected_experts=(selected,),
+        token_masks=(token_mask,),
+    )
+    active_only_loss = seq_load_balancing_loss_func(
+        (gate_logits[token_mask],),
+        num_experts=2,
+        top_k=1,
+        batch_size=1,
+        selected_experts=(selected[token_mask],),
+    )
+
+    torch.testing.assert_close(masked_loss, active_only_loss)

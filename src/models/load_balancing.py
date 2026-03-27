@@ -21,6 +21,7 @@ def load_balancing_loss_func(
     num_experts: int | None = None,
     top_k: int = 2,
     attention_mask: torch.Tensor | None = None,
+    token_masks: tuple[torch.Tensor] | None = None,
 ) -> torch.Tensor | int:
     """
     Computes auxiliary load balancing loss (Switch Transformer).
@@ -39,9 +40,23 @@ def load_balancing_loss_func(
         return 0
 
     compute_device = gate_logits[0].device
-    concatenated_gate_logits = torch.cat(
-        [layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0
-    )
+
+    if token_masks is not None:
+        filtered = []
+        for layer_idx, layer_gate in enumerate(gate_logits):
+            if layer_idx >= len(token_masks) or token_masks[layer_idx] is None:
+                filtered.append(layer_gate.to(compute_device))
+                continue
+            layer_mask = token_masks[layer_idx].reshape(-1).bool().to(layer_gate.device)
+            if layer_mask.any():
+                filtered.append(layer_gate[layer_mask].to(compute_device))
+        if not filtered:
+            return gate_logits[0].new_zeros(())
+        concatenated_gate_logits = torch.cat(filtered, dim=0)
+    else:
+        concatenated_gate_logits = torch.cat(
+            [layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0
+        )
 
     # gate_logits are already softmax probabilities from the router — use directly.
     routing_weights = concatenated_gate_logits
@@ -94,6 +109,7 @@ def seq_load_balancing_loss_func(
     top_k: int = 2,
     batch_size: int = 1,
     selected_experts: tuple[torch.Tensor] | None = None,
+    token_masks: tuple[torch.Tensor] | None = None,
 ) -> torch.Tensor | int:
     """
     Sequence-level load balancing loss (DeepSeek V3, arxiv 2412.19437 Eqs. 17-20).
@@ -127,6 +143,7 @@ def seq_load_balancing_loss_func(
         return 0
 
     total_loss = gate_logits[0].new_zeros(())
+    num_active_layers = 0
 
     for layer_idx, layer_gate in enumerate(gate_logits):
         T, E = layer_gate.shape
@@ -149,21 +166,49 @@ def seq_load_balancing_loss_func(
         else:
             selected = None
 
+        if token_masks is not None and layer_idx < len(token_masks):
+            token_mask = token_masks[layer_idx]
+            if token_mask is not None:
+                token_mask = token_mask.reshape(batch_size, seq_len).to(scores.device).float()
+            else:
+                token_mask = None
+        else:
+            token_mask = None
+
         # Fall back to score top-k if actual routing indices aren't available.
         if selected is None:
             _, selected = torch.topk(scores, top_k, dim=-1)          # (B, S, K)
         expert_mask = F.one_hot(selected, num_experts)                # (B, S, K, E)
 
-        # Eq. 18: f_i = (E / (K * T)) * Σ_t 1[expert i selected]
-        expert_counts = expert_mask.float().sum(dim=(1, 2))           # (B, E)
-        f_i = (num_experts / (top_k * seq_len)) * expert_counts       # (B, E)
+        if token_mask is None:
+            # Eq. 18: f_i = (E / (K * T)) * Σ_t 1[expert i selected]
+            expert_counts = expert_mask.float().sum(dim=(1, 2))           # (B, E)
+            f_i = (num_experts / (top_k * seq_len)) * expert_counts       # (B, E)
 
-        # Eq. 20: P_i = (1/T) * Σ_t s'_{i,t}
-        P_i = scores.mean(dim=1)                                      # (B, E)
+            # Eq. 20: P_i = (1/T) * Σ_t s'_{i,t}
+            P_i = scores.mean(dim=1)                                      # (B, E)
+
+            # Eq. 17: L_Bal = Σ_i f_i * P_i
+            per_seq_loss = (f_i * P_i).sum(dim=-1)                        # (B,)
+            total_loss = total_loss + per_seq_loss.mean()
+            num_active_layers += 1
+            continue
+
+        token_count = token_mask.sum(dim=1)                               # (B,)
+        valid = token_count > 0
+        if not valid.any():
+            continue
+
+        expert_mask = expert_mask.float() * token_mask.unsqueeze(-1).unsqueeze(-1)
+        expert_counts = expert_mask.sum(dim=(1, 2))                       # (B, E)
+        f_i = (num_experts / (top_k * token_count.clamp(min=1.0).unsqueeze(-1))) * expert_counts
+        P_i = (scores * token_mask.unsqueeze(-1)).sum(dim=1) / token_count.clamp(min=1.0).unsqueeze(-1)
 
         # Eq. 17: L_Bal = Σ_i f_i * P_i
         per_seq_loss = (f_i * P_i).sum(dim=-1)                        # (B,)
+        total_loss = total_loss + per_seq_loss[valid].mean()
+        num_active_layers += 1
 
-        total_loss = total_loss + per_seq_loss.mean()
-
-    return total_loss / len(gate_logits)
+    if num_active_layers == 0:
+        return gate_logits[0].new_zeros(())
+    return total_loss / num_active_layers

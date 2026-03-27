@@ -16,7 +16,7 @@ Attention bank modes:
   - "fully_independent"  : Q, K, V, O each from separate banks — 4 routers
   - "per_head_fully_independent": each Q/K/V/O head routes independently
   - "precompute_kv"      : per-expert KV tables, routed Q and O — 1 router
-  - "per_head_precompute_kv": Q, KV, O heads route independently (K,V share router) — per-head precompute KV
+  - "per_head_precompute_kv": one flat router picks per-head experts; KV/O reuse that routing
 
 MLP bank: standard top-k MoE over SwiGLU experts (reuses Qwen3MoeExperts).
 
@@ -24,9 +24,11 @@ Design notes:
   - Token state is (E, K, V).  K,V persist across depths and are only
     refreshed when a token takes the attention branch.
   - Hard branch routing: each token picks EITHER attention OR MLP via
-    argmax. Only the selected branch computes. The output is scaled by
-    the softmax probability of the chosen branch for gradient flow
-    (same pattern as MoE expert routing).
+    argmax. MLP compute is restricted to selected tokens, and the
+    per-head attention modes also restrict attention compute to
+    selected tokens. The output is scaled by the softmax probability
+    of the chosen branch for gradient flow (same pattern as MoE
+    expert routing).
   - KV state: tokens that chose attention get fresh KV; tokens that
     chose MLP keep their old KV from the previous depth.
   - Pre-norm is bundled with each bank: the attention bank and MLP bank
@@ -408,12 +410,12 @@ class AttentionExpertBank(nn.Module):
             self.q_routers = nn.ModuleList([self._make_flat_bank_router(self.hidden_size, self.num_heads) for _ in range(self.num_depths)])
             self.k_routers = nn.ModuleList([self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv) for _ in range(self.num_depths)])
             self.v_routers = nn.ModuleList([self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv) for _ in range(self.num_depths)])
-            self.o_routers = nn.ModuleList([self._make_flat_bank_router(self.hidden_size, self.num_heads) for _ in range(self.num_depths)])
+            self.o_routers = nn.ModuleList([self._make_flat_bank_router(self.q_dim, self.num_heads) for _ in range(self.num_depths)])
         else:
             self.q_router = self._make_flat_bank_router(self.hidden_size, self.num_heads)
             self.k_router = self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv)
             self.v_router = self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv)
-            self.o_router = self._make_flat_bank_router(self.hidden_size, self.num_heads)
+            self.o_router = self._make_flat_bank_router(self.q_dim, self.num_heads)
         self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.head_dim))
         self.k_proj = nn.Parameter(torch.empty(E_kv, self.hidden_size, self.head_dim))
         self.v_proj = nn.Parameter(torch.empty(E_kv, self.hidden_size, self.head_dim))
@@ -476,11 +478,41 @@ class AttentionExpertBank(nn.Module):
         x = w.unsqueeze(1) * x
         return x.to(orig_dtype).view(N, num_heads * self.head_dim)
 
-    def _store_router_info(self, name: str, router_probs: torch.Tensor, expert_idx: torch.Tensor) -> None:
+    def _store_router_info(
+        self,
+        name: str,
+        router_probs: torch.Tensor,
+        expert_idx: torch.Tensor,
+        token_mask: torch.Tensor | None = None,
+    ) -> None:
+        if token_mask is not None:
+            flat_mask = token_mask.reshape(-1).bool().to(router_probs.device)
+            dense_probs = router_probs.new_zeros(flat_mask.numel(), router_probs.shape[-1])
+            dense_probs[flat_mask] = router_probs
+
+            if expert_idx.ndim == 1:
+                dense_idx = expert_idx.new_zeros(flat_mask.numel())
+            else:
+                dense_idx = expert_idx.new_zeros((flat_mask.numel(), expert_idx.shape[-1]))
+            dense_idx[flat_mask] = expert_idx
+
+            self.last_router_info[name] = {
+                "router_logits": dense_probs.detach(),
+                "selected_experts": dense_idx.detach(),
+                "token_mask": flat_mask.detach(),
+            }
+            return
+
         self.last_router_info[name] = {
             "router_logits": router_probs.detach(),
             "selected_experts": expert_idx.detach(),
         }
+
+    def _zero_dummy(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        dummy = torch.zeros((), device=device, dtype=dtype)
+        for param in self.parameters():
+            dummy = dummy + param.reshape(-1)[0].to(dtype) * 0.0
+        return dummy
 
     def _route(self, router, x):
         """Compute routing and return (expert_idx, expert_weights, router_probs)."""
@@ -626,18 +658,13 @@ class AttentionExpertBank(nn.Module):
                 q_router = self.q_router
                 k_router = self.k_router
                 v_router = self.v_router
-                o_router = self.o_router
 
             q_idx, q_w, q_probs = self._route_flat(q_router, q_flat, self.num_heads)
             k_idx, k_w, k_probs = self._route_flat(k_router, k_flat, self.num_kv_heads)
             v_idx, v_w, v_probs = self._route_flat(v_router, v_flat, self.num_kv_heads)
-            o_idx, o_w, o_probs = self._route_flat(o_router, q_flat, self.num_heads)
             self._store_router_info("q", q_probs, q_idx)
             self._store_router_info("k", k_probs, k_idx)
             self._store_router_info("v", v_probs, v_idx)
-            self._store_router_info("o", o_probs, o_idx)
-            self._flat_o_idx = o_idx
-            self._flat_o_w = o_w
 
             # Batched projections: (N, num_heads, head_dim)
             Q_heads = self._project_heads_batched(q_flat, self.q_proj, q_idx, q_w, self.q_norm_weight)
@@ -667,6 +694,7 @@ class AttentionExpertBank(nn.Module):
         K: torch.Tensor,
         V: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        depth_idx: int | None = None,
     ) -> torch.Tensor:
         """Run attention and O projection."""
         B = Q.shape[0]
@@ -683,11 +711,18 @@ class AttentionExpertBank(nn.Module):
 
         if self.mode == "per_head_fully_independent":
             N = B * T
+            attn_flat = attn_output.transpose(1, 2).reshape(N, self.q_dim)
+            if self.per_layer_attn_router and depth_idx is not None:
+                o_router = self.o_routers[depth_idx]
+            else:
+                o_router = self.o_router
+            o_idx, o_w, o_probs = self._route_flat(o_router, attn_flat, self.num_heads)
+            self._store_router_info("o", o_probs, o_idx)
             o_out = attn_output.new_zeros(N, self.hidden_size)
             for h in range(self.num_heads):
                 attn_h = attn_output[:, h, :, :].reshape(N, self.head_dim)
                 o_out = o_out + self._project_flat_head(
-                    attn_h, self.o_proj, self._flat_o_idx[:, h], self._flat_o_w[:, h])
+                    attn_h, self.o_proj, o_idx[:, h], o_w[:, h])
             return o_out.view(B, T, self.hidden_size)
 
         attn_output = attn_output.transpose(1, 2).reshape(B * T, self.q_dim)
@@ -699,6 +734,258 @@ class AttentionExpertBank(nn.Module):
             attn_output = self._route_and_project(self.o_router, attn_output, self.o_proj, router_name="o")
 
         return attn_output.view(B, T, self.hidden_size)
+
+    def _select_attn_routers(self, depth_idx: int | None = None):
+        if self.mode != "per_head_fully_independent":
+            return None
+        if self.per_layer_attn_router and depth_idx is not None:
+            return (
+                self.q_routers[depth_idx],
+                self.k_routers[depth_idx],
+                self.v_routers[depth_idx],
+                self.o_routers[depth_idx],
+            )
+        return self.q_router, self.k_router, self.v_router, self.o_router
+
+    def _empty_sparse_attn_result(
+        self,
+        hidden_states: torch.Tensor,
+        K_old: torch.Tensor,
+        V_old: torch.Tensor,
+        router_specs: list[tuple[str, int, int]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, T, _ = hidden_states.shape
+        flat_mask = torch.zeros(B * T, dtype=torch.bool, device=hidden_states.device)
+        for name, num_experts, top_k in router_specs:
+            empty_probs = hidden_states.new_zeros((0, num_experts))
+            empty_idx = torch.zeros((0, top_k), device=hidden_states.device, dtype=torch.long)
+            self._store_router_info(name, empty_probs, empty_idx, token_mask=flat_mask)
+        dummy = self._zero_dummy(hidden_states.device, hidden_states.dtype)
+        attn_out = hidden_states.new_zeros(B, T, self.hidden_size) + dummy
+        return attn_out, K_old, V_old
+
+    def project_and_attend_per_head_fully_independent_sparse(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        K_old: torch.Tensor,
+        V_old: torch.Tensor,
+        token_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        depth_idx: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, T, H = hidden_states.shape
+        self.last_router_info = {}
+        flat_mask = token_mask.reshape(-1).bool()
+
+        if not flat_mask.any():
+            return self._empty_sparse_attn_result(
+                hidden_states,
+                K_old,
+                V_old,
+                [
+                    ("q", self.num_experts, self.num_heads),
+                    ("k", self.num_kv_experts, self.num_kv_heads),
+                    ("v", self.num_kv_experts, self.num_kv_heads),
+                    ("o", self.num_experts, self.num_heads),
+                ],
+            )
+
+        if flat_mask.all():
+            Q, K_fresh, V_fresh = self.project(hidden_states, position_embeddings, depth_idx=depth_idx)
+            attn_out = self.attend(Q, K_fresh, V_fresh, attention_mask, depth_idx=depth_idx)
+            return attn_out, K_fresh, V_fresh
+
+        flat_hidden = hidden_states.reshape(B * T, H)
+        hidden_selected = flat_hidden[flat_mask]
+
+        if self.routed_norm:
+            normed = self.attn_pre_norm(hidden_selected)
+            q_flat = k_flat = v_flat = normed
+        elif self.per_layer_norm and depth_idx is not None:
+            normed = self.attn_pre_norms[depth_idx](hidden_selected)
+            q_flat = k_flat = v_flat = normed
+        else:
+            q_flat = self.q_pre_norm(hidden_selected)
+            k_flat = self.k_pre_norm(hidden_selected)
+            v_flat = self.v_pre_norm(hidden_selected)
+
+        q_router, k_router, v_router, o_router = self._select_attn_routers(depth_idx)
+        q_idx, q_w, q_probs = self._route_flat(q_router, q_flat, self.num_heads)
+        k_idx, k_w, k_probs = self._route_flat(k_router, k_flat, self.num_kv_heads)
+        v_idx, v_w, v_probs = self._route_flat(v_router, v_flat, self.num_kv_heads)
+        self._store_router_info("q", q_probs, q_idx, token_mask=flat_mask)
+        self._store_router_info("k", k_probs, k_idx, token_mask=flat_mask)
+        self._store_router_info("v", v_probs, v_idx, token_mask=flat_mask)
+
+        Q_sel = self._project_heads_batched(q_flat, self.q_proj, q_idx, q_w, self.q_norm_weight)
+        K_sel = self._project_heads_batched(k_flat, self.k_proj, k_idx, k_w, self.k_norm_weight)
+        V_sel = self._project_heads_batched(v_flat, self.v_proj, v_idx, v_w)
+
+        Q_flat = hidden_states.new_zeros(B * T, self.num_heads, self.head_dim)
+        K_flat = hidden_states.new_zeros(B * T, self.num_kv_heads, self.head_dim)
+        V_flat = hidden_states.new_zeros(B * T, self.num_kv_heads, self.head_dim)
+        Q_flat[flat_mask] = Q_sel
+        K_flat[flat_mask] = K_sel
+        V_flat[flat_mask] = V_sel
+
+        Q = Q_flat.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        K_fresh = K_flat.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        V_fresh = V_flat.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        Q, K_fresh = apply_rotary_pos_emb(Q, K_fresh, cos, sin)
+
+        attn_mask_kv = token_mask.unsqueeze(1)
+        K_new = torch.where(attn_mask_kv, K_fresh, K_old)
+        V_new = torch.where(attn_mask_kv, V_fresh, V_old)
+
+        K_expanded = repeat_kv(K_new, self.num_kv_groups)
+        V_expanded = repeat_kv(V_new, self.num_kv_groups)
+        attn_heads = hidden_states.new_zeros(B, self.num_heads, T, self.head_dim)
+        token_mask_2d = token_mask.squeeze(-1).bool()
+
+        for b in range(B):
+            pos = token_mask_2d[b].nonzero(as_tuple=False).squeeze(-1)
+            if pos.numel() == 0:
+                continue
+            Q_b = Q[b : b + 1, :, pos, :]
+            scores = torch.matmul(Q_b, K_expanded[b : b + 1].transpose(2, 3)) * self.scaling
+            if attention_mask is not None:
+                scores = scores + attention_mask[:, :, pos, :]
+            scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
+            attn_b = torch.matmul(scores, V_expanded[b : b + 1])
+            attn_heads[b, :, pos, :] = attn_b.squeeze(0).to(attn_heads.dtype)
+
+        attn_flat = attn_heads.transpose(1, 2).reshape(B * T, self.q_dim)
+        attn_selected = attn_flat[flat_mask]
+        o_idx, o_w, o_probs = self._route_flat(o_router, attn_selected, self.num_heads)
+        self._store_router_info("o", o_probs, o_idx, token_mask=flat_mask)
+
+        o_selected = hidden_states.new_zeros(attn_selected.shape[0], self.hidden_size)
+        for h in range(self.num_heads):
+            attn_h = attn_heads[:, h, :, :].reshape(B * T, self.head_dim)[flat_mask]
+            o_selected = o_selected + self._project_flat_head(attn_h, self.o_proj, o_idx[:, h], o_w[:, h])
+
+        attn_out = hidden_states.new_zeros(B * T, self.hidden_size)
+        attn_out[flat_mask] = o_selected
+        return attn_out.view(B, T, self.hidden_size), K_new, V_new
+
+    def project_and_attend_per_head_precompute_kv_sparse(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        K_old: torch.Tensor,
+        V_old: torch.Tensor,
+        token_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        depth_idx: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, T, H = hidden_states.shape
+        self.last_router_info = {}
+        flat_mask = token_mask.reshape(-1).bool()
+
+        if not flat_mask.any():
+            return self._empty_sparse_attn_result(
+                hidden_states,
+                K_old,
+                V_old,
+                [("attn", self.num_experts, self.num_heads)],
+            )
+
+        if flat_mask.all():
+            return self.project_and_attend_per_head_precompute_kv(
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                depth_idx=depth_idx,
+            )
+
+        flat_hidden = hidden_states.reshape(B * T, H)
+        hidden_selected = flat_hidden[flat_mask]
+
+        if self.per_layer_norm and depth_idx is not None:
+            normed = self.norms[depth_idx](hidden_selected)
+        else:
+            normed = self.norm(hidden_selected)
+
+        if self.per_layer_attn_router and depth_idx is not None:
+            router = self.routers[depth_idx]
+        else:
+            router = self.router
+
+        idx, w, probs = self._route_flat(router, normed, self.num_heads)
+        self._store_router_info("attn", probs, idx, token_mask=flat_mask)
+
+        Q_sel = self._project_heads_batched(normed, self.q_proj, idx, w, self.q_norm_weight)
+        Q_flat = hidden_states.new_zeros(B * T, self.num_heads, self.head_dim)
+        Q_flat[flat_mask] = Q_sel
+        Q = Q_flat.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        ones = normed.new_ones(normed.shape[0])
+        K_sel_parts = []
+        V_sel_parts = []
+        kv_weight_parts = []
+        for g in range(self.num_kv_heads):
+            kv_rank = g * self.num_kv_groups
+            kv_expert = idx[:, kv_rank]
+            kv_weight = w[:, kv_rank]
+            K_sel_parts.append(self._project_flat_head(normed, self.k_proj, kv_expert, ones, self.k_norm_weight))
+            V_sel_parts.append(self._project_flat_head(normed, self.v_proj, kv_expert, ones))
+            kv_weight_parts.append(kv_weight)
+
+        K_sel = torch.stack(K_sel_parts, dim=1)
+        V_sel = torch.stack(V_sel_parts, dim=1)
+
+        K_flat = hidden_states.new_zeros(B * T, self.num_kv_heads, self.head_dim)
+        V_flat = hidden_states.new_zeros(B * T, self.num_kv_heads, self.head_dim)
+        K_flat[flat_mask] = K_sel
+        V_flat[flat_mask] = V_sel
+
+        K_fresh = K_flat.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        V_fresh = V_flat.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        _, K_fresh = apply_rotary_pos_emb(Q, K_fresh, cos, sin)
+
+        attn_mask_kv = token_mask.unsqueeze(1)
+        K_new = torch.where(attn_mask_kv, K_fresh, K_old)
+        V_new = torch.where(attn_mask_kv, V_fresh, V_old)
+
+        attn_heads = hidden_states.new_zeros(B, self.num_heads, T, self.head_dim)
+        token_mask_2d = token_mask.squeeze(-1).bool()
+        selected_counts = token_mask_2d.sum(dim=1)
+        selected_ends = selected_counts.cumsum(dim=0)
+
+        for b in range(B):
+            pos = token_mask_2d[b].nonzero(as_tuple=False).squeeze(-1)
+            if pos.numel() == 0:
+                continue
+            start = 0 if b == 0 else int(selected_ends[b - 1].item())
+            end = int(selected_ends[b].item())
+            for g in range(self.num_kv_heads):
+                q_start = g * self.num_kv_groups
+                q_end = q_start + self.num_kv_groups
+                Q_b = Q[b : b + 1, q_start:q_end, pos, :]
+                K_b = K_new[b : b + 1, g : g + 1].expand(-1, self.num_kv_groups, -1, -1)
+                V_b = V_new[b : b + 1, g : g + 1].expand(-1, self.num_kv_groups, -1, -1)
+                scores = torch.matmul(Q_b, K_b.transpose(2, 3)) * self.scaling
+                if attention_mask is not None:
+                    scores = scores + attention_mask[:, :, pos, :]
+                scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
+                attn_b = torch.matmul(scores, V_b)
+                kv_weight = kv_weight_parts[g][start:end]
+                attn_b = attn_b * kv_weight.view(1, 1, -1, 1)
+                attn_heads[b, q_start:q_end, pos, :] = attn_b.squeeze(0).to(attn_heads.dtype)
+
+        o_selected = hidden_states.new_zeros(normed.shape[0], self.hidden_size)
+        for h in range(self.num_heads):
+            attn_h = attn_heads[:, h, :, :].reshape(B * T, self.head_dim)[flat_mask]
+            o_selected = o_selected + self._project_flat_head(attn_h, self.o_proj, idx[:, h], w[:, h])
+
+        attn_out = hidden_states.new_zeros(B * T, self.hidden_size)
+        attn_out[flat_mask] = o_selected
+        return attn_out.view(B, T, self.hidden_size), K_new, V_new
 
     def project_and_attend_precompute_kv(
         self,
@@ -916,18 +1203,73 @@ class MlpExpertBank(nn.Module):
         self.experts = Qwen3MoeExperts(config)
         self.last_router_logits = None
         self.last_selected_experts = None
+        self.last_token_mask = None
 
-    def forward(self, hidden_states: torch.Tensor, depth_idx: int | None = None) -> torch.Tensor:
+    def _zero_dummy(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        dummy = torch.zeros((), device=device, dtype=dtype)
+        for param in self.parameters():
+            dummy = dummy + param.reshape(-1)[0].to(dtype) * 0.0
+        return dummy
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        depth_idx: int | None = None,
+        token_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         B, T, H = hidden_states.shape
+        total_tokens = B * T
+        if token_mask is None:
+            self.last_token_mask = None
+        else:
+            flat_mask = token_mask.reshape(-1).bool()
+            self.last_token_mask = flat_mask.detach()
+            if not flat_mask.any():
+                self.last_router_logits = hidden_states.new_zeros(total_tokens, self.gate.num_experts)
+                self.last_selected_experts = torch.zeros(
+                    total_tokens,
+                    self.gate.top_k,
+                    device=hidden_states.device,
+                    dtype=torch.long,
+                )
+                dummy = self._zero_dummy(hidden_states.device, hidden_states.dtype)
+                return hidden_states.new_zeros(B, T, H) + dummy
+            if flat_mask.all():
+                token_mask = None
+
         if self.per_layer_norm and depth_idx is not None:
             normed = self.norms[depth_idx](hidden_states)
         else:
             normed = self.norm(hidden_states)
         flat = normed.view(-1, H)
-        router_logits, routing_weights, selected_experts = self.gate(flat)
-        out = self.experts(flat, selected_experts, routing_weights)
-        self.last_router_logits = router_logits
-        self.last_selected_experts = selected_experts
+
+        if token_mask is None:
+            router_logits, routing_weights, selected_experts = self.gate(flat)
+            out = self.experts(flat, selected_experts, routing_weights)
+            self.last_router_logits = router_logits
+            self.last_selected_experts = selected_experts
+            return out.view(B, T, H)
+
+        flat_mask = token_mask.reshape(-1).bool()
+        flat_selected = flat[flat_mask]
+        router_logits, routing_weights, selected_experts = self.gate(flat_selected)
+        out_selected = self.experts(flat_selected, selected_experts, routing_weights)
+
+        out = flat.new_zeros(total_tokens, H)
+        out[flat_mask] = out_selected
+
+        dense_logits = router_logits.new_zeros(total_tokens, router_logits.shape[-1])
+        dense_logits[flat_mask] = router_logits
+        dense_selected = torch.zeros(
+            total_tokens,
+            selected_experts.shape[-1],
+            device=selected_experts.device,
+            dtype=selected_experts.dtype,
+        )
+        dense_selected[flat_mask] = selected_experts
+
+        self.last_router_logits = dense_logits
+        self.last_selected_experts = dense_selected
         return out.view(B, T, H)
 
 
@@ -1003,6 +1345,7 @@ class MoEverythingModel(nn.Module):
 
         self._all_mlp_router_logits = []
         self._all_mlp_selected_experts = []
+        self._all_mlp_token_masks = []
         self._all_branch_probs = []
         self._all_attn_router_info = []
 
@@ -1043,42 +1386,64 @@ class MoEverythingModel(nn.Module):
         else:
             w_attn, w_mlp, attn_mask, mlp_mask = self.branch_router(hidden_states)
 
-        # w_attn/w_mlp: (B, T, 1) — routing weight for selected branch, 0 for unselected
-        # Both branches always execute (required for DDP gradient sync).
-        # Unselected tokens contribute zero via w_attn=0 / w_mlp=0.
+        attn_mask_bool = attn_mask.bool()
+        sparse_attn = not attn_mask_bool.all()
 
         # Attention branch
-        if self.attn_bank.mode == "per_head_precompute_kv":
+        if self.attn_bank.mode == "per_head_precompute_kv" and sparse_attn:
+            attn_out, K_new, V_new = self.attn_bank.project_and_attend_per_head_precompute_kv_sparse(
+                hidden_states, position_embeddings, K_old, V_old, attn_mask_bool, causal_mask, depth_idx=depth_idx
+            )
+        elif self.attn_bank.mode == "per_head_fully_independent" and sparse_attn:
+            attn_out, K_new, V_new = self.attn_bank.project_and_attend_per_head_fully_independent_sparse(
+                hidden_states, position_embeddings, K_old, V_old, attn_mask_bool, causal_mask, depth_idx=depth_idx
+            )
+        elif self.attn_bank.mode == "per_head_precompute_kv":
             attn_out, K_fresh, V_fresh = self.attn_bank.project_and_attend_per_head_precompute_kv(
                 hidden_states, position_embeddings, causal_mask, depth_idx=depth_idx
             )
+            attn_mask_kv = attn_mask_bool.unsqueeze(1)
+            K_new = torch.where(attn_mask_kv, K_fresh, K_old)
+            V_new = torch.where(attn_mask_kv, V_fresh, V_old)
+            if attn_mask_bool.all():
+                flat_attn_mask = attn_mask_bool.reshape(-1).detach()
+                for info in self.attn_bank.last_router_info.values():
+                    info["token_mask"] = flat_attn_mask
         elif self.attn_bank.mode == "precompute_kv":
             attn_out, K_fresh, V_fresh = self.attn_bank.project_and_attend_precompute_kv(
                 hidden_states, position_embeddings, causal_mask
             )
+            attn_mask_kv = attn_mask_bool.unsqueeze(1)
+            K_new = torch.where(attn_mask_kv, K_fresh, K_old)
+            V_new = torch.where(attn_mask_kv, V_fresh, V_old)
         else:
             Q, K_fresh, V_fresh = self.attn_bank.project(hidden_states, position_embeddings, depth_idx=depth_idx)
             # Tokens that chose MLP keep old KV in the blend
-            attn_mask_kv = attn_mask.unsqueeze(1)  # (B, 1, T, 1)
+            attn_mask_kv = attn_mask_bool.unsqueeze(1)  # (B, 1, T, 1)
             K_blend = torch.where(attn_mask_kv, K_fresh, K_old)
             V_blend = torch.where(attn_mask_kv, V_fresh, V_old)
-            attn_out = self.attn_bank.attend(Q, K_blend, V_blend, causal_mask)
+            attn_out = self.attn_bank.attend(Q, K_blend, V_blend, causal_mask, depth_idx=depth_idx)
+            K_new = torch.where(attn_mask_kv, K_fresh, K_old)
+            V_new = torch.where(attn_mask_kv, V_fresh, V_old)
+            if (
+                self.attn_bank.mode in ("per_head_fully_independent", "per_head_precompute_kv")
+                and attn_mask_bool.all()
+            ):
+                flat_attn_mask = attn_mask_bool.reshape(-1).detach()
+                for info in self.attn_bank.last_router_info.values():
+                    info["token_mask"] = flat_attn_mask
         if self.post_norm:
             pn = self.attn_post_norms[depth_idx] if hasattr(self, "attn_post_norms") else self.attn_post_norm
             attn_out = pn(attn_out)
         hidden_states = hidden_states + w_attn * attn_out
 
         # MLP branch
-        mlp_out = self.mlp_bank(hidden_states, depth_idx=depth_idx)
+        mlp_out = self.mlp_bank(hidden_states, depth_idx=depth_idx, token_mask=mlp_mask.bool())
         if self.post_norm:
             pn = self.mlp_post_norms[depth_idx] if hasattr(self, "mlp_post_norms") else self.mlp_post_norm
             mlp_out = pn(mlp_out)
         hidden_states = hidden_states + w_mlp * mlp_out
 
-        # KV state: attention tokens get fresh KV, MLP tokens keep old
-        attn_mask_kv = attn_mask.unsqueeze(1)  # (B, 1, T, 1)
-        K_new = torch.where(attn_mask_kv, K_fresh, K_old)
-        V_new = torch.where(attn_mask_kv, V_fresh, V_old)
         return hidden_states, K_new, V_new
 
     def forward(
@@ -1115,6 +1480,7 @@ class MoEverythingModel(nn.Module):
 
         self._all_mlp_router_logits = []
         self._all_mlp_selected_experts = []
+        self._all_mlp_token_masks = []
         self._all_branch_probs = []
         self._all_attn_router_info = []
 
@@ -1174,6 +1540,7 @@ class MoEverythingModel(nn.Module):
                 self._all_branch_probs.append(self.branch_router.last_probs)
             self._all_mlp_router_logits.append(self.mlp_bank.last_router_logits)
             self._all_mlp_selected_experts.append(self.mlp_bank.last_selected_experts)
+            self._all_mlp_token_masks.append(self.mlp_bank.last_token_mask)
             self._all_attn_router_info.append(self.attn_bank.last_router_info)
 
             kv_state = (K_new, V_new)
@@ -1195,7 +1562,7 @@ class MoEverythingModel(nn.Module):
 class MoEverythingForCausalLM(nn.Module):
     """Causal LM head over MoEverythingModel.
 
-    Computes CE loss + MLP load-balancing aux loss + branch entropy loss.
+    Computes CE loss plus optional MoE auxiliary losses.
     """
 
     supports_gradient_checkpointing = True
@@ -1256,6 +1623,7 @@ class MoEverythingForCausalLM(nn.Module):
 
         mlp_router_logits = tuple(self.model._all_mlp_router_logits) or None
         mlp_selected_experts = tuple(self.model._all_mlp_selected_experts) or None
+        mlp_token_masks = tuple(self.model._all_mlp_token_masks) or None
         branch_prob_tensors = tuple(self.model._all_branch_probs) or None
         attention_router_info = tuple(self.model._all_attn_router_info) or None
 
@@ -1274,6 +1642,7 @@ class MoEverythingForCausalLM(nn.Module):
                     mlp_router_logits,
                     self.num_experts,
                     self.num_experts_per_tok,
+                    token_masks=mlp_token_masks,
                 )
                 if isinstance(mlp_aux, torch.Tensor):
                     aux_loss = mlp_aux
@@ -1287,6 +1656,7 @@ class MoEverythingForCausalLM(nn.Module):
                     self.num_experts_per_tok,
                     batch_size=input_ids.shape[0],
                     selected_experts=mlp_selected_experts,
+                    token_masks=mlp_token_masks,
                 )
                 if isinstance(seq_aux, torch.Tensor):
                     seq_aux_loss = seq_aux
@@ -1301,6 +1671,7 @@ class MoEverythingForCausalLM(nn.Module):
                 for rname in attn_router_names:
                     r_logits = tuple(d[rname]["router_logits"] for d in attention_router_info if rname in d)
                     r_selected = tuple(d[rname]["selected_experts"] for d in attention_router_info if rname in d)
+                    r_masks = tuple(d[rname].get("token_mask") for d in attention_router_info if rname in d)
                     if not r_logits:
                         continue
                     n_experts = num_kv_experts if rname in ("k", "v") else num_attn_experts
@@ -1309,19 +1680,18 @@ class MoEverythingForCausalLM(nn.Module):
                         r_logits, n_experts, n_per_tok,
                         batch_size=input_ids.shape[0],
                         selected_experts=r_selected,
+                        token_masks=r_masks,
                     )
                     if isinstance(attn_seq_aux, torch.Tensor):
                         loss = loss + seq_aux_coef * attn_seq_aux
 
-            if branch_prob_tensors:
-                cat_probs = torch.cat([p.reshape(-1, 2) for p in branch_prob_tensors], dim=0)
-                mean_probs = cat_probs.mean(dim=0)
-                branch_aux_loss = 2.0 * (mean_probs**2).sum()
-                loss = loss + self.branch_router_aux_loss_coef * branch_aux_loss
+            # Branch probs tracked for logging only — no aux loss forcing balance.
+            # The model is free to learn any attention/MLP ratio per depth.
 
         if output_router_logits:
             router_logits_out = tuple(t.detach() for t in mlp_router_logits) if mlp_router_logits is not None else None
             selected_experts_out = tuple(t.detach() for t in mlp_selected_experts) if mlp_selected_experts is not None else None
+            router_token_masks_out = tuple(t.detach() if t is not None else None for t in mlp_token_masks) if mlp_token_masks is not None else None
             branch_probs_out = tuple(t.detach() for t in branch_prob_tensors) if branch_prob_tensors is not None else None
             attention_router_info_out = None
             if attention_router_info is not None:
@@ -1330,6 +1700,7 @@ class MoEverythingForCausalLM(nn.Module):
                         name: {
                             "router_logits": info["router_logits"],
                             "selected_experts": info["selected_experts"],
+                            **({"token_mask": info["token_mask"]} if "token_mask" in info else {}),
                         }
                         for name, info in depth_info.items()
                     }
@@ -1338,6 +1709,7 @@ class MoEverythingForCausalLM(nn.Module):
         else:
             router_logits_out = None
             selected_experts_out = None
+            router_token_masks_out = None
             branch_probs_out = None
             attention_router_info_out = None
 
@@ -1350,6 +1722,7 @@ class MoEverythingForCausalLM(nn.Module):
             seq_aux_loss=seq_aux_loss,
             branch_aux_loss=branch_aux_loss,
             selected_experts=selected_experts_out,
+            router_token_masks=router_token_masks_out,
             branch_probs=branch_probs_out,
             attention_router_info=attention_router_info_out,
         )
@@ -1368,6 +1741,7 @@ class _MoEverythingOutput:
         seq_aux_loss=None,
         branch_aux_loss=None,
         selected_experts=None,
+        router_token_masks=None,
         branch_probs=None,
         attention_router_info=None,
     ):
@@ -1379,6 +1753,7 @@ class _MoEverythingOutput:
         self.seq_aux_loss = seq_aux_loss
         self.branch_aux_loss = branch_aux_loss
         self.selected_experts = selected_experts
+        self.router_token_masks = router_token_masks
         self.branch_probs = branch_probs
         self.attention_router_info = attention_router_info
         self.past_key_values = None

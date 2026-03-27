@@ -2,10 +2,15 @@
 Tests for Standard MoE and Global MoE models.
 Run with: uv run pytest tests/ -v
 """
+from pathlib import Path
+from types import MethodType
+
 import pytest
 import torch
+import torch.nn.functional as F
 from src.models import Qwen3MoeConfig, StandardMoEModel, GlobalMoEConfig, GlobalMoEForCausalLM
 from src.models.global_moe import GlobalMoEModel
+from transformers.models.qwen3_moe.modeling_qwen3_moe import repeat_kv
 
 
 # ── Tiny config for fast CPU tests ──────────────────────────────────────────
@@ -434,12 +439,13 @@ def test_moe_everything_output_router_fields(mode):
 
     assert out.loss is not None
     assert out.ce_loss is not None
-    assert out.branch_aux_loss is not None
+    # branch_aux_loss removed — no forced balance between attention and MLP
     assert out.router_logits is not None and len(out.router_logits) == 2
     assert out.selected_experts is not None and len(out.selected_experts) == 2
     assert out.branch_probs is not None and len(out.branch_probs) == 2
     assert out.attention_router_info is not None and len(out.attention_router_info) == 2
     assert set(out.attention_router_info[0].keys()) == _expected_attn_router_keys(mode)
+    assert out.router_token_masks is not None and len(out.router_token_masks) == 2
 
 
 def test_moe_everything_deepseek_checkpointing_counts_once():
@@ -462,9 +468,10 @@ def test_moe_everything_deepseek_checkpointing_counts_once():
 
     attn_count = model.model.attn_bank.router.local_tokens_per_expert.sum().item()
     mlp_count = model.model.mlp_bank.gate.local_tokens_per_expert.sum().item()
+    mlp_active_tokens = sum(mask.sum().item() for mask in out.router_token_masks if mask is not None)
 
     assert attn_count == pytest.approx(num_tokens * num_depths * attn_topk)
-    assert mlp_count == pytest.approx(num_tokens * num_depths * mlp_topk)
+    assert mlp_count == pytest.approx(mlp_active_tokens * mlp_topk)
 
 
 # ── Per-layer router tests ────────────────────────────────────────────────
@@ -628,6 +635,134 @@ def test_routed_norm_combined_with_per_layer_attn_router(mode):
                if p.requires_grad and p.grad is None
                and (mode not in PRECOMPUTE_KV_MODES or n not in skip)]
     assert len(no_grad) == 0, f"Params without grad: {no_grad}"
+
+
+def _force_branch_choices(model: MoEverythingForCausalLM, attn_ids: list[int], mlp_ids: list[int]) -> None:
+    with torch.no_grad():
+        emb = model.model.embed_tokens.weight
+        emb.zero_()
+        for token_id in attn_ids:
+            emb[token_id, 0] = 1.0
+        for token_id in mlp_ids:
+            emb[token_id, 0] = -1.0
+
+        gate = model.model.branch_router.gate.weight
+        gate.zero_()
+        gate[0, 0] = 1.0
+        gate[1, 0] = -1.0
+
+
+def test_per_head_fully_independent_o_router_uses_attention_output():
+    config = tiny_moe_everything_config("per_head_fully_independent")
+    config.num_hidden_layers = 1
+    model = MoEverythingForCausalLM(config).eval()
+    bank = model.model.attn_bank
+    captured = {}
+    original_route_flat = bank._route_flat
+
+    def wrapped_route_flat(self, router, x, top_k):
+        if router is bank.o_router:
+            captured["o_input"] = x.detach().clone()
+        return original_route_flat(router, x, top_k)
+
+    bank._route_flat = MethodType(wrapped_route_flat, bank)
+
+    hidden_states = torch.randn(2, 4, config.hidden_size)
+    position_ids = torch.arange(hidden_states.shape[1]).unsqueeze(0).expand(hidden_states.shape[0], -1)
+    position_embeddings = model.model.rotary_emb(hidden_states, position_ids=position_ids)
+
+    with torch.no_grad():
+        Q, K, V = bank.project(hidden_states, position_embeddings, depth_idx=0)
+        K_expanded = repeat_kv(K, bank.num_kv_groups)
+        V_expanded = repeat_kv(V, bank.num_kv_groups)
+        scores = torch.matmul(Q, K_expanded.transpose(2, 3)) * bank.scaling
+        probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
+        expected_o_input = torch.matmul(probs, V_expanded).transpose(1, 2).reshape(-1, bank.q_dim)
+        _ = bank.attend(Q, K, V, depth_idx=0)
+
+    assert "o_input" in captured
+    assert captured["o_input"].shape[-1] == bank.q_dim
+    torch.testing.assert_close(captured["o_input"], expected_o_input)
+
+
+@pytest.mark.parametrize("mode", PER_HEAD_MODES)
+def test_per_head_branch_masks_are_reported(mode):
+    config = tiny_moe_everything_config(mode)
+    config.num_hidden_layers = 1
+    model = MoEverythingForCausalLM(config).eval()
+    _force_branch_choices(model, attn_ids=[1], mlp_ids=[2])
+    ids = torch.tensor([[1, 2, 1, 2]])
+
+    with torch.no_grad():
+        out = model(input_ids=ids, labels=ids, output_router_logits=True)
+
+    expected_attn = torch.tensor([True, False, True, False])
+    expected_mlp = ~expected_attn
+    torch.testing.assert_close(out.router_token_masks[0].cpu(), expected_mlp)
+
+    attn_info = out.attention_router_info[0]
+    attn_router_names = ("q", "k", "v", "o") if mode == "per_head_fully_independent" else ("attn",)
+    for name in attn_router_names:
+        info = attn_info[name]
+        torch.testing.assert_close(info["token_mask"].cpu(), expected_attn)
+        assert torch.count_nonzero(info["router_logits"][~expected_attn]).item() == 0
+
+    assert torch.count_nonzero(out.router_logits[0][~expected_mlp]).item() == 0
+
+
+@pytest.mark.parametrize("mode", PER_HEAD_MODES)
+@pytest.mark.parametrize(
+    ("attn_ids", "mlp_ids"),
+    [
+        ([1], []),
+        ([], [2]),
+    ],
+)
+def test_per_head_single_branch_backward_keeps_grads(mode, attn_ids, mlp_ids):
+    config = tiny_moe_everything_config(mode)
+    config.num_hidden_layers = 1
+    model = MoEverythingForCausalLM(config).train()
+    _force_branch_choices(model, attn_ids=attn_ids, mlp_ids=mlp_ids)
+    token_id = attn_ids[0] if attn_ids else mlp_ids[0]
+    ids = torch.full((2, 4), token_id, dtype=torch.long)
+
+    out = model(input_ids=ids, labels=ids, output_router_logits=True)
+    out.loss.backward()
+
+    assert model.model.attn_bank.q_proj.grad is not None
+    assert model.model.mlp_bank.gate.weight.grad is not None
+
+    attn_info = out.attention_router_info[0]
+    attn_router_names = ("q", "k", "v", "o") if mode == "per_head_fully_independent" else ("attn",)
+    expected_attn = torch.full((ids.numel(),), bool(attn_ids))
+    expected_mlp = ~expected_attn
+    torch.testing.assert_close(out.router_token_masks[0].cpu(), expected_mlp)
+    for name in attn_router_names:
+        torch.testing.assert_close(attn_info[name]["token_mask"].cpu(), expected_attn)
+
+
+@pytest.mark.parametrize("mode", PER_HEAD_MODES)
+def test_per_head_sparse_paths_work_under_bfloat16_autocast(mode):
+    config = tiny_moe_everything_config(mode)
+    config.num_hidden_layers = 1
+    model = MoEverythingForCausalLM(config).train()
+    _force_branch_choices(model, attn_ids=[1], mlp_ids=[2])
+    ids = torch.tensor([[1, 2, 1, 2]])
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        out = model(input_ids=ids, labels=ids, output_router_logits=True)
+
+    assert out.loss is not None
+    assert torch.isfinite(out.loss.float())
+
+
+def test_base_per_head_fully_independent_configs_use_256_attention_experts():
+    base_cfg = Path("configs/moe_everything_per_head_fully_independent.yaml").read_text()
+    debug_cfg = Path(
+        "configs/scaling/debug8_xs_deepseek_moe_everything_per_head_fully_independent.yaml"
+    ).read_text()
+    assert "num_attn_experts: 256" in base_cfg
+    assert "num_attn_experts: 256" in debug_cfg
 
 
 # ── Dynamic depth tests ───────────────────────────────────────────────────

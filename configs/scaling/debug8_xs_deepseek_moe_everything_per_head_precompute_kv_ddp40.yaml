@@ -1,11 +1,12 @@
-# Per-head precompute KV + per-layer routers + per-layer norms (1 attn + 1 MLP norm per depth)
-experiment_name: moe_everything_per_head_precompute_kv_prenorm
+# XS scale — per-head precompute_kv on 8 GPUs for throughput / stability checks
+# Extended debug run: 40 steps to catch slowdowns after warmup
+experiment_name: debug8_xs_deepseek_moe_everything_per_head_precompute_kv_ddp40
 
 model:
   type: moe_everything
   vocab_size: 151936
   hidden_size: 1024
-  num_hidden_layers: 32
+  num_hidden_layers: 8
   head_dim: 128
   num_attention_heads: 16
   num_key_value_heads: 8
@@ -24,9 +25,7 @@ model:
   num_attn_experts_per_tok: 1
   attn_expert_mode: per_head_precompute_kv
   use_deepseek_routing: true
-  per_layer_router: true
-  per_layer_attn_router: true
-  per_layer_norm: true
+  branch_router_aux_loss_coef: 0.01
   attention_bias: false
   attention_dropout: 0.0
   rms_norm_eps: 1.0e-6
@@ -42,19 +41,19 @@ training:
   beta2: 0.95
   max_grad_norm: 1.0
   lr_scheduler: cosine
-  warmup_steps: 1000
-  max_steps: 100000
+  warmup_steps: 8
+  max_steps: 40
   min_lr_ratio: 0.1
-  batch_size: 16
-  gradient_accumulation: 4
+  batch_size: 8
+  gradient_accumulation: 1
   mixed_precision: bf16
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   log_every: 1
-  routing_log_every: 50
-  save_every: 1000
-  output_dir: ./outputs/moe_everything_per_head_precompute_kv_prenorm
-  wandb_project: moe-scaling
-  wandb_run_name: moe_everything_per_head_precompute_kv_prenorm
+  routing_log_every: 10
+  save_every: 100000
+  output_dir: ./outputs/debug8_xs_deepseek_moe_everything_per_head_precompute_kv_ddp40
+  wandb_project: null
+  wandb_run_name: debug8_xs_deepseek_moe_everything_per_head_precompute_kv_ddp40
 
 data:
   data_dir: ./data/parquet
