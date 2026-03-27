@@ -390,6 +390,10 @@ def build_model(cfg: dict):
             group_topk=mcfg.get("group_topk", None),
             seq_aux_loss_coef=mcfg.get("seq_aux_loss_coef", 0.0),
             per_layer_router=mcfg.get("per_layer_router", False),
+            per_layer_attn_router=mcfg.get("per_layer_attn_router", False),
+            routed_norm=mcfg.get("routed_norm", False),
+            per_layer_norm=mcfg.get("per_layer_norm", False),
+            post_norm=mcfg.get("post_norm", False),
             dynamic_depth_min=mcfg.get("dynamic_depth_min", 1.0),
             dynamic_depth_max=mcfg.get("dynamic_depth_max", 1.0),
             depthwise_attention=mcfg.get("depthwise_attention", False),
@@ -959,6 +963,18 @@ def main() -> None:
                         torch.distributed.all_reduce(entry["sum"], op=torch.distributed.ReduceOp.SUM)
                         torch.distributed.all_reduce(entry["count"], op=torch.distributed.ReduceOp.SUM)
 
+                # Collect norm bank counts (all ranks need to participate in all_reduce)
+                norm_counts = {}
+                unwrapped = accelerator.unwrap_model(model)
+                for name, module in unwrapped.named_modules():
+                    if isinstance(module, NormExpertBank):
+                        counts = module.local_tokens_per_expert.clone()
+                        if accelerator.num_processes > 1:
+                            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+                        label = "attn_norm" if "attn" in name else "mlp_norm"
+                        norm_counts[label] = counts
+                        module.local_tokens_per_expert.zero_()
+
                 if accelerator.is_main_process:
                     scalar_stats = {}
                     if expert_count_accum is not None:
@@ -985,20 +1001,9 @@ def main() -> None:
 
                     scalar_stats.update(branch_accumulator_to_stats(branch_prob_accum))
 
-                    # Collect norm bank counts
-                    norm_counts = {}
-                    for name, module in raw_model.named_modules():
-                        if isinstance(module, NormExpertBank):
-                            counts = module.local_tokens_per_expert.clone()
-                            if accelerator.num_processes > 1:
-                                torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
-                            label = "attn_norm" if "attn" in name else "mlp_norm"
-                            norm_counts[label] = counts
-                            total = counts.sum().item()
-                            num_e = counts.shape[0]
-                            active = int((counts > 0).sum().item())
-                            scalar_stats[f"routing/{label}_global_active_experts"] = active
-                            module.local_tokens_per_expert.zero_()
+                    for label, counts in norm_counts.items():
+                        active = int((counts > 0).sum().item())
+                        scalar_stats[f"routing/{label}_global_active_experts"] = active
 
                     # Surface global active expert counts at top level for easy tracking
                     if "routing/global_pool_num_active" in scalar_stats:

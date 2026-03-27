@@ -1,19 +1,29 @@
 #!/bin/bash
-# Launch all DeepSeek MoE experiments in parallel
+# Launch all 4 MoE-Everything per-head + per-layer router experiments sequentially
+# batch_size=32 × grad_accum=2 = 64 per rank, gradient checkpointing ON
 set -e
 
-echo "Launching all runs in parallel..."
+ACCEL_CONFIG="accelerate_configs/ddp_8gpu.yaml"
 
-# modal run --detach modal_train.py --config configs/global_moe.yaml &
-# modal run --detach modal_train.py --config configs/global_moe_nointerp.yaml &
-# modal run --detach modal_train.py --config configs/standard_moe.yaml &
-# modal run --detach modal_train.py --config configs/scaling/xs_dense_baseline.yaml &
+CONFIGS=(
+  "configs/moe_everything_per_head_independent_prenorm.yaml"
+  "configs/moe_everything_per_head_independent_bothnorm.yaml"
+  "configs/moe_everything_per_head_precompute_kv_prenorm.yaml"
+  "configs/moe_everything_per_head_precompute_kv_bothnorm.yaml"
+)
 
-modal run --detach modal_train.py --config configs/moe_everything_bundled.yaml &
-modal run --detach modal_train.py --config configs/moe_everything_kv_paired.yaml &
-modal run --detach modal_train.py --config configs/moe_everything_qk_paired.yaml &
-modal run --detach modal_train.py --config configs/moe_everything_fully_independent.yaml &
-modal run --detach modal_train.py --config configs/moe_everything_precompute_kv.yaml &
+for cfg in "${CONFIGS[@]}"; do
+  name=$(basename "$cfg" .yaml)
+  echo "=========================================="
+  echo "Launching: $name"
+  echo "Config:    $cfg"
+  echo "=========================================="
+  uv run accelerate launch --config_file "$ACCEL_CONFIG" \
+    train.py --config "$cfg" \
+    --output_dir "./outputs/${name}"
+  echo ""
+  echo "$name finished."
+  echo ""
+done
 
-wait
-echo "All runs launched."
+echo "All 4 runs complete."

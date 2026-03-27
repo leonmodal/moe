@@ -1,381 +1,293 @@
-# Mixture-of-Everything
+# Mixture-of-Everything Architecture
 
-We want to design an architecture that dynamically allocates both **weights** and **computation graph** at the **token level**.
+## Core Idea
 
-We start with a new view about transformer and token states.
+A standard MoE transformer has 16 independent layers, each owning its own attention weights and MLP experts. Mixture-of-Everything takes ALL those weights and puts them into shared banks — one bank of attention head experts, one bank of MLP experts — then loops over 32 depth iterations, routing into the same banks every time. This is a Universal Transformer with heterogeneous expert routing.
 
----
+The key difference from a standard transformer: instead of each layer doing attention THEN MLP in sequence, each token at each depth picks EITHER attention OR MLP via a branch router. Only the selected branch computes.
 
-## 1. A new view of token state as $(E, K, V)$
+## Standard Transformer Comparison
 
-We represent each token $i$ at depth $\ell$ as a triple:
-
-$$
-s_i^{(\ell)} = \big(E_i^{(\ell)},\; K_i^{(\ell)},\; V_i^{(\ell)}\big)
-$$
-
-- $E_i^{(\ell)} \in \mathbb{R}^{d}$ — the hidden states
-- $K_i^{(\ell)} \in \mathbb{R}^{d_k}$ — Key
-- $V_i^{(\ell)} \in \mathbb{R}^{d_v}$ — Value
-
-Based on this separation, we will show what the model updates the token state for attention and MLP separately.
-
-The full sequence state at depth $\ell$ is
-
-$$
-S^{(\ell)} = \{(E_i^{(\ell)}, K_i^{(\ell)}, V_i^{(\ell)})\}_{i=0}^{n-1}.
-$$
-
-**Initialization.** At depth 0, we set:
-
-$$
-E_i^{(0)} = \mathrm{Embed}(x_i)
-$$
-
-$$
-K_i^{(0)} = \mathrm{RoPE}\!\left(E_i^{(0)} W_K^{(0)},\; i\right), \qquad V_i^{(0)} = E_i^{(0)} W_V^{(0)}
-$$
-
-This creates an initial KV cache from the embedding before any attention is run. We use **RoPE** as the only source of positional information — no learned or additive positional embeddings.
-
-Another way to initialize this initial KV cache is to create a big matrix like the token embedding. This could create more memory and might be hard to optimize.
-
----
-
-## 2. Decomposing the Transformer
-
-A Transformer block is just two operations applied to the token state. They differ in what they update:
-
-| Operation | Updates $E$ | Updates $(K, V)$ | Reads other tokens |
-| --- | --- | --- | --- |
-| **Attention** | yes | yes | yes |
-| **MLP** | yes | no | no |
-
-### 2.1 Attention
-
-Given token $i$ at depth $ell$:
-
-$$
-\tilde{E}_i = \mathrm{RMSNorm}(E_i^{(\ell)})
-$$
-
-First, compute Q, K, V from the current state:
-
-$$
-Q_i = \mathrm{RoPE}(\tilde{E}_i \, W_Q, \; i), \qquad K_i^{(\ell)} = \mathrm{RoPE}(\tilde{E}_i \, W_K, \; i), \qquad V_i^{(\ell)} = \tilde{E}_i \, W_V
-$$
-
-Then, attend over all visible positions using the updated KV table:
-
-$$
-\alpha_{ij} = \mathrm{softmax}_j\!\left(\frac{Q_i^\top K_j^{(\ell)}}{\sqrt{d_k}}\right), \qquad j \leq i
-$$
-
-$$
-\mathrm{AttnOut}_i = \left(\sum_{j \leq i} \alpha_{ij} \, V_j^{(\ell)}\right) W_O
-$$
-
-State update — only $E$ changes after attention:
-
-$$
-E_i^{(\ell+1)} = E_i^{(\ell)} + \mathrm{AttnOut}_i
-$$
-
-$$
-K_i^{(\ell+1)} = K_i^{(\ell)}, \qquad V_i^{(\ell+1)} = V_i^{(\ell)}
-$$
-
-```python
-# Attention step for token i at depth l
-E_norm = rmsnorm(E_i)
-Q_i = rope(E_norm @ W_Q, position=i)
-K_i = rope(E_norm @ W_K, position=i)      # refresh KV before attention
-V_i = E_norm @ W_V
-
-scores = (Q_i @ K_all.T) / sqrt(d_k)
-scores = causal_mask(scores, i)
-alpha = softmax(scores)
-attn_out = (alpha @ V_all) @ W_O
-
-E_i = E_i + attn_out                       # only E updates after attention
-```
-
-### 2.2 MLP
-
-Each MLP uses a **SiLU-gated** feedforward network. Given token $i$ at depth $ell$:
-
-$$
-\tilde{E}_i = \mathrm{RMSNorm}(E_i^{(\ell)})
-$$
-
-$$
-\mathrm{MLPOut}_i = \big(\mathrm{SiLU}(\tilde{E}_i \, W_{\text{gate}}) \odot \tilde{E}_i \, W_{\text{up}}\big) \, W_{\text{down}}
-$$
-
-State update — MLP updates only $E$:
-
-$$
-E_i^{(\ell+1)} = E_i^{(\ell)} + \mathrm{MLPOut}_i
-$$
-
-$$
-K_i^{(\ell+1)} = K_i^{(\ell)}, \qquad V_i^{(\ell+1)} = V_i^{(\ell)}
-$$
-
-```python
-# MLP step for token i at depth l
-E_norm = rmsnorm(E_i)
-
-gate = silu(E_norm @ W_gate)
-up   = E_norm @ W_up
-mlp_out = (gate * up) @ W_down
-
-E_i = E_i + mlp_out
-# K_i, V_i unchanged
-```
-
----
-
-## 4. Main architectural design
-
-### 4.1 Mixture of Everything
-
-Each token at each depth uses a hierarchical router:
-
-1. choose **ATTENTION** or **MLP**
-2. then choose weights/operators inside that branch
-
-Formally,
-
-$$
-r_i^{(\ell)} \in \{\mathrm{ATTN}, \mathrm{MLP}\}.
-$$
-
-**MLP bank.** A set of $N_{\text{MLP}}$ experts:
-
-$$
-\mathcal{B}_{\text{MLP}} = \{f_1, f_2, \dots, f_{N_{\text{MLP}}}\}
-$$
-
-The router selects top-$K$ experts and produces a weighted combination:
-
-$$
-\mathrm{MLPOut}_i = \sum_{m \in \mathrm{TopK}(i,\ell)} w_{i,m}^{(\ell)} \; f_m\!\left(\tilde{E}_i\right)
-$$
-
-**Attention bank.** A set of $N_{\text{ATTN}}$ attention weight sets. What goes into each set is a design choice — the options below vary in how much is shared vs. independent:
-
-**Fully independent selection.** Each matrix is chosen independently per token:
-
-$$
-W_Q \sim \mathcal{B}_Q,\qquad
-W_K \sim \mathcal{B}_K,\qquad
-W_V \sim \mathcal{B}_V,\qquad
-W_O \sim \mathcal{B}_O
-$$
-
-Maximum flexibility, but query and key may come from unrelated expert spaces.
-
-$Q,O$ **paired,** $(K,V)$ **paired.** $K$ and $V$ are always chosen together:
-
-$$
-(W_Q, W_O) \sim \mathcal{B}_{QO},\qquad
-(W_K, W_V) \sim \mathcal{B}_{KV}
-$$
-
-$K$ and $V$ stay coherent per token, but cross-token $Q$-$K$ mismatch remains.
-
-$(Q,K,V)$ **bundled.** Everything selected as one unit:
-
-$$
-(W_Q, W_K, W_V, W_O) \sim \mathcal{B}_{\mathrm{ATTN}}
-$$
-
-This removes internal mismatch within a bundle, but because $(K,V)$ persist across depth, cross-token compatibility is still not guaranteed once different tokens carry memories written by different bundles at different times.
-
-The central question is whether attention scores remain meaningful when different tokens publish $(K,V)$ using different expert-specific projections.
-
-$$
-K_i = \phi_K^{(e_i)}(E_i),\qquad
-V_i = \phi_V^{(e_i)}(E_i).
-$$
-
-Then a single query must compare against keys generated by many different expert families inside one softmax, which might not be ideal, as they live in different subspaces.
-
-### 4.1.2
-
-Compute all KV heads for every single token first, and let the router choose $W_Q$, $W_O$, and then choose the corresponding $K$, $V$ with $Q$ and $O$.
-
----
-
-### 4.2 Mixture of Depthwise Recurrent MLPs, fixed attention
-
-Attention is standard and always applied at fixed block positions. Routing is used only for MLP experts and optionally for the number of MLP rounds between attention steps.
-
-A token path may therefore look like
-
-$$
-\mathrm{Attn}_{\ell_1}
-\rightarrow
-\mathrm{MLP}
-\rightarrow
-\mathrm{MLP}
-\rightarrow
-\mathrm{MLP}
-\rightarrow
-\mathrm{Attn}_{\ell_2}.
-$$
-
-A block is:
+A standard 16-layer MoE transformer (our XS baseline):
 
 ```
-1. Standard attention
-   E <- E + Attn(RMSNorm(E))
-   K, V refreshed from E using standard shared projections
-
-2. MLP routing for R rounds
-   E <- E + MoE-MLP(RMSNorm(E))
-   K, V unchanged during MLP rounds
+Layer 0:  RMSNorm → Attention(Q₀,K₀,V₀,O₀) → RMSNorm → MLP(Router₀ → top-4 of 16 experts)
+Layer 1:  RMSNorm → Attention(Q₁,K₁,V₁,O₁) → RMSNorm → MLP(Router₁ → top-4 of 16 experts)
+...
+Layer 15: RMSNorm → Attention(Q₁₅,K₁₅,V₁₅,O₁₅) → RMSNorm → MLP(Router₁₅ → top-4 of 16 experts)
 ```
 
-This avoids public (K,V) subspace mismatch because all attention uses the same shared projections.
+Total attention head parameters across all layers:
+- Q: 16 layers × 16 heads = 256 head projections `(1024 → 128)` each
+- K: 16 layers × 8 KV heads = 128 head projections `(1024 → 128)` each
+- V: 16 layers × 8 KV heads = 128 head projections `(1024 → 128)` each
+- O: 16 layers × 16 heads = 256 head projections `(128 → 1024)` each
 
----
+Total MLP experts: 16 layers × 16 experts = 256 SwiGLU experts
 
-### 4.3 Mixture of MLPs + recursion + mixture of depth
+In MoE-Everything, we collect all of these into shared banks:
+- Q bank: 256 expert head projections
+- K bank: 128 expert head projections
+- V bank: 128 expert head projections
+- O bank: 256 expert head projections
+- MLP bank: 256 SwiGLU experts
 
-Attention uses shared weights. MLP uses routed experts. On top of this, the model can **loop** — repeating the same weights multiple times before moving on. A per-token router decides at each step:
+Then loop 32 times, routing into these banks at every depth.
 
-$$
-r_i^{(\ell)} \in \{\mathrm{NEXT}, \mathrm{RECURSE}\}
-$$
+## Forward Pass
 
-**RECURSE** re-applies the current block with the same weights. **NEXT** advances to the next block. Different tokens can recurse a different number of times, so recursion depth is token-dependent.
+### 1. Input Processing
 
-**What gets looped.** Let $B$ be a recurrent block consisting of one or more layers $L_1, dots, L_k$. A block with $k=1$ is a single attention+MLP layer; $k>1$ groups multiple layers as one recurrent unit. The model is:
+```
+input_ids (B, T)
+    → Embedding(151936, 1024)
+    → hidden_states (B, T, 1024)
 
-$$
-\underbrace{B_1, \dots, B_P}_{\text{non-recurrent}} \;\rightarrow\; \underbrace{B_{P+1}, \dots, B_{P+R}}_{\text{recurrent}} \;\rightarrow\; \underbrace{B_{P+R+1}, \dots, B_{P+R+C}}_{\text{non-recurrent}}
-$$
+Initial KV state (so attention works from depth 0):
+    K_init = Linear(1024 → 1024) → RMSNorm per head → RoPE
+    V_init = Linear(1024 → 1024)
+    Shape: (B, 8 kv_heads, T, 128 head_dim)
 
-Each recurrent block $B_j$ repeats $r_i^{(j)}$ times for token $i$, with all iterations sharing the same weights. At each recurrent step $t$:
-
-$$
-E_i^{(t)} = B_j(E_i^{(t-1)})
-$$
-
-Since the same block weights are reused across iterations, all KV projections stay in the same subspace.
-
-```python
-# General recurrent execution for token i
-E_i = embed(x_i)
-
-for block in all_blocks:
-    if block.recurrent:
-        for t in range(r_i[block]):         # r_i per block, token-dependent
-            E_i = block(E_i)                # same weights every iteration
-    else:
-        E_i = block(E_i)                    # run once
+Position embeddings:
+    cos, sin = RotaryEmbedding()    # computed once, reused all 32 depths
 ```
 
-Within between each attention block, we could still do as many MLP forwards as we want.
+### 2. Depth Loop (32 iterations)
 
-**References:**
+All weight banks are shared. Only activations change. The state carried across depths is `(hidden_states, K, V)`.
 
-- **Scaling up Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach** — [https://arxiv.org/abs/2502.05171](https://arxiv.org/abs/2502.05171)
-- **Mixture-of-Recursions: Learning Dynamic Recursive Depths for Adaptive Token-Level Computation** — [https://arxiv.org/abs/2507.10524](https://arxiv.org/abs/2507.10524)
-- **Scaling Latent Reasoning via Looped Language Models** — [https://arxiv.org/abs/2510.25741](https://arxiv.org/abs/2510.25741)
+For each depth `d` in 0..31:
 
----
+#### Step A: Branch Router — ATTENTION or MLP (hard routing)
 
-## 5. Depth-wise attention and attention residuals
-
-If the model includes recursion or looping, one may additionally introduce attention over depth/history rather than only over sequence positions.
-
-Let the history of token $i$ up to depth $\ell$ be
-
-$$
-\mathcal{H}_i^{(\ell)} = \{E_i^{(0)}, E_i^{(1)}, \dots, E_i^{(\ell)}\}.
-$$
-
-A generic depth-attention update is
-
-$$
-\widetilde{E}_i^{(\ell+1)}
-=
-E_i^{(\ell)} + \mathrm{DepthAttn}\!\left(E_i^{(\ell)}, \mathcal{H}_i^{(\ell)}\right).
-$$
-
-A practical implementation in the style of **Attention Residuals** is to maintain a running residual memory across recursive steps and allow the current step to attend to that history.
-
-### 5.1 Attention Residuals-style pseudocode
-
-```python
-# token i at recurrent step t inside layer l
-# states from previous recurrent steps are stored in depth memory
-
-depth_keys   = []
-depth_values = []
-residual     = E_i
-
-for t in range(T_l_i):   # T_l_i can be token-dependent if routed
-    x = rmsnorm(residual)
-
-    # standard sequence attention at this recurrent step
-    q_seq = rope(x @ W_Q_seq[l], position=i)
-    k_seq = K_all_seq[l][t]          # current sequence KV table
-    v_seq = V_all_seq[l][t]
-    seq_out = attention(q_seq, k_seq, v_seq, causal=True) @ W_O_seq[l]
-
-    # depth attention over previous recurrent states of the same token
-    if len(depth_keys) > 0:
-        q_depth = x @ W_Q_depth[l]
-        depth_out = attention(
-            q_depth,
-            stack(depth_keys),
-            stack(depth_values),
-            causal=False
-        ) @ W_O_depth[l]
-    else:
-        depth_out = 0.0
-
-    # combine sequence attention and depth residual attention
-    residual = residual + seq_out + depth_out
-
-    # publish current recurrent state into depth memory
-    z = rmsnorm(residual)
-    depth_keys.append(z @ W_K_depth[l])
-    depth_values.append(z @ W_V_depth[l])
-
-# final recurrent output of this layer
-E_i_next = residual
+```
+BranchRouter[d]: Linear(1024 → 2) → softmax → (p_attn, p_mlp)
+    choice = argmax(probs)              # each token picks 0 (attention) or 1 (MLP)
+    weight = probs[chosen]              # differentiable scaling weight
 ```
 
-This is the key idea: recurrent steps do not only overwrite the state; they can also **attend back over prior intermediate states** within the same layer or loop.
+Each token computes ONLY its chosen branch. The unselected branch does not run for that token. The output is scaled by the softmax probability of the chosen branch, so gradients flow through the router (same mechanism as MoE expert routing).
 
-**References:**
+#### Step B: ATTENTION Branch (tokens that chose attention)
 
-- **Depth-Recurrent Attention Mixtures: Giving Latent Reasoning the Attention it Deserves** — [https://arxiv.org/abs/2601.21582](https://arxiv.org/abs/2601.21582)
-- **Attention Residuals** — [https://github.com/MoonshotAI/Attention-Residuals/blob/master/Attention_Residuals.pdf](https://github.com/MoonshotAI/Attention-Residuals/blob/master/Attention_Residuals.pdf)
-- **DeepCrossAttention: Supercharging Transformer Residual Connections** — [https://arxiv.org/abs/2502.06785](https://arxiv.org/abs/2502.06785)
+**Pre-norm** — one of three modes:
+- `routed_norm`: NormExpertBank with 32 norm weight vectors, router picks 1 per token
+- `per_layer_norm`: RMSNorm[d], one per depth (standard transformer style)
+- default: shared RMSNorm (same norm every depth)
 
-Without depth-history access, recursion repeatedly overwrites the same token state. With depth attention / attention residuals, the model can instead:
+**Per-head expert routing** (`per_head_fully_independent` mode):
 
-- preserve intermediate reasoning states
-- retrieve earlier partial computations
-- avoid forcing all information through a single overwritten latent state
+Each head independently selects its expert from the shared bank:
 
-This is especially relevant if recursion depth becomes large.
+```
+normed = PreNorm(hidden_states)                     # (B, T, 1024)
 
----
+Q_router[d](normed) → select 16 experts from 256   # one per Q head
+K_router[d](normed) → select 8 experts from 128    # one per KV head (GQA 2:1)
+V_router[d](normed) → select 8 experts from 128    # one per KV head
+O_router[d](normed) → select 16 experts from 256   # one per output head
+```
 
-## Comparison
+All 4 routers are per-depth (32 copies each when `per_layer_attn_router=True`).
 
-1. Comparing to standard MoE with the same amount of total parameters.
-2. How to control active parameters?
+**Per-head projection through shared weight banks:**
 
-## Synthetic tasks
+```
+For each Q head h in 0..15:
+    expert_id = Q_router_selection[h]
+    Q_h = Q_bank[expert_id] · normed                # (1024 → 128)
+    Q_h = QK_norm(Q_h, weight=q_norm_weight[expert_id])
+    Q_h = RoPE(Q_h)
+    Q_h *= routing_weight[h]                         # scale by router prob
 
-$s_0, s_1, \dots, s_{100}, i, s_i$ — only train on $s_i$. $q$ can be computed at $i$.
+For each KV head h in 0..7:
+    K_h = K_bank[K_expert_id[h]] · normed            # (1024 → 128)
+    K_h = QK_norm(K_h) → RoPE(K_h)
+    K_h *= routing_weight[h]
+    V_h = V_bank[V_expert_id[h]] · normed            # (1024 → 128)
+    V_h *= routing_weight[h]
+```
 
-Can also train a router to decide whether we need to discard some KV as we don't need them.
+**GQA expansion:**
+```
+Q: (B, 16 heads, T, 128)
+K: (B, 8 kv_heads, T, 128) → repeat_kv(groups=2) → (B, 16, T, 128)
+V: (B, 8 kv_heads, T, 128) → repeat_kv(groups=2) → (B, 16, T, 128)
+```
+
+**KV state handling:**
+
+Tokens that chose attention get fresh K,V. Tokens that chose MLP keep their old K,V from the previous depth:
+```
+K_blend = where(chose_attn, K_fresh, K_old)
+V_blend = where(chose_attn, V_fresh, V_old)
+```
+
+**Attention computation:**
+```
+scores = Q @ K_blend^T / sqrt(128)
+scores += causal_mask                               # upper triangle = -inf
+attn_weights = softmax(scores)
+attn_output = attn_weights @ V_blend                # (B, 16, T, 128)
+```
+
+**O projection:**
+```
+For each head h in 0..15:
+    out_h = O_bank[O_expert_id[h]] · attn_head_h    # (128 → 1024)
+    out_h *= routing_weight[h]
+attn_out = sum(out_h for h in 0..15)                # (B, T, 1024)
+```
+
+**Residual:**
+```
+hidden_states += branch_weight_attn * attn_out
+```
+
+#### Step C: MLP Branch (tokens that chose MLP)
+
+**Pre-norm** — same three modes as attention (separate norm instance).
+
+**DeepSeek V3 expert routing:**
+```
+normed = MLP_PreNorm(hidden_states)
+DeepSeekRouter(normed):
+    logits = Linear(1024 → 256) in FP32
+    scores = sigmoid(logits)                         # NOT softmax
+    biased_scores = scores + expert_bias             # non-gradient bias for load balancing
+    group_limited_topk:                              # 8 groups, pick top-4 groups, top-4 experts
+        → select top-4 experts from 256
+    gather unbiased scores → normalize → scale by 2.5
+```
+
+**SwiGLU expert computation:**
+```
+For each selected expert e (4 per token):
+    gate_up = gate_up_proj[e] · normed               # (1024 → 1536)
+    gate, up = split(gate_up)                        # each (768,)
+    out_e = silu(gate) * up                          # SwiGLU activation
+    out_e = down_proj[e] · out_e                     # (768 → 1024)
+mlp_out = Σ routing_weight[e] × out_e
+```
+
+**Residual:**
+```
+hidden_states += branch_weight_mlp * mlp_out
+```
+
+#### Step D: KV State Update
+
+```
+K_new = where(chose_attn, K_fresh, K_old)
+V_new = where(chose_attn, V_fresh, V_old)
+```
+
+Tokens that picked MLP carry their KV state forward unchanged. Tokens that picked attention have fresh KV. This means a token's KV state persists until it next chooses the attention branch.
+
+### 3. Output
+
+```
+hidden_states = RMSNorm(hidden_states)      # single final norm
+logits = Linear(1024 → 151936)              # LM head (tied with embedding)
+```
+
+### 4. Losses
+
+| Loss | Formula | Coefficient | Purpose |
+|---|---|---|---|
+| Cross-entropy | standard next-token prediction | 1.0 | Language modeling |
+| MLP seq aux | sequence-level load balancing (DeepSeek V3) | 0.0001 | Expert utilization |
+| Branch balance | `2 × Σ(mean_prob²)` | 0.01 | Prevent branch collapse |
+| MLP batch aux | batch-level load balancing | 0.0 (disabled) | — |
+
+The expert bias in DeepSeekRouter is updated non-gradient after each step:
+```
+bias += sign(average_load - expert_load) × rate
+```
+
+## `per_head_precompute_kv` Variant
+
+Same architecture except the attention routing:
+
+- **1 router per depth** (not 4): picks 16 experts from pool of 256
+- Single routing decision binds Q, K, V, O for each head position
+- K and V are **precomputed per-expert over all tokens**: expert `e` computes K and V for ALL tokens, then only tokens assigned to expert `e` attend through those KV tables
+- This eliminates subspace mismatch: Q and K always come from the same expert
+- GQA via rank selection: KV head for group `g` uses expert at rank `g × 2`
+- Pool is 256/256/256/256 (bundled, since one expert provides Q+K+V+O)
+- Active per token: 16 Q, 8 KV (GQA), 16 O — same compute as fully_independent
+
+## Norm Variants
+
+| Config flag | Attention pre-norm | MLP pre-norm | Total norms |
+|---|---|---|---|
+| (default) | 1 shared RMSNorm | 1 shared RMSNorm | 2 |
+| `per_layer_norm` | 32 RMSNorms (one per depth) | 32 RMSNorms (one per depth) | 64 |
+| `routed_norm` | NormExpertBank (32 weight vectors, top-1 router) | NormExpertBank (32 weight vectors, top-1 router) | 64 weight vectors + 2 routers |
+
+`per_layer_norm` matches a standard 32-layer transformer: fixed depth-to-norm mapping.
+
+`routed_norm` is more expressive: same parameter count but dynamic — different tokens at the same depth can use different norm weights.
+
+## Router Summary
+
+| Router | Per-depth? | Input → Output | Selection |
+|---|---|---|---|
+| Branch router | Yes (32 copies) | `(1024 → 2)` | argmax, hard 0/1 |
+| Q expert router | Yes (32 copies) | `(1024 → 256)` | top-16 from 256 |
+| K expert router | Yes (32 copies) | `(1024 → 128)` | top-8 from 128 |
+| V expert router | Yes (32 copies) | `(1024 → 128)` | top-8 from 128 |
+| O expert router | Yes (32 copies) | `(1024 → 256)` | top-16 from 256 |
+| MLP expert router | Shared | `(1024 → 256)` DeepSeek sigmoid | top-4 from 256 |
+| Attn norm router | Shared | `(1024 → 32)` | top-1 from 32 |
+| MLP norm router | Shared | `(1024 → 32)` | top-1 from 32 |
+
+For `per_head_precompute_kv`: single attn router per depth `(1024 → 256)` selecting 16, replaces the 4 separate Q/K/V/O routers.
+
+## Shared vs Per-Depth
+
+| Component | Shared | Per-depth |
+|---|---|---|
+| Q weight bank `[256, 1024, 128]` | Yes | — |
+| K weight bank `[128, 1024, 128]` | Yes | — |
+| V weight bank `[128, 1024, 128]` | Yes | — |
+| O weight bank `[256, 128, 1024]` | Yes | — |
+| QK norm weights `[256+128, 128]` | Yes | — |
+| MLP experts `[256, 1024, 1536]` + `[256, 768, 1024]` | Yes | — |
+| MLP router (DeepSeek) | Yes | — |
+| Branch routers | — | 32 copies |
+| Attn expert routers (Q,K,V,O) | — | 32 × 4 copies |
+| Attn pre-norm | — | 32 (per_layer_norm or routed_norm) |
+| MLP pre-norm | — | 32 (per_layer_norm or routed_norm) |
+| Embedding / LM head (tied) | Single | — |
+| Init KV projections | Single | — |
+| Final RMSNorm | Single | — |
+
+## Parameter Budget (XS scale, `num_attn_experts=256`)
+
+| Component | Shape | Parameters |
+|---|---|---|
+| MLP gate_up bank | `[256, 1024, 1536]` | 402.7M |
+| Embedding (tied w/ LM head) | `[151936, 1024]` | 311.2M |
+| MLP down bank | `[256, 768, 1024]` | 201.3M |
+| Q bank | `[256, 1024, 128]` | 33.6M |
+| O bank | `[256, 128, 1024]` | 33.6M |
+| Attn expert routers (32 × 4) | | 25.2M |
+| K bank | `[128, 1024, 128]` | 16.8M |
+| V bank | `[128, 1024, 128]` | 16.8M |
+| Init KV projections | | 2.1M |
+| MLP router, branch routers, norms | | ~0.6M |
+| **Total** | | **1043.6M** |
+
+## Config Reference
+
+Four variants, all in `configs/`:
+
+| Config | Attention | Norm |
+|---|---|---|
+| `moe_everything_phfi_perlayer_routednorm.yaml` | per_head_fully_independent (4 routers/depth) | NormExpertBank |
+| `moe_everything_phfi_perlayer_perlayernorm.yaml` | per_head_fully_independent (4 routers/depth) | per-depth RMSNorm |
+| `moe_everything_phpkv_perlayer_routednorm.yaml` | per_head_precompute_kv (1 router/depth) | NormExpertBank |
+| `moe_everything_phpkv_perlayer_perlayernorm.yaml` | per_head_precompute_kv (1 router/depth) | per-depth RMSNorm |
+
+All use: 32 depths, hidden 1024, 16 Q heads, 8 KV heads, 256 attn experts, 256 MLP experts top-4, DeepSeek routing, per-layer branch + attn routers, gradient checkpointing, batch 32, grad_accum 2, seq 1024.
