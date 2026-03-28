@@ -45,8 +45,8 @@ training:
   warmup_steps: 1000
   max_steps: 100000
   min_lr_ratio: 0.1
-  batch_size: 16
-  gradient_accumulation: 4
+  batch_size: 32
+  gradient_accumulation: 2
   mixed_precision: bf16
   gradient_checkpointing: true
   log_every: 1
