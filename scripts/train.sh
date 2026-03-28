@@ -43,8 +43,34 @@ echo "  Config : $CONFIG"
 echo "  Extra  : ${EXTRA_ARGS[*]:-none}"
 echo "========================================"
 
-uv run accelerate launch \
-  --config_file accelerate_configs/ddp_8gpu.yaml \
-  train.py \
-  --config "$CONFIG" \
-  "${EXTRA_ARGS[@]}"
+LAUNCHER="${LAUNCHER:-torchrun}"
+
+if [[ "$LAUNCHER" == "accelerate" ]]; then
+  uv run accelerate launch \
+    --config_file accelerate_configs/ddp_8gpu.yaml \
+    train.py \
+    --config "$CONFIG" \
+    "${EXTRA_ARGS[@]}"
+  exit 0
+fi
+
+if [[ -z "${NPROC_PER_NODE:-}" ]]; then
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    NPROC_PER_NODE="$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | tr -d ' ')"
+  else
+    NPROC_PER_NODE=1
+  fi
+fi
+
+if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
+  uv run torchrun \
+    --standalone \
+    --nproc_per_node "${NPROC_PER_NODE}" \
+    train.py \
+    --config "$CONFIG" \
+    "${EXTRA_ARGS[@]}"
+else
+  uv run python train.py \
+    --config "$CONFIG" \
+    "${EXTRA_ARGS[@]}"
+fi

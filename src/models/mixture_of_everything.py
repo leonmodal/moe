@@ -84,6 +84,11 @@ class MoEverythingConfig(Qwen3MoeConfig):
         # Depthwise attention (AttnRes): learned weighted combination across depths
         depthwise_attention: bool = False,
         depthwise_block_size: int = 0,
+        # Per-head attention execution strategy
+        per_head_compute_mode: str = "auto",
+        per_head_dense_fraction_threshold: float = 0.75,
+        # Deterministic routing mode used for architecture sanity checks
+        sanity_check_mode: str | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -101,6 +106,9 @@ class MoEverythingConfig(Qwen3MoeConfig):
         self.dynamic_depth_max = dynamic_depth_max
         self.depthwise_attention = depthwise_attention
         self.depthwise_block_size = depthwise_block_size
+        self.per_head_compute_mode = per_head_compute_mode
+        self.per_head_dense_fraction_threshold = per_head_dense_fraction_threshold
+        self.sanity_check_mode = sanity_check_mode
 
 
 # ─── Branch router ─────────────────────────────────────────────────────────── #
@@ -212,6 +220,11 @@ class AttentionExpertBank(nn.Module):
         self.routed_norm = getattr(config, "routed_norm", False)
         self.per_layer_norm = getattr(config, "per_layer_norm", False)
         self.num_depths = config.num_hidden_layers
+        self.per_head_compute_mode = getattr(config, "per_head_compute_mode", "auto")
+        self.per_head_dense_fraction_threshold = getattr(
+            config, "per_head_dense_fraction_threshold", 0.75
+        )
+        self.sanity_check_mode = getattr(config, "sanity_check_mode", None)
         self.last_router_info = {}
         self._last_routing = None
 
@@ -226,6 +239,15 @@ class AttentionExpertBank(nn.Module):
         }
         if self.mode not in _MODES:
             raise ValueError(f"Unknown attn_expert_mode: {self.mode}, must be one of {_MODES}")
+        if self.per_head_compute_mode not in {"auto", "sparse", "dense"}:
+            raise ValueError(
+                f"Unknown per_head_compute_mode: {self.per_head_compute_mode}, must be one of "
+                "{'auto', 'sparse', 'dense'}"
+            )
+        if self.sanity_check_mode is not None and self.mode != "per_head_precompute_kv":
+            raise ValueError(
+                "sanity_check_mode is only supported with attn_expert_mode='per_head_precompute_kv'"
+            )
         getattr(self, f"_init_{self.mode}")()
 
     def _make_router(self, input_dim):
@@ -302,8 +324,104 @@ class AttentionExpertBank(nn.Module):
             out[mask] = (proj * expert_weights[mask].unsqueeze(-1)).to(out.dtype)
         return out
 
+    def _apply_single_head_norm(self, proj, norm_weight):
+        proj_f = proj.float()
+        var = proj_f.pow(2).mean(-1, keepdim=True)
+        proj_normed = proj_f * torch.rsqrt(var + self.eps)
+        return (norm_weight * proj_normed).to(proj.dtype)
+
+    def _project_shared_inputs_grouped(self, flat, weight_bank, idx, weights, norm_weights=None):
+        """Project shared token inputs for all head slots, grouped by expert."""
+        N, num_slots = idx.shape
+        H_out = weight_bank.shape[2]
+        pair_expert = idx.reshape(-1)
+        pair_weight = weights.reshape(-1)
+        token_idx = (
+            torch.arange(N, device=flat.device)
+            .unsqueeze(1)
+            .expand(N, num_slots)
+            .reshape(-1)
+        )
+        pair_out = flat.new_zeros(pair_expert.shape[0], H_out)
+        if pair_expert.numel() == 0:
+            return pair_out.view(N, num_slots, H_out)
+
+        sort_order = torch.argsort(pair_expert)
+        sorted_expert = pair_expert[sort_order]
+        sorted_token_idx = token_idx[sort_order]
+        sorted_weight = pair_weight[sort_order]
+        unique_experts, counts = torch.unique_consecutive(sorted_expert, return_counts=True)
+
+        start = 0
+        for expert, count in zip(unique_experts.tolist(), counts.tolist()):
+            end = start + count
+            proj = flat.index_select(0, sorted_token_idx[start:end]) @ weight_bank[expert]
+            if norm_weights is not None:
+                proj = self._apply_single_head_norm(proj, norm_weights[expert])
+            proj = proj * sorted_weight[start:end].unsqueeze(-1)
+            pair_out[sort_order[start:end]] = proj.to(pair_out.dtype)
+            start = end
+
+        return pair_out.view(N, num_slots, H_out)
+
+    def _project_pair_inputs_grouped(
+        self,
+        inputs,
+        weight_bank,
+        idx,
+        weights,
+        norm_weights=None,
+        reduce_tokens: bool = False,
+    ):
+        """Project per-head inputs grouped by expert, optionally summing back to tokens."""
+        N, num_slots, head_dim = inputs.shape
+        H_out = weight_bank.shape[2]
+        pair_inputs = inputs.reshape(-1, head_dim)
+        pair_expert = idx.reshape(-1)
+        pair_weight = weights.reshape(-1)
+        if pair_expert.numel() == 0:
+            if reduce_tokens:
+                return inputs.new_zeros(N, H_out)
+            return inputs.new_zeros(N, num_slots, H_out)
+
+        token_idx = (
+            torch.arange(N, device=inputs.device)
+            .unsqueeze(1)
+            .expand(N, num_slots)
+            .reshape(-1)
+        )
+        sort_order = torch.argsort(pair_expert)
+        sorted_expert = pair_expert[sort_order]
+        sorted_inputs = pair_inputs[sort_order]
+        sorted_weight = pair_weight[sort_order]
+        sorted_token_idx = token_idx[sort_order]
+        unique_experts, counts = torch.unique_consecutive(sorted_expert, return_counts=True)
+
+        if reduce_tokens:
+            token_out = inputs.new_zeros(N, H_out)
+        else:
+            pair_out = inputs.new_zeros(pair_inputs.shape[0], H_out)
+
+        start = 0
+        for expert, count in zip(unique_experts.tolist(), counts.tolist()):
+            end = start + count
+            proj = sorted_inputs[start:end] @ weight_bank[expert]
+            if norm_weights is not None:
+                proj = self._apply_single_head_norm(proj, norm_weights[expert])
+            proj = proj * sorted_weight[start:end].unsqueeze(-1)
+            proj = proj.to(inputs.dtype)
+            if reduce_tokens:
+                token_out.index_add_(0, sorted_token_idx[start:end], proj)
+            else:
+                pair_out[sort_order[start:end]] = proj
+            start = end
+
+        if reduce_tokens:
+            return token_out
+        return pair_out.view(N, num_slots, H_out)
+
     def _project_heads_batched(self, flat, weight_bank, idx, weights, norm_weights=None):
-        """Project all heads using vectorized per-expert gather within each head.
+        """Project all heads using grouped expert matmuls across all head slots.
 
         Args:
             flat: (N, H) input tokens
@@ -315,22 +433,18 @@ class AttentionExpertBank(nn.Module):
         Returns:
             (N, num_heads, H_out)
         """
-        N, num_heads = idx.shape
-        H_out = weight_bank.shape[2]
-        out = flat.new_zeros(N, num_heads, H_out)
-
-        for h in range(num_heads):
-            out[:, h] = self._project_flat_head(
-                flat, weight_bank, idx[:, h], weights[:, h], norm_weights
-            )
-
-        return out
+        return self._project_shared_inputs_grouped(flat, weight_bank, idx, weights, norm_weights)
 
     def _init_bundled(self):
         """(Q,K,V,O) all selected as one unit.  1 norm, 1 router."""
         self.norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         E = self.num_experts
-        self.router = self._make_router(self.hidden_size)
+        if self.per_layer_attn_router:
+            self.routers = nn.ModuleList(
+                [self._make_router(self.hidden_size) for _ in range(self.num_depths)]
+            )
+        else:
+            self.router = self._make_router(self.hidden_size)
         self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_dim))
         self.k_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
         self.v_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
@@ -344,9 +458,20 @@ class AttentionExpertBank(nn.Module):
         self.kv_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         self.q_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         E = self.num_experts
-        self.kv_router = self._make_router(self.hidden_size)
-        self.q_router = self._make_router(self.hidden_size)
-        self.o_router = self._make_router(self.q_dim)
+        if self.per_layer_attn_router:
+            self.kv_routers = nn.ModuleList(
+                [self._make_router(self.hidden_size) for _ in range(self.num_depths)]
+            )
+            self.q_routers = nn.ModuleList(
+                [self._make_router(self.hidden_size) for _ in range(self.num_depths)]
+            )
+            self.o_routers = nn.ModuleList(
+                [self._make_router(self.q_dim) for _ in range(self.num_depths)]
+            )
+        else:
+            self.kv_router = self._make_router(self.hidden_size)
+            self.q_router = self._make_router(self.hidden_size)
+            self.o_router = self._make_router(self.q_dim)
         self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_dim))
         self.k_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
         self.v_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
@@ -360,9 +485,20 @@ class AttentionExpertBank(nn.Module):
         self.qk_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         self.v_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         E = self.num_experts
-        self.qk_router = self._make_router(self.hidden_size)
-        self.v_router = self._make_router(self.hidden_size)
-        self.o_router = self._make_router(self.q_dim)
+        if self.per_layer_attn_router:
+            self.qk_routers = nn.ModuleList(
+                [self._make_router(self.hidden_size) for _ in range(self.num_depths)]
+            )
+            self.v_routers = nn.ModuleList(
+                [self._make_router(self.hidden_size) for _ in range(self.num_depths)]
+            )
+            self.o_routers = nn.ModuleList(
+                [self._make_router(self.q_dim) for _ in range(self.num_depths)]
+            )
+        else:
+            self.qk_router = self._make_router(self.hidden_size)
+            self.v_router = self._make_router(self.hidden_size)
+            self.o_router = self._make_router(self.q_dim)
         self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_dim))
         self.k_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
         self.v_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
@@ -377,10 +513,24 @@ class AttentionExpertBank(nn.Module):
         self.k_pre_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         self.v_pre_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         E = self.num_experts
-        self.q_router = self._make_router(self.hidden_size)
-        self.k_router = self._make_router(self.hidden_size)
-        self.v_router = self._make_router(self.hidden_size)
-        self.o_router = self._make_router(self.q_dim)
+        if self.per_layer_attn_router:
+            self.q_routers = nn.ModuleList(
+                [self._make_router(self.hidden_size) for _ in range(self.num_depths)]
+            )
+            self.k_routers = nn.ModuleList(
+                [self._make_router(self.hidden_size) for _ in range(self.num_depths)]
+            )
+            self.v_routers = nn.ModuleList(
+                [self._make_router(self.hidden_size) for _ in range(self.num_depths)]
+            )
+            self.o_routers = nn.ModuleList(
+                [self._make_router(self.q_dim) for _ in range(self.num_depths)]
+            )
+        else:
+            self.q_router = self._make_router(self.hidden_size)
+            self.k_router = self._make_router(self.hidden_size)
+            self.v_router = self._make_router(self.hidden_size)
+            self.o_router = self._make_router(self.q_dim)
         self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_dim))
         self.k_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
         self.v_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
@@ -428,7 +578,12 @@ class AttentionExpertBank(nn.Module):
         """Per-expert KV tables, routed Q and O.  1 norm, 1 router."""
         self.norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         E = self.num_experts
-        self.router = self._make_router(self.hidden_size)
+        if self.per_layer_attn_router:
+            self.routers = nn.ModuleList(
+                [self._make_router(self.hidden_size) for _ in range(self.num_depths)]
+            )
+        else:
+            self.router = self._make_router(self.hidden_size)
         self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_dim))
         self.k_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
         self.v_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.kv_dim))
@@ -461,6 +616,51 @@ class AttentionExpertBank(nn.Module):
         self.q_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
         self.k_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
         self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
+
+    def _select_router(self, name: str, depth_idx: int | None = None):
+        plural_name = f"{name}s"
+        if self.per_layer_attn_router and depth_idx is not None and hasattr(self, plural_name):
+            return getattr(self, plural_name)[depth_idx]
+        return getattr(self, name)
+
+    def _maybe_build_sanity_attention_routing(
+        self,
+        num_tokens: int,
+        num_slots: int,
+        depth_idx: int | None,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+        token_mask: torch.Tensor | None = None,
+    ):
+        if self.sanity_check_mode != "alternating_global_moe":
+            return None
+        logical_layer = 0 if depth_idx is None else depth_idx // 2
+        base = (logical_layer * self.num_heads) % self.num_experts
+        slot_idx = (base + torch.arange(num_slots, device=device)) % self.num_experts
+        idx = slot_idx.unsqueeze(0).expand(num_tokens, -1).contiguous()
+        weights = torch.ones(num_tokens, num_slots, device=device, dtype=dtype)
+        probs = torch.zeros(num_tokens, self.num_experts, device=device, dtype=dtype)
+        probs.scatter_(1, idx, 1.0 / max(1, num_slots))
+        if token_mask is not None:
+            self._store_router_info("attn", probs, idx, token_mask=token_mask)
+        else:
+            self._store_router_info("attn", probs, idx)
+        return idx, weights, probs
+
+    def should_use_sparse_path(self, token_mask: torch.Tensor) -> bool:
+        flat_mask = token_mask.reshape(-1).bool()
+        if not flat_mask.any():
+            return True
+        if flat_mask.all():
+            return False
+        if self.mode not in {"per_head_fully_independent", "per_head_precompute_kv"}:
+            return False
+        if self.per_head_compute_mode == "dense":
+            return False
+        if self.per_head_compute_mode == "sparse":
+            return True
+        attn_fraction = flat_mask.float().mean().item()
+        return attn_fraction < self.per_head_dense_fraction_threshold
 
     def _init_params(self, params):
         std = self.config.initializer_range
@@ -598,7 +798,7 @@ class AttentionExpertBank(nn.Module):
 
         if self.mode == "bundled":
             flat = self.norm(hidden_states).reshape(B * T, H)
-            idx, w, router_probs = self._route(self.router, flat)
+            idx, w, router_probs = self._route(self._select_router("router", depth_idx), flat)
             self._last_routing = (idx, w)
             self._store_router_info("attn", router_probs, idx)
             Q = self._apply_projection(flat, self.q_proj, idx, w, self.q_norm_weight, self.num_heads)
@@ -608,34 +808,59 @@ class AttentionExpertBank(nn.Module):
         elif self.mode == "kv_paired":
             kv_flat = self.kv_norm(hidden_states).reshape(B * T, H)
             q_flat = self.q_norm(hidden_states).reshape(B * T, H)
-            kv_idx, kv_w, kv_router_probs = self._route(self.kv_router, kv_flat)
+            kv_idx, kv_w, kv_router_probs = self._route(self._select_router("kv_router", depth_idx), kv_flat)
             self._store_router_info("kv", kv_router_probs, kv_idx)
             K = self._apply_projection(kv_flat, self.k_proj, kv_idx, kv_w, self.k_norm_weight, self.num_kv_heads)
             V = self._apply_projection(kv_flat, self.v_proj, kv_idx, kv_w)
             Q = self._route_and_project(
-                self.q_router, q_flat, self.q_proj, self.q_norm_weight, self.num_heads, router_name="q"
+                self._select_router("q_router", depth_idx),
+                q_flat,
+                self.q_proj,
+                self.q_norm_weight,
+                self.num_heads,
+                router_name="q",
             )
 
         elif self.mode == "qk_paired":
             qk_flat = self.qk_norm(hidden_states).reshape(B * T, H)
             v_flat = self.v_norm(hidden_states).reshape(B * T, H)
-            qk_idx, qk_w, qk_router_probs = self._route(self.qk_router, qk_flat)
+            qk_idx, qk_w, qk_router_probs = self._route(self._select_router("qk_router", depth_idx), qk_flat)
             self._store_router_info("qk", qk_router_probs, qk_idx)
             Q = self._apply_projection(qk_flat, self.q_proj, qk_idx, qk_w, self.q_norm_weight, self.num_heads)
             K = self._apply_projection(qk_flat, self.k_proj, qk_idx, qk_w, self.k_norm_weight, self.num_kv_heads)
-            V = self._route_and_project(self.v_router, v_flat, self.v_proj, router_name="v")
+            V = self._route_and_project(
+                self._select_router("v_router", depth_idx),
+                v_flat,
+                self.v_proj,
+                router_name="v",
+            )
 
         elif self.mode == "fully_independent":
             q_flat = self.q_pre_norm(hidden_states).reshape(B * T, H)
             k_flat = self.k_pre_norm(hidden_states).reshape(B * T, H)
             v_flat = self.v_pre_norm(hidden_states).reshape(B * T, H)
             Q = self._route_and_project(
-                self.q_router, q_flat, self.q_proj, self.q_norm_weight, self.num_heads, router_name="q"
+                self._select_router("q_router", depth_idx),
+                q_flat,
+                self.q_proj,
+                self.q_norm_weight,
+                self.num_heads,
+                router_name="q",
             )
             K = self._route_and_project(
-                self.k_router, k_flat, self.k_proj, self.k_norm_weight, self.num_kv_heads, router_name="k"
+                self._select_router("k_router", depth_idx),
+                k_flat,
+                self.k_proj,
+                self.k_norm_weight,
+                self.num_kv_heads,
+                router_name="k",
             )
-            V = self._route_and_project(self.v_router, v_flat, self.v_proj, router_name="v")
+            V = self._route_and_project(
+                self._select_router("v_router", depth_idx),
+                v_flat,
+                self.v_proj,
+                router_name="v",
+            )
 
         elif self.mode == "per_head_fully_independent":
             if self.routed_norm:
@@ -649,15 +874,9 @@ class AttentionExpertBank(nn.Module):
                 k_flat = self.k_pre_norm(hidden_states).reshape(B * T, H)
                 v_flat = self.v_pre_norm(hidden_states).reshape(B * T, H)
 
-            if self.per_layer_attn_router and depth_idx is not None:
-                q_router = self.q_routers[depth_idx]
-                k_router = self.k_routers[depth_idx]
-                v_router = self.v_routers[depth_idx]
-                o_router = self.o_routers[depth_idx]
-            else:
-                q_router = self.q_router
-                k_router = self.k_router
-                v_router = self.v_router
+            q_router = self._select_router("q_router", depth_idx)
+            k_router = self._select_router("k_router", depth_idx)
+            v_router = self._select_router("v_router", depth_idx)
 
             q_idx, q_w, q_probs = self._route_flat(q_router, q_flat, self.num_heads)
             k_idx, k_w, k_probs = self._route_flat(k_router, k_flat, self.num_kv_heads)
@@ -702,27 +921,36 @@ class AttentionExpertBank(nn.Module):
 
         K_expanded = repeat_kv(K, self.num_kv_groups)
         V_expanded = repeat_kv(V, self.num_kv_groups)
-
-        attn_weights = torch.matmul(Q, K_expanded.transpose(2, 3)) * self.scaling
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(Q.dtype)
-        attn_output = torch.matmul(attn_weights, V_expanded)
+        if Q.is_cuda:
+            attn_output = F.scaled_dot_product_attention(
+                Q,
+                K_expanded,
+                V_expanded,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                scale=self.scaling,
+            )
+        else:
+            attn_weights = torch.matmul(Q, K_expanded.transpose(2, 3)) * self.scaling
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(Q.dtype)
+            attn_output = torch.matmul(attn_weights, V_expanded)
 
         if self.mode == "per_head_fully_independent":
             N = B * T
-            attn_flat = attn_output.transpose(1, 2).reshape(N, self.q_dim)
-            if self.per_layer_attn_router and depth_idx is not None:
-                o_router = self.o_routers[depth_idx]
-            else:
-                o_router = self.o_router
+            attn_heads = attn_output.transpose(1, 2).reshape(N, self.num_heads, self.head_dim)
+            attn_flat = attn_heads.reshape(N, self.q_dim)
+            o_router = self._select_router("o_router", depth_idx)
             o_idx, o_w, o_probs = self._route_flat(o_router, attn_flat, self.num_heads)
             self._store_router_info("o", o_probs, o_idx)
-            o_out = attn_output.new_zeros(N, self.hidden_size)
-            for h in range(self.num_heads):
-                attn_h = attn_output[:, h, :, :].reshape(N, self.head_dim)
-                o_out = o_out + self._project_flat_head(
-                    attn_h, self.o_proj, o_idx[:, h], o_w[:, h])
+            o_out = self._project_pair_inputs_grouped(
+                attn_heads,
+                self.o_proj,
+                o_idx,
+                o_w,
+                reduce_tokens=True,
+            )
             return o_out.view(B, T, self.hidden_size)
 
         attn_output = attn_output.transpose(1, 2).reshape(B * T, self.q_dim)
@@ -731,21 +959,24 @@ class AttentionExpertBank(nn.Module):
             idx, w = self._last_routing
             attn_output = self._apply_projection(attn_output, self.o_proj, idx, w)
         elif self.mode in ("kv_paired", "qk_paired", "fully_independent"):
-            attn_output = self._route_and_project(self.o_router, attn_output, self.o_proj, router_name="o")
+            attn_output = self._route_and_project(
+                self._select_router("o_router", depth_idx),
+                attn_output,
+                self.o_proj,
+                router_name="o",
+            )
 
         return attn_output.view(B, T, self.hidden_size)
 
     def _select_attn_routers(self, depth_idx: int | None = None):
         if self.mode != "per_head_fully_independent":
             return None
-        if self.per_layer_attn_router and depth_idx is not None:
-            return (
-                self.q_routers[depth_idx],
-                self.k_routers[depth_idx],
-                self.v_routers[depth_idx],
-                self.o_routers[depth_idx],
-            )
-        return self.q_router, self.k_router, self.v_router, self.o_router
+        return (
+            self._select_router("q_router", depth_idx),
+            self._select_router("k_router", depth_idx),
+            self._select_router("v_router", depth_idx),
+            self._select_router("o_router", depth_idx),
+        )
 
     def _empty_sparse_attn_result(
         self,
@@ -850,26 +1081,148 @@ class AttentionExpertBank(nn.Module):
             if pos.numel() == 0:
                 continue
             Q_b = Q[b : b + 1, :, pos, :]
-            scores = torch.matmul(Q_b, K_expanded[b : b + 1].transpose(2, 3)) * self.scaling
-            if attention_mask is not None:
-                scores = scores + attention_mask[:, :, pos, :]
-            scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
-            attn_b = torch.matmul(scores, V_expanded[b : b + 1])
+            if Q_b.is_cuda:
+                attn_b = F.scaled_dot_product_attention(
+                    Q_b,
+                    K_expanded[b : b + 1],
+                    V_expanded[b : b + 1],
+                    attn_mask=attention_mask[:, :, pos, :] if attention_mask is not None else None,
+                    dropout_p=0.0,
+                    scale=self.scaling,
+                )
+            else:
+                scores = torch.matmul(Q_b, K_expanded[b : b + 1].transpose(2, 3)) * self.scaling
+                if attention_mask is not None:
+                    scores = scores + attention_mask[:, :, pos, :]
+                scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
+                attn_b = torch.matmul(scores, V_expanded[b : b + 1])
             attn_heads[b, :, pos, :] = attn_b.squeeze(0).to(attn_heads.dtype)
 
-        attn_flat = attn_heads.transpose(1, 2).reshape(B * T, self.q_dim)
-        attn_selected = attn_flat[flat_mask]
-        o_idx, o_w, o_probs = self._route_flat(o_router, attn_selected, self.num_heads)
+        attn_selected = attn_heads.transpose(1, 2).reshape(B * T, self.num_heads, self.head_dim)[flat_mask]
+        attn_flat = attn_selected.reshape(attn_selected.shape[0], self.q_dim)
+        o_idx, o_w, o_probs = self._route_flat(o_router, attn_flat, self.num_heads)
         self._store_router_info("o", o_probs, o_idx, token_mask=flat_mask)
 
-        o_selected = hidden_states.new_zeros(attn_selected.shape[0], self.hidden_size)
-        for h in range(self.num_heads):
-            attn_h = attn_heads[:, h, :, :].reshape(B * T, self.head_dim)[flat_mask]
-            o_selected = o_selected + self._project_flat_head(attn_h, self.o_proj, o_idx[:, h], o_w[:, h])
+        o_selected = self._project_pair_inputs_grouped(
+            attn_selected,
+            self.o_proj,
+            o_idx,
+            o_w,
+            reduce_tokens=True,
+        )
 
         attn_out = hidden_states.new_zeros(B * T, self.hidden_size)
         attn_out[flat_mask] = o_selected
         return attn_out.view(B, T, self.hidden_size), K_new, V_new
+
+    def _build_per_head_precompute_kv_tables(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        depth_idx: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        B, T, H = hidden_states.shape
+        N = B * T
+        if self.per_layer_norm and depth_idx is not None:
+            normed = self.norms[depth_idx](hidden_states)
+        else:
+            normed = self.norm(hidden_states)
+        flat = normed.reshape(N, H)
+
+        routed = self._maybe_build_sanity_attention_routing(
+            N, self.num_heads, depth_idx, hidden_states.device, dtype=flat.dtype
+        )
+        if routed is None:
+            router = self._select_router("router", depth_idx)
+            idx, w, probs = self._route_flat(router, flat, self.num_heads)
+            self._store_router_info("attn", probs, idx)
+        else:
+            idx, w, probs = routed
+
+        Q_heads = self._project_heads_batched(flat, self.q_proj, idx, w, self.q_norm_weight)
+        kv_ranks = torch.arange(self.num_kv_heads, device=flat.device) * self.num_kv_groups
+        kv_idx = idx.index_select(1, kv_ranks)
+        kv_weight = w.index_select(1, kv_ranks)
+        ones = torch.ones_like(kv_weight)
+        K_heads = self._project_heads_batched(flat, self.k_proj, kv_idx, ones, self.k_norm_weight)
+        V_heads = self._project_heads_batched(flat, self.v_proj, kv_idx, ones)
+
+        Q = Q_heads.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        K_fresh = K_heads.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        V_fresh = V_heads.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        cos, sin = position_embeddings
+        Q, K_fresh = apply_rotary_pos_emb(Q, K_fresh, cos, sin)
+
+        return {
+            "flat": flat,
+            "idx": idx,
+            "weights": w,
+            "kv_weight": kv_weight,
+            "Q": Q,
+            "K_fresh": K_fresh,
+            "V_fresh": V_fresh,
+        }
+
+    def project_and_attend_per_head_precompute_kv_dense_mixed(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        K_old: torch.Tensor,
+        V_old: torch.Tensor,
+        token_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        depth_idx: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, T, _ = hidden_states.shape
+        self.last_router_info = {}
+        tables = self._build_per_head_precompute_kv_tables(
+            hidden_states, position_embeddings, depth_idx=depth_idx
+        )
+        idx = tables["idx"]
+        w = tables["weights"]
+        kv_weight = tables["kv_weight"]
+        Q = tables["Q"]
+        K_fresh = tables["K_fresh"]
+        V_fresh = tables["V_fresh"]
+
+        attn_mask_kv = token_mask.unsqueeze(1)
+        K_new = torch.where(attn_mask_kv, K_fresh, K_old)
+        V_new = torch.where(attn_mask_kv, V_fresh, V_old)
+
+        K_expanded = repeat_kv(K_new, self.num_kv_groups)
+        V_expanded = repeat_kv(V_new, self.num_kv_groups)
+        if Q.is_cuda:
+            attn_output = F.scaled_dot_product_attention(
+                Q,
+                K_expanded,
+                V_expanded,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                scale=self.scaling,
+            )
+        else:
+            scores = torch.matmul(Q, K_expanded.transpose(2, 3)) * self.scaling
+            if attention_mask is not None:
+                scores = scores + attention_mask
+            scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
+            attn_output = torch.matmul(scores, V_expanded)
+
+        kv_weight_expanded = (
+            kv_weight.view(B, T, self.num_kv_heads)
+            .transpose(1, 2)
+            .repeat_interleave(self.num_kv_groups, dim=1)
+            .unsqueeze(-1)
+        )
+        attn_output = attn_output * kv_weight_expanded.to(attn_output.dtype)
+        attn_heads = attn_output.transpose(1, 2).reshape(B * T, self.num_heads, self.head_dim)
+        o_out = self._project_pair_inputs_grouped(
+            attn_heads,
+            self.o_proj,
+            idx,
+            w,
+            reduce_tokens=True,
+        )
+        return o_out.view(B, T, self.hidden_size), K_new, V_new
 
     def project_and_attend_per_head_precompute_kv_sparse(
         self,
@@ -909,33 +1262,32 @@ class AttentionExpertBank(nn.Module):
         else:
             normed = self.norm(hidden_selected)
 
-        if self.per_layer_attn_router and depth_idx is not None:
-            router = self.routers[depth_idx]
+        routed = self._maybe_build_sanity_attention_routing(
+            normed.shape[0],
+            self.num_heads,
+            depth_idx,
+            hidden_states.device,
+            dtype=normed.dtype,
+            token_mask=flat_mask,
+        )
+        if routed is None:
+            router = self._select_router("router", depth_idx)
+            idx, w, probs = self._route_flat(router, normed, self.num_heads)
+            self._store_router_info("attn", probs, idx, token_mask=flat_mask)
         else:
-            router = self.router
-
-        idx, w, probs = self._route_flat(router, normed, self.num_heads)
-        self._store_router_info("attn", probs, idx, token_mask=flat_mask)
+            idx, w, probs = routed
 
         Q_sel = self._project_heads_batched(normed, self.q_proj, idx, w, self.q_norm_weight)
         Q_flat = hidden_states.new_zeros(B * T, self.num_heads, self.head_dim)
         Q_flat[flat_mask] = Q_sel
         Q = Q_flat.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
-        ones = normed.new_ones(normed.shape[0])
-        K_sel_parts = []
-        V_sel_parts = []
-        kv_weight_parts = []
-        for g in range(self.num_kv_heads):
-            kv_rank = g * self.num_kv_groups
-            kv_expert = idx[:, kv_rank]
-            kv_weight = w[:, kv_rank]
-            K_sel_parts.append(self._project_flat_head(normed, self.k_proj, kv_expert, ones, self.k_norm_weight))
-            V_sel_parts.append(self._project_flat_head(normed, self.v_proj, kv_expert, ones))
-            kv_weight_parts.append(kv_weight)
-
-        K_sel = torch.stack(K_sel_parts, dim=1)
-        V_sel = torch.stack(V_sel_parts, dim=1)
+        kv_ranks = torch.arange(self.num_kv_heads, device=normed.device) * self.num_kv_groups
+        kv_idx = idx.index_select(1, kv_ranks)
+        kv_weight_parts = [kv_weight for kv_weight in w.index_select(1, kv_ranks).unbind(dim=1)]
+        ones = torch.ones_like(kv_idx, dtype=normed.dtype)
+        K_sel = self._project_heads_batched(normed, self.k_proj, kv_idx, ones, self.k_norm_weight)
+        V_sel = self._project_heads_batched(normed, self.v_proj, kv_idx, ones)
 
         K_flat = hidden_states.new_zeros(B * T, self.num_kv_heads, self.head_dim)
         V_flat = hidden_states.new_zeros(B * T, self.num_kv_heads, self.head_dim)
@@ -946,7 +1298,7 @@ class AttentionExpertBank(nn.Module):
         V_fresh = V_flat.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = position_embeddings
-        _, K_fresh = apply_rotary_pos_emb(Q, K_fresh, cos, sin)
+        Q, K_fresh = apply_rotary_pos_emb(Q, K_fresh, cos, sin)
 
         attn_mask_kv = token_mask.unsqueeze(1)
         K_new = torch.where(attn_mask_kv, K_fresh, K_old)
@@ -969,19 +1321,32 @@ class AttentionExpertBank(nn.Module):
                 Q_b = Q[b : b + 1, q_start:q_end, pos, :]
                 K_b = K_new[b : b + 1, g : g + 1].expand(-1, self.num_kv_groups, -1, -1)
                 V_b = V_new[b : b + 1, g : g + 1].expand(-1, self.num_kv_groups, -1, -1)
-                scores = torch.matmul(Q_b, K_b.transpose(2, 3)) * self.scaling
-                if attention_mask is not None:
-                    scores = scores + attention_mask[:, :, pos, :]
-                scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
-                attn_b = torch.matmul(scores, V_b)
+                if Q_b.is_cuda:
+                    attn_b = F.scaled_dot_product_attention(
+                        Q_b,
+                        K_b,
+                        V_b,
+                        attn_mask=attention_mask[:, :, pos, :] if attention_mask is not None else None,
+                        dropout_p=0.0,
+                        scale=self.scaling,
+                    )
+                else:
+                    scores = torch.matmul(Q_b, K_b.transpose(2, 3)) * self.scaling
+                    if attention_mask is not None:
+                        scores = scores + attention_mask[:, :, pos, :]
+                    scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
+                    attn_b = torch.matmul(scores, V_b)
                 kv_weight = kv_weight_parts[g][start:end]
                 attn_b = attn_b * kv_weight.view(1, 1, -1, 1)
                 attn_heads[b, q_start:q_end, pos, :] = attn_b.squeeze(0).to(attn_heads.dtype)
 
-        o_selected = hidden_states.new_zeros(normed.shape[0], self.hidden_size)
-        for h in range(self.num_heads):
-            attn_h = attn_heads[:, h, :, :].reshape(B * T, self.head_dim)[flat_mask]
-            o_selected = o_selected + self._project_flat_head(attn_h, self.o_proj, idx[:, h], w[:, h])
+        o_selected = self._project_pair_inputs_grouped(
+            attn_heads.transpose(1, 2).reshape(B * T, self.num_heads, self.head_dim)[flat_mask],
+            self.o_proj,
+            idx,
+            w,
+            reduce_tokens=True,
+        )
 
         attn_out = hidden_states.new_zeros(B * T, self.hidden_size)
         attn_out[flat_mask] = o_selected
@@ -992,6 +1357,7 @@ class AttentionExpertBank(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
+        depth_idx: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Section 4.1.2: apply norm, route first, compute per-expert KV tables, attend."""
         B, T, H = hidden_states.shape
@@ -1000,7 +1366,7 @@ class AttentionExpertBank(nn.Module):
         N = B * T
         flat = normed.reshape(N, H)
 
-        idx, w, router_probs = self._route(self.router, flat)
+        idx, w, router_probs = self._route(self._select_router("router", depth_idx), flat)
         self._last_routing = (idx, w)
         self._store_router_info("attn", router_probs, idx)
 
@@ -1033,15 +1399,25 @@ class AttentionExpertBank(nn.Module):
 
             K_e_heads = K_e_normed.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
             V_e_heads = V_e.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-            _, K_e_rope = apply_rotary_pos_emb(Q, K_e_heads, cos, sin)
+            Q_rope, K_e_rope = apply_rotary_pos_emb(Q, K_e_heads, cos, sin)
             K_e_exp = repeat_kv(K_e_rope, self.num_kv_groups)
             V_e_exp = repeat_kv(V_e_heads, self.num_kv_groups)
 
-            scores = torch.matmul(Q, K_e_exp.transpose(2, 3)) * self.scaling
-            if attention_mask is not None:
-                scores = scores + attention_mask
-            scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
-            attn_e = torch.matmul(scores, V_e_exp)
+            if Q_rope.is_cuda:
+                attn_e = F.scaled_dot_product_attention(
+                    Q_rope,
+                    K_e_exp,
+                    V_e_exp,
+                    attn_mask=attention_mask,
+                    dropout_p=0.0,
+                    scale=self.scaling,
+                )
+            else:
+                scores = torch.matmul(Q_rope, K_e_exp.transpose(2, 3)) * self.scaling
+                if attention_mask is not None:
+                    scores = scores + attention_mask
+                scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
+                attn_e = torch.matmul(scores, V_e_exp)
 
             mask_head = mask_2d.unsqueeze(1).unsqueeze(-1)
             attn_output = attn_output + attn_e * mask_head
@@ -1073,113 +1449,52 @@ class AttentionExpertBank(nn.Module):
         depth_idx: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Flat-bank precompute KV: 1 router, corresponding QKVO, with GQA."""
-        B, T, H = hidden_states.shape
         self.last_router_info = {}
-        N = B * T
-        if self.per_layer_norm and depth_idx is not None:
-            normed = self.norms[depth_idx](hidden_states)
+        tables = self._build_per_head_precompute_kv_tables(
+            hidden_states, position_embeddings, depth_idx=depth_idx
+        )
+        idx = tables["idx"]
+        w = tables["weights"]
+        kv_weight = tables["kv_weight"]
+        Q = tables["Q"]
+        K_fresh = tables["K_fresh"]
+        V_fresh = tables["V_fresh"]
+        B, _, T, _ = Q.shape
+
+        K_expanded = repeat_kv(K_fresh, self.num_kv_groups)
+        V_expanded = repeat_kv(V_fresh, self.num_kv_groups)
+        if Q.is_cuda:
+            attn_output = F.scaled_dot_product_attention(
+                Q,
+                K_expanded,
+                V_expanded,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                scale=self.scaling,
+            )
         else:
-            normed = self.norm(hidden_states)
-        flat = normed.reshape(N, H)
-        cos, sin = position_embeddings
+            scores = torch.matmul(Q, K_expanded.transpose(2, 3)) * self.scaling
+            if attention_mask is not None:
+                scores = scores + attention_mask
+            scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
+            attn_output = torch.matmul(scores, V_expanded)
 
-        # Single routing decision — picks num_heads experts
-        if self.per_layer_attn_router and depth_idx is not None:
-            router = self.routers[depth_idx]
-        else:
-            router = self.router
-        idx, w, probs = self._route_flat(router, flat, self.num_heads)  # (N, num_heads)
-        self._store_router_info("attn", probs, idx)
+        kv_weight_expanded = (
+            kv_weight.view(B, T, self.num_kv_heads)
+            .transpose(1, 2)
+            .repeat_interleave(self.num_kv_groups, dim=1)
+            .unsqueeze(-1)
+        )
+        attn_output = attn_output * kv_weight_expanded.to(attn_output.dtype)
+        o_out = self._project_pair_inputs_grouped(
+            attn_output.transpose(1, 2).reshape(B * T, self.num_heads, self.head_dim),
+            self.o_proj,
+            idx,
+            w,
+            reduce_tokens=True,
+        )
 
-        # Q projection: batched over all heads
-        Q_heads = self._project_heads_batched(flat, self.q_proj, idx, w, self.q_norm_weight)
-        Q = Q_heads.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)  # (B, num_heads, T, head_dim)
-
-        # KV precompute + attention with GQA grouping
-        # KV for group g comes from the expert at rank g * num_kv_groups
-        head_outputs = []
-        K_parts = []
-        V_parts = []
-        kv_head_expert_idx = []
-
-        for g in range(self.num_kv_heads):
-            kv_rank = g * self.num_kv_groups
-            kv_expert = idx[:, kv_rank]   # (N,) — KV expert for this group
-            kv_weight = w[:, kv_rank]     # (N,)
-            kv_head_expert_idx.append(kv_expert)
-            active_experts = kv_expert.unique()
-
-            q_start = g * self.num_kv_groups
-            q_end = q_start + self.num_kv_groups
-            Q_g = Q[:, q_start:q_end, :, :]  # (B, num_kv_groups, T, head_dim)
-
-            head_attn = flat.new_zeros(B, self.num_kv_groups, T, self.head_dim)
-            head_K = flat.new_zeros(B, T, self.head_dim)
-            head_V = flat.new_zeros(B, T, self.head_dim)
-
-            for e in active_experts:
-                mask_e = kv_expert == e
-                mask_2d = mask_e.view(B, T)
-
-                K_he = flat @ self.k_proj[e]
-                V_he = flat @ self.v_proj[e]
-
-                K_he_f = K_he.float()
-                var_k = K_he_f.pow(2).mean(-1, keepdim=True)
-                K_he_normed = (K_he_f * torch.rsqrt(var_k + self.eps))
-                K_he_normed = (self.k_norm_weight[e] * K_he_normed).to(flat.dtype)
-
-                K_he_heads = K_he_normed.view(B, T, 1, self.head_dim).transpose(1, 2)
-                V_he_heads = V_he.view(B, T, 1, self.head_dim).transpose(1, 2)
-
-                _, K_he_rope = apply_rotary_pos_emb(Q_g, K_he_heads, cos, sin)
-
-                K_he_exp = K_he_rope.expand(-1, self.num_kv_groups, -1, -1)
-                V_he_exp = V_he_heads.expand(-1, self.num_kv_groups, -1, -1)
-
-                scores = torch.matmul(Q_g, K_he_exp.transpose(2, 3)) * self.scaling
-                if attention_mask is not None:
-                    scores = scores + attention_mask
-                scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
-                attn_he = torch.matmul(scores, V_he_exp)
-
-                mask_head = mask_2d.unsqueeze(1).unsqueeze(-1)
-                head_attn = head_attn + attn_he * mask_head
-
-                head_K = head_K + K_he.view(B, T, self.head_dim) * mask_2d.unsqueeze(-1)
-                head_V = head_V + V_he.view(B, T, self.head_dim) * mask_2d.unsqueeze(-1)
-
-            routing_scale = kv_weight.view(B, T).unsqueeze(1).unsqueeze(-1)
-            head_attn = head_attn * routing_scale
-
-            head_outputs.append(head_attn)
-            K_parts.append(head_K.unsqueeze(1))
-            V_parts.append(head_V.unsqueeze(1))
-
-        attn_output = torch.cat(head_outputs, dim=1)  # (B, num_heads, T, head_dim)
-        K_per_token = torch.cat(K_parts, dim=1)  # (B, num_kv_heads, T, head_dim)
-        V_per_token = torch.cat(V_parts, dim=1)
-
-        # O projection: per head, same expert as Q for each head
-        o_out = attn_output.new_zeros(N, H)
-        for h in range(self.num_heads):
-            attn_h = attn_output[:, h, :, :].reshape(N, self.head_dim)
-            o_out = o_out + self._project_flat_head(attn_h, self.o_proj, idx[:, h], w[:, h])
-        attn_output = o_out.view(B, T, H)
-
-        # K_fresh with QK norm
-        for h in range(self.num_kv_heads):
-            K_h = K_per_token[:, h, :, :].reshape(N, self.head_dim).float()
-            var_k = K_h.pow(2).mean(-1, keepdim=True)
-            K_h_normed = K_h * torch.rsqrt(var_k + self.eps)
-            kw = self.k_norm_weight[kv_head_expert_idx[h]]
-            K_per_token[:, h, :, :] = (kw * K_h_normed).to(flat.dtype).view(B, T, self.head_dim)
-
-        K_fresh = K_per_token
-        V_fresh = V_per_token
-        _, K_fresh = apply_rotary_pos_emb(Q, K_fresh, cos, sin)
-
-        return attn_output, K_fresh, V_fresh
+        return o_out.view(B, T, self.hidden_size), K_fresh, V_fresh
 
 
 # ─── MLP expert bank ──────────────────────────────────────────────────────── #
@@ -1190,6 +1505,7 @@ class MlpExpertBank(nn.Module):
     def __init__(self, config: MoEverythingConfig):
         super().__init__()
         self.per_layer_norm = getattr(config, "per_layer_norm", False)
+        self.sanity_check_mode = getattr(config, "sanity_check_mode", None)
         if getattr(config, "routed_norm", False):
             self.norm = NormExpertBank(config.num_hidden_layers, config.hidden_size, eps=config.rms_norm_eps)
         elif self.per_layer_norm:
@@ -1290,6 +1606,9 @@ class MoEverythingModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
         self.num_depths = config.num_hidden_layers
+        self.sanity_check_mode = getattr(config, "sanity_check_mode", None)
+        if self.sanity_check_mode == "alternating_global_moe" and self.num_depths % 2 != 0:
+            raise ValueError("sanity_check_mode='alternating_global_moe' requires an even num_hidden_layers")
 
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.head_dim = head_dim
@@ -1372,6 +1691,29 @@ class MoEverythingModel(nn.Module):
     def gradient_checkpointing_disable(self):
         self.gradient_checkpointing = False
 
+    def _sanity_branch_route(
+        self,
+        hidden_states: torch.Tensor,
+        depth_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        choose_attn = (depth_idx % 2) == 0
+        probs = hidden_states.new_zeros(*hidden_states.shape[:2], 2)
+        probs[..., 0 if choose_attn else 1] = 1.0
+        attn_mask = torch.full(
+            (*hidden_states.shape[:2], 1),
+            choose_attn,
+            device=hidden_states.device,
+            dtype=torch.bool,
+        )
+        mlp_mask = ~attn_mask
+        w_attn = attn_mask.to(hidden_states.dtype)
+        w_mlp = mlp_mask.to(hidden_states.dtype)
+        if self.per_layer_router:
+            self.branch_routers[depth_idx].last_probs = probs
+        else:
+            self.branch_router.last_probs = probs
+        return w_attn, w_mlp, attn_mask, mlp_mask
+
     def _depth_step(
         self,
         hidden_states: torch.Tensor,
@@ -1381,37 +1723,35 @@ class MoEverythingModel(nn.Module):
         causal_mask: torch.Tensor,
         depth_idx: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.per_layer_router:
+        if self.sanity_check_mode == "alternating_global_moe":
+            w_attn, w_mlp, attn_mask, mlp_mask = self._sanity_branch_route(hidden_states, depth_idx)
+        elif self.per_layer_router:
             w_attn, w_mlp, attn_mask, mlp_mask = self.branch_routers[depth_idx](hidden_states)
         else:
             w_attn, w_mlp, attn_mask, mlp_mask = self.branch_router(hidden_states)
 
         attn_mask_bool = attn_mask.bool()
-        sparse_attn = not attn_mask_bool.all()
+        use_sparse_attn = self.attn_bank.should_use_sparse_path(attn_mask_bool)
 
         # Attention branch
-        if self.attn_bank.mode == "per_head_precompute_kv" and sparse_attn:
+        if self.attn_bank.mode == "per_head_precompute_kv" and use_sparse_attn:
             attn_out, K_new, V_new = self.attn_bank.project_and_attend_per_head_precompute_kv_sparse(
                 hidden_states, position_embeddings, K_old, V_old, attn_mask_bool, causal_mask, depth_idx=depth_idx
             )
-        elif self.attn_bank.mode == "per_head_fully_independent" and sparse_attn:
+        elif self.attn_bank.mode == "per_head_precompute_kv":
+            attn_out, K_new, V_new = self.attn_bank.project_and_attend_per_head_precompute_kv_dense_mixed(
+                hidden_states, position_embeddings, K_old, V_old, attn_mask_bool, causal_mask, depth_idx=depth_idx
+            )
+            flat_attn_mask = attn_mask_bool.reshape(-1).detach()
+            for info in self.attn_bank.last_router_info.values():
+                info["token_mask"] = flat_attn_mask
+        elif self.attn_bank.mode == "per_head_fully_independent" and use_sparse_attn:
             attn_out, K_new, V_new = self.attn_bank.project_and_attend_per_head_fully_independent_sparse(
                 hidden_states, position_embeddings, K_old, V_old, attn_mask_bool, causal_mask, depth_idx=depth_idx
             )
-        elif self.attn_bank.mode == "per_head_precompute_kv":
-            attn_out, K_fresh, V_fresh = self.attn_bank.project_and_attend_per_head_precompute_kv(
-                hidden_states, position_embeddings, causal_mask, depth_idx=depth_idx
-            )
-            attn_mask_kv = attn_mask_bool.unsqueeze(1)
-            K_new = torch.where(attn_mask_kv, K_fresh, K_old)
-            V_new = torch.where(attn_mask_kv, V_fresh, V_old)
-            if attn_mask_bool.all():
-                flat_attn_mask = attn_mask_bool.reshape(-1).detach()
-                for info in self.attn_bank.last_router_info.values():
-                    info["token_mask"] = flat_attn_mask
         elif self.attn_bank.mode == "precompute_kv":
             attn_out, K_fresh, V_fresh = self.attn_bank.project_and_attend_precompute_kv(
-                hidden_states, position_embeddings, causal_mask
+                hidden_states, position_embeddings, causal_mask, depth_idx=depth_idx
             )
             attn_mask_kv = attn_mask_bool.unsqueeze(1)
             K_new = torch.where(attn_mask_kv, K_fresh, K_old)
@@ -1425,10 +1765,7 @@ class MoEverythingModel(nn.Module):
             attn_out = self.attn_bank.attend(Q, K_blend, V_blend, causal_mask, depth_idx=depth_idx)
             K_new = torch.where(attn_mask_kv, K_fresh, K_old)
             V_new = torch.where(attn_mask_kv, V_fresh, V_old)
-            if (
-                self.attn_bank.mode in ("per_head_fully_independent", "per_head_precompute_kv")
-                and attn_mask_bool.all()
-            ):
+            if self.attn_bank.mode in ("per_head_fully_independent", "per_head_precompute_kv"):
                 flat_attn_mask = attn_mask_bool.reshape(-1).detach()
                 for info in self.attn_bank.last_router_info.values():
                     info["token_mask"] = flat_attn_mask

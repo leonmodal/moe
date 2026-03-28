@@ -68,6 +68,11 @@ Config files: `configs/scaling/`
 ./scripts/train.sh configs/scaling/m_global.yaml --resume outputs/m_global_moe/checkpoint-5000
 ```
 
+`scripts/train.sh` now uses `torchrun` by default for single-node multi-GPU runs.
+
+- `NPROC_PER_NODE=8 ./scripts/train.sh ...` launches 8-way DDP with `uv run torchrun`
+- `LAUNCHER=accelerate ./scripts/train.sh ...` keeps the old `accelerate launch` path
+
 ## Logging
 
 All metrics are logged to stdout and wandb (if `WANDB_API_KEY` is set).
@@ -76,7 +81,7 @@ All metrics are logged to stdout and wandb (if `WANDB_API_KEY` is set).
 
 Stdout format:
 ```
-step    182  loss=10.3080  ce=10.3059  aux=2.0113  lr=1.46e-05  tok/s=446.9k  |g|=1.841
+step    182  loss=10.3080  ce=10.3059  aux=2.0113  lr=1.46e-05  tok/s=446.9k  sec/step=2.291  |g|=1.841
 ```
 
 #### `train/ce_loss` — Cross-entropy loss
@@ -106,7 +111,11 @@ Linear warmup from 0 → peak over `warmup_steps`, then cosine decay to `min_lr_
 
 #### `train/tokens_per_sec` — Throughput
 
-Tokens processed per second across all GPUs. Use this to compare hardware efficiency across configs.
+Exact last-step throughput across all GPUs. This is not a windowed or cumulative average.
+
+#### `train/sec_per_step` — Step runtime
+
+Exact last-step wall-clock runtime for the optimizer step.
 
 #### `train/tokens_seen_B` — Cumulative tokens (billions)
 

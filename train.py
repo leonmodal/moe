@@ -414,6 +414,11 @@ def build_model(cfg: dict):
             dynamic_depth_max=mcfg.get("dynamic_depth_max", 1.0),
             depthwise_attention=mcfg.get("depthwise_attention", False),
             depthwise_block_size=mcfg.get("depthwise_block_size", 0),
+            per_head_compute_mode=mcfg.get("per_head_compute_mode", "auto"),
+            per_head_dense_fraction_threshold=mcfg.get(
+                "per_head_dense_fraction_threshold", 0.75
+            ),
+            sanity_check_mode=mcfg.get("sanity_check_mode"),
             **common,
         )
         model = MoEverythingForCausalLM(config)
@@ -761,11 +766,8 @@ def main() -> None:
     model.train()
 
     data_iter = iter(dataloader)
-    t0 = time.perf_counter()
-    log_t0 = t0
-    tokens_this_session = 0.0
-    tokens_since_log = 0.0
-    steps_since_log = 0
+    session_t0 = time.perf_counter()
+    step_t0 = session_t0
     routing_log_every = tcfg_dict.get("routing_log_every", 50)
     expert_count_accum = None
     expert_margin_accum = None
@@ -784,6 +786,8 @@ def main() -> None:
     accelerator.print(f"Starting training from step {global_step}")
 
     while global_step < train_cfg.max_steps:
+        if microbatches_in_step == 0:
+            step_t0 = time.perf_counter()
         try:
             batch = next(data_iter)
         except StopIteration:
@@ -926,12 +930,11 @@ def main() -> None:
 
             scheduler.step()
             global_step += 1
+            step_elapsed = time.perf_counter() - step_t0
 
             tokens_this_step = reduce_scalar(accelerator, float(local_tokens_in_step), reduction="sum")
             tokens_seen += tokens_this_step
-            tokens_this_session += tokens_this_step
-            tokens_since_log += tokens_this_step
-            steps_since_log += 1
+            step_tokens_per_sec = tokens_this_step / max(step_elapsed, 1e-6)
 
             avg_total = reduce_scalar(accelerator, loss_window_sum / max(1, microbatches_in_step))
             avg_ce = reduce_scalar(accelerator, ce_window_sum / max(1, microbatches_in_step))
@@ -941,12 +944,6 @@ def main() -> None:
             avg_grad_norm = reduce_scalar(accelerator, grad_norm)
 
             if global_step % train_cfg.log_every == 0 and accelerator.is_main_process:
-                now = time.perf_counter()
-                elapsed = now - t0
-                log_elapsed = now - log_t0
-                tok_per_sec = tokens_since_log / max(log_elapsed, 1e-6)
-                tok_per_sec_cumulative = tokens_this_session / max(elapsed, 1e-6)
-                ms_per_step = 1000.0 * log_elapsed / max(1, steps_since_log)
                 lr = scheduler.get_last_lr()[0]
                 log_dict = {
                     "train/loss": avg_total,
@@ -956,26 +953,21 @@ def main() -> None:
                     "train/branch_aux_loss": avg_branch_aux,
                     "train/grad_norm": avg_grad_norm,
                     "train/lr": lr,
-                    "train/tokens_per_sec": tok_per_sec,
-                    "train/tokens_per_sec_cumulative": tok_per_sec_cumulative,
-                    "train/ms_per_step": ms_per_step,
+                    "train/tokens_per_sec": step_tokens_per_sec,
+                    "train/sec_per_step": step_elapsed,
                     "train/tokens_seen_B": tokens_seen / 1e9,
                 }
                 accelerator.print(
                     f"step {global_step:6d}  "
                     f"loss={avg_total:.4f}  ce={avg_ce:.4f}  aux={avg_aux:.4f}  "
                     f"seq_aux={avg_seq_aux:.4f}  branch_aux={avg_branch_aux:.4f}  "
-                    f"lr={lr:.2e}  tok/s={tok_per_sec/1e3:.1f}k  "
-                    f"tok/s(cum)={tok_per_sec_cumulative/1e3:.1f}k  "
-                    f"ms/step={ms_per_step:.0f}  |g|={avg_grad_norm:.3f}"
+                    f"lr={lr:.2e}  tok/s={step_tokens_per_sec/1e3:.1f}k  "
+                    f"sec/step={step_elapsed:.3f}  |g|={avg_grad_norm:.3f}"
                 )
                 if bias_stats:
                     log_dict.update(bias_stats)
                 if log_with:
                     accelerator.log(log_dict, step=global_step)
-                log_t0 = now
-                tokens_since_log = 0.0
-                steps_since_log = 0
 
             if global_step % routing_log_every == 0:
                 if expert_count_accum is not None and accelerator.num_processes > 1:

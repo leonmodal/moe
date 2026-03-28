@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from src.models import Qwen3MoeConfig, StandardMoEModel, GlobalMoEConfig, GlobalMoEForCausalLM
 from src.models.global_moe import GlobalMoEModel
-from transformers.models.qwen3_moe.modeling_qwen3_moe import repeat_kv
+from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_emb, repeat_kv
 
 
 # ── Tiny config for fast CPU tests ──────────────────────────────────────────
@@ -510,6 +510,7 @@ def test_per_layer_router_precompute_kv():
 # ── Per-layer attention router tests ──────────────────────────────────────
 
 PER_HEAD_MODES = ["per_head_fully_independent", "per_head_precompute_kv"]
+NON_PER_HEAD_ATTN_ROUTER_MODES = ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"]
 
 
 @pytest.mark.parametrize("mode", PER_HEAD_MODES)
@@ -560,6 +561,47 @@ def test_per_layer_attn_router_loss_decreases(mode):
         out.loss.backward()
         opt.step()
     assert out.loss.item() < first_loss
+
+
+@pytest.mark.parametrize("mode", NON_PER_HEAD_ATTN_ROUTER_MODES)
+def test_non_per_head_per_layer_attn_router_creates_separate_routers(mode):
+    config = tiny_moe_everything_config(mode)
+    config.per_layer_attn_router = True
+    model = MoEverythingForCausalLM(config)
+    bank = model.model.attn_bank
+    if mode in ("bundled", "precompute_kv"):
+        assert hasattr(bank, "routers") and len(bank.routers) == config.num_hidden_layers
+    elif mode == "kv_paired":
+        assert hasattr(bank, "kv_routers") and len(bank.kv_routers) == config.num_hidden_layers
+        assert hasattr(bank, "q_routers") and len(bank.q_routers) == config.num_hidden_layers
+        assert hasattr(bank, "o_routers") and len(bank.o_routers) == config.num_hidden_layers
+    elif mode == "qk_paired":
+        assert hasattr(bank, "qk_routers") and len(bank.qk_routers) == config.num_hidden_layers
+        assert hasattr(bank, "v_routers") and len(bank.v_routers) == config.num_hidden_layers
+        assert hasattr(bank, "o_routers") and len(bank.o_routers) == config.num_hidden_layers
+    elif mode == "fully_independent":
+        assert hasattr(bank, "q_routers") and len(bank.q_routers) == config.num_hidden_layers
+        assert hasattr(bank, "k_routers") and len(bank.k_routers) == config.num_hidden_layers
+        assert hasattr(bank, "v_routers") and len(bank.v_routers) == config.num_hidden_layers
+        assert hasattr(bank, "o_routers") and len(bank.o_routers) == config.num_hidden_layers
+
+
+@pytest.mark.parametrize("mode", NON_PER_HEAD_ATTN_ROUTER_MODES)
+def test_non_per_head_per_layer_attn_router_forward_and_grads(mode):
+    config = tiny_moe_everything_config(mode)
+    config.per_layer_attn_router = True
+    model = MoEverythingForCausalLM(config).train()
+    ids, labels = _dummy_batch()
+    out = model(input_ids=ids, labels=labels)
+    assert out.loss is not None
+    out.loss.backward()
+    skip = {"model.init_k_proj.weight", "model.init_v_proj.weight", "model.init_k_norm.weight"}
+    no_grad = [
+        n for n, p in model.named_parameters()
+        if p.requires_grad and p.grad is None
+        and (mode not in PRECOMPUTE_KV_MODES or n not in skip)
+    ]
+    assert len(no_grad) == 0, f"Params without grad: {no_grad}"
 
 
 # ── Routed norm tests ─────────────────────────────────────────────────────
@@ -685,6 +727,96 @@ def test_per_head_fully_independent_o_router_uses_attention_output():
     torch.testing.assert_close(captured["o_input"], expected_o_input)
 
 
+def test_per_head_fully_independent_sparse_o_router_uses_attention_output():
+    config = tiny_moe_everything_config("per_head_fully_independent")
+    config.num_hidden_layers = 1
+    model = MoEverythingForCausalLM(config).eval()
+    bank = model.model.attn_bank
+    captured = {}
+    original_route_flat = bank._route_flat
+
+    def wrapped_route_flat(self, router, x, top_k):
+        if router is bank.o_router:
+            captured["o_input"] = x.detach().clone()
+        return original_route_flat(router, x, top_k)
+
+    bank._route_flat = MethodType(wrapped_route_flat, bank)
+
+    hidden_states = torch.randn(2, 4, config.hidden_size)
+    token_mask = torch.tensor([[1, 0, 1, 0], [0, 1, 0, 1]], dtype=torch.bool).unsqueeze(-1)
+    position_ids = torch.arange(hidden_states.shape[1]).unsqueeze(0).expand(hidden_states.shape[0], -1)
+    position_embeddings = model.model.rotary_emb(hidden_states, position_ids=position_ids)
+    K_old = torch.zeros(hidden_states.shape[0], bank.num_kv_heads, hidden_states.shape[1], bank.head_dim)
+    V_old = torch.zeros_like(K_old)
+
+    with torch.no_grad():
+        B, T, H = hidden_states.shape
+        flat_mask = token_mask.reshape(-1).bool()
+        flat_hidden = hidden_states.reshape(B * T, H)
+        hidden_selected = flat_hidden[flat_mask]
+
+        q_flat = bank.q_pre_norm(hidden_selected)
+        k_flat = bank.k_pre_norm(hidden_selected)
+        v_flat = bank.v_pre_norm(hidden_selected)
+        q_router, k_router, v_router, _ = bank._select_attn_routers(depth_idx=0)
+
+        q_idx, q_w, _ = original_route_flat(q_router, q_flat, bank.num_heads)
+        k_idx, k_w, _ = original_route_flat(k_router, k_flat, bank.num_kv_heads)
+        v_idx, v_w, _ = original_route_flat(v_router, v_flat, bank.num_kv_heads)
+
+        Q_sel = bank._project_heads_batched(q_flat, bank.q_proj, q_idx, q_w, bank.q_norm_weight)
+        K_sel = bank._project_heads_batched(k_flat, bank.k_proj, k_idx, k_w, bank.k_norm_weight)
+        V_sel = bank._project_heads_batched(v_flat, bank.v_proj, v_idx, v_w)
+
+        Q_flat = hidden_states.new_zeros(B * T, bank.num_heads, bank.head_dim)
+        K_flat = hidden_states.new_zeros(B * T, bank.num_kv_heads, bank.head_dim)
+        V_flat = hidden_states.new_zeros(B * T, bank.num_kv_heads, bank.head_dim)
+        Q_flat[flat_mask] = Q_sel
+        K_flat[flat_mask] = K_sel
+        V_flat[flat_mask] = V_sel
+
+        Q = Q_flat.view(B, T, bank.num_heads, bank.head_dim).transpose(1, 2)
+        K_fresh = K_flat.view(B, T, bank.num_kv_heads, bank.head_dim).transpose(1, 2)
+        V_fresh = V_flat.view(B, T, bank.num_kv_heads, bank.head_dim).transpose(1, 2)
+        cos, sin = position_embeddings
+        Q, K_fresh = apply_rotary_pos_emb(Q, K_fresh, cos, sin)
+
+        attn_mask_kv = token_mask.unsqueeze(1)
+        K_new = torch.where(attn_mask_kv, K_fresh, K_old)
+        V_new = torch.where(attn_mask_kv, V_fresh, V_old)
+
+        K_expanded = repeat_kv(K_new, bank.num_kv_groups)
+        V_expanded = repeat_kv(V_new, bank.num_kv_groups)
+        attn_heads = hidden_states.new_zeros(B, bank.num_heads, T, bank.head_dim)
+        token_mask_2d = token_mask.squeeze(-1).bool()
+
+        for b in range(B):
+            pos = token_mask_2d[b].nonzero(as_tuple=False).squeeze(-1)
+            if pos.numel() == 0:
+                continue
+            Q_b = Q[b : b + 1, :, pos, :]
+            scores = torch.matmul(Q_b, K_expanded[b : b + 1].transpose(2, 3)) * bank.scaling
+            probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
+            attn_b = torch.matmul(probs, V_expanded[b : b + 1])
+            attn_heads[b, :, pos, :] = attn_b.squeeze(0).to(attn_heads.dtype)
+
+        expected_o_input = (
+            attn_heads.transpose(1, 2).reshape(B * T, bank.num_heads, bank.head_dim)[flat_mask].reshape(-1, bank.q_dim)
+        )
+        _ = bank.project_and_attend_per_head_fully_independent_sparse(
+            hidden_states,
+            position_embeddings,
+            K_old,
+            V_old,
+            token_mask,
+            depth_idx=0,
+        )
+
+    assert "o_input" in captured
+    assert captured["o_input"].shape[-1] == bank.q_dim
+    torch.testing.assert_close(captured["o_input"], expected_o_input)
+
+
 @pytest.mark.parametrize("mode", PER_HEAD_MODES)
 def test_per_head_branch_masks_are_reported(mode):
     config = tiny_moe_everything_config(mode)
@@ -756,6 +888,35 @@ def test_per_head_sparse_paths_work_under_bfloat16_autocast(mode):
     assert torch.isfinite(out.loss.float())
 
 
+@pytest.mark.parametrize("mode", PER_HEAD_MODES)
+def test_per_head_dense_and_sparse_dispatch_match(mode):
+    sparse_cfg = tiny_moe_everything_config(mode)
+    sparse_cfg.num_hidden_layers = 1
+    sparse_cfg.per_head_compute_mode = "sparse"
+    dense_cfg = tiny_moe_everything_config(mode)
+    dense_cfg.num_hidden_layers = 1
+    dense_cfg.per_head_compute_mode = "dense"
+
+    sparse_model = MoEverythingForCausalLM(sparse_cfg).eval()
+    dense_model = MoEverythingForCausalLM(dense_cfg).eval()
+    dense_model.load_state_dict(sparse_model.state_dict())
+
+    _force_branch_choices(sparse_model, attn_ids=[1], mlp_ids=[2])
+    dense_model.load_state_dict(sparse_model.state_dict())
+
+    ids = torch.tensor([[1, 2, 1, 2]])
+    with torch.no_grad():
+        out_sparse = sparse_model(input_ids=ids, labels=ids, output_router_logits=True)
+        out_dense = dense_model(input_ids=ids, labels=ids, output_router_logits=True)
+
+    torch.testing.assert_close(out_dense.logits, out_sparse.logits, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out_dense.loss, out_sparse.loss, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        out_dense.attention_router_info[0]["attn" if mode == "per_head_precompute_kv" else "o"]["token_mask"].cpu(),
+        out_sparse.attention_router_info[0]["attn" if mode == "per_head_precompute_kv" else "o"]["token_mask"].cpu(),
+    )
+
+
 def test_base_per_head_fully_independent_configs_use_256_attention_experts():
     base_cfg = Path("configs/moe_everything_per_head_fully_independent.yaml").read_text()
     debug_cfg = Path(
@@ -763,6 +924,139 @@ def test_base_per_head_fully_independent_configs_use_256_attention_experts():
     ).read_text()
     assert "num_attn_experts: 256" in base_cfg
     assert "num_attn_experts: 256" in debug_cfg
+
+
+def _tiny_global_equiv_config():
+    return GlobalMoEConfig(
+        vocab_size=256,
+        hidden_size=64,
+        num_hidden_layers=2,
+        head_dim=32,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        num_experts=1,
+        num_experts_per_tok=1,
+        moe_intermediate_size=32,
+        intermediate_size=128,
+        max_position_embeddings=128,
+        output_router_logits=True,
+        norm_topk_prob=True,
+        router_aux_loss_coef=0.0,
+    )
+
+
+def _tiny_alternating_sanity_config():
+    return MoEverythingConfig(
+        vocab_size=256,
+        hidden_size=64,
+        num_hidden_layers=4,
+        head_dim=32,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        num_experts=1,
+        num_experts_per_tok=1,
+        moe_intermediate_size=32,
+        intermediate_size=128,
+        max_position_embeddings=128,
+        num_attn_experts=4,
+        num_attn_experts_per_tok=1,
+        attn_expert_mode="per_head_precompute_kv",
+        norm_topk_prob=True,
+        router_aux_loss_coef=0.0,
+        per_layer_norm=True,
+        sanity_check_mode="alternating_global_moe",
+    )
+
+
+def _copy_global_weights_into_sanity_moe(global_model, sanity_model):
+    global_inner = global_model.model
+    sanity_inner = sanity_model.model
+    head_dim = global_model.config.head_dim
+    num_heads = global_model.config.num_attention_heads
+    num_kv_groups = num_heads // global_model.config.num_key_value_heads
+
+    with torch.no_grad():
+        sanity_inner.embed_tokens.weight.copy_(global_inner.embed_tokens.weight)
+        sanity_inner.norm.weight.copy_(global_inner.norm.weight)
+        sanity_model.lm_head.weight.copy_(global_model.lm_head.weight)
+        sanity_inner.mlp_bank.experts.gate_up_proj.copy_(global_inner.global_experts.gate_up_proj)
+        sanity_inner.mlp_bank.experts.down_proj.copy_(global_inner.global_experts.down_proj)
+
+        for layer_idx, layer in enumerate(global_inner.layers):
+            attn_depth = 2 * layer_idx
+            mlp_depth = attn_depth + 1
+            sanity_inner.attn_bank.norms[attn_depth].weight.copy_(layer.input_layernorm.weight)
+            sanity_inner.mlp_bank.norms[mlp_depth].weight.copy_(layer.post_attention_layernorm.weight)
+
+            q_proj = layer.self_attn.q_proj.weight
+            k_proj = layer.self_attn.k_proj.weight
+            v_proj = layer.self_attn.v_proj.weight
+            o_proj = layer.self_attn.o_proj.weight
+            q_norm = layer.self_attn.q_norm.weight
+            k_norm = layer.self_attn.k_norm.weight
+
+            for head_idx in range(num_heads):
+                expert_idx = layer_idx * num_heads + head_idx
+                kv_head_idx = head_idx // num_kv_groups
+                q_start = head_idx * head_dim
+                q_end = q_start + head_dim
+                kv_start = kv_head_idx * head_dim
+                kv_end = kv_start + head_dim
+
+                sanity_inner.attn_bank.q_proj[expert_idx].copy_(q_proj[q_start:q_end].t())
+                sanity_inner.attn_bank.k_proj[expert_idx].copy_(k_proj[kv_start:kv_end].t())
+                sanity_inner.attn_bank.v_proj[expert_idx].copy_(v_proj[kv_start:kv_end].t())
+                sanity_inner.attn_bank.o_proj[expert_idx].copy_(o_proj[:, q_start:q_end].t())
+                sanity_inner.attn_bank.q_norm_weight[expert_idx].copy_(q_norm)
+                sanity_inner.attn_bank.k_norm_weight[expert_idx].copy_(k_norm)
+
+
+def test_alternating_global_sanity_matches_global_moe():
+    global_model = GlobalMoEForCausalLM(_tiny_global_equiv_config()).eval()
+    sanity_model = MoEverythingForCausalLM(_tiny_alternating_sanity_config()).eval()
+    _copy_global_weights_into_sanity_moe(global_model, sanity_model)
+
+    ids, labels = _dummy_batch(B=2, T=8)
+    with torch.no_grad():
+        global_out = global_model(input_ids=ids, labels=labels, output_router_logits=True)
+        sanity_out = sanity_model(input_ids=ids, labels=labels, output_router_logits=True)
+
+    torch.testing.assert_close(sanity_out.logits, global_out.logits, atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(sanity_out.loss, global_out.loss, atol=2e-4, rtol=2e-4)
+
+
+def test_alternating_global_sanity_uses_learned_mlp_gate():
+    config = tiny_moe_everything_config("per_head_precompute_kv")
+    config.num_hidden_layers = 2
+    config.num_experts = 4
+    config.num_experts_per_tok = 1
+    config.per_layer_norm = True
+    config.sanity_check_mode = "alternating_global_moe"
+    model = MoEverythingForCausalLM(config).eval()
+    bank = model.model.mlp_bank
+    captured = {"gate_called": False}
+
+    def fake_gate_forward(self, flat):
+        captured["gate_called"] = True
+        logits = flat.new_full((flat.shape[0], self.num_experts), -1.0e4)
+        logits[:, 3] = 1.0e4
+        weights = flat.new_ones((flat.shape[0], 1))
+        selected = torch.full((flat.shape[0], 1), 3, device=flat.device, dtype=torch.long)
+        return logits, weights, selected
+
+    bank.gate.forward = MethodType(fake_gate_forward, bank.gate)
+
+    hidden_states = torch.randn(2, 4, config.hidden_size)
+    with torch.no_grad():
+        out = bank(hidden_states, depth_idx=1)
+
+    assert captured["gate_called"]
+    assert out.shape == hidden_states.shape
+    expected_selected = torch.full_like(bank.last_selected_experts, 3)
+    expected_logits = bank.last_router_logits.new_full(bank.last_router_logits.shape, -1.0e4)
+    expected_logits[:, 3] = 1.0e4
+    torch.testing.assert_close(bank.last_selected_experts, expected_selected)
+    torch.testing.assert_close(bank.last_router_logits, expected_logits)
 
 
 # ── Dynamic depth tests ───────────────────────────────────────────────────
