@@ -37,6 +37,11 @@ modal run --detach modal_train.py --config configs/scaling/xs_global.yaml
 modal run --detach modal_train.py --config configs/global_moe.yaml
 modal run --detach modal_train.py --config configs/standard_moe.yaml
 
+# Per-head Modal sweep (5 jobs)
+bash scripts/launch_all.sh
+```
+
+`scripts/launch_all.sh` launches the 5 current per-head MHA experiments, including the fixed-schedule sanity run.
 
 
 ## Configuration
@@ -192,5 +197,3 @@ moe/
 ├── scripts/                    # Standalone launch scripts
 └── accelerate_configs/         # Accelerate configs (standalone mode only)
 ```
-
-

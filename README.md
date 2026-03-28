@@ -73,6 +73,35 @@ Config files: `configs/scaling/`
 - `NPROC_PER_NODE=8 ./scripts/train.sh ...` launches 8-way DDP with `uv run torchrun`
 - `LAUNCHER=accelerate ./scripts/train.sh ...` keeps the old `accelerate launch` path
 
+### Per-Head Modal Sweep
+
+`scripts/launch_all.sh` launches 5 Modal jobs for the current per-head sweep:
+
+- `configs/moe_everything_per_head_independent_prenorm.yaml`
+- `configs/moe_everything_per_head_independent_bothnorm.yaml`
+- `configs/moe_everything_per_head_precompute_kv_prenorm.yaml`
+- `configs/moe_everything_per_head_precompute_kv_bothnorm.yaml`
+- `configs/moe_everything_per_head_precompute_kv_sanity.yaml`
+
+These 5 configs are aligned on the main model dimensions:
+
+- MHA: `num_attention_heads = num_key_value_heads = 16`
+- attention bank size: `num_attn_experts = 256`
+- MLP bank size: `num_experts = 256`
+- active MLP experts: `num_experts_per_tok = 4`
+
+The first four are normal learned-routing runs. The sanity config keeps:
+
+- a fixed alternating attention/MLP branch schedule
+- fixed attention expert assignment
+- normal learned MLP routing
+
+Run the full sweep with:
+
+```bash
+bash scripts/launch_all.sh
+```
+
 ## Logging
 
 All metrics are logged to stdout and wandb (if `WANDB_API_KEY` is set).

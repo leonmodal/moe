@@ -6,7 +6,8 @@ This repo has three model families:
 2. `global_moe`
 3. `moe_everything`
 
-All three use the Qwen3/Qwen3-MoE backbone pieces: RoPE, GQA, RMSNorm, SwiGLU, and a causal LM head.
+All three use the Qwen3/Qwen3-MoE backbone pieces: RoPE, RMSNorm, SwiGLU, and a causal LM head.
+Standard/global configs keep the usual Qwen GQA layouts; the current per-head launch configs use MHA.
 
 ## Standard MoE
 
@@ -110,6 +111,14 @@ This is a deterministic debugging mode for `per_head_precompute_kv`.
 - MLP routing still uses the normal learned gate.
 
 This is meant for “does this reduce to a global-MoE-like stack when routing is hardcoded?” checks.
+
+The launch config `configs/moe_everything_per_head_precompute_kv_sanity.yaml` is now aligned with the main
+per-head sweep on MLP capacity and routing settings:
+
+- MHA: `num_attention_heads = num_key_value_heads = 16`
+- attention bank: `num_attn_experts = 256`
+- MLP bank: `num_experts = 256`
+- active MLP experts: `num_experts_per_tok = 4`
 
 ## Training
 

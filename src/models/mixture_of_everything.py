@@ -1999,8 +1999,14 @@ class MoEverythingForCausalLM(nn.Module):
                     seq_aux_loss = seq_aux
                     loss = loss + seq_aux_coef * seq_aux
 
-            # Attention expert seq aux loss (same coef as MLP)
-            if seq_aux_coef > 0 and attention_router_info is not None:
+            # Attention expert seq aux loss (same coef as MLP).
+            # Skip this in sanity mode because attention routing is deterministic
+            # and would only add a constant term to the loss.
+            if (
+                seq_aux_coef > 0
+                and attention_router_info is not None
+                and getattr(self.config, "sanity_check_mode", None) != "alternating_global_moe"
+            ):
                 # Gather per-router logits and selected experts across depths
                 attn_router_names = sorted({n for d in attention_router_info for n in d})
                 num_attn_experts = self.config.num_attn_experts
