@@ -227,6 +227,47 @@ class Qwen3MoeExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
 
+    def _maybe_grouped_mm(
+        self,
+        sorted_inputs: torch.Tensor,
+        expert_weights_t: torch.Tensor,
+        counts: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if (
+            not sorted_inputs.is_cuda
+            or sorted_inputs.dtype not in (torch.bfloat16, torch.float16)
+            or not is_grouped_mm_available()
+            or not hasattr(torch, "_grouped_mm")
+        ):
+            return None
+
+        offsets = counts.to(device=sorted_inputs.device, dtype=torch.int32).cumsum(dim=0)
+        try:
+            return torch._grouped_mm(sorted_inputs.contiguous(), expert_weights_t.contiguous(), offs=offsets)
+        except RuntimeError:
+            return None
+
+    def _run_grouped_expert_linear(
+        self,
+        sorted_inputs: torch.Tensor,
+        unique_experts: torch.Tensor,
+        counts: torch.Tensor,
+        weight_bank: torch.Tensor,
+    ) -> torch.Tensor:
+        expert_weights = weight_bank.index_select(0, unique_experts)
+        expert_weights_t = expert_weights.transpose(1, 2)
+        proj = self._maybe_grouped_mm(sorted_inputs, expert_weights_t, counts)
+
+        if proj is None:
+            proj = sorted_inputs.new_empty(sorted_inputs.shape[0], expert_weights.shape[1])
+            start = 0
+            for expert_idx, count in zip(unique_experts.tolist(), counts.tolist()):
+                end = start + count
+                proj[start:end] = F.linear(sorted_inputs[start:end], weight_bank[expert_idx])
+                start = end
+
+        return proj
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -234,22 +275,41 @@ class Qwen3MoeExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        if top_k_index.numel() == 0:
+            return final_hidden_states
 
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+        token_idx = (
+            torch.arange(hidden_states.shape[0], device=hidden_states.device)
+            .unsqueeze(1)
+            .expand_as(top_k_index)
+            .reshape(-1)
+        )
+        pair_expert = top_k_index.reshape(-1)
+        pair_weight = top_k_weights.reshape(-1)
+
+        sort_order = torch.argsort(pair_expert)
+        sorted_expert = pair_expert[sort_order]
+        sorted_token_idx = token_idx[sort_order]
+        sorted_weight = pair_weight[sort_order]
+        unique_experts, counts = torch.unique_consecutive(sorted_expert, return_counts=True)
+
+        sorted_inputs = hidden_states.index_select(0, sorted_token_idx)
+        gate_up = self._run_grouped_expert_linear(
+            sorted_inputs,
+            unique_experts,
+            counts,
+            self.gate_up_proj,
+        )
+        gate, up = gate_up.chunk(2, dim=-1)
+        current_hidden_states = self.act_fn(gate) * up
+        current_hidden_states = self._run_grouped_expert_linear(
+            current_hidden_states,
+            unique_experts,
+            counts,
+            self.down_proj,
+        )
+        current_hidden_states = current_hidden_states * sorted_weight.unsqueeze(-1).to(current_hidden_states.dtype)
+        final_hidden_states.index_add_(0, sorted_token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
         return final_hidden_states
 

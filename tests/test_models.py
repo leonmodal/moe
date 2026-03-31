@@ -8,9 +8,11 @@ from types import MethodType
 import pytest
 import torch
 import torch.nn.functional as F
+import yaml
 from src.models import Qwen3MoeConfig, StandardMoEModel, GlobalMoEConfig, GlobalMoEForCausalLM
 from src.models.global_moe import GlobalMoEModel
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+    Qwen3MoeExperts,
     Qwen3MoeTopKRouter,
     apply_rotary_pos_emb,
     repeat_kv,
@@ -227,9 +229,80 @@ def test_loss_decreases_with_gradient_step():
     assert loss2.item() < loss1.item(), "Loss did not decrease after one gradient step"
 
 
+def test_qwen3_moe_experts_grouped_mm_matches_legacy_reference():
+    config = tiny_standard_config()
+    experts = Qwen3MoeExperts(config).eval()
+    assert hasattr(experts, "_maybe_grouped_mm")
+    assert hasattr(experts, "_run_grouped_expert_linear")
+    hidden_states = torch.randn(7, config.hidden_size)
+    top_k_index = torch.tensor(
+        [
+            [0, 1],
+            [2, 3],
+            [1, 0],
+            [3, 2],
+            [0, 2],
+            [1, 3],
+            [2, 0],
+        ],
+        dtype=torch.long,
+    )
+    top_k_weights = torch.tensor(
+        [
+            [0.7, 0.3],
+            [0.6, 0.4],
+            [0.2, 0.8],
+            [0.5, 0.5],
+            [0.9, 0.1],
+            [0.4, 0.6],
+            [0.3, 0.7],
+        ],
+        dtype=hidden_states.dtype,
+    )
+
+    def legacy_forward():
+        final_hidden_states = torch.zeros_like(hidden_states)
+        expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=experts.num_experts)
+        expert_mask = expert_mask.permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate, up = F.linear(current_state, experts.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            current_hidden_states = experts.act_fn(gate) * up
+            current_hidden_states = F.linear(current_hidden_states, experts.down_proj[expert_idx])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+        return final_hidden_states
+
+    expected = legacy_forward()
+
+    with torch.no_grad():
+        fallback = experts(hidden_states, top_k_index, top_k_weights)
+
+    torch.testing.assert_close(fallback, expected, atol=1e-6, rtol=1e-6)
+
+    def fake_grouped_mm(self, sorted_inputs, expert_weights_t, counts):
+        outputs = []
+        start = 0
+        for weight_t, count in zip(expert_weights_t, counts.tolist()):
+            end = start + count
+            outputs.append(sorted_inputs[start:end] @ weight_t)
+            start = end
+        return torch.cat(outputs, dim=0)
+
+    experts._maybe_grouped_mm = MethodType(fake_grouped_mm, experts)
+
+    with torch.no_grad():
+        grouped = experts(hidden_states, top_k_index, top_k_weights)
+
+    torch.testing.assert_close(grouped, expected, atol=1e-6, rtol=1e-6)
+
+
 # ── Mixture-of-Everything tests ─────────────────────────────────────────────
 
-from src.models.mixture_of_everything import MoEverythingConfig, MoEverythingForCausalLM
+from src.models.mixture_of_everything import AttentionExpertBank, MoEverythingConfig, MoEverythingForCausalLM
 from train import get_bias_update_routers, update_expert_biases
 
 
@@ -949,6 +1022,45 @@ def test_per_head_dense_and_sparse_dispatch_match(mode):
     )
 
 
+def test_per_head_precompute_kv_routes_one_slot_per_kv_head():
+    config = tiny_moe_everything_config("per_head_precompute_kv")
+    model = MoEverythingForCausalLM(config).eval()
+    hidden_states = torch.randn(2, 4, config.hidden_size)
+    position_ids = torch.arange(hidden_states.shape[1]).unsqueeze(0).expand(hidden_states.shape[0], -1)
+    position_embeddings = model.model.rotary_emb(hidden_states, position_ids=position_ids)
+
+    with torch.no_grad():
+        tables = model.model.attn_bank._build_per_head_precompute_kv_tables(
+            hidden_states,
+            position_embeddings,
+            depth_idx=0,
+        )
+
+    assert tables["idx"].shape == (hidden_states.shape[0] * hidden_states.shape[1], config.num_key_value_heads)
+    assert tables["weights"].shape == (hidden_states.shape[0] * hidden_states.shape[1], config.num_key_value_heads)
+    assert tables["Q"].shape[1] == config.num_attention_heads
+    assert tables["K_fresh"].shape[1] == config.num_key_value_heads
+    assert tables["V_fresh"].shape[1] == config.num_key_value_heads
+
+
+@pytest.mark.parametrize(
+    ("mode", "attn_tokens", "expected"),
+    [
+        ("per_head_precompute_kv", 2, True),
+        ("per_head_precompute_kv", 3, False),
+        ("per_head_fully_independent", 1, True),
+        ("per_head_fully_independent", 2, True),
+        ("per_head_fully_independent", 4, False),
+    ],
+)
+def test_per_head_auto_sparse_thresholds_are_mode_specific(mode, attn_tokens, expected):
+    config = tiny_moe_everything_config(mode)
+    bank = AttentionExpertBank(config)
+    token_mask = torch.zeros(1, 4, 1, dtype=torch.bool)
+    token_mask[:, :attn_tokens, :] = True
+    assert bank.should_use_sparse_path(token_mask) is expected
+
+
 def test_base_per_head_fully_independent_configs_use_256_attention_experts():
     base_cfg = Path("configs/moe_everything_per_head_fully_independent.yaml").read_text()
     debug_cfg = Path(
@@ -1006,7 +1118,8 @@ def _copy_global_weights_into_sanity_moe(global_model, sanity_model):
     sanity_inner = sanity_model.model
     head_dim = global_model.config.head_dim
     num_heads = global_model.config.num_attention_heads
-    num_kv_groups = num_heads // global_model.config.num_key_value_heads
+    num_kv_heads = global_model.config.num_key_value_heads
+    num_kv_groups = num_heads // num_kv_heads
 
     with torch.no_grad():
         sanity_inner.embed_tokens.weight.copy_(global_inner.embed_tokens.weight)
@@ -1028,11 +1141,10 @@ def _copy_global_weights_into_sanity_moe(global_model, sanity_model):
             q_norm = layer.self_attn.q_norm.weight
             k_norm = layer.self_attn.k_norm.weight
 
-            for head_idx in range(num_heads):
-                expert_idx = layer_idx * num_heads + head_idx
-                kv_head_idx = head_idx // num_kv_groups
-                q_start = head_idx * head_dim
-                q_end = q_start + head_dim
+            for kv_head_idx in range(num_kv_heads):
+                expert_idx = layer_idx * num_kv_heads + kv_head_idx
+                q_start = kv_head_idx * num_kv_groups * head_dim
+                q_end = q_start + num_kv_groups * head_dim
                 kv_start = kv_head_idx * head_dim
                 kv_end = kv_start + head_dim
 
@@ -1138,6 +1250,35 @@ def test_alternating_global_sanity_bias_updates_use_global_mlp_pool_only():
         torch.testing.assert_close(router.expert_bias, ref_bias)
     for router in model.model.attn_bank.routers:
         torch.testing.assert_close(router.expert_bias, torch.zeros_like(router.expert_bias))
+
+
+def test_representative_experiment_configs_use_expected_gqa_ratios():
+    expected = {
+        "configs/standard_moe.yaml": 8,
+        "configs/global_moe.yaml": 8,
+        "configs/scaling/xs_standard.yaml": 8,
+        "configs/scaling/xs_global.yaml": 8,
+        "configs/scaling/xs_dense_baseline.yaml": 8,
+        "configs/scaling/m_standard.yaml": 4,
+        "configs/scaling/m_global.yaml": 4,
+        "configs/scaling/s_standard.yaml": 4,
+        "configs/scaling/s_global.yaml": 4,
+        "configs/moe_everything_per_head_precompute_kv.yaml": 8,
+        "configs/moe_everything_per_head_precompute_kv_sanity.yaml": 8,
+        "configs/moe_everything_per_head_fully_independent.yaml": 8,
+    }
+    for rel_path, num_kv_heads in expected.items():
+        model_cfg = yaml.safe_load(Path(rel_path).read_text())["model"]
+        assert model_cfg["num_key_value_heads"] == num_kv_heads, rel_path
+
+
+def test_sanity_config_matches_global_attention_geometry():
+    sanity_cfg = yaml.safe_load(Path("configs/moe_everything_per_head_precompute_kv_sanity.yaml").read_text())["model"]
+    global_cfg = yaml.safe_load(Path("configs/global_moe.yaml").read_text())["model"]
+
+    assert sanity_cfg["num_hidden_layers"] == global_cfg["num_hidden_layers"] * 2
+    for key in ("hidden_size", "head_dim", "num_attention_heads", "num_key_value_heads"):
+        assert sanity_cfg[key] == global_cfg[key]
 
 
 # ── Dynamic depth tests ───────────────────────────────────────────────────

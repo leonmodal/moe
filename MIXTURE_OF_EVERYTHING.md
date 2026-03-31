@@ -129,65 +129,65 @@ Sanity config:
 
 - `configs/moe_everything_per_head_precompute_kv_sanity.yaml`
 
-The per-head configs are currently MHA:
+The per-head configs now use the same GQA geometry as the baseline configs:
 
 - `num_attention_heads = 16`
-- `num_key_value_heads = 16`
-
-That means they are not matching the GQA setup used by `global_moe`.
+- `num_key_value_heads = 8`
 
 ## Per-Head Attention Picture
 
 For the current root per-head configs:
 
-- there are `16` fixed head slots
+- there are `8` fixed KV groups
+- there are `16` query heads arranged as `2` query heads per KV group
 - there are `256` attention experts in the shared pool
-- each token routes those `16` head slots into that `256`-expert pool
+- each token routes those `8` KV groups into that `256`-expert pool
 
 The important distinction is:
 
-- a head slot is a fixed position such as `head 0`, `head 1`, ..., `head 15`
+- a KV group is a fixed position such as `group 0`, `group 1`, ..., `group 7`
 - an attention expert is a reusable parameter set from the shared expert pool
 
-So an expert is not permanently tied to one head id. For each token, the router fills the `16` head slots with selected experts from the `256`-expert pool.
+So an expert is not permanently tied to one KV group id. For each token, the router fills the `8` KV-group slots with selected experts from the `256`-expert pool.
 
 ### `per_head_precompute_kv`
 
-In `per_head_precompute_kv`, one selected expert provides the full `Q`, `K`, `V`, and `O` behavior for that head slot.
+In `per_head_precompute_kv`, one selected expert provides the grouped-query slice plus the shared `K`, `V`, and `O` behavior for that KV group.
 
 ```text
 Config:
   num_attention_heads = 16
-  num_key_value_heads = 16
+  num_key_value_heads = 8
   num_attn_experts = 256
 
 For one token x: [1024]
 
-router(x) -> 16 expert ids, one for each head slot
+router(x) -> 8 expert ids, one for each KV group
 
-head slot:    0    1    2    3   ...   15
+kv group:     0    1    2    3   ...    7
 expert id:   37   91    4  144   ...    8
 
-Then for each head slot h:
+Then for each KV group g:
 
-  e = expert_id[h]
+  e = expert_id[g]
 
-  Q_h = q_norm[e](x @ Wq[e])   -> [128]
-  K_h = k_norm[e](x @ Wk[e])   -> [128]
-  V_h =            x @ Wv[e]   -> [128]
+  Q_g = q_norm[e](x @ Wq[e])   -> [2, 128]
+  K_g = k_norm[e](x @ Wk[e])   -> [128]
+  V_g =            x @ Wv[e]   -> [128]
 
-Collect over 16 head slots:
+Collect over 8 KV groups:
 
-  Q, K, V -> [16, 128]
+  Q -> [16, 128]
+  K, V -> [8, 128]
 
-Run attention across those 16 heads:
+Run GQA attention:
 
   attn(Q, K, V) -> Y -> [16, 128]
 
-Project back with the selected output experts:
+Project back with the selected output experts per KV group:
 
-  out_h = Y_h @ Wo[e]          -> [1024]
-  sum over head slots          -> final token output [1024]
+  out_g = Y_g @ Wo[e]          -> [1024]
+  sum over KV groups           -> final token output [1024]
 ```
 
 Batch-shaped view:
@@ -231,10 +231,11 @@ token B:
 
 So the right mental model is:
 
-- `16` fixed head positions
+- `8` fixed KV-group positions
+- `16` query heads derived from those `8` groups
 - `256` candidate attention experts
-- each token chooses which experts fill those `16` positions
-- the selected expert brings its own Q/K norm weights
+- each token chooses which experts fill those `8` KV-group positions
+- the selected expert brings its own grouped-Q and K norm weights
 
 ### `per_head_fully_independent`
 

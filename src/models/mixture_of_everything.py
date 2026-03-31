@@ -16,7 +16,7 @@ Attention bank modes:
   - "fully_independent"  : Q, K, V, O each from separate banks — 4 routers
   - "per_head_fully_independent": each Q/K/V/O head routes independently
   - "precompute_kv"      : per-expert KV tables, routed Q and O — 1 router
-  - "per_head_precompute_kv": one flat router picks per-head experts; KV/O reuse that routing
+  - "per_head_precompute_kv": one flat router picks per-KV-group experts; each expert emits a grouped Q plus shared KV/O
 
 MLP bank: standard top-k MoE over SwiGLU experts (reuses Qwen3MoeExperts).
 
@@ -52,6 +52,12 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 
 from .load_balancing import load_balancing_loss_func, seq_load_balancing_loss_func
 from .router import DeepSeekRouter, checkpoint_recompute_context, is_checkpoint_recompute
+
+DEFAULT_PER_HEAD_DENSE_FRACTION_THRESHOLD = 0.75
+AUTO_PER_HEAD_SPARSE_THRESHOLDS = {
+    "per_head_fully_independent": 0.75,
+    "per_head_precompute_kv": 0.75,
+}
 
 
 # ─── Config ────────────────────────────────────────────────────────────────── #
@@ -214,7 +220,11 @@ class AttentionExpertBank(nn.Module):
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
+        if self.num_heads % self.num_kv_heads != 0:
+            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
         self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.q_heads_per_kv = self.num_kv_groups
+        self.q_group_dim = self.q_heads_per_kv * self.head_dim
         self.q_dim = self.num_heads * self.head_dim
         self.kv_dim = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
@@ -334,6 +344,54 @@ class AttentionExpertBank(nn.Module):
         proj_normed = proj_f * torch.rsqrt(var + self.eps)
         return (norm_weight * proj_normed).to(proj.dtype)
 
+    def _maybe_grouped_mm(
+        self,
+        sorted_inputs: torch.Tensor,
+        weight_bank: torch.Tensor,
+        unique_experts: torch.Tensor,
+        counts: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if (
+            not sorted_inputs.is_cuda
+            or sorted_inputs.dtype not in (torch.bfloat16, torch.float16)
+            or not hasattr(torch, "_grouped_mm")
+        ):
+            return None
+
+        expert_weights = weight_bank.index_select(0, unique_experts).contiguous()
+        offsets = counts.to(device=sorted_inputs.device, dtype=torch.int32).cumsum(dim=0)
+        try:
+            return torch._grouped_mm(sorted_inputs.contiguous(), expert_weights, offs=offsets)
+        except RuntimeError:
+            return None
+
+    def _run_grouped_expert_matmul(
+        self,
+        sorted_inputs: torch.Tensor,
+        sorted_expert: torch.Tensor,
+        unique_experts: torch.Tensor,
+        counts: torch.Tensor,
+        weight_bank: torch.Tensor,
+        norm_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        proj = self._maybe_grouped_mm(sorted_inputs, weight_bank, unique_experts, counts)
+
+        if proj is None:
+            proj = sorted_inputs.new_empty(sorted_inputs.shape[0], weight_bank.shape[2])
+            start = 0
+            for expert, count in zip(unique_experts.tolist(), counts.tolist()):
+                end = start + count
+                proj[start:end] = sorted_inputs[start:end] @ weight_bank[expert]
+                start = end
+
+        if norm_weights is not None:
+            proj_f = proj.float()
+            variance = proj_f.pow(2).mean(-1, keepdim=True)
+            proj_normed = proj_f * torch.rsqrt(variance + self.eps)
+            proj = (norm_weights.index_select(0, sorted_expert) * proj_normed).to(sorted_inputs.dtype)
+
+        return proj
+
     def _project_shared_inputs_grouped(self, flat, weight_bank, idx, weights, norm_weights=None):
         """Project shared token inputs for all head slots, grouped by expert."""
         N, num_slots = idx.shape
@@ -356,15 +414,17 @@ class AttentionExpertBank(nn.Module):
         sorted_weight = pair_weight[sort_order]
         unique_experts, counts = torch.unique_consecutive(sorted_expert, return_counts=True)
 
-        start = 0
-        for expert, count in zip(unique_experts.tolist(), counts.tolist()):
-            end = start + count
-            proj = flat.index_select(0, sorted_token_idx[start:end]) @ weight_bank[expert]
-            if norm_weights is not None:
-                proj = self._apply_single_head_norm(proj, norm_weights[expert])
-            proj = proj * sorted_weight[start:end].unsqueeze(-1)
-            pair_out[sort_order[start:end]] = proj.to(pair_out.dtype)
-            start = end
+        sorted_inputs = flat.index_select(0, sorted_token_idx)
+        proj = self._run_grouped_expert_matmul(
+            sorted_inputs,
+            sorted_expert,
+            unique_experts,
+            counts,
+            weight_bank,
+            norm_weights=norm_weights,
+        )
+        proj = proj * sorted_weight.unsqueeze(-1).to(proj.dtype)
+        pair_out[sort_order] = proj.to(pair_out.dtype)
 
         return pair_out.view(N, num_slots, H_out)
 
@@ -406,19 +466,20 @@ class AttentionExpertBank(nn.Module):
         else:
             pair_out = inputs.new_zeros(pair_inputs.shape[0], H_out)
 
-        start = 0
-        for expert, count in zip(unique_experts.tolist(), counts.tolist()):
-            end = start + count
-            proj = sorted_inputs[start:end] @ weight_bank[expert]
-            if norm_weights is not None:
-                proj = self._apply_single_head_norm(proj, norm_weights[expert])
-            proj = proj * sorted_weight[start:end].unsqueeze(-1)
-            proj = proj.to(inputs.dtype)
-            if reduce_tokens:
-                token_out.index_add_(0, sorted_token_idx[start:end], proj)
-            else:
-                pair_out[sort_order[start:end]] = proj
-            start = end
+        proj = self._run_grouped_expert_matmul(
+            sorted_inputs,
+            sorted_expert,
+            unique_experts,
+            counts,
+            weight_bank,
+            norm_weights=norm_weights,
+        )
+        proj = proj * sorted_weight.unsqueeze(-1).to(proj.dtype)
+        proj = proj.to(inputs.dtype)
+        if reduce_tokens:
+            token_out.index_add_(0, sorted_token_idx, proj)
+        else:
+            pair_out[sort_order] = proj
 
         if reduce_tokens:
             return token_out
@@ -438,6 +499,49 @@ class AttentionExpertBank(nn.Module):
             (N, num_heads, H_out)
         """
         return self._project_shared_inputs_grouped(flat, weight_bank, idx, weights, norm_weights)
+
+    def _project_grouped_query_heads_batched(self, flat, weight_bank, idx, weights, norm_weights=None):
+        """Project grouped-query outputs for per_head_precompute_kv GQA routing."""
+        N, num_slots = idx.shape
+        H_out = weight_bank.shape[2]
+        pair_expert = idx.reshape(-1)
+        pair_weight = weights.reshape(-1)
+        token_idx = (
+            torch.arange(N, device=flat.device)
+            .unsqueeze(1)
+            .expand(N, num_slots)
+            .reshape(-1)
+        )
+        pair_out = flat.new_zeros(pair_expert.shape[0], H_out)
+        if pair_expert.numel() == 0:
+            return pair_out.view(N, num_slots, H_out)
+
+        sort_order = torch.argsort(pair_expert)
+        sorted_expert = pair_expert[sort_order]
+        sorted_token_idx = token_idx[sort_order]
+        sorted_weight = pair_weight[sort_order]
+        unique_experts, counts = torch.unique_consecutive(sorted_expert, return_counts=True)
+
+        sorted_inputs = flat.index_select(0, sorted_token_idx)
+        proj = self._run_grouped_expert_matmul(
+            sorted_inputs,
+            sorted_expert,
+            unique_experts,
+            counts,
+            weight_bank,
+            norm_weights=None,
+        )
+
+        if norm_weights is not None:
+            proj_f = proj.view(-1, self.q_heads_per_kv, self.head_dim).float()
+            variance = proj_f.pow(2).mean(-1, keepdim=True)
+            proj_normed = proj_f * torch.rsqrt(variance + self.eps)
+            gathered = norm_weights.index_select(0, sorted_expert).unsqueeze(1)
+            proj = (gathered * proj_normed).to(sorted_inputs.dtype).view(-1, H_out)
+
+        proj = proj * sorted_weight.unsqueeze(-1).to(proj.dtype)
+        pair_out[sort_order] = proj.to(pair_out.dtype)
+        return pair_out.view(N, num_slots, H_out)
 
     def _init_bundled(self):
         """(Q,K,V,O) all selected as one unit.  1 norm, 1 router."""
@@ -597,10 +701,11 @@ class AttentionExpertBank(nn.Module):
         self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
 
     def _init_per_head_precompute_kv(self):
-        """Flat-bank precompute KV: 1 router, corresponding QKVO.  1 norm.
+        """Flat-bank precompute KV with GQA-group routing.
 
-        Single router picks top-num_heads from E experts.
-        Each selected expert provides Q, K, V, and O for that head.
+        A single router picks top-num_kv_heads experts from E. Each selected
+        expert provides one KV head plus the grouped-query slice that attends
+        against it.
         """
         if self.routed_norm:
             self.norm = NormExpertBank(self.num_depths, self.hidden_size, eps=self.eps)
@@ -610,13 +715,15 @@ class AttentionExpertBank(nn.Module):
             self.norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         E = self.num_experts
         if self.per_layer_attn_router:
-            self.routers = nn.ModuleList([self._make_flat_bank_router(self.hidden_size, self.num_heads) for _ in range(self.num_depths)])
+            self.routers = nn.ModuleList(
+                [self._make_flat_bank_router(self.hidden_size, self.num_kv_heads) for _ in range(self.num_depths)]
+            )
         else:
-            self.router = self._make_flat_bank_router(self.hidden_size, self.num_heads)
-        self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.head_dim))
+            self.router = self._make_flat_bank_router(self.hidden_size, self.num_kv_heads)
+        self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_group_dim))
         self.k_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.head_dim))
         self.v_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.head_dim))
-        self.o_proj = nn.Parameter(torch.empty(E, self.head_dim, self.hidden_size))
+        self.o_proj = nn.Parameter(torch.empty(E, self.q_group_dim, self.hidden_size))
         self.q_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
         self.k_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
         self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
@@ -639,7 +746,7 @@ class AttentionExpertBank(nn.Module):
         if self.sanity_check_mode != "alternating_global_moe":
             return None
         logical_layer = 0 if depth_idx is None else depth_idx // 2
-        base = (logical_layer * self.num_heads) % self.num_experts
+        base = (logical_layer * num_slots) % self.num_experts
         slot_idx = (base + torch.arange(num_slots, device=device)) % self.num_experts
         idx = slot_idx.unsqueeze(0).expand(num_tokens, -1).contiguous()
         weights = torch.ones(num_tokens, num_slots, device=device, dtype=dtype)
@@ -664,7 +771,10 @@ class AttentionExpertBank(nn.Module):
         if self.per_head_compute_mode == "sparse":
             return True
         attn_fraction = flat_mask.float().mean().item()
-        return attn_fraction < self.per_head_dense_fraction_threshold
+        threshold = self.per_head_dense_fraction_threshold
+        if threshold == DEFAULT_PER_HEAD_DENSE_FRACTION_THRESHOLD:
+            threshold = AUTO_PER_HEAD_SPARSE_THRESHOLDS.get(self.mode, threshold)
+        return attn_fraction < threshold
 
     def _init_params(self, params):
         std = self.config.initializer_range
@@ -711,6 +821,17 @@ class AttentionExpertBank(nn.Module):
             "router_logits": router_probs.detach(),
             "selected_experts": expert_idx.detach(),
         }
+
+    def _attach_token_mask_to_last_router_info(self, token_mask: torch.Tensor) -> None:
+        flat_mask = token_mask.reshape(-1).bool().detach()
+        for info in self.last_router_info.values():
+            info["token_mask"] = flat_mask
+            if info["router_logits"].shape[0] != flat_mask.numel():
+                continue
+            info["router_logits"] = info["router_logits"].clone()
+            info["router_logits"][~flat_mask] = 0
+            info["selected_experts"] = info["selected_experts"].clone()
+            info["selected_experts"][~flat_mask] = 0
 
     def _zero_dummy(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         dummy = torch.zeros((), device=device, dtype=dtype)
@@ -1134,24 +1255,25 @@ class AttentionExpertBank(nn.Module):
         flat = normed.reshape(N, H)
 
         routed = self._maybe_build_sanity_attention_routing(
-            N, self.num_heads, depth_idx, hidden_states.device, dtype=flat.dtype
+            N, self.num_kv_heads, depth_idx, hidden_states.device, dtype=flat.dtype
         )
         if routed is None:
             router = self._select_router("router", depth_idx)
-            idx, w, probs = self._route_flat(router, flat, self.num_heads)
+            idx, w, probs = self._route_flat(router, flat, self.num_kv_heads)
             self._store_router_info("attn", probs, idx)
         else:
             idx, w, probs = routed
 
-        Q_heads = self._project_heads_batched(flat, self.q_proj, idx, w, self.q_norm_weight)
-        kv_ranks = torch.arange(self.num_kv_heads, device=flat.device) * self.num_kv_groups
-        kv_idx = idx.index_select(1, kv_ranks)
-        kv_weight = w.index_select(1, kv_ranks)
-        ones = torch.ones_like(kv_weight)
-        K_heads = self._project_heads_batched(flat, self.k_proj, kv_idx, ones, self.k_norm_weight)
-        V_heads = self._project_heads_batched(flat, self.v_proj, kv_idx, ones)
+        Q_groups = self._project_grouped_query_heads_batched(flat, self.q_proj, idx, w, self.q_norm_weight)
+        ones = torch.ones_like(w)
+        K_heads = self._project_heads_batched(flat, self.k_proj, idx, ones, self.k_norm_weight)
+        V_heads = self._project_heads_batched(flat, self.v_proj, idx, ones)
 
-        Q = Q_heads.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        Q = (
+            Q_groups.view(B, T, self.num_kv_heads, self.q_heads_per_kv, self.head_dim)
+            .reshape(B, T, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
         K_fresh = K_heads.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         V_fresh = V_heads.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         cos, sin = position_embeddings
@@ -1161,7 +1283,7 @@ class AttentionExpertBank(nn.Module):
             "flat": flat,
             "idx": idx,
             "weights": w,
-            "kv_weight": kv_weight,
+            "kv_weight": w,
             "Q": Q,
             "K_fresh": K_fresh,
             "V_fresh": V_fresh,
@@ -1218,9 +1340,9 @@ class AttentionExpertBank(nn.Module):
             .unsqueeze(-1)
         )
         attn_output = attn_output * kv_weight_expanded.to(attn_output.dtype)
-        attn_heads = attn_output.transpose(1, 2).reshape(B * T, self.num_heads, self.head_dim)
+        attn_groups = attn_output.transpose(1, 2).reshape(B * T, self.num_kv_heads, self.q_group_dim)
         o_out = self._project_pair_inputs_grouped(
-            attn_heads,
+            attn_groups,
             self.o_proj,
             idx,
             w,
@@ -1268,7 +1390,7 @@ class AttentionExpertBank(nn.Module):
 
         routed = self._maybe_build_sanity_attention_routing(
             normed.shape[0],
-            self.num_heads,
+            self.num_kv_heads,
             depth_idx,
             hidden_states.device,
             dtype=normed.dtype,
@@ -1276,22 +1398,21 @@ class AttentionExpertBank(nn.Module):
         )
         if routed is None:
             router = self._select_router("router", depth_idx)
-            idx, w, probs = self._route_flat(router, normed, self.num_heads)
+            idx, w, probs = self._route_flat(router, normed, self.num_kv_heads)
             self._store_router_info("attn", probs, idx, token_mask=flat_mask)
         else:
             idx, w, probs = routed
 
-        Q_sel = self._project_heads_batched(normed, self.q_proj, idx, w, self.q_norm_weight)
+        Q_sel_groups = self._project_grouped_query_heads_batched(normed, self.q_proj, idx, w, self.q_norm_weight)
+        Q_sel = Q_sel_groups.view(-1, self.num_heads, self.head_dim)
         Q_flat = hidden_states.new_zeros(B * T, self.num_heads, self.head_dim)
         Q_flat[flat_mask] = Q_sel
         Q = Q_flat.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
-        kv_ranks = torch.arange(self.num_kv_heads, device=normed.device) * self.num_kv_groups
-        kv_idx = idx.index_select(1, kv_ranks)
-        kv_weight_parts = [kv_weight for kv_weight in w.index_select(1, kv_ranks).unbind(dim=1)]
-        ones = torch.ones_like(kv_idx, dtype=normed.dtype)
-        K_sel = self._project_heads_batched(normed, self.k_proj, kv_idx, ones, self.k_norm_weight)
-        V_sel = self._project_heads_batched(normed, self.v_proj, kv_idx, ones)
+        kv_weight = w
+        ones = torch.ones_like(idx, dtype=normed.dtype)
+        K_sel = self._project_heads_batched(normed, self.k_proj, idx, ones, self.k_norm_weight)
+        V_sel = self._project_heads_batched(normed, self.v_proj, idx, ones)
 
         K_flat = hidden_states.new_zeros(B * T, self.num_kv_heads, self.head_dim)
         V_flat = hidden_states.new_zeros(B * T, self.num_kv_heads, self.head_dim)
@@ -1308,44 +1429,45 @@ class AttentionExpertBank(nn.Module):
         K_new = torch.where(attn_mask_kv, K_fresh, K_old)
         V_new = torch.where(attn_mask_kv, V_fresh, V_old)
 
+        kv_weight_flat = hidden_states.new_zeros(B * T, self.num_kv_heads)
+        kv_weight_flat[flat_mask] = kv_weight
+        kv_weight_expanded = (
+            kv_weight_flat.view(B, T, self.num_kv_heads)
+            .transpose(1, 2)
+            .repeat_interleave(self.num_kv_groups, dim=1)
+            .unsqueeze(-1)
+        )
+
+        K_expanded = repeat_kv(K_new, self.num_kv_groups)
+        V_expanded = repeat_kv(V_new, self.num_kv_groups)
         attn_heads = hidden_states.new_zeros(B, self.num_heads, T, self.head_dim)
         token_mask_2d = token_mask.squeeze(-1).bool()
-        selected_counts = token_mask_2d.sum(dim=1)
-        selected_ends = selected_counts.cumsum(dim=0)
 
         for b in range(B):
             pos = token_mask_2d[b].nonzero(as_tuple=False).squeeze(-1)
             if pos.numel() == 0:
                 continue
-            start = 0 if b == 0 else int(selected_ends[b - 1].item())
-            end = int(selected_ends[b].item())
-            for g in range(self.num_kv_heads):
-                q_start = g * self.num_kv_groups
-                q_end = q_start + self.num_kv_groups
-                Q_b = Q[b : b + 1, q_start:q_end, pos, :]
-                K_b = K_new[b : b + 1, g : g + 1].expand(-1, self.num_kv_groups, -1, -1)
-                V_b = V_new[b : b + 1, g : g + 1].expand(-1, self.num_kv_groups, -1, -1)
-                if Q_b.is_cuda:
-                    attn_b = F.scaled_dot_product_attention(
-                        Q_b,
-                        K_b,
-                        V_b,
-                        attn_mask=attention_mask[:, :, pos, :] if attention_mask is not None else None,
-                        dropout_p=0.0,
-                        scale=self.scaling,
-                    )
-                else:
-                    scores = torch.matmul(Q_b, K_b.transpose(2, 3)) * self.scaling
-                    if attention_mask is not None:
-                        scores = scores + attention_mask[:, :, pos, :]
-                    scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
-                    attn_b = torch.matmul(scores, V_b)
-                kv_weight = kv_weight_parts[g][start:end]
-                attn_b = attn_b * kv_weight.view(1, 1, -1, 1)
-                attn_heads[b, q_start:q_end, pos, :] = attn_b.squeeze(0).to(attn_heads.dtype)
+            Q_b = Q[b : b + 1, :, pos, :]
+            if Q_b.is_cuda:
+                attn_b = F.scaled_dot_product_attention(
+                    Q_b,
+                    K_expanded[b : b + 1],
+                    V_expanded[b : b + 1],
+                    attn_mask=attention_mask[:, :, pos, :] if attention_mask is not None else None,
+                    dropout_p=0.0,
+                    scale=self.scaling,
+                )
+            else:
+                scores = torch.matmul(Q_b, K_expanded[b : b + 1].transpose(2, 3)) * self.scaling
+                if attention_mask is not None:
+                    scores = scores + attention_mask[:, :, pos, :]
+                scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
+                attn_b = torch.matmul(scores, V_expanded[b : b + 1])
+            attn_b = attn_b * kv_weight_expanded[b : b + 1, :, pos, :].to(attn_b.dtype)
+            attn_heads[b, :, pos, :] = attn_b.squeeze(0).to(attn_heads.dtype)
 
         o_selected = self._project_pair_inputs_grouped(
-            attn_heads.transpose(1, 2).reshape(B * T, self.num_heads, self.head_dim)[flat_mask],
+            attn_heads.transpose(1, 2).reshape(B * T, self.num_kv_heads, self.q_group_dim)[flat_mask],
             self.o_proj,
             idx,
             w,
@@ -1452,7 +1574,7 @@ class AttentionExpertBank(nn.Module):
         attention_mask: torch.Tensor | None = None,
         depth_idx: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Flat-bank precompute KV: 1 router, corresponding QKVO, with GQA."""
+        """Flat-bank precompute KV with one routed expert per KV group."""
         self.last_router_info = {}
         tables = self._build_per_head_precompute_kv_tables(
             hidden_states, position_embeddings, depth_idx=depth_idx
@@ -1491,7 +1613,7 @@ class AttentionExpertBank(nn.Module):
         )
         attn_output = attn_output * kv_weight_expanded.to(attn_output.dtype)
         o_out = self._project_pair_inputs_grouped(
-            attn_output.transpose(1, 2).reshape(B * T, self.num_heads, self.head_dim),
+            attn_output.transpose(1, 2).reshape(B * T, self.num_kv_heads, self.q_group_dim),
             self.o_proj,
             idx,
             w,
@@ -1766,9 +1888,7 @@ class MoEverythingModel(nn.Module):
             attn_out, K_new, V_new = self.attn_bank.project_and_attend_per_head_precompute_kv_dense_mixed(
                 hidden_states, position_embeddings, K_old, V_old, attn_mask_bool, causal_mask, depth_idx=depth_idx
             )
-            flat_attn_mask = attn_mask_bool.reshape(-1).detach()
-            for info in self.attn_bank.last_router_info.values():
-                info["token_mask"] = flat_attn_mask
+            self.attn_bank._attach_token_mask_to_last_router_info(attn_mask_bool)
         elif self.attn_bank.mode == "per_head_fully_independent" and use_sparse_attn:
             attn_out, K_new, V_new = self.attn_bank.project_and_attend_per_head_fully_independent_sparse(
                 hidden_states, position_embeddings, K_old, V_old, attn_mask_bool, causal_mask, depth_idx=depth_idx
@@ -1790,9 +1910,7 @@ class MoEverythingModel(nn.Module):
             K_new = torch.where(attn_mask_kv, K_fresh, K_old)
             V_new = torch.where(attn_mask_kv, V_fresh, V_old)
             if self.attn_bank.mode in ("per_head_fully_independent", "per_head_precompute_kv"):
-                flat_attn_mask = attn_mask_bool.reshape(-1).detach()
-                for info in self.attn_bank.last_router_info.values():
-                    info["token_mask"] = flat_attn_mask
+                self.attn_bank._attach_token_mask_to_last_router_info(attn_mask_bool)
         if self.post_norm:
             pn = self.attn_post_norms[depth_idx] if hasattr(self, "attn_post_norms") else self.attn_post_norm
             attn_out = pn(attn_out)
