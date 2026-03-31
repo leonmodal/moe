@@ -42,6 +42,7 @@ from torch.utils.checkpoint import checkpoint
 from transformers import Qwen3MoeConfig
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeExperts,
+    Qwen3MoePreTrainedModel,
     Qwen3MoeRMSNorm,
     Qwen3MoeRotaryEmbedding,
     Qwen3MoeTopKRouter,
@@ -65,11 +66,13 @@ class MoEverythingConfig(Qwen3MoeConfig):
         num_attn_experts_per_tok: int = 1,
         attn_expert_mode: str = "bundled",
         # Branch router
-        branch_router_aux_loss_coef: float = 0.01,
+        branch_router_aux_loss_coef: float = 0.0,
         # Routing style
         use_deepseek_routing: bool = False,
         # Per-layer router: one branch router per depth instead of shared
         per_layer_router: bool = False,
+        # Per-layer MLP router: one MLP gate per depth instead of shared
+        per_layer_mlp_router: bool = False,
         # Per-layer attention router: one set of attn expert routers per depth
         per_layer_attn_router: bool = False,
         # Routed norm: bank of RMSNorm experts with per-token routing
@@ -98,6 +101,7 @@ class MoEverythingConfig(Qwen3MoeConfig):
         self.branch_router_aux_loss_coef = branch_router_aux_loss_coef
         self.use_deepseek_routing = use_deepseek_routing
         self.per_layer_router = per_layer_router
+        self.per_layer_mlp_router = per_layer_mlp_router
         self.per_layer_attn_router = per_layer_attn_router
         self.routed_norm = routed_norm
         self.per_layer_norm = per_layer_norm
@@ -1506,20 +1510,39 @@ class MlpExpertBank(nn.Module):
         super().__init__()
         self.per_layer_norm = getattr(config, "per_layer_norm", False)
         self.sanity_check_mode = getattr(config, "sanity_check_mode", None)
+        self.logical_layer_gates = self.sanity_check_mode == "alternating_global_moe"
+        self.per_layer_gate = (
+            getattr(config, "per_layer_mlp_router", False)
+            or self.sanity_check_mode == "alternating_global_moe"
+        )
         if getattr(config, "routed_norm", False):
             self.norm = NormExpertBank(config.num_hidden_layers, config.hidden_size, eps=config.rms_norm_eps)
         elif self.per_layer_norm:
             self.norms = nn.ModuleList([Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps) for _ in range(config.num_hidden_layers)])
         else:
             self.norm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        if getattr(config, 'use_deepseek_routing', False):
-            self.gate = DeepSeekRouter(config)
+        if self.per_layer_gate:
+            num_gate_layers = config.num_hidden_layers // 2 if self.logical_layer_gates else config.num_hidden_layers
+            self.gates = nn.ModuleList([self._make_gate(config) for _ in range(num_gate_layers)])
         else:
-            self.gate = Qwen3MoeTopKRouter(config)
+            self.gate = self._make_gate(config)
         self.experts = Qwen3MoeExperts(config)
         self.last_router_logits = None
         self.last_selected_experts = None
         self.last_token_mask = None
+
+    def _make_gate(self, config: MoEverythingConfig):
+        if getattr(config, "use_deepseek_routing", False):
+            return DeepSeekRouter(config)
+        return Qwen3MoeTopKRouter(config)
+
+    def _select_gate(self, depth_idx: int | None):
+        if not self.per_layer_gate:
+            return self.gate
+        if depth_idx is None:
+            raise ValueError("per_layer_mlp_router requires depth_idx during MLP routing")
+        gate_depth_idx = depth_idx // 2 if self.logical_layer_gates else depth_idx
+        return self.gates[gate_depth_idx]
 
     def _zero_dummy(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         dummy = torch.zeros((), device=device, dtype=dtype)
@@ -1535,16 +1558,17 @@ class MlpExpertBank(nn.Module):
     ) -> torch.Tensor:
         B, T, H = hidden_states.shape
         total_tokens = B * T
+        gate = self._select_gate(depth_idx)
         if token_mask is None:
             self.last_token_mask = None
         else:
             flat_mask = token_mask.reshape(-1).bool()
             self.last_token_mask = flat_mask.detach()
             if not flat_mask.any():
-                self.last_router_logits = hidden_states.new_zeros(total_tokens, self.gate.num_experts)
+                self.last_router_logits = hidden_states.new_zeros(total_tokens, gate.num_experts)
                 self.last_selected_experts = torch.zeros(
                     total_tokens,
-                    self.gate.top_k,
+                    gate.top_k,
                     device=hidden_states.device,
                     dtype=torch.long,
                 )
@@ -1560,7 +1584,7 @@ class MlpExpertBank(nn.Module):
         flat = normed.view(-1, H)
 
         if token_mask is None:
-            router_logits, routing_weights, selected_experts = self.gate(flat)
+            router_logits, routing_weights, selected_experts = gate(flat)
             out = self.experts(flat, selected_experts, routing_weights)
             self.last_router_logits = router_logits
             self.last_selected_experts = selected_experts
@@ -1568,7 +1592,7 @@ class MlpExpertBank(nn.Module):
 
         flat_mask = token_mask.reshape(-1).bool()
         flat_selected = flat[flat_mask]
-        router_logits, routing_weights, selected_experts = self.gate(flat_selected)
+        router_logits, routing_weights, selected_experts = gate(flat_selected)
         out_selected = self.experts(flat_selected, selected_experts, routing_weights)
 
         out = flat.new_zeros(total_tokens, H)
@@ -1896,22 +1920,19 @@ class MoEverythingModel(nn.Module):
         return hidden_states
 
 
-class MoEverythingForCausalLM(nn.Module):
+class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
     """Causal LM head over MoEverythingModel.
 
     Computes CE loss plus optional MoE auxiliary losses.
     """
 
-    supports_gradient_checkpointing = True
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: MoEverythingConfig):
-        super().__init__()
+        super().__init__(config)
         self.config = config
         self.model = MoEverythingModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        if getattr(config, "tie_word_embeddings", False):
-            self.lm_head.weight = self.model.embed_tokens.weight
 
         self.vocab_size = config.vocab_size
         self.num_experts = config.num_experts
@@ -1920,20 +1941,21 @@ class MoEverythingForCausalLM(nn.Module):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self._seq_aux_loss_coef = getattr(config, "seq_aux_loss_coef", 0.0)
 
-        self._init_weights()
+        # Match Qwen3/Qwen3-MoE init semantics, including router weight init
+        # and experts implementation dispatch through the shared config object.
+        self.post_init()
 
-    def _init_weights(self):
-        std = self.config.initializer_range
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=std)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0.0, std=std)
-            elif isinstance(module, Qwen3MoeExperts):
-                nn.init.normal_(module.gate_up_proj, mean=0.0, std=std)
-                nn.init.normal_(module.down_proj, mean=0.0, std=std)
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: dict | None = None):
         self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
@@ -2028,8 +2050,9 @@ class MoEverythingForCausalLM(nn.Module):
                     if isinstance(attn_seq_aux, torch.Tensor):
                         loss = loss + seq_aux_coef * attn_seq_aux
 
-            # Branch probs tracked for logging only — no aux loss forcing balance.
-            # The model is free to learn any attention/MLP ratio per depth.
+            # Branch probs are tracked for logging only. We do not force
+            # balance between attention and MLP; the model is free to learn
+            # any branch ratio per depth.
 
         if output_router_logits:
             router_logits_out = tuple(t.detach() for t in mlp_router_logits) if mlp_router_logits is not None else None

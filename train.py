@@ -58,7 +58,10 @@ from src.models import (
     MoEverythingForCausalLM,
 )
 from src.models.router import DeepSeekRouter
-from src.models.load_balancing import seq_load_balancing_loss_func
+from src.models.load_balancing import (
+    normalized_load_balancing_loss_func,
+    seq_load_balancing_loss_func,
+)
 from src.utils.training import (
     TrainingConfig,
     build_lr_scheduler,
@@ -92,9 +95,31 @@ def bias_alpha_schedule(step: int, warmup_steps: int = 5000) -> float:
     return 0.5 * (1 + math.cos(math.pi * progress))
 
 
+def get_bias_update_routers(model, *, mlp_only: bool = False) -> list[DeepSeekRouter]:
+    """Collect DeepSeek routers that should receive expert-bias updates."""
+    if not mlp_only:
+        return [m for m in model.modules() if isinstance(m, DeepSeekRouter)]
+
+    inner_model = getattr(model, "model", None)
+    mlp_bank = getattr(inner_model, "mlp_bank", None)
+    if mlp_bank is None:
+        return []
+
+    gates = getattr(mlp_bank, "gates", None)
+    if gates is not None:
+        return [gate for gate in gates if isinstance(gate, DeepSeekRouter)]
+
+    gate = getattr(mlp_bank, "gate", None)
+    if isinstance(gate, DeepSeekRouter):
+        return [gate]
+
+    return []
+
+
 def update_expert_biases(
     model, update_rate: float, accelerator,
     is_global: bool = False, alpha: float = 0.0,
+    routers: list[DeepSeekRouter] | None = None,
 ) -> dict:
     """
     Walk all DeepSeekRouter modules, all-reduce token counts across DDP ranks,
@@ -113,7 +138,8 @@ def update_expert_biases(
     Returns dict of bias stats for logging (empty if no DeepSeekRouters found).
     """
     stats = {}
-    routers = [m for m in model.modules() if isinstance(m, DeepSeekRouter)]
+    if routers is None:
+        routers = [m for m in model.modules() if isinstance(m, DeepSeekRouter)]
     if not routers:
         return stats
 
@@ -399,13 +425,14 @@ def build_model(cfg: dict):
             num_attn_experts=mcfg.get("num_attn_experts", 4),
             num_attn_experts_per_tok=mcfg.get("num_attn_experts_per_tok", 1),
             attn_expert_mode=mcfg.get("attn_expert_mode", "bundled"),
-            branch_router_aux_loss_coef=mcfg.get("branch_router_aux_loss_coef", 0.01),
+            branch_router_aux_loss_coef=mcfg.get("branch_router_aux_loss_coef", 0.0),
             use_deepseek_routing=mcfg.get("use_deepseek_routing", False),
             topk_scaling_factor=mcfg.get("topk_scaling_factor", None),
             num_groups=mcfg.get("num_groups", None),
             group_topk=mcfg.get("group_topk", None),
             seq_aux_loss_coef=mcfg.get("seq_aux_loss_coef", 0.0),
             per_layer_router=mcfg.get("per_layer_router", False),
+            per_layer_mlp_router=mcfg.get("per_layer_mlp_router", False),
             per_layer_attn_router=mcfg.get("per_layer_attn_router", False),
             routed_norm=mcfg.get("routed_norm", False),
             per_layer_norm=mcfg.get("per_layer_norm", False),
@@ -667,6 +694,11 @@ def main() -> None:
     is_global = cfg["model"]["type"] in ("global_moe", "deepseek_global_moe")
     is_moe_everything = cfg["model"]["type"] == "moe_everything"
     shared_mlp_pool = is_global or is_moe_everything
+    global_router_update = cfg["model"].get("global_router_update", False)
+    global_like_sanity = (
+        is_moe_everything
+        and cfg["model"].get("sanity_check_mode") == "alternating_global_moe"
+    )
     bias_update_rate = cfg["model"].get("bias_update_rate", 0.0)
     bias_interpolation = cfg["model"].get("bias_interpolation", False)
     seq_aux_loss_coef = cfg["model"].get("seq_aux_loss_coef", 0.0)
@@ -778,6 +810,7 @@ def main() -> None:
     loss_window_sum = 0.0
     ce_window_sum = 0.0
     aux_window_sum = 0.0
+    aux_normalized_window_sum = 0.0
     seq_aux_window_sum = 0.0
     branch_aux_window_sum = 0.0
     microbatches_in_step = 0
@@ -805,9 +838,24 @@ def main() -> None:
             )
             loss = output.loss
             raw_model = accelerator.unwrap_model(model)
+            router_token_masks = get_output_router_token_masks(output)
 
             aux = getattr(output, "aux_loss", None)
             aux_value = aux.detach().float().item() if isinstance(aux, torch.Tensor) else float(aux or 0.0)
+            aux_normalized = None
+            if getattr(output, "router_logits", None) is not None:
+                aux_normalized = normalized_load_balancing_loss_func(
+                    output.router_logits,
+                    model_cfg.num_experts,
+                    model_cfg.num_experts_per_tok,
+                    token_masks=router_token_masks,
+                )
+            if isinstance(aux_normalized, torch.Tensor):
+                aux_normalized_value = aux_normalized.detach().float().item()
+            elif aux_normalized is not None:
+                aux_normalized_value = float(aux_normalized)
+            else:
+                aux_normalized_value = 0.0
             total_value = loss.detach().float().item()
 
             ce_tensor = getattr(output, "ce_loss", None)
@@ -821,7 +869,6 @@ def main() -> None:
             seq_aux = getattr(output, "seq_aux_loss", None)
             if seq_aux is None and seq_aux_loss_coef > 0 and getattr(output, "router_logits", None) is not None:
                 selected_for_seq_aux = get_output_selected_experts(output, raw_model)
-                router_token_masks = get_output_router_token_masks(output)
                 seq_aux = seq_load_balancing_loss_func(
                     output.router_logits,
                     model_cfg.num_experts,
@@ -852,13 +899,13 @@ def main() -> None:
             loss_window_sum += total_value
             ce_window_sum += ce_value
             aux_window_sum += aux_value
+            aux_normalized_window_sum += aux_normalized_value
             seq_aux_window_sum += seq_aux_value
             branch_aux_window_sum += branch_aux_value
             microbatches_in_step += 1
             local_tokens_in_step += input_ids.numel()
 
             selected_experts = get_output_selected_experts(output, raw_model)
-            router_token_masks = get_output_router_token_masks(output)
             if getattr(output, "router_logits", None) is not None:
                 expert_count_accum = accumulate_expert_counts(
                     output.router_logits,
@@ -916,13 +963,21 @@ def main() -> None:
 
         if accelerator.sync_gradients:
             if bias_update_rate > 0:
-                alpha = bias_alpha_schedule(global_step) if (is_global and bias_interpolation) else 0.0
+                effective_global_bias = is_global or global_like_sanity or global_router_update
+                bias_routers = None
+                if global_like_sanity:
+                    bias_routers = get_bias_update_routers(
+                        accelerator.unwrap_model(model),
+                        mlp_only=True,
+                    )
+                alpha = bias_alpha_schedule(global_step) if (effective_global_bias and bias_interpolation) else 0.0
                 bias_stats = update_expert_biases(
                     accelerator.unwrap_model(model),
                     bias_update_rate,
                     accelerator,
-                    is_global=is_global,
+                    is_global=effective_global_bias,
                     alpha=alpha,
+                    routers=bias_routers,
                 )
                 bias_stats["routing/bias_alpha"] = alpha
             else:
@@ -939,6 +994,9 @@ def main() -> None:
             avg_total = reduce_scalar(accelerator, loss_window_sum / max(1, microbatches_in_step))
             avg_ce = reduce_scalar(accelerator, ce_window_sum / max(1, microbatches_in_step))
             avg_aux = reduce_scalar(accelerator, aux_window_sum / max(1, microbatches_in_step))
+            avg_aux_normalized = reduce_scalar(
+                accelerator, aux_normalized_window_sum / max(1, microbatches_in_step)
+            )
             avg_seq_aux = reduce_scalar(accelerator, seq_aux_window_sum / max(1, microbatches_in_step))
             avg_branch_aux = reduce_scalar(accelerator, branch_aux_window_sum / max(1, microbatches_in_step))
             avg_grad_norm = reduce_scalar(accelerator, grad_norm)
@@ -949,6 +1007,7 @@ def main() -> None:
                     "train/loss": avg_total,
                     "train/ce_loss": avg_ce,
                     "train/aux_loss": avg_aux,
+                    "train/aux_loss_normalized": avg_aux_normalized,
                     "train/seq_aux_loss": avg_seq_aux,
                     "train/branch_aux_loss": avg_branch_aux,
                     "train/grad_norm": avg_grad_norm,
@@ -960,6 +1019,7 @@ def main() -> None:
                 accelerator.print(
                     f"step {global_step:6d}  "
                     f"loss={avg_total:.4f}  ce={avg_ce:.4f}  aux={avg_aux:.4f}  "
+                    f"aux_n={avg_aux_normalized:.4f}  "
                     f"seq_aux={avg_seq_aux:.4f}  branch_aux={avg_branch_aux:.4f}  "
                     f"lr={lr:.2e}  tok/s={step_tokens_per_sec/1e3:.1f}k  "
                     f"sec/step={step_elapsed:.3f}  |g|={avg_grad_norm:.3f}"
@@ -1094,6 +1154,7 @@ def main() -> None:
             loss_window_sum = 0.0
             ce_window_sum = 0.0
             aux_window_sum = 0.0
+            aux_normalized_window_sum = 0.0
             seq_aux_window_sum = 0.0
             branch_aux_window_sum = 0.0
             microbatches_in_step = 0

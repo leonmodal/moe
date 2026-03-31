@@ -1,5 +1,5 @@
-# Per-head fully independent + per-layer routers + per-layer pre-norm AND post-norm
-experiment_name: moe_everything_per_head_independent_bothnorm
+# Per-head fully independent + per-layer routers + global-style bias updates + both norms
+experiment_name: moe_everything_per_head_independent_perlayer_bothnorm
 
 model:
   type: moe_everything
@@ -14,9 +14,11 @@ model:
   moe_intermediate_size: 768
   intermediate_size: 3072
   norm_topk_prob: true
+  branch_router_aux_loss_coef: 0.0
   router_aux_loss_coef: 0.0
   seq_aux_loss_coef: 0.0001
   bias_update_rate: 0.001
+  bias_interpolation: true
   topk_scaling_factor: 2.5
   num_groups: 8
   group_topk: 4
@@ -26,6 +28,7 @@ model:
   use_deepseek_routing: true
   per_layer_router: true
   per_layer_attn_router: true
+  global_router_update: true
   per_layer_norm: true
   post_norm: true
   attention_bias: false
@@ -53,9 +56,9 @@ training:
   log_every: 1
   routing_log_every: 50
   save_every: 1000
-  output_dir: ./outputs/moe_everything_per_head_independent_bothnorm
+  output_dir: ./outputs/moe_everything_per_head_independent_perlayer_bothnorm
   wandb_project: moe-scaling
-  wandb_run_name: moe_everything_per_head_independent_bothnorm
+  wandb_run_name: moe_everything_per_head_independent_perlayer_bothnorm
 
 data:
   data_dir: ./data/parquet

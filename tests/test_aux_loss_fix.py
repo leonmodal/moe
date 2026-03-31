@@ -3,7 +3,10 @@ Test that the double-softmax bug is fixed and aux loss responds to skewed routin
 """
 import torch
 import torch.nn.functional as F
-from src.models.load_balancing import load_balancing_loss_func
+from src.models.load_balancing import (
+    load_balancing_loss_func,
+    normalized_load_balancing_loss_func,
+)
 
 
 def test_uniform_routing():
@@ -50,6 +53,13 @@ def test_no_double_softmax():
     print(f"Fixed loss (skewed):           {fixed.item():.4f}")
     print(f"Double-softmax loss (skewed):  {buggy.item():.4f}")
     assert fixed.item() > 3 * buggy.item(), "Fixed loss should be much larger than double-softmax loss for skewed input"
+
+
+def test_normalized_aux_uniform_sigmoid_scores():
+    """Uniform raw sigmoid-style scores should normalize to the top-k baseline."""
+    scores = torch.full((1000, 128), 0.5)
+    loss = normalized_load_balancing_loss_func((scores,), num_experts=128, top_k=4)
+    assert abs(loss.item() - 4.0) < 0.1, f"Expected ~4.0, got {loss.item()}"
 
 
 def test_standard_moe_uses_fixed_loss():

@@ -1,7 +1,7 @@
 # Alternating attention/MLP sanity config for per-head precompute_kv.
 # This fixes the branch schedule to ATTENTION, MLP, ATTENTION, ... and uses
 # deterministic per-layer attention experts with no learned routing noise.
-# MLP experts still use the normal learned gate.
+# MLP experts use per-layer learned gates into the shared expert pool.
 experiment_name: moe_everything_per_head_precompute_kv_sanity
 
 model:
@@ -17,9 +17,11 @@ model:
   moe_intermediate_size: 768
   intermediate_size: 3072
   norm_topk_prob: true
+  branch_router_aux_loss_coef: 0.0
   router_aux_loss_coef: 0.0
   seq_aux_loss_coef: 0.0001
   bias_update_rate: 0.001
+  bias_interpolation: true
   topk_scaling_factor: 2.5
   num_groups: 8
   group_topk: 4
@@ -28,6 +30,7 @@ model:
   attn_expert_mode: per_head_precompute_kv
   use_deepseek_routing: true
   per_layer_router: true
+  per_layer_mlp_router: true
   per_layer_attn_router: true
   per_layer_norm: true
   sanity_check_mode: alternating_global_moe

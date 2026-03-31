@@ -10,7 +10,11 @@ import torch
 import torch.nn.functional as F
 from src.models import Qwen3MoeConfig, StandardMoEModel, GlobalMoEConfig, GlobalMoEForCausalLM
 from src.models.global_moe import GlobalMoEModel
-from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_emb, repeat_kv
+from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+    Qwen3MoeTopKRouter,
+    apply_rotary_pos_emb,
+    repeat_kv,
+)
 
 
 # ── Tiny config for fast CPU tests ──────────────────────────────────────────
@@ -226,6 +230,7 @@ def test_loss_decreases_with_gradient_step():
 # ── Mixture-of-Everything tests ─────────────────────────────────────────────
 
 from src.models.mixture_of_everything import MoEverythingConfig, MoEverythingForCausalLM
+from train import get_bias_update_routers, update_expert_biases
 
 
 def tiny_moe_everything_config(mode="bundled"):
@@ -245,7 +250,7 @@ def tiny_moe_everything_config(mode="bundled"):
         num_attn_experts_per_tok=1,
         attn_expert_mode=mode,
         norm_topk_prob=True,
-        branch_router_aux_loss_coef=0.01,
+        branch_router_aux_loss_coef=0.0,
         router_aux_loss_coef=0.01,
     )
 
@@ -270,6 +275,21 @@ PRECOMPUTE_KV_MODES = {
 def test_moe_everything_instantiates(mode):
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode))
     assert model is not None
+
+
+def test_moe_everything_deepseek_router_weights_initialized():
+    model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config("per_head_precompute_kv"))
+    routers = [module for module in model.modules() if isinstance(module, Qwen3MoeTopKRouter)]
+    assert routers, "Expected MoE-Everything to contain routed expert modules"
+    for router in routers:
+        assert torch.count_nonzero(router.weight).item() > 0
+
+
+def test_moe_everything_supports_experts_implementation_dispatch():
+    model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config("bundled"))
+    assert hasattr(model, "set_experts_implementation")
+    model.set_experts_implementation("eager")
+    assert model.config._experts_implementation == "eager"
 
 
 @pytest.mark.parametrize("mode", MOE_EVERYTHING_MODES)
@@ -337,7 +357,7 @@ def tiny_moe_everything_deepseek_config(mode="bundled"):
         num_attn_experts_per_tok=1,
         attn_expert_mode=mode,
         norm_topk_prob=True,
-        branch_router_aux_loss_coef=0.01,
+        branch_router_aux_loss_coef=0.0,
         router_aux_loss_coef=0.01,
         use_deepseek_routing=True,
     )
@@ -505,6 +525,18 @@ def test_per_layer_router_precompute_kv():
     out = model(input_ids=ids, labels=labels)
     assert out.loss is not None
     out.loss.backward()
+
+
+# ── Per-layer MLP router tests ────────────────────────────────────────────
+
+def test_per_layer_mlp_router_creates_separate_routers():
+    config = tiny_moe_everything_deepseek_config("bundled")
+    config.per_layer_mlp_router = True
+    model = MoEverythingForCausalLM(config)
+    bank = model.model.mlp_bank
+    assert hasattr(bank, "gates")
+    assert len(bank.gates) == config.num_hidden_layers
+    assert not hasattr(bank, "gate")
 
 
 # ── Per-layer attention router tests ──────────────────────────────────────
@@ -962,6 +994,7 @@ def _tiny_alternating_sanity_config():
         num_attn_experts_per_tok=1,
         attn_expert_mode="per_head_precompute_kv",
         norm_topk_prob=True,
+        branch_router_aux_loss_coef=0.0,
         router_aux_loss_coef=0.0,
         per_layer_norm=True,
         sanity_check_mode="alternating_global_moe",
@@ -1027,36 +1060,84 @@ def test_alternating_global_sanity_matches_global_moe():
 
 def test_alternating_global_sanity_uses_learned_mlp_gate():
     config = tiny_moe_everything_config("per_head_precompute_kv")
-    config.num_hidden_layers = 2
+    config.num_hidden_layers = 4
     config.num_experts = 4
     config.num_experts_per_tok = 1
     config.per_layer_norm = True
     config.sanity_check_mode = "alternating_global_moe"
     model = MoEverythingForCausalLM(config).eval()
     bank = model.model.mlp_bank
-    captured = {"gate_called": False}
 
-    def fake_gate_forward(self, flat):
-        captured["gate_called"] = True
-        logits = flat.new_full((flat.shape[0], self.num_experts), -1.0e4)
-        logits[:, 3] = 1.0e4
-        weights = flat.new_ones((flat.shape[0], 1))
-        selected = torch.full((flat.shape[0], 1), 3, device=flat.device, dtype=torch.long)
-        return logits, weights, selected
+    assert hasattr(bank, "gates")
+    assert len(bank.gates) == 2
+    captured = {"layer_0": False, "layer_1": False}
 
-    bank.gate.forward = MethodType(fake_gate_forward, bank.gate)
+    def fake_gate_forward(expert_idx, key):
+        def _forward(self, flat):
+            captured[key] = True
+            logits = flat.new_full((flat.shape[0], self.num_experts), -1.0e4)
+            logits[:, expert_idx] = 1.0e4
+            weights = flat.new_ones((flat.shape[0], 1))
+            selected = torch.full((flat.shape[0], 1), expert_idx, device=flat.device, dtype=torch.long)
+            return logits, weights, selected
 
-    hidden_states = torch.randn(2, 4, config.hidden_size)
+        return _forward
+
+    bank.gates[0].forward = MethodType(fake_gate_forward(1, "layer_0"), bank.gates[0])
+    bank.gates[1].forward = MethodType(fake_gate_forward(3, "layer_1"), bank.gates[1])
+
+    ids, _ = _dummy_batch(vocab_size=config.vocab_size, B=2, T=4)
     with torch.no_grad():
-        out = bank(hidden_states, depth_idx=1)
+        out = model(input_ids=ids, output_router_logits=True)
 
-    assert captured["gate_called"]
-    assert out.shape == hidden_states.shape
-    expected_selected = torch.full_like(bank.last_selected_experts, 3)
-    expected_logits = bank.last_router_logits.new_full(bank.last_router_logits.shape, -1.0e4)
-    expected_logits[:, 3] = 1.0e4
-    torch.testing.assert_close(bank.last_selected_experts, expected_selected)
-    torch.testing.assert_close(bank.last_router_logits, expected_logits)
+    assert captured["layer_0"]
+    assert captured["layer_1"]
+
+    expected_depth_1 = torch.full_like(out.selected_experts[1], 1)
+    expected_depth_3 = torch.full_like(out.selected_experts[3], 3)
+    torch.testing.assert_close(out.selected_experts[1], expected_depth_1)
+    torch.testing.assert_close(out.selected_experts[3], expected_depth_3)
+
+
+def test_alternating_global_sanity_bias_updates_use_global_mlp_pool_only():
+    class _FakeAccelerator:
+        num_processes = 1
+
+    config = tiny_moe_everything_deepseek_config("per_head_precompute_kv")
+    config.num_hidden_layers = 4
+    config.num_experts = 4
+    config.num_experts_per_tok = 1
+    config.per_layer_norm = True
+    config.per_layer_attn_router = True
+    config.sanity_check_mode = "alternating_global_moe"
+    model = MoEverythingForCausalLM(config).eval()
+
+    mlp_routers = get_bias_update_routers(model, mlp_only=True)
+    assert mlp_routers == list(model.model.mlp_bank.gates)
+    assert len(mlp_routers) == 2
+
+    with torch.no_grad():
+        for depth_idx, router in enumerate(model.model.mlp_bank.gates):
+            router.local_tokens_per_expert.zero_()
+            router.local_tokens_per_expert[depth_idx % config.num_experts] = 10.0
+
+        for router in model.model.attn_bank.routers:
+            router.local_tokens_per_expert.fill_(7.0)
+
+    update_expert_biases(
+        model,
+        update_rate=0.1,
+        accelerator=_FakeAccelerator(),
+        is_global=True,
+        alpha=0.0,
+        routers=mlp_routers,
+    )
+
+    ref_bias = model.model.mlp_bank.gates[0].expert_bias
+    for router in model.model.mlp_bank.gates[1:]:
+        torch.testing.assert_close(router.expert_bias, ref_bias)
+    for router in model.model.attn_bank.routers:
+        torch.testing.assert_close(router.expert_bias, torch.zeros_like(router.expert_bias))
 
 
 # ── Dynamic depth tests ───────────────────────────────────────────────────

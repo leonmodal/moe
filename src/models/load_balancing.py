@@ -16,6 +16,26 @@ import torch
 import torch.nn.functional as F
 
 
+def normalize_router_scores(
+    gate_logits: torch.Tensor | tuple[torch.Tensor] | None,
+) -> torch.Tensor | tuple[torch.Tensor] | None:
+    """Normalize router scores to sum-to-1 per token.
+
+    For softmax routers this is effectively a no-op. For DeepSeek sigmoid
+    routers this produces a probability-like diagnostic view that is easier
+    to interpret for logging and comparisons.
+    """
+    if gate_logits is None or not isinstance(gate_logits, tuple):
+        return gate_logits
+
+    normalized = []
+    for layer_gate in gate_logits:
+        scores = layer_gate.float()
+        scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+        normalized.append(scores)
+    return tuple(normalized)
+
+
 def load_balancing_loss_func(
     gate_logits: torch.Tensor | tuple[torch.Tensor] | None,
     num_experts: int | None = None,
@@ -101,6 +121,28 @@ def load_balancing_loss_func(
 
     overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
     return overall_loss * num_experts
+
+
+def normalized_load_balancing_loss_func(
+    gate_logits: torch.Tensor | tuple[torch.Tensor] | None,
+    num_experts: int | None = None,
+    top_k: int = 2,
+    attention_mask: torch.Tensor | None = None,
+    token_masks: tuple[torch.Tensor] | None = None,
+) -> torch.Tensor | int:
+    """Diagnostic batch aux loss using normalized router scores.
+
+    This is mainly useful for DeepSeek sigmoid routers, where the raw
+    batch aux can be large because scores are not normalized to sum to 1.
+    """
+    normalized = normalize_router_scores(gate_logits)
+    return load_balancing_loss_func(
+        normalized,
+        num_experts=num_experts,
+        top_k=top_k,
+        attention_mask=attention_mask,
+        token_masks=token_masks,
+    )
 
 
 def seq_load_balancing_loss_func(
