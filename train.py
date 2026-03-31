@@ -34,15 +34,33 @@ from accelerate.utils import set_seed
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
-def enable_liger_kernels() -> None:
-    """Enable Liger monkey-patches only for real training entrypoints.
+def configure_liger_kernels(cfg: dict) -> str:
+    """Apply the safe Liger subset for the current config and return a summary.
 
     Import-time patching leaks into unrelated CPU-only tests that import train.py,
     causing Triton kernels to run on CPU tensors.
+
+    For `moe_everything`, the full Qwen3-MoE patch is not safe: the `swiglu`
+    expert replacement breaks the learned-routing path and pushes fresh-init CE
+    from ~12 to ~20. The fused linear CE patch also does not currently help
+    `MoEverythingForCausalLM`, because that patch only replaces the stock
+    `Qwen3MoeForCausalLM.forward`. Keep only the validated-safe RoPE and RMSNorm
+    patches for that model family.
     """
     from liger_kernel.transformers import apply_liger_kernel_to_qwen3_moe
 
+    if cfg["model"]["type"] == "moe_everything":
+        apply_liger_kernel_to_qwen3_moe(
+            rope=True,
+            rms_norm=True,
+            swiglu=False,
+            fused_linear_cross_entropy=False,
+            cross_entropy=False,
+        )
+        return "partial (rope+rms_norm only; swiglu/fused CE disabled for moe_everything)"
+
     apply_liger_kernel_to_qwen3_moe()
+    return "full"
 
 from src.data.parquet_dataset import DataConfig, StatefulParquetDataset
 from src.models import (
@@ -546,8 +564,6 @@ def cleanup_checkpoints(output_dir: str, max_keep: int) -> None:
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    enable_liger_kernels()
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--resume", default=None, help="Path to checkpoint directory")
@@ -563,6 +579,11 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    liger_mode = configure_liger_kernels(cfg)
+    print(
+        f"Liger kernels: {liger_mode} for model type '{cfg['model']['type']}'",
+        flush=True,
+    )
     tcfg_dict = cfg["training"]
     dcfg_dict = cfg.get("data", {})
 
