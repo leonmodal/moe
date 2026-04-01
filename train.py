@@ -520,6 +520,7 @@ def build_model(cfg: dict):
             per_layer_attn_router=mcfg.get("per_layer_attn_router", False),
             routed_norm=mcfg.get("routed_norm", False),
             per_layer_norm=mcfg.get("per_layer_norm", False),
+            per_layer_qk_norm=mcfg.get("per_layer_qk_norm", False),
             post_norm=mcfg.get("post_norm", False),
             dynamic_depth_min=mcfg.get("dynamic_depth_min", 1.0),
             dynamic_depth_max=mcfg.get("dynamic_depth_max", 1.0),

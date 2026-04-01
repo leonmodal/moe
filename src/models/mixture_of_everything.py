@@ -85,6 +85,9 @@ class MoEverythingConfig(Qwen3MoeConfig):
         routed_norm: bool = False,
         # Per-layer norm: separate attn + MLP norms per depth (standard transformer style)
         per_layer_norm: bool = False,
+        # Per-layer Q/K head norms: share learned q_norm/k_norm within each depth
+        # instead of attaching separate norm weights to every attention expert.
+        per_layer_qk_norm: bool = False,
         # Post-norm: RMSNorm on branch output before residual addition
         post_norm: bool = False,
         # Dynamic depth: random perturbation of depth during training
@@ -111,6 +114,7 @@ class MoEverythingConfig(Qwen3MoeConfig):
         self.per_layer_attn_router = per_layer_attn_router
         self.routed_norm = routed_norm
         self.per_layer_norm = per_layer_norm
+        self.per_layer_qk_norm = per_layer_qk_norm
         self.post_norm = post_norm
         self.dynamic_depth_min = dynamic_depth_min
         self.dynamic_depth_max = dynamic_depth_max
@@ -234,6 +238,7 @@ class AttentionExpertBank(nn.Module):
         self.per_layer_attn_router = getattr(config, "per_layer_attn_router", False)
         self.routed_norm = getattr(config, "routed_norm", False)
         self.per_layer_norm = getattr(config, "per_layer_norm", False)
+        self.per_layer_qk_norm = getattr(config, "per_layer_qk_norm", False)
         self.num_depths = config.num_hidden_layers
         self.per_head_compute_mode = getattr(config, "per_head_compute_mode", "auto")
         self.per_head_dense_fraction_threshold = getattr(
@@ -680,8 +685,12 @@ class AttentionExpertBank(nn.Module):
         self.k_proj = nn.Parameter(torch.empty(E_kv, self.hidden_size, self.head_dim))
         self.v_proj = nn.Parameter(torch.empty(E_kv, self.hidden_size, self.head_dim))
         self.o_proj = nn.Parameter(torch.empty(E, self.head_dim, self.hidden_size))
-        self.q_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
-        self.k_norm_weight = nn.Parameter(torch.ones(E_kv, self.head_dim))
+        if self.per_layer_qk_norm:
+            self.layer_q_norm_weight = nn.Parameter(torch.ones(self.num_depths, self.head_dim))
+            self.layer_k_norm_weight = nn.Parameter(torch.ones(self.num_depths, self.head_dim))
+        else:
+            self.q_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
+            self.k_norm_weight = nn.Parameter(torch.ones(E_kv, self.head_dim))
         self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
 
     def _init_precompute_kv(self):
@@ -726,8 +735,23 @@ class AttentionExpertBank(nn.Module):
         self.k_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.head_dim))
         self.v_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.head_dim))
         self.o_proj = nn.Parameter(torch.empty(E, self.q_group_dim, self.hidden_size))
-        self.q_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
-        self.k_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
+        if self.sanity_check_mode == "alternating_global_moe":
+            num_logical_layers = max(1, self.num_depths // 2)
+            self.logical_q_norm_weight = nn.Parameter(torch.ones(num_logical_layers, self.head_dim))
+            self.logical_k_norm_weight = nn.Parameter(torch.ones(num_logical_layers, self.head_dim))
+            expert_to_layer = torch.arange(E, dtype=torch.long) // max(1, self.num_kv_heads)
+            expert_to_layer.clamp_(max=num_logical_layers - 1)
+            self.register_buffer(
+                "logical_qk_norm_layer_index",
+                expert_to_layer,
+                persistent=False,
+            )
+        elif self.per_layer_qk_norm:
+            self.layer_q_norm_weight = nn.Parameter(torch.ones(self.num_depths, self.head_dim))
+            self.layer_k_norm_weight = nn.Parameter(torch.ones(self.num_depths, self.head_dim))
+        else:
+            self.q_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
+            self.k_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
         self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
 
     def _select_router(self, name: str, depth_idx: int | None = None):
@@ -735,6 +759,24 @@ class AttentionExpertBank(nn.Module):
         if self.per_layer_attn_router and depth_idx is not None and hasattr(self, plural_name):
             return getattr(self, plural_name)[depth_idx]
         return getattr(self, name)
+
+    def _get_q_norm_weight_bank(self, depth_idx: int | None, num_experts: int) -> torch.Tensor:
+        if hasattr(self, "logical_q_norm_weight"):
+            return self.logical_q_norm_weight.index_select(0, self.logical_qk_norm_layer_index)
+        if hasattr(self, "layer_q_norm_weight"):
+            if depth_idx is None:
+                raise ValueError("per_layer_qk_norm requires depth_idx")
+            return self.layer_q_norm_weight[depth_idx].unsqueeze(0).expand(num_experts, -1)
+        return self.q_norm_weight
+
+    def _get_k_norm_weight_bank(self, depth_idx: int | None, num_experts: int) -> torch.Tensor:
+        if hasattr(self, "logical_k_norm_weight"):
+            return self.logical_k_norm_weight.index_select(0, self.logical_qk_norm_layer_index)
+        if hasattr(self, "layer_k_norm_weight"):
+            if depth_idx is None:
+                raise ValueError("per_layer_qk_norm requires depth_idx")
+            return self.layer_k_norm_weight[depth_idx].unsqueeze(0).expand(num_experts, -1)
+        return self.k_norm_weight
 
     def _maybe_build_sanity_attention_routing(
         self,
@@ -1013,9 +1055,11 @@ class AttentionExpertBank(nn.Module):
             self._store_router_info("k", k_probs, k_idx)
             self._store_router_info("v", v_probs, v_idx)
 
+            q_norm_weight = self._get_q_norm_weight_bank(depth_idx, self.num_experts)
+            k_norm_weight = self._get_k_norm_weight_bank(depth_idx, self.num_kv_experts)
             # Batched projections: (N, num_heads, head_dim)
-            Q_heads = self._project_heads_batched(q_flat, self.q_proj, q_idx, q_w, self.q_norm_weight)
-            K_heads = self._project_heads_batched(k_flat, self.k_proj, k_idx, k_w, self.k_norm_weight)
+            Q_heads = self._project_heads_batched(q_flat, self.q_proj, q_idx, q_w, q_norm_weight)
+            K_heads = self._project_heads_batched(k_flat, self.k_proj, k_idx, k_w, k_norm_weight)
             V_heads = self._project_heads_batched(v_flat, self.v_proj, v_idx, v_w)
 
             Q = Q_heads.reshape(B * T, self.num_heads * self.head_dim)
@@ -1177,8 +1221,10 @@ class AttentionExpertBank(nn.Module):
         self._store_router_info("k", k_probs, k_idx, token_mask=flat_mask)
         self._store_router_info("v", v_probs, v_idx, token_mask=flat_mask)
 
-        Q_sel = self._project_heads_batched(q_flat, self.q_proj, q_idx, q_w, self.q_norm_weight)
-        K_sel = self._project_heads_batched(k_flat, self.k_proj, k_idx, k_w, self.k_norm_weight)
+        q_norm_weight = self._get_q_norm_weight_bank(depth_idx, self.num_experts)
+        k_norm_weight = self._get_k_norm_weight_bank(depth_idx, self.num_kv_experts)
+        Q_sel = self._project_heads_batched(q_flat, self.q_proj, q_idx, q_w, q_norm_weight)
+        K_sel = self._project_heads_batched(k_flat, self.k_proj, k_idx, k_w, k_norm_weight)
         V_sel = self._project_heads_batched(v_flat, self.v_proj, v_idx, v_w)
 
         Q_flat = hidden_states.new_zeros(B * T, self.num_heads, self.head_dim)
@@ -1267,9 +1313,11 @@ class AttentionExpertBank(nn.Module):
         else:
             idx, w, probs = routed
 
-        Q_groups = self._project_grouped_query_heads_batched(flat, self.q_proj, idx, w, self.q_norm_weight)
+        q_norm_weight = self._get_q_norm_weight_bank(depth_idx, self.num_experts)
+        k_norm_weight = self._get_k_norm_weight_bank(depth_idx, self.num_experts)
+        Q_groups = self._project_grouped_query_heads_batched(flat, self.q_proj, idx, w, q_norm_weight)
         ones = torch.ones_like(w)
-        K_heads = self._project_heads_batched(flat, self.k_proj, idx, ones, self.k_norm_weight)
+        K_heads = self._project_heads_batched(flat, self.k_proj, idx, ones, k_norm_weight)
         V_heads = self._project_heads_batched(flat, self.v_proj, idx, ones)
 
         Q = (
@@ -1406,7 +1454,9 @@ class AttentionExpertBank(nn.Module):
         else:
             idx, w, probs = routed
 
-        Q_sel_groups = self._project_grouped_query_heads_batched(normed, self.q_proj, idx, w, self.q_norm_weight)
+        q_norm_weight = self._get_q_norm_weight_bank(depth_idx, self.num_experts)
+        k_norm_weight = self._get_k_norm_weight_bank(depth_idx, self.num_experts)
+        Q_sel_groups = self._project_grouped_query_heads_batched(normed, self.q_proj, idx, w, q_norm_weight)
         Q_sel = Q_sel_groups.view(-1, self.num_heads, self.head_dim)
         Q_flat = hidden_states.new_zeros(B * T, self.num_heads, self.head_dim)
         Q_flat[flat_mask] = Q_sel
@@ -1414,7 +1464,7 @@ class AttentionExpertBank(nn.Module):
 
         kv_weight = w
         ones = torch.ones_like(idx, dtype=normed.dtype)
-        K_sel = self._project_heads_batched(normed, self.k_proj, idx, ones, self.k_norm_weight)
+        K_sel = self._project_heads_batched(normed, self.k_proj, idx, ones, k_norm_weight)
         V_sel = self._project_heads_batched(normed, self.v_proj, idx, ones)
 
         K_flat = hidden_states.new_zeros(B * T, self.num_kv_heads, self.head_dim)

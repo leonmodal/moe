@@ -4,7 +4,7 @@ Modal multi-node training launcher for MoE pretraining.
 Features:
   1. Multi-node distributed training via torchrun + Accelerate
   2. Auto-resume from latest checkpoint on Modal Volume
-  3. Fault tolerance via Modal retries + checkpoint resume
+  3. Fault tolerance via checkpoint resume
 
 Configuration:
   Edit N_NODES, GPUS_PER_NODE, GPU_TYPE at the top of this file.
@@ -118,7 +118,6 @@ app = modal.App(
 @app.function(
     gpu=f"{GPU_TYPE}:{GPUS_PER_NODE}",
     timeout=60 * 60 * TIMEOUT_HOURS,
-    retries=modal.Retries(initial_delay=0.0, max_retries=10),
     experimental_options={"efa_enabled": True},
 )
 @modal.experimental.clustered(size=N_NODES, rdma=True)

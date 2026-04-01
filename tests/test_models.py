@@ -1135,6 +1135,33 @@ def test_base_per_head_fully_independent_configs_use_256_attention_experts():
     assert "num_attn_experts: 256" in debug_cfg
 
 
+@pytest.mark.parametrize("mode", PER_HEAD_MODES)
+def test_per_head_layer_qk_norm_uses_per_layer_parameters(mode):
+    config = tiny_moe_everything_config(mode)
+    config.per_layer_qk_norm = True
+    model = MoEverythingForCausalLM(config).eval()
+    bank = model.model.attn_bank
+
+    assert hasattr(bank, "layer_q_norm_weight")
+    assert hasattr(bank, "layer_k_norm_weight")
+    assert bank.layer_q_norm_weight.shape == (config.num_hidden_layers, config.head_dim)
+    assert bank.layer_k_norm_weight.shape == (config.num_hidden_layers, config.head_dim)
+    assert not hasattr(bank, "q_norm_weight")
+    assert not hasattr(bank, "k_norm_weight")
+
+
+@pytest.mark.parametrize("mode", PER_HEAD_MODES)
+def test_per_head_layer_qk_norm_forward_runs(mode):
+    config = tiny_moe_everything_deepseek_config(mode)
+    config.per_layer_qk_norm = True
+    model = MoEverythingForCausalLM(config).eval()
+    ids, labels = _dummy_batch(vocab_size=config.vocab_size, B=2, T=8)
+    with torch.no_grad():
+        out = model(input_ids=ids, labels=labels, output_router_logits=True)
+    assert out.loss is not None
+    assert out.logits.shape == (2, 8, config.vocab_size)
+
+
 def _tiny_global_equiv_config():
     return GlobalMoEConfig(
         vocab_size=256,
@@ -1198,6 +1225,10 @@ def _copy_global_weights_into_sanity_moe(global_model, sanity_model):
             mlp_depth = attn_depth + 1
             sanity_inner.attn_bank.norms[attn_depth].weight.copy_(layer.input_layernorm.weight)
             sanity_inner.mlp_bank.norms[mlp_depth].weight.copy_(layer.post_attention_layernorm.weight)
+            if hasattr(sanity_inner.mlp_bank, "gates"):
+                sanity_inner.mlp_bank.gates[layer_idx].weight.copy_(layer.mlp.gate.weight)
+                if hasattr(layer.mlp.gate, "expert_bias"):
+                    sanity_inner.mlp_bank.gates[layer_idx].expert_bias.copy_(layer.mlp.gate.expert_bias)
 
             q_proj = layer.self_attn.q_proj.weight
             k_proj = layer.self_attn.k_proj.weight
@@ -1205,6 +1236,10 @@ def _copy_global_weights_into_sanity_moe(global_model, sanity_model):
             o_proj = layer.self_attn.o_proj.weight
             q_norm = layer.self_attn.q_norm.weight
             k_norm = layer.self_attn.k_norm.weight
+
+            if hasattr(sanity_inner.attn_bank, "logical_q_norm_weight"):
+                sanity_inner.attn_bank.logical_q_norm_weight[layer_idx].copy_(q_norm)
+                sanity_inner.attn_bank.logical_k_norm_weight[layer_idx].copy_(k_norm)
 
             for kv_head_idx in range(num_kv_heads):
                 expert_idx = layer_idx * num_kv_heads + kv_head_idx
@@ -1217,8 +1252,9 @@ def _copy_global_weights_into_sanity_moe(global_model, sanity_model):
                 sanity_inner.attn_bank.k_proj[expert_idx].copy_(k_proj[kv_start:kv_end].t())
                 sanity_inner.attn_bank.v_proj[expert_idx].copy_(v_proj[kv_start:kv_end].t())
                 sanity_inner.attn_bank.o_proj[expert_idx].copy_(o_proj[:, q_start:q_end].t())
-                sanity_inner.attn_bank.q_norm_weight[expert_idx].copy_(q_norm)
-                sanity_inner.attn_bank.k_norm_weight[expert_idx].copy_(k_norm)
+                if hasattr(sanity_inner.attn_bank, "q_norm_weight"):
+                    sanity_inner.attn_bank.q_norm_weight[expert_idx].copy_(q_norm)
+                    sanity_inner.attn_bank.k_norm_weight[expert_idx].copy_(k_norm)
 
 
 def test_alternating_global_sanity_matches_global_moe():
@@ -1233,6 +1269,18 @@ def test_alternating_global_sanity_matches_global_moe():
 
     torch.testing.assert_close(sanity_out.logits, global_out.logits, atol=2e-4, rtol=2e-4)
     torch.testing.assert_close(sanity_out.loss, global_out.loss, atol=2e-4, rtol=2e-4)
+
+
+def test_alternating_global_sanity_uses_logical_attention_norms():
+    model = MoEverythingForCausalLM(_tiny_alternating_sanity_config()).eval()
+    bank = model.model.attn_bank
+
+    assert hasattr(bank, "logical_q_norm_weight")
+    assert hasattr(bank, "logical_k_norm_weight")
+    assert not hasattr(bank, "q_norm_weight")
+    assert not hasattr(bank, "k_norm_weight")
+    assert bank.logical_q_norm_weight.shape == (model.config.num_hidden_layers // 2, model.config.head_dim)
+    assert bank.logical_k_norm_weight.shape == (model.config.num_hidden_layers // 2, model.config.head_dim)
 
 
 def test_alternating_global_sanity_uses_learned_mlp_gate():
