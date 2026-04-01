@@ -1194,12 +1194,67 @@ def _tiny_alternating_sanity_config():
         moe_intermediate_size=32,
         intermediate_size=128,
         max_position_embeddings=128,
-        num_attn_experts=4,
+        num_attn_experts=2,
         num_attn_experts_per_tok=1,
         attn_expert_mode="per_head_precompute_kv",
         norm_topk_prob=True,
         branch_router_aux_loss_coef=0.0,
         router_aux_loss_coef=0.0,
+        per_layer_norm=True,
+        sanity_check_mode="alternating_global_moe",
+    )
+
+
+def _bf16_global_equiv_config(logical_layers: int = 4, vocab_size: int = 4096):
+    config = GlobalMoEConfig(
+        vocab_size=vocab_size,
+        hidden_size=1024,
+        num_hidden_layers=logical_layers,
+        head_dim=128,
+        num_attention_heads=16,
+        num_key_value_heads=8,
+        num_experts=16 * logical_layers,
+        num_experts_per_tok=4,
+        moe_intermediate_size=768,
+        intermediate_size=3072,
+        max_position_embeddings=32768,
+        output_router_logits=True,
+        norm_topk_prob=True,
+        router_aux_loss_coef=0.0,
+        tie_word_embeddings=True,
+    )
+    config.topk_scaling_factor = 2.5
+    config.num_groups = 8
+    config.group_topk = 4
+    return config
+
+
+def _bf16_alternating_sanity_config(logical_layers: int = 4, vocab_size: int = 4096):
+    return MoEverythingConfig(
+        vocab_size=vocab_size,
+        hidden_size=1024,
+        num_hidden_layers=2 * logical_layers,
+        head_dim=128,
+        num_attention_heads=16,
+        num_key_value_heads=8,
+        num_experts=16 * logical_layers,
+        num_experts_per_tok=4,
+        moe_intermediate_size=768,
+        intermediate_size=3072,
+        max_position_embeddings=32768,
+        output_router_logits=True,
+        norm_topk_prob=True,
+        router_aux_loss_coef=0.0,
+        tie_word_embeddings=True,
+        num_attn_experts=logical_layers * 8,
+        num_attn_experts_per_tok=1,
+        attn_expert_mode="per_head_precompute_kv",
+        per_head_compute_mode="dense",
+        use_deepseek_routing=True,
+        topk_scaling_factor=2.5,
+        num_groups=8,
+        group_topk=4,
+        per_layer_mlp_router=True,
         per_layer_norm=True,
         sanity_check_mode="alternating_global_moe",
     )
@@ -1269,6 +1324,27 @@ def test_alternating_global_sanity_matches_global_moe():
 
     torch.testing.assert_close(sanity_out.logits, global_out.logits, atol=2e-4, rtol=2e-4)
     torch.testing.assert_close(sanity_out.loss, global_out.loss, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_alternating_global_sanity_mixed_precision_bf16_stays_close_to_global_moe():
+    from src.models import DeepSeekGlobalMoEForCausalLM
+
+    device = "cuda"
+
+    global_model = DeepSeekGlobalMoEForCausalLM(_bf16_global_equiv_config()).to(device=device).eval()
+    sanity_model = MoEverythingForCausalLM(_bf16_alternating_sanity_config()).to(device=device).eval()
+    _copy_global_weights_into_sanity_moe(global_model, sanity_model)
+
+    torch.manual_seed(42)
+    ids = torch.randint(0, global_model.config.vocab_size, (1, 64), device=device)
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        global_out = global_model(input_ids=ids, labels=ids, output_router_logits=True)
+        sanity_out = sanity_model(input_ids=ids, labels=ids, output_router_logits=True)
+
+    logit_diff = (global_out.logits.float() - sanity_out.logits.float()).abs()
+    assert logit_diff.mean().item() < 0.05
+    assert logit_diff.max().item() < 1.0
 
 
 def test_alternating_global_sanity_uses_logical_attention_norms():

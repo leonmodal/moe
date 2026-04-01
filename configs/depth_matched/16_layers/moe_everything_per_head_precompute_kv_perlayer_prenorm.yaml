@@ -1,9 +1,10 @@
-# XS scale — DeepSeek V3 global MoE, global-only bias (no per-layer interpolation)
-# Same as xs_deepseek_global but bias_interpolation is off (alpha=0 always)
-experiment_name: global_moe_nointerp
+# Depth-matched per-head precompute-KV MoE.
+# 16 layers, 256 MLP experts (= 16 layers x 16 experts/layer equivalent).
+# Attention pool tracks total KV heads: 16 layers x 8 KV heads = 128 experts.
+experiment_name: depth_matched_16_layers_moe_everything_per_head_precompute_kv_perlayer_prenorm
 
 model:
-  type: deepseek_global_moe
+  type: moe_everything
   vocab_size: 151936
   hidden_size: 1024
   num_hidden_layers: 16
@@ -15,13 +16,24 @@ model:
   moe_intermediate_size: 768
   intermediate_size: 3072
   norm_topk_prob: true
+  branch_router_aux_loss_coef: 0.0
   router_aux_loss_coef: 0.0
   seq_aux_loss_coef: 0.0001
   bias_update_rate: 0.001
-  bias_interpolation: false         # purely global bias update from step 0
+  bias_interpolation: true
+  bias_interpolation_warmup_steps: 5000
   topk_scaling_factor: 2.5
   num_groups: 8
   group_topk: 4
+  num_attn_experts: 128
+  num_attn_experts_per_tok: 1
+  attn_expert_mode: per_head_precompute_kv
+  per_head_compute_mode: dense
+  use_deepseek_routing: true
+  per_layer_router: true
+  per_layer_attn_router: true
+  global_router_update: true
+  per_layer_norm: true
   attention_bias: false
   attention_dropout: 0.0
   rms_norm_eps: 1.0e-6
@@ -40,16 +52,16 @@ training:
   warmup_steps: 1000
   max_steps: 100000
   min_lr_ratio: 0.1
-  batch_size: 16
-  gradient_accumulation: 4
+  batch_size: 32
+  gradient_accumulation: 2
   mixed_precision: bf16
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   log_every: 1
   routing_log_every: 50
   save_every: 1000
-  output_dir: ./outputs/global_moe_nointerp
+  output_dir: ./outputs/depth_matched/16_layers/moe_everything_per_head_precompute_kv_perlayer_prenorm
   wandb_project: moe-scaling
-  wandb_run_name: global_moe_nointerp
+  wandb_run_name: depth_matched_16_layers_moe_everything_per_head_precompute_kv_perlayer_prenorm
 
 data:
   data_dir: ./data/parquet

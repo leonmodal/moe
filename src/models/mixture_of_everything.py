@@ -469,7 +469,15 @@ class AttentionExpertBank(nn.Module):
         unique_experts, counts = torch.unique_consecutive(sorted_expert, return_counts=True)
 
         if reduce_tokens:
-            token_out = inputs.new_zeros(N, H_out)
+            # When we sum per-slot O projections back into token outputs, low-precision
+            # accumulation can drift noticeably from the monolithic dense O projection
+            # used by the baseline models. Keep the reduction in fp32, then cast back.
+            accum_dtype = (
+                torch.float32
+                if inputs.dtype in (torch.bfloat16, torch.float16)
+                else inputs.dtype
+            )
+            token_out = torch.zeros(N, H_out, device=inputs.device, dtype=accum_dtype)
         else:
             pair_out = inputs.new_zeros(pair_inputs.shape[0], H_out)
 
@@ -481,15 +489,17 @@ class AttentionExpertBank(nn.Module):
             weight_bank,
             norm_weights=norm_weights,
         )
-        proj = proj * sorted_weight.unsqueeze(-1).to(proj.dtype)
-        proj = proj.to(inputs.dtype)
         if reduce_tokens:
+            proj = proj.to(token_out.dtype)
+            proj = proj * sorted_weight.unsqueeze(-1).to(token_out.dtype)
             token_out.index_add_(0, sorted_token_idx, proj)
         else:
+            proj = proj * sorted_weight.unsqueeze(-1).to(proj.dtype)
+            proj = proj.to(inputs.dtype)
             pair_out[sort_order] = proj
 
         if reduce_tokens:
-            return token_out
+            return token_out.to(inputs.dtype)
         return pair_out.view(N, num_slots, H_out)
 
     def _project_heads_batched(self, flat, weight_bank, idx, weights, norm_weights=None):

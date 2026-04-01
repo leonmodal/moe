@@ -789,6 +789,7 @@ def main() -> None:
     )
     bias_update_rate = cfg["model"].get("bias_update_rate", 0.0)
     bias_interpolation = cfg["model"].get("bias_interpolation", False)
+    bias_interpolation_warmup_steps = cfg["model"].get("bias_interpolation_warmup_steps", 5000)
     seq_aux_loss_coef = cfg["model"].get("seq_aux_loss_coef", 0.0)
 
     # Attach seq_aux_loss_coef to model (read by forward methods)
@@ -1058,7 +1059,11 @@ def main() -> None:
                         accelerator.unwrap_model(model),
                         mlp_only=True,
                     )
-                alpha = bias_alpha_schedule(global_step) if (effective_global_bias and bias_interpolation) else 0.0
+                alpha = (
+                    bias_alpha_schedule(global_step, warmup_steps=bias_interpolation_warmup_steps)
+                    if (effective_global_bias and bias_interpolation)
+                    else 0.0
+                )
                 bias_stats = update_expert_biases(
                     accelerator.unwrap_model(model),
                     bias_update_rate,
