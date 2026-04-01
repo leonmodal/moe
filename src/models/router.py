@@ -120,40 +120,41 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
 
     def forward(self, hidden_states: torch.Tensor):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        device_type = hidden_states.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            # 1. FP32 gating linear — match Megatron-LM moe_router_dtype=fp32
+            router_logits = F.linear(
+                hidden_states.float(), self.weight.float()
+            )  # (T, E) in fp32
 
-        # 1. FP32 gating linear — match Megatron-LM moe_router_dtype=fp32
-        router_logits = F.linear(
-            hidden_states.float(), self.weight.float()
-        )  # (T, E) in fp32
+            # 2. Sigmoid scoring in fp32
+            scores = torch.sigmoid(router_logits)  # (T, E) in (0, 1), fp32
 
-        # 2. Sigmoid scoring in fp32
-        scores = torch.sigmoid(router_logits)  # (T, E) in (0, 1), fp32
+            # 3. Biased top-k selection (with optional group-limited routing)
+            bias = self.expert_bias.float()
+            biased_scores = scores + bias.unsqueeze(0)  # (T, E)
 
-        # 3. Biased top-k selection (with optional group-limited routing)
-        bias = self.expert_bias.float()
-        biased_scores = scores + bias.unsqueeze(0)  # (T, E)
+            if self.num_groups is not None and self.group_topk is not None:
+                # Group-limited top-k: select from top groups only
+                _, top_k_idx = group_limited_topk(
+                    biased_scores,
+                    topk=self.top_k,
+                    num_groups=self.num_groups,
+                    group_topk=self.group_topk,
+                )
+            else:
+                _, top_k_idx = torch.topk(biased_scores, self.top_k, dim=-1)  # (T, K)
 
-        if self.num_groups is not None and self.group_topk is not None:
-            # Group-limited top-k: select from top groups only
-            _, top_k_idx = group_limited_topk(
-                biased_scores,
-                topk=self.top_k,
-                num_groups=self.num_groups,
-                group_topk=self.group_topk,
-            )
-        else:
-            _, top_k_idx = torch.topk(biased_scores, self.top_k, dim=-1)  # (T, K)
+            # 4. Gather unbiased scores for selected experts
+            router_top_value = scores.gather(1, top_k_idx)  # (T, K)
 
-        # 4. Gather unbiased scores for selected experts
-        router_top_value = scores.gather(1, top_k_idx)  # (T, K)
-
-        # 5. Normalize + scaling factor
-        if self.norm_topk_prob:
-            router_top_value = router_top_value / (
-                router_top_value.sum(dim=-1, keepdim=True) + 1e-20
-            )
-        if self.scaling_factor is not None:
-            router_top_value = router_top_value * self.scaling_factor
+            # 5. Normalize + scaling factor
+            if self.norm_topk_prob:
+                router_top_value = router_top_value / (
+                    router_top_value.sum(dim=-1, keepdim=True) + 1e-20
+                )
+            if self.scaling_factor is not None:
+                router_top_value = router_top_value * self.scaling_factor
 
         router_top_value = router_top_value.to(hidden_states.dtype)
 

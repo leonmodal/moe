@@ -178,8 +178,9 @@ class NormExpertBank(nn.Module):
         flat = hidden_states.reshape(-1, self.hidden_size)
 
         # Top-1 routing
-        logits = self.router(flat.float())
-        probs = F.softmax(logits, dim=-1)
+        with torch.autocast(device_type=flat.device.type, enabled=False):
+            logits = self.router(flat.float())
+            probs = F.softmax(logits, dim=-1, dtype=torch.float32)
         idx = probs.argmax(dim=-1)                           # (N,)
         router_weight = probs.gather(1, idx.unsqueeze(-1))   # (N, 1)
 
@@ -317,10 +318,11 @@ class AttentionExpertBank(nn.Module):
             router_probs, weights, idx = router(x)
             return idx, weights, router_probs
 
-        logits = router(x.float())
-        probs = F.softmax(logits, dim=-1)
-        top_vals, top_idx = torch.topk(probs, top_k, dim=-1)
-        top_vals = top_vals / (top_vals.sum(dim=-1, keepdim=True) + 1e-20)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            logits = router(x.float())
+            probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+            top_vals, top_idx = torch.topk(probs, top_k, dim=-1)
+            top_vals = top_vals / (top_vals.sum(dim=-1, keepdim=True) + 1e-20)
         return top_idx, top_vals.to(x.dtype), probs
 
     def _project_flat_head(self, flat, weight_bank, expert_idx, expert_weights, norm_weights=None):
@@ -847,8 +849,9 @@ class AttentionExpertBank(nn.Module):
                 idx = idx.squeeze(-1)
             return idx, weights, router_probs
 
-        logits = router(x.float())
-        probs = F.softmax(logits, dim=-1)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            logits = router(x.float())
+            probs = F.softmax(logits, dim=-1, dtype=torch.float32)
         if self.top_k == 1:
             idx = probs.argmax(dim=-1)
             weights = probs.gather(1, idx.unsqueeze(-1)).to(x.dtype)

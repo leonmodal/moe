@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import yaml
 from src.models import Qwen3MoeConfig, StandardMoEModel, GlobalMoEConfig, GlobalMoEForCausalLM
 from src.models.global_moe import GlobalMoEModel
+from src.models.router import DeepSeekRouter
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeExperts,
     Qwen3MoeTopKRouter,
@@ -300,10 +301,74 @@ def test_qwen3_moe_experts_grouped_mm_matches_legacy_reference():
     torch.testing.assert_close(grouped, expected, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_router_probs_stay_fp32_under_cuda_autocast():
+    cfg = tiny_moe_everything_config("per_head_precompute_kv")
+    cfg.use_deepseek_routing = True
+
+    hidden_states = torch.randn(8, cfg.hidden_size, device="cuda", dtype=torch.bfloat16)
+
+    deepseek_router = DeepSeekRouter(cfg).cuda().eval()
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        deepseek_probs, deepseek_weights, _ = deepseek_router(hidden_states)
+    assert deepseek_probs.dtype == torch.float32
+    assert deepseek_weights.dtype == torch.bfloat16
+
+    hf_router = Qwen3MoeTopKRouter(cfg).cuda().eval()
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        hf_probs, hf_weights, _ = hf_router(hidden_states)
+    assert hf_probs.dtype == torch.float32
+    assert hf_weights.dtype == torch.float32
+
+    cfg.use_deepseek_routing = False
+    bank = AttentionExpertBank(cfg).cuda().eval()
+    router = bank._select_router("router", None)
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        _, bank_weights, bank_probs = bank._route_flat(router, hidden_states, bank.num_kv_heads)
+    assert bank_probs.dtype == torch.float32
+    assert bank_weights.dtype == torch.bfloat16
+
+
+def test_global_moe_logits_and_loss_match_with_grouped_mlp_dispatch():
+    ref_model = GlobalMoEForCausalLM(tiny_global_config()).eval()
+    grouped_model = GlobalMoEForCausalLM(tiny_global_config()).eval()
+    grouped_model.load_state_dict(ref_model.state_dict())
+
+    def fake_grouped_mm(self, sorted_inputs, expert_weights_t, counts):
+        outputs = []
+        start = 0
+        for weight_t, count in zip(expert_weights_t, counts.tolist()):
+            end = start + count
+            outputs.append(sorted_inputs[start:end] @ weight_t)
+            start = end
+        return torch.cat(outputs, dim=0)
+
+    grouped_model.model.global_experts._maybe_grouped_mm = MethodType(
+        fake_grouped_mm,
+        grouped_model.model.global_experts,
+    )
+
+    ids = torch.tensor(
+        [
+            [1, 2, 3, 4, 5, 6],
+            [6, 5, 4, 3, 2, 1],
+        ],
+        dtype=torch.long,
+    )
+
+    with torch.no_grad():
+        ref_out = ref_model(input_ids=ids, labels=ids, output_router_logits=True)
+        grouped_out = grouped_model(input_ids=ids, labels=ids, output_router_logits=True)
+
+    torch.testing.assert_close(grouped_out.logits, ref_out.logits, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(grouped_out.loss, ref_out.loss, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(grouped_out.aux_loss, ref_out.aux_loss, atol=1e-6, rtol=1e-6)
+
+
 # ── Mixture-of-Everything tests ─────────────────────────────────────────────
 
 from src.models.mixture_of_everything import AttentionExpertBank, MoEverythingConfig, MoEverythingForCausalLM
-from train import get_bias_update_routers, update_expert_biases
+from train import get_bias_update_router_groups, get_bias_update_routers, update_expert_biases
 
 
 def tiny_moe_everything_config(mode="bundled"):
@@ -1248,8 +1313,63 @@ def test_alternating_global_sanity_bias_updates_use_global_mlp_pool_only():
     ref_bias = model.model.mlp_bank.gates[0].expert_bias
     for router in model.model.mlp_bank.gates[1:]:
         torch.testing.assert_close(router.expert_bias, ref_bias)
-    for router in model.model.attn_bank.routers:
-        torch.testing.assert_close(router.expert_bias, torch.zeros_like(router.expert_bias))
+
+
+def test_global_router_update_groups_mixed_attention_pools_by_bank():
+    class _FakeAccelerator:
+        num_processes = 1
+
+    config = tiny_moe_everything_deepseek_config("per_head_fully_independent")
+    config.num_hidden_layers = 2
+    config.num_experts = 4
+    config.num_attn_experts = 4
+    config.num_experts_per_tok = 1
+    config.num_attn_experts_per_tok = 1
+    config.per_layer_attn_router = True
+    config.global_router_update = True
+    model = MoEverythingForCausalLM(config).eval()
+
+    router_groups = get_bias_update_router_groups(model)
+    group_sizes = [[router.num_experts for router in group] for group in router_groups]
+    assert group_sizes == [[4], [4, 4], [2, 2], [2, 2], [4, 4]]
+
+    with torch.no_grad():
+        model.model.mlp_bank.gate.local_tokens_per_expert.copy_(torch.tensor([10.0, 0.0, 0.0, 0.0]))
+        model.model.attn_bank.q_routers[0].local_tokens_per_expert.copy_(torch.tensor([0.0, 8.0, 0.0, 0.0]))
+        model.model.attn_bank.q_routers[1].local_tokens_per_expert.copy_(torch.tensor([0.0, 0.0, 8.0, 0.0]))
+        model.model.attn_bank.k_routers[0].local_tokens_per_expert.copy_(torch.tensor([5.0, 0.0]))
+        model.model.attn_bank.k_routers[1].local_tokens_per_expert.copy_(torch.tensor([0.0, 5.0]))
+        model.model.attn_bank.v_routers[0].local_tokens_per_expert.copy_(torch.tensor([5.0, 0.0]))
+        model.model.attn_bank.v_routers[1].local_tokens_per_expert.copy_(torch.tensor([0.0, 5.0]))
+        model.model.attn_bank.o_routers[0].local_tokens_per_expert.copy_(torch.tensor([0.0, 0.0, 8.0, 0.0]))
+        model.model.attn_bank.o_routers[1].local_tokens_per_expert.copy_(torch.tensor([0.0, 0.0, 0.0, 8.0]))
+
+    update_expert_biases(
+        model,
+        update_rate=0.1,
+        accelerator=_FakeAccelerator(),
+        is_global=True,
+        alpha=0.0,
+    )
+
+    torch.testing.assert_close(
+        model.model.attn_bank.q_routers[0].expert_bias,
+        model.model.attn_bank.q_routers[1].expert_bias,
+    )
+    torch.testing.assert_close(
+        model.model.attn_bank.k_routers[0].expert_bias,
+        model.model.attn_bank.k_routers[1].expert_bias,
+    )
+    torch.testing.assert_close(
+        model.model.attn_bank.v_routers[0].expert_bias,
+        model.model.attn_bank.v_routers[1].expert_bias,
+    )
+    torch.testing.assert_close(
+        model.model.attn_bank.o_routers[0].expert_bias,
+        model.model.attn_bank.o_routers[1].expert_bias,
+    )
+    assert model.model.attn_bank.k_routers[0].expert_bias.shape[0] == 2
+    assert model.model.attn_bank.q_routers[0].expert_bias.shape[0] == 4
 
 
 def test_representative_experiment_configs_use_expected_gqa_ratios():

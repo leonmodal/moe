@@ -115,29 +115,119 @@ def bias_alpha_schedule(step: int, warmup_steps: int = 5000) -> float:
 
 def get_bias_update_routers(model, *, mlp_only: bool = False) -> list[DeepSeekRouter]:
     """Collect DeepSeek routers that should receive expert-bias updates."""
-    if not mlp_only:
-        return [m for m in model.modules() if isinstance(m, DeepSeekRouter)]
+    return [router for group in get_bias_update_router_groups(model, mlp_only=mlp_only) for router in group]
 
+
+def get_bias_update_router_groups(model, *, mlp_only: bool = False) -> list[list[DeepSeekRouter]]:
+    """Collect DeepSeek routers grouped by routed expert pool.
+
+    Global-style bias updates should pool counts only across routers that map
+    into the same logical expert bank. For `moe_everything`, that means the
+    MLP gate(s) are one group and each attention-router family (q/k/v/o or
+    bundled variants) is its own group. Standard/global MoE fall back to a
+    single flat group because all DeepSeek routers operate on the same MLP
+    expert pool.
+    """
     inner_model = getattr(model, "model", None)
-    mlp_bank = getattr(inner_model, "mlp_bank", None)
-    if mlp_bank is None:
-        return []
+    groups: list[list[DeepSeekRouter]] = []
 
-    gates = getattr(mlp_bank, "gates", None)
-    if gates is not None:
-        return [gate for gate in gates if isinstance(gate, DeepSeekRouter)]
+    def _append_group(group) -> None:
+        if group is None:
+            return
+        if isinstance(group, DeepSeekRouter):
+            groups.append([group])
+            return
+        routers = [router for router in group if isinstance(router, DeepSeekRouter)]
+        if routers:
+            groups.append(routers)
 
-    gate = getattr(mlp_bank, "gate", None)
-    if isinstance(gate, DeepSeekRouter):
-        return [gate]
+    if inner_model is not None:
+        mlp_bank = getattr(inner_model, "mlp_bank", None)
+        if mlp_bank is not None:
+            gates = getattr(mlp_bank, "gates", None)
+            if gates is not None:
+                _append_group(gates)
+            else:
+                _append_group(getattr(mlp_bank, "gate", None))
 
-    return []
+        if mlp_only:
+            return groups
+
+        attn_bank = getattr(inner_model, "attn_bank", None)
+        if attn_bank is not None:
+            for name in ("routers", "q_routers", "k_routers", "v_routers", "o_routers", "kv_routers", "qk_routers"):
+                _append_group(getattr(attn_bank, name, None))
+            for name in ("router", "q_router", "k_router", "v_router", "o_router", "kv_router", "qk_router"):
+                _append_group(getattr(attn_bank, name, None))
+
+    if groups:
+        return groups
+
+    fallback = [m for m in model.modules() if isinstance(m, DeepSeekRouter)]
+    return [fallback] if fallback else []
+
+
+def _reduce_router_counts(router: DeepSeekRouter, accelerator) -> torch.Tensor:
+    counts = router.local_tokens_per_expert.clone()
+    if accelerator.num_processes > 1:
+        torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+    router.local_tokens_per_expert.zero_()
+    return counts
+
+
+def _apply_global_bias_update_to_group(
+    router_group: list[DeepSeekRouter],
+    accelerator,
+    update_rate: float,
+    alpha: float,
+) -> None:
+    per_router_counts = [_reduce_router_counts(router, accelerator) for router in router_group]
+    global_counts = torch.stack(per_router_counts).sum(dim=0)
+    global_avg = global_counts.mean()
+    global_delta = torch.sign(global_avg - global_counts) * update_rate
+
+    for router, counts in zip(router_group, per_router_counts):
+        if alpha > 0:
+            layer_avg = counts.mean()
+            layer_delta = torch.sign(layer_avg - counts) * update_rate
+            router.expert_bias += alpha * layer_delta + (1 - alpha) * global_delta
+        else:
+            router.expert_bias += global_delta
+
+
+def _apply_per_router_bias_update(
+    router_group: list[DeepSeekRouter],
+    accelerator,
+    update_rate: float,
+) -> None:
+    for router in router_group:
+        counts = _reduce_router_counts(router, accelerator)
+        avg = counts.mean()
+        router.expert_bias += torch.sign(avg - counts) * update_rate
+
+
+def _flatten_router_groups(router_groups: list[list[DeepSeekRouter]]) -> list[DeepSeekRouter]:
+    return [router for group in router_groups for router in group]
+
+
+def _bias_stats_for_routers(routers: list[DeepSeekRouter]) -> dict:
+    stats = {}
+    if not routers:
+        return stats
+
+    all_bias = torch.cat([r.expert_bias for r in routers])
+    stats["routing/expert_bias_mean"] = all_bias.mean().item()
+    stats["routing/expert_bias_std"] = all_bias.std().item()
+    stats["routing/expert_bias_min"] = all_bias.min().item()
+    stats["routing/expert_bias_max"] = all_bias.max().item()
+    return stats
 
 
 def update_expert_biases(
     model, update_rate: float, accelerator,
     is_global: bool = False, alpha: float = 0.0,
     routers: list[DeepSeekRouter] | None = None,
+    router_groups: list[list[DeepSeekRouter]] | None = None,
 ) -> dict:
     """
     Walk all DeepSeekRouter modules, all-reduce token counts across DDP ranks,
@@ -155,48 +245,24 @@ def update_expert_biases(
 
     Returns dict of bias stats for logging (empty if no DeepSeekRouters found).
     """
-    stats = {}
-    if routers is None:
-        routers = [m for m in model.modules() if isinstance(m, DeepSeekRouter)]
-    if not routers:
-        return stats
+    if router_groups is None:
+        if routers is not None:
+            router_groups = [routers] if routers else []
+        else:
+            router_groups = get_bias_update_router_groups(model)
 
-    # Step 1: All-reduce each router's token counts across DDP ranks
-    per_router_counts = []
-    for router in routers:
-        counts = router.local_tokens_per_expert.clone()
-        if accelerator.num_processes > 1:
-            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
-        per_router_counts.append(counts)
-        router.local_tokens_per_expert.zero_()
+    router_groups = [group for group in router_groups if group]
+    if not router_groups:
+        return {}
 
     if is_global:
-        # Global delta: sum across all layers → total load on shared experts
-        global_counts = torch.stack(per_router_counts).sum(dim=0)  # [E]
-        global_avg = global_counts.mean()
-        global_delta = torch.sign(global_avg - global_counts) * update_rate
-
-        # Blend per-layer and global deltas for each router
-        for router, counts in zip(routers, per_router_counts):
-            if alpha > 0:
-                layer_avg = counts.mean()
-                layer_delta = torch.sign(layer_avg - counts) * update_rate
-                router.expert_bias += alpha * layer_delta + (1 - alpha) * global_delta
-            else:
-                router.expert_bias += global_delta
+        for group in router_groups:
+            _apply_global_bias_update_to_group(group, accelerator, update_rate, alpha)
     else:
-        # Step 2 (standard): Each router updates independently
-        for router, counts in zip(routers, per_router_counts):
-            avg = counts.mean()
-            router.expert_bias += torch.sign(avg - counts) * update_rate
+        for group in router_groups:
+            _apply_per_router_bias_update(group, accelerator, update_rate)
 
-    # Aggregate bias stats across all routers
-    all_bias = torch.cat([r.expert_bias for r in routers])
-    stats["routing/expert_bias_mean"] = all_bias.mean().item()
-    stats["routing/expert_bias_std"] = all_bias.std().item()
-    stats["routing/expert_bias_min"] = all_bias.min().item()
-    stats["routing/expert_bias_max"] = all_bias.max().item()
-    return stats
+    return _bias_stats_for_routers(_flatten_router_groups(router_groups))
 
 
 def get_selected_experts_for_seq_aux(model) -> tuple[torch.Tensor, ...] | None:
@@ -985,9 +1051,9 @@ def main() -> None:
         if accelerator.sync_gradients:
             if bias_update_rate > 0:
                 effective_global_bias = is_global or global_like_sanity or global_router_update
-                bias_routers = None
+                bias_router_groups = None
                 if global_like_sanity:
-                    bias_routers = get_bias_update_routers(
+                    bias_router_groups = get_bias_update_router_groups(
                         accelerator.unwrap_model(model),
                         mlp_only=True,
                     )
@@ -998,7 +1064,7 @@ def main() -> None:
                     accelerator,
                     is_global=effective_global_bias,
                     alpha=alpha,
-                    routers=bias_routers,
+                    router_groups=bias_router_groups,
                 )
                 bias_stats["routing/bias_alpha"] = alpha
             else:
