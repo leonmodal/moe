@@ -20,3 +20,7 @@ c. gemm
 basically figure out whats wrong, we need to have similar losses in long run before we can train the per head models successfully, as only then the results are meaningful.
 
 once you finished, update status.md
+
+I think the loss are still not reconciled. And there might be a few bugs in the other per head models '/tmp/moe/configs/depth_matched/4_layers' liek for example, for 4 layer models per head should be 8 because split into attention and mlp, am i right.
+
+and check status.md we see that test on finewedu edu we just have huge differences. I need  you to again run ddp code and everything to lockin and fix those stuff. I need you to fix them, before returning to me the sanity check and the global moe should be logically the same and there shoudl not be a gap. if there is a gap then some code must be wrong.

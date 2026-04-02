@@ -1,19 +1,12 @@
 """
-DDP stepwise equivalence check for:
+ZeRO-1 stepwise equivalence check for:
 
   - DeepSeek global MoE
   - per-head precompute_kv alternating_global_moe sanity mode
 
-Each rank runs both models on the same local batch. Gradients are synchronized
-within each model via DDP, so rank 0 can report the post-step divergence after
-real multi-GPU training steps.
-
-Examples:
-  uv run torchrun --standalone --nproc_per_node 8 \
-    scripts/compare_global_sanity_stepwise_ddp.py \
-    --global-config configs/depth_matched/4_layers/global_moe.yaml \
-    --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml \
-    --steps 10 --data-mode parquet --batch-size 1 --seq-len 128 --amp-bf16
+This mirrors the DDP parity harness but wraps each model in DeepSpeed ZeRO-1
+instead of DistributedDataParallel so we can test whether optimizer-state
+partitioning materially changes the matched drift behavior.
 """
 
 from __future__ import annotations
@@ -25,10 +18,10 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Iterator
 
+import deepspeed
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
@@ -40,7 +33,6 @@ from scripts.compare_global_sanity_stepwise import (  # noqa: E402
     ParamPair,
     _build_cfg,
     _compare_grad_pairs,
-    _compare_optimizer_states,
     _compare_param_pairs,
     _copy_global_to_sanity,
     _selected_expert_mismatches,
@@ -138,25 +130,22 @@ def _make_parquet_iterator(
 
 
 def _forward_backward_model(
-    model,
+    engine,
     batch: dict[str, torch.Tensor],
     *,
     amp_bf16: bool,
     capture_logits: bool,
-    loss_scale: float = 1.0,
-    sync_gradients: bool = True,
 ) -> StepResult:
-    sync_context = nullcontext()
-    if not sync_gradients and hasattr(model, "no_sync"):
-        sync_context = model.no_sync()
-    with sync_context:
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_bf16):
-            output = model(
-                input_ids=batch["input_ids"],
-                labels=batch["labels"],
-                output_router_logits=True,
-            )
-            loss = output.loss
+    engine.zero_grad()
+    # DeepSpeed controls bf16/fp16 from its own config; nesting torch.autocast
+    # around the engine only adds warnings and does not change the engine path.
+    with nullcontext():
+        output = engine(
+            input_ids=batch["input_ids"],
+            labels=batch["labels"],
+            output_router_logits=True,
+        )
+        loss = output.loss
     with torch.no_grad():
         shift_logits = output.logits[..., :-1, :].float().contiguous()
         shift_labels = batch["labels"][..., 1:].contiguous()
@@ -165,7 +154,7 @@ def _forward_backward_model(
             shift_labels.view(-1),
             ignore_index=-100,
         )
-    (loss * loss_scale).backward()
+    engine.backward(loss)
     return StepResult(
         loss=float(loss.item()),
         ce_loss=float(ce_loss.item()),
@@ -192,6 +181,22 @@ def _reduce_max(value: float, device: torch.device) -> float:
     return float(tensor.item())
 
 
+def _zero1_config(*, batch_size: int, amp_bf16: bool) -> dict:
+    return {
+        "train_micro_batch_size_per_gpu": batch_size,
+        "gradient_accumulation_steps": 1,
+        "zero_optimization": {
+            "stage": 1,
+            "offload_optimizer": {"device": "none"},
+            "offload_param": {"device": "none"},
+        },
+        "bf16": {"enabled": amp_bf16},
+        "fp16": {"enabled": False},
+        "steps_per_print": 10_000_000,
+        "wall_clock_breakdown": False,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--global-config", default=GLOBAL_CFG)
@@ -207,19 +212,6 @@ def main() -> None:
     parser.add_argument("--data-dir", default="./data/parquet")
     parser.add_argument("--text-column", default="text")
     parser.add_argument("--tokenizer-name", default="Qwen/Qwen3-0.6B")
-    parser.add_argument("--bucket-cap-mb", type=float, default=25.0)
-    parser.add_argument(
-        "--grad-accum-steps",
-        type=int,
-        default=1,
-        help="Accumulate gradients across this many local microbatches before each optimizer step.",
-    )
-    parser.add_argument(
-        "--static-graph",
-        choices=("on", "off"),
-        default="off",
-        help="Enable or disable DDP static_graph.",
-    )
     parser.add_argument(
         "--learning-rate",
         type=float,
@@ -246,7 +238,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    rank, world_size, local_rank, device = _dist_info()
+    rank, world_size, _local_rank, device = _dist_info()
     is_main = rank == 0
 
     global_cfg = _build_cfg(args.global_config, batch_size=args.batch_size, seq_len=args.seq_len)
@@ -277,32 +269,33 @@ def main() -> None:
     if sanity_cfg["training"].get("gradient_checkpointing", False):
         sanity_model.gradient_checkpointing_enable()
 
-    global_ddp = DDP(
-        global_model,
-        device_ids=[local_rank],
-        output_device=local_rank,
-        static_graph=args.static_graph == "on",
-        bucket_cap_mb=args.bucket_cap_mb,
-    )
-    sanity_ddp = DDP(
-        sanity_model,
-        device_ids=[local_rank],
-        output_device=local_rank,
-        static_graph=args.static_graph == "on",
-        bucket_cap_mb=args.bucket_cap_mb,
-    )
-
     global_opt = torch.optim.AdamW(
-        global_ddp.parameters(),
+        global_model.parameters(),
         lr=global_cfg["training"]["learning_rate"],
         weight_decay=global_cfg["training"]["weight_decay"],
         betas=(global_cfg["training"]["beta1"], global_cfg["training"]["beta2"]),
     )
     sanity_opt = torch.optim.AdamW(
-        sanity_ddp.parameters(),
+        sanity_model.parameters(),
         lr=sanity_cfg["training"]["learning_rate"],
         weight_decay=sanity_cfg["training"]["weight_decay"],
         betas=(sanity_cfg["training"]["beta1"], sanity_cfg["training"]["beta2"]),
+    )
+
+    ds_config = _zero1_config(batch_size=args.batch_size, amp_bf16=args.amp_bf16)
+    global_engine, _, _, _ = deepspeed.initialize(
+        model=global_model,
+        optimizer=global_opt,
+        model_parameters=global_model.parameters(),
+        config=ds_config,
+        dist_init_required=False,
+    )
+    sanity_engine, _, _, _ = deepspeed.initialize(
+        model=sanity_model,
+        optimizer=sanity_opt,
+        model_parameters=sanity_model.parameters(),
+        config=ds_config,
+        dist_init_required=False,
     )
 
     if args.data_mode == "synthetic":
@@ -331,11 +324,8 @@ def main() -> None:
 
     if is_main:
         print(
-            f"ddp_world_size={world_size} data_mode={args.data_mode} "
+            f"zero1_world_size={world_size} data_mode={args.data_mode} "
             f"amp_bf16={args.amp_bf16} "
-            f"bucket_cap_mb={args.bucket_cap_mb} "
-            f"static_graph={args.static_graph} "
-            f"grad_accum_steps={args.grad_accum_steps} "
             f"learning_rate={global_cfg['training']['learning_rate']} "
             f"bias_update_rate={global_cfg['model'].get('bias_update_rate', 0.0)} "
             f"gradient_checkpointing=(global={global_cfg['training'].get('gradient_checkpointing', False)}, "
@@ -343,7 +333,7 @@ def main() -> None:
         )
         print(
             "step  global_ce  sanity_ce  |ce|  global_loss  sanity_loss  |loss|  "
-            "logits_max  grad_max  param_max  opt_max  mismatched_selected"
+            "logits_max  grad_max  param_max  mismatched_selected"
         )
 
     max_ce_diff = 0.0
@@ -352,53 +342,38 @@ def main() -> None:
     max_loss_step = -1
 
     for step in range(args.steps):
-        global_opt.zero_grad(set_to_none=True)
-        sanity_opt.zero_grad(set_to_none=True)
+        batch = next(iterator)
 
-        mean_global_loss_local = 0.0
-        mean_sanity_loss_local = 0.0
-        mean_global_ce_local = 0.0
-        mean_sanity_ce_local = 0.0
+        global_result = _forward_backward_model(
+            global_engine,
+            batch,
+            amp_bf16=args.amp_bf16,
+            capture_logits=args.capture_logits == "on",
+        )
+        sanity_result = _forward_backward_model(
+            sanity_engine,
+            batch,
+            amp_bf16=args.amp_bf16,
+            capture_logits=args.capture_logits == "on",
+        )
+
         logits_diff = 0.0
+        if global_result.logits is not None and sanity_result.logits is not None:
+            logits_diff = (global_result.logits.float() - sanity_result.logits.float()).abs().max().item()
+        mismatches = _selected_expert_mismatches(global_engine.module, sanity_engine.module)
+        selected_total = sum(mismatches)
 
-        for micro_step in range(args.grad_accum_steps):
-            batch = next(iterator)
-            sync_gradients = micro_step == args.grad_accum_steps - 1
-            global_result = _forward_backward_model(
-                global_ddp,
-                batch,
-                amp_bf16=args.amp_bf16,
-                capture_logits=args.capture_logits == "on",
-                loss_scale=1.0 / args.grad_accum_steps,
-                sync_gradients=sync_gradients,
-            )
-            sanity_result = _forward_backward_model(
-                sanity_ddp,
-                batch,
-                amp_bf16=args.amp_bf16,
-                capture_logits=args.capture_logits == "on",
-                loss_scale=1.0 / args.grad_accum_steps,
-                sync_gradients=sync_gradients,
-            )
+        mean_global_loss = _reduce_mean(global_result.loss, device)
+        mean_sanity_loss = _reduce_mean(sanity_result.loss, device)
+        mean_global_ce = _reduce_mean(global_result.ce_loss, device)
+        mean_sanity_ce = _reduce_mean(sanity_result.ce_loss, device)
+        max_logits_diff = _reduce_max(logits_diff, device)
+        total_selected = _reduce_sum(selected_total, device)
 
-            mean_global_loss_local += global_result.loss
-            mean_sanity_loss_local += sanity_result.loss
-            mean_global_ce_local += global_result.ce_loss
-            mean_sanity_ce_local += sanity_result.ce_loss
+        grad_name, grad_diff = _compare_grad_pairs(pairs)
 
-            if global_result.logits is not None and sanity_result.logits is not None:
-                micro_logits_diff = (
-                    global_result.logits.float() - sanity_result.logits.float()
-                ).abs().max().item()
-                logits_diff = max(logits_diff, micro_logits_diff)
-
-        mean_global_loss_local /= args.grad_accum_steps
-        mean_sanity_loss_local /= args.grad_accum_steps
-        mean_global_ce_local /= args.grad_accum_steps
-        mean_sanity_ce_local /= args.grad_accum_steps
-
-        global_opt.step()
-        sanity_opt.step()
+        global_engine.step()
+        sanity_engine.step()
 
         if global_cfg["model"].get("bias_update_rate", 0.0) > 0:
             global_alpha = (
@@ -418,32 +393,22 @@ def main() -> None:
                 else 0.0
             )
             update_expert_biases(
-                global_ddp.module,
+                global_engine.module,
                 global_cfg["model"]["bias_update_rate"],
                 accelerator,
                 is_global=True,
                 alpha=global_alpha,
             )
             update_expert_biases(
-                sanity_ddp.module,
+                sanity_engine.module,
                 sanity_cfg["model"]["bias_update_rate"],
                 accelerator,
                 is_global=True,
                 alpha=sanity_alpha,
-                router_groups=get_bias_update_router_groups(sanity_ddp.module, mlp_only=True),
+                router_groups=get_bias_update_router_groups(sanity_engine.module, mlp_only=True),
             )
 
-        mismatches = _selected_expert_mismatches(global_ddp.module, sanity_ddp.module)
-        selected_total = sum(mismatches)
-
-        mean_global_loss = _reduce_mean(mean_global_loss_local, device)
-        mean_sanity_loss = _reduce_mean(mean_sanity_loss_local, device)
-        mean_global_ce = _reduce_mean(mean_global_ce_local, device)
-        mean_sanity_ce = _reduce_mean(mean_sanity_ce_local, device)
-        max_logits_diff = _reduce_max(logits_diff, device)
-        total_selected = _reduce_sum(selected_total, device)
-
-        dist.barrier(device_ids=[local_rank])
+        dist.barrier()
 
         if is_main:
             ce_diff = abs(mean_global_ce - mean_sanity_ce)
@@ -454,9 +419,7 @@ def main() -> None:
             if loss_diff > max_loss_diff:
                 max_loss_diff = loss_diff
                 max_loss_step = step
-            grad_name, grad_diff = _compare_grad_pairs(pairs)
             param_name, param_diff = _compare_param_pairs(pairs)
-            opt_name, opt_key, opt_diff = _compare_optimizer_states(pairs, global_opt, sanity_opt)
 
             should_report = (
                 step == 0
@@ -468,15 +431,12 @@ def main() -> None:
                     f"{step:>4d}  "
                     f"{mean_global_ce:>9.6f}  {mean_sanity_ce:>9.6f}  {ce_diff:>7.6f}  "
                     f"{mean_global_loss:>11.6f}  {mean_sanity_loss:>11.6f}  {loss_diff:>7.6f}  "
-                    f"{max_logits_diff:>10.6f}  {grad_diff:>8.3g}  "
-                    f"{param_diff:>9.3g}  {opt_diff:>7.3g}  {total_selected:>6d}"
+                    f"{max_logits_diff:>10.6f}  {grad_diff:>8.3g}  {param_diff:>9.3g}  {total_selected:>6d}"
                 )
                 if grad_name:
                     print(f"      worst_grad={grad_name}")
                 if param_name:
                     print(f"      worst_param={param_name}")
-                if opt_name:
-                    print(f"      worst_opt={opt_name}:{opt_key}")
                 print(f"      mismatches_by_layer(local_rank0)={mismatches}")
 
     if is_main:
@@ -485,7 +445,7 @@ def main() -> None:
             f"max_loss_diff={max_loss_diff:.6f}@step{max_loss_step}"
         )
 
-    dist.barrier(device_ids=[local_rank])
+    dist.barrier()
     dist.destroy_process_group()
 
 

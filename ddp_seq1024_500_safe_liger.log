@@ -1,0 +1,200 @@
+W0402 18:31:32.825000 324231 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] 
+W0402 18:31:32.825000 324231 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] *****************************************
+W0402 18:31:32.825000 324231 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0402 18:31:32.825000 324231 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] *****************************************
+[W402 18:31:44.906983679 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:31:44.070984042 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:31:44.071464964 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:31:44.127822075 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:31:44.186422331 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:31:44.197627868 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:31:44.274946446 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:31:44.319424939 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+ddp_world_size=8 data_mode=parquet amp_bf16=True bucket_cap_mb=25.0 static_graph=off learning_rate=0.001 bias_update_rate=0.001 gradient_checkpointing=(global=False, sanity=False)
+step  global_ce  sanity_ce  |ce|  global_loss  sanity_loss  |loss|  logits_max  grad_max  param_max  opt_max  mismatched_selected
+   0  12.117006  12.117167  0.000161    12.117139    12.117301  0.000162    0.000000  0.000728      0.002  7.28e-05    1001
+      worst_grad=embed
+      worst_param=embed
+      worst_opt=embed:exp_avg
+      mismatches_by_layer(local_rank0)=[4, 13, 59, 86]
+  50   7.887704   7.886012  0.001693     7.887848     7.886156  0.001692    0.000000    0.0926      0.066  0.00694  130320
+      worst_grad=embed
+      worst_param=layer0.mlp_gate_bias
+      worst_opt=embed:exp_avg
+      mismatches_by_layer(local_rank0)=[4044, 4095, 4096, 4078]
+ 100   7.716582   7.711248  0.005334     7.716714     7.711386  0.005328    0.000000    0.0745      0.154   0.0133  128173
+      worst_grad=embed
+      worst_param=layer0.mlp_gate_bias
+      worst_opt=embed:exp_avg
+      mismatches_by_layer(local_rank0)=[4081, 4096, 3949, 3890]
+ 150   7.477792   7.547556  0.069764     7.477919     7.547683  0.069764    0.000000     0.109      0.224   0.0257  129946
+      worst_grad=embed
+      worst_param=layer0.mlp_gate_bias
+      worst_opt=embed:exp_avg
+      mismatches_by_layer(local_rank0)=[4082, 4051, 4015, 4089]
+W0402 18:32:46.460000 324231 .venv/lib/python3.12/site-packages/torch/distributed/elastic/agent/server/api.py:739] Received 2 death signal, shutting down workers
+W0402 18:32:46.461000 324231 .venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 324476 closing signal SIGINT
+W0402 18:32:46.461000 324231 .venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 324477 closing signal SIGINT
+W0402 18:32:46.461000 324231 .venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 324478 closing signal SIGINT
+W0402 18:32:46.462000 324231 .venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 324479 closing signal SIGINT
+W0402 18:32:46.462000 324231 .venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 324480 closing signal SIGINT
+W0402 18:32:46.462000 324231 .venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 324481 closing signal SIGINT
+W0402 18:32:46.463000 324231 .venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 324482 closing signal SIGINT
+W0402 18:32:46.463000 324231 .venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 324483 closing signal SIGINT
+[rank4]: Traceback (most recent call last):
+[rank4]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp_safe_liger.py", line 24, in <module>
+[rank4]:     main()
+[rank4]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 346, in main
+[rank4]:     global_result = _step_model(
+[rank4]:                     ^^^^^^^^^^^^
+[rank4]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 163, in _step_model
+[rank4]:     loss.backward()
+[rank4]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/_tensor.py", line 630, in backward
+[rank4]:     torch.autograd.backward(
+[rank4]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/__init__.py", line 364, in backward
+[rank4]:     _engine_run_backward(
+[rank4]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank4]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank4]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]: KeyboardInterrupt
+[rank3]: Traceback (most recent call last):
+[rank3]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp_safe_liger.py", line 24, in <module>
+[rank3]:     main()
+[rank3]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 346, in main
+[rank3]:     global_result = _step_model(
+[rank3]:                     ^^^^^^^^^^^^
+[rank3]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 163, in _step_model
+[rank3]:     loss.backward()
+[rank3]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/_tensor.py", line 630, in backward
+[rank3]:     torch.autograd.backward(
+[rank3]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/__init__.py", line 364, in backward
+[rank3]:     _engine_run_backward(
+[rank3]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank3]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]: KeyboardInterrupt
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp_safe_liger.py", line 24, in <module>
+[rank1]:     main()
+[rank1]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 346, in main
+[rank1]:     global_result = _step_model(
+[rank1]:                     ^^^^^^^^^^^^
+[rank1]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 163, in _step_model
+[rank1]:     loss.backward()
+[rank1]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/_tensor.py", line 630, in backward
+[rank1]:     torch.autograd.backward(
+[rank1]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/__init__.py", line 364, in backward
+[rank1]:     _engine_run_backward(
+[rank1]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank1]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]: KeyboardInterrupt
+[rank5]: Traceback (most recent call last):
+[rank5]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp_safe_liger.py", line 24, in <module>
+[rank5]:     main()
+[rank5]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 346, in main
+[rank5]:     global_result = _step_model(
+[rank5]:                     ^^^^^^^^^^^^
+[rank5]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 163, in _step_model
+[rank5]:     loss.backward()
+[rank5]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/_tensor.py", line 630, in backward
+[rank5]:     torch.autograd.backward(
+[rank5]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/__init__.py", line 364, in backward
+[rank5]:     _engine_run_backward(
+[rank5]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank5]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank5]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]: KeyboardInterrupt
+[rank6]: Traceback (most recent call last):
+[rank6]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp_safe_liger.py", line 24, in <module>
+[rank6]:     main()
+[rank6]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 346, in main
+[rank6]:     global_result = _step_model(
+[rank6]:                     ^^^^^^^^^^^^
+[rank6]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 163, in _step_model
+[rank6]:     loss.backward()
+[rank6]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/_tensor.py", line 630, in backward
+[rank6]:     torch.autograd.backward(
+[rank6]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/__init__.py", line 364, in backward
+[rank6]:     _engine_run_backward(
+[rank6]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank6]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank6]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]: KeyboardInterrupt
+[rank2]: Traceback (most recent call last):
+[rank2]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp_safe_liger.py", line 24, in <module>
+[rank2]:     main()
+[rank2]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 346, in main
+[rank2]:     global_result = _step_model(
+[rank2]:                     ^^^^^^^^^^^^
+[rank2]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 163, in _step_model
+[rank2]:     loss.backward()
+[rank2]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/_tensor.py", line 630, in backward
+[rank2]:     torch.autograd.backward(
+[rank2]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/__init__.py", line 364, in backward
+[rank2]:     _engine_run_backward(
+[rank2]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank2]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]: KeyboardInterrupt
+[rank7]: Traceback (most recent call last):
+[rank7]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp_safe_liger.py", line 24, in <module>
+[rank7]:     main()
+[rank7]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 346, in main
+[rank7]:     global_result = _step_model(
+[rank7]:                     ^^^^^^^^^^^^
+[rank7]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 163, in _step_model
+[rank7]:     loss.backward()
+[rank7]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/_tensor.py", line 630, in backward
+[rank7]:     torch.autograd.backward(
+[rank7]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/__init__.py", line 364, in backward
+[rank7]:     _engine_run_backward(
+[rank7]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank7]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank7]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]: KeyboardInterrupt
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp_safe_liger.py", line 24, in <module>
+[rank0]:     main()
+[rank0]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 346, in main
+[rank0]:     global_result = _step_model(
+[rank0]:                     ^^^^^^^^^^^^
+[rank0]:   File "/tmp/moe/scripts/compare_global_sanity_stepwise_ddp.py", line 163, in _step_model
+[rank0]:     loss.backward()
+[rank0]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/_tensor.py", line 630, in backward
+[rank0]:     torch.autograd.backward(
+[rank0]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/__init__.py", line 364, in backward
+[rank0]:     _engine_run_backward(
+[rank0]:   File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank0]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]: KeyboardInterrupt
+[rank0]:[W402 18:32:46.466351163 ProcessGroupNCCL.cpp:1553] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+Traceback (most recent call last):
+  File "/tmp/moe/.venv/bin/torchrun", line 10, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/distributed/run.py", line 991, in main
+    run(args)
+  File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/distributed/run.py", line 982, in run
+    elastic_launch(
+  File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/distributed/launcher/api.py", line 308, in launch_agent
+    result = agent.run()
+             ^^^^^^^^^^^
+  File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/distributed/elastic/metrics/api.py", line 134, in wrapper
+    result = f(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^
+  File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/distributed/elastic/agent/server/api.py", line 731, in run
+    result = self._invoke_run(role)
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/distributed/elastic/agent/server/api.py", line 908, in _invoke_run
+    time.sleep(monitor_interval)
+  File "/tmp/moe/.venv/lib64/python3.12/site-packages/torch/distributed/elastic/multiprocessing/api.py", line 86, in _terminate_process_handler
+    raise SignalException(f"Process {os.getpid()} got signal: {sigval}", sigval=sigval)
+torch.distributed.elastic.multiprocessing.api.SignalException: Process 324231 got signal: 2

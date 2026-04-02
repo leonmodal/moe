@@ -1102,6 +1102,33 @@ def test_per_head_dense_and_sparse_dispatch_match(mode):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_run_attention_respects_query_positions_on_cuda():
+    config = tiny_moe_everything_config("per_head_precompute_kv")
+    model = MoEverythingForCausalLM(config).to(device="cuda").eval()
+    bank = model.model.attn_bank
+
+    torch.manual_seed(0)
+    q_len = 3
+    kv_len = 6
+    Q = torch.randn(1, bank.num_heads, q_len, bank.head_dim, device="cuda", dtype=torch.bfloat16)
+    K = torch.randn(1, bank.num_kv_heads, kv_len, bank.head_dim, device="cuda", dtype=torch.bfloat16)
+    V = torch.randn(1, bank.num_kv_heads, kv_len, bank.head_dim, device="cuda", dtype=torch.bfloat16)
+    query_positions = torch.tensor([0, 2, 4], device="cuda", dtype=torch.long)
+
+    with torch.no_grad():
+        out = bank._run_attention(Q, K, V, query_positions=query_positions)
+        mask = bank._build_query_position_mask(
+            query_positions,
+            key_length=kv_len,
+            device=Q.device,
+            dtype=Q.dtype,
+        )
+        ref = bank._run_attention_backend(Q, K, V, mask)
+
+    torch.testing.assert_close(out.float(), ref.float())
+
+
 def test_per_head_precompute_kv_routes_one_slot_per_kv_head():
     config = tiny_moe_everything_config("per_head_precompute_kv")
     model = MoEverythingForCausalLM(config).eval()
@@ -1366,11 +1393,17 @@ def test_alternating_global_sanity_bf16_attention_path_matches_global_moe():
             dropout_p=0.0,
             scale=bank.scaling,
         )
+        o_dense = layer.self_attn.o_proj(attn_dense.transpose(1, 2).reshape(1, ids.shape[1], -1))
+        o_sanity = bank._project_sanity_logical_o(
+            attn_sanity.transpose(1, 2).reshape(ids.shape[0] * ids.shape[1], -1),
+            depth_idx=0,
+        ).view(1, ids.shape[1], -1)
 
     torch.testing.assert_close(tables["Q"], q_dense)
     torch.testing.assert_close(tables["K_fresh"], k_dense)
     torch.testing.assert_close(tables["V_fresh"].float(), v_dense.float())
     torch.testing.assert_close(attn_sanity.float(), attn_dense.float())
+    torch.testing.assert_close(o_sanity.float(), o_dense.float())
 
 
 def test_alternating_global_sanity_uses_logical_attention_norms():

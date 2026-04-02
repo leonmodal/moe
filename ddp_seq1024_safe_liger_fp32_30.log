@@ -1,0 +1,50 @@
+W0402 18:46:29.582000 354503 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] 
+W0402 18:46:29.582000 354503 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] *****************************************
+W0402 18:46:29.582000 354503 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0402 18:46:29.582000 354503 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] *****************************************
+[W402 18:46:40.502088080 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:46:41.698602727 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:46:41.793335667 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:46:41.903754273 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:46:41.906043433 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:46:41.009616704 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:46:41.031218405 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:46:41.038889713 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+ddp_world_size=8 data_mode=parquet amp_bf16=False bucket_cap_mb=25.0 static_graph=off grad_accum_steps=1 learning_rate=0.001 bias_update_rate=0.001 gradient_checkpointing=(global=False, sanity=False)
+step  global_ce  sanity_ce  |ce|  global_loss  sanity_loss  |loss|  logits_max  grad_max  param_max  opt_max  mismatched_selected
+   0  12.117275  12.117275  0.000000    12.117407    12.117407  0.000000    0.000000  3.26e-08   8.75e-05  3.26e-09       0
+      worst_grad=embed
+      worst_param=layer0.q_proj
+      worst_opt=embed:exp_avg
+      mismatches_by_layer(local_rank0)=[0, 0, 0, 0]
+   5   8.501472   8.501431  0.000041     8.501645     8.501604  0.000041    0.000000  6.65e-05    0.00481  7.24e-06     876
+      worst_grad=embed
+      worst_param=embed
+      worst_opt=embed:exp_avg
+      mismatches_by_layer(local_rank0)=[108, 0, 10, 0]
+  10   8.163186   8.162201  0.000985     8.163354     8.162369  0.000985    0.000000    0.0358     0.0068  0.00358     680
+      worst_grad=embed
+      worst_param=mlp_gate_up
+      worst_opt=embed:exp_avg
+      mismatches_by_layer(local_rank0)=[120, 0, 0, 4]
+  15   7.878102   7.891576  0.013474     7.878260     7.891736  0.013476    0.000000    0.0282    0.00914  0.00403   52809
+      worst_grad=embed
+      worst_param=mlp_gate_up
+      worst_opt=embed:exp_avg
+      mismatches_by_layer(local_rank0)=[2637, 2996, 1, 918]
+  20   8.187961   8.203626  0.015665     8.188107     8.203778  0.015671    0.000000    0.0743     0.0114    0.124   86010
+      worst_grad=embed
+      worst_param=mlp_gate_up
+      worst_opt=embed:exp_avg
+      mismatches_by_layer(local_rank0)=[3772, 2028, 2897, 2065]
+  25   8.072174   8.076371  0.004197     8.072313     8.076519  0.004206    0.000000    0.0467      0.018   0.0733  113998
+      worst_grad=embed
+      worst_param=layer0.mlp_gate_bias
+      worst_opt=embed:exp_avg
+      mismatches_by_layer(local_rank0)=[3961, 3034, 4096, 3191]
+  29   7.899393   7.921786  0.022394     7.899532     7.921931  0.022398    0.000000    0.0715      0.024   0.0569  130347
+      worst_grad=embed
+      worst_param=layer0.mlp_gate_bias
+      worst_opt=embed:exp_avg_sq
+      mismatches_by_layer(local_rank0)=[4068, 3981, 4089, 4072]
+summary max_ce_diff=0.048881@step14 max_loss_diff=0.048882@step14

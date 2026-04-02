@@ -1,0 +1,39 @@
+W0402 18:23:48.550000 308331 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] 
+W0402 18:23:48.550000 308331 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] *****************************************
+W0402 18:23:48.550000 308331 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0402 18:23:48.550000 308331 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] *****************************************
+[W402 18:24:01.518356190 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:24:02.594346588 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:24:02.671597807 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:24:02.682559344 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:24:02.775087167 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:24:02.859511348 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:24:02.882067066 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:24:02.882498672 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+zero1_world_size=8 data_mode=parquet amp_bf16=True learning_rate=0.001 bias_update_rate=0.001 gradient_checkpointing=(global=False, sanity=False)
+step  global_ce  sanity_ce  |ce|  global_loss  sanity_loss  |loss|  logits_max  grad_max  param_max  mismatched_selected
+[2026-04-02 18:24:20,061] [WARNING] [torch_autocast.py:122:autocast_if_enabled] torch.autocast is enabled outside DeepSpeed but disabled within the DeepSpeed engine. If you are using DeepSpeed's built-in mixed precision, the engine will follow the settings in bf16/fp16 section. To use torch's native autocast instead, configure the `torch_autocast` section in the DeepSpeed config.
+/tmp/moe/.venv/lib64/python3.12/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+   0  12.117250  12.117250  0.000000    12.117383    12.117383  0.000000    0.000000         0     0.0022       0
+      worst_param=embed
+      mismatches_by_layer(local_rank0)=[0, 0, 0, 0]
+   5   8.509827   8.508947  0.000879     8.509998     8.509119  0.000879    0.000000         0    0.00861   45720
+      worst_param=mlp_gate_up
+      mismatches_by_layer(local_rank0)=[1982, 762, 1005, 2046]
+  10   8.167971   8.169321  0.001350     8.168138     8.169489  0.001351    0.000000         0     0.0124   91719
+      worst_param=mlp_gate_up
+      mismatches_by_layer(local_rank0)=[2090, 3235, 3063, 3064]
+  15   7.949082   8.011940  0.062858     7.949241     8.012094  0.062853    0.000000         0     0.0161   74616
+      worst_param=embed
+      mismatches_by_layer(local_rank0)=[3248, 2047, 2985, 1024]
+  20   8.152491   8.187894  0.035403     8.152645     8.188043  0.035398    0.000000         0     0.0195  107464
+      worst_param=mlp_gate_up
+      mismatches_by_layer(local_rank0)=[3857, 3072, 3408, 3072]
+  25   8.035030   8.067136  0.032105     8.035178     8.067285  0.032106    0.000000         0     0.0237  112220
+      worst_param=mlp_down
+      mismatches_by_layer(local_rank0)=[3729, 3116, 4094, 2996]
+  29   7.898123   7.921728  0.023605     7.898268     7.921878  0.023610    0.000000         0     0.0291  119822
+      worst_param=mlp_down
+      mismatches_by_layer(local_rank0)=[4022, 3889, 3066, 3937]
+summary max_ce_diff=9.095173@step12 max_loss_diff=9.095204@step12

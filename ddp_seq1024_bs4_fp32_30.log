@@ -1,0 +1,29 @@
+W0402 18:43:20.930000 345684 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] 
+W0402 18:43:20.930000 345684 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] *****************************************
+W0402 18:43:20.930000 345684 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0402 18:43:20.930000 345684 .venv/lib/python3.12/site-packages/torch/distributed/run.py:852] *****************************************
+[W402 18:43:29.813582435 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:43:29.813591152 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:43:29.813606277 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:43:29.813627806 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:43:29.813642714 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:43:29.813690976 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:43:29.821933716 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+[W402 18:43:29.830844190 Context.cpp:534] Warning: torch.backends.cuda.preferred_blas_library is an experimental feature. If you see any error or unexpected behavior when this flag is set please file an issue on GitHub. (function operator())
+ddp_world_size=8 data_mode=parquet amp_bf16=False bucket_cap_mb=25.0 static_graph=off grad_accum_steps=1 learning_rate=0.001 bias_update_rate=0.001 gradient_checkpointing=(global=False, sanity=False)
+step  global_ce  sanity_ce  |ce|  global_loss  sanity_loss  |loss|  logits_max  grad_max  param_max  opt_max  mismatched_selected
+   0  12.091810  12.091810  0.000000    12.091944    12.091944  0.000000    0.000000         0          0        0       0
+      mismatches_by_layer(local_rank0)=[0, 0, 0, 0]
+   5   8.182125   8.182125  0.000000     8.182299     8.182299  0.000000    0.000000         0          0        0       0
+      mismatches_by_layer(local_rank0)=[0, 0, 0, 0]
+  10   8.039262   8.039262  0.000000     8.039424     8.039424  0.000000    0.000000         0          0        0       0
+      mismatches_by_layer(local_rank0)=[0, 0, 0, 0]
+  15   7.917068   7.917068  0.000000     7.917219     7.917219  0.000000    0.000000         0          0        0       0
+      mismatches_by_layer(local_rank0)=[0, 0, 0, 0]
+  20   7.980923   7.980923  0.000000     7.981073     7.981073  0.000000    0.000000         0          0        0       0
+      mismatches_by_layer(local_rank0)=[0, 0, 0, 0]
+  25   7.853382   7.853382  0.000000     7.853528     7.853528  0.000000    0.000000         0          0        0       0
+      mismatches_by_layer(local_rank0)=[0, 0, 0, 0]
+  29   7.811118   7.811118  0.000000     7.811261     7.811261  0.000000    0.000000         0          0        0       0
+      mismatches_by_layer(local_rank0)=[0, 0, 0, 0]
+summary max_ce_diff=0.000000@step-1 max_loss_diff=0.000000@step-1

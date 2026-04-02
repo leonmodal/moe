@@ -40,6 +40,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from transformers import Qwen3MoeConfig
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeExperts,
     Qwen3MoePreTrainedModel,
@@ -47,6 +49,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeRotaryEmbedding,
     Qwen3MoeTopKRouter,
     apply_rotary_pos_emb,
+    eager_attention_forward,
     repeat_kv,
 )
 
@@ -236,12 +239,16 @@ class AttentionExpertBank(nn.Module):
         if self.num_heads % self.num_kv_heads != 0:
             raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
         self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.num_key_value_groups = self.num_kv_groups
+        self.is_causal = True
         self.q_heads_per_kv = self.num_kv_groups
         self.q_group_dim = self.q_heads_per_kv * self.head_dim
         self.q_dim = self.num_heads * self.head_dim
         self.kv_dim = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.eps = config.rms_norm_eps
+        self.attention_dropout = getattr(config, "attention_dropout", 0.0)
+        self.sliding_window = getattr(config, "sliding_window", None)
         self.use_deepseek_routing = getattr(config, "use_deepseek_routing", False)
         self.per_layer_attn_router = getattr(config, "per_layer_attn_router", False)
         self.routed_norm = getattr(config, "routed_norm", False)
@@ -1193,23 +1200,7 @@ class AttentionExpertBank(nn.Module):
         B = Q.shape[0]
         T = Q.shape[2]
 
-        K_expanded = repeat_kv(K, self.num_kv_groups)
-        V_expanded = repeat_kv(V, self.num_kv_groups)
-        if Q.is_cuda:
-            attn_output = F.scaled_dot_product_attention(
-                Q,
-                K_expanded,
-                V_expanded,
-                attn_mask=attention_mask,
-                dropout_p=0.0,
-                scale=self.scaling,
-            )
-        else:
-            attn_weights = torch.matmul(Q, K_expanded.transpose(2, 3)) * self.scaling
-            if attention_mask is not None:
-                attn_weights = attn_weights + attention_mask
-            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(Q.dtype)
-            attn_output = torch.matmul(attn_weights, V_expanded)
+        attn_output = self._run_attention(Q, K, V, attention_mask)
 
         if self.mode == "per_head_fully_independent":
             N = B * T
@@ -1347,8 +1338,6 @@ class AttentionExpertBank(nn.Module):
         K_new = torch.where(attn_mask_kv, K_fresh, K_old)
         V_new = torch.where(attn_mask_kv, V_fresh, V_old)
 
-        K_expanded = repeat_kv(K_new, self.num_kv_groups)
-        V_expanded = repeat_kv(V_new, self.num_kv_groups)
         attn_heads = hidden_states.new_zeros(B, self.num_heads, T, self.head_dim)
         token_mask_2d = token_mask.squeeze(-1).bool()
 
@@ -1357,21 +1346,13 @@ class AttentionExpertBank(nn.Module):
             if pos.numel() == 0:
                 continue
             Q_b = Q[b : b + 1, :, pos, :]
-            if Q_b.is_cuda:
-                attn_b = F.scaled_dot_product_attention(
-                    Q_b,
-                    K_expanded[b : b + 1],
-                    V_expanded[b : b + 1],
-                    attn_mask=attention_mask[:, :, pos, :] if attention_mask is not None else None,
-                    dropout_p=0.0,
-                    scale=self.scaling,
-                )
-            else:
-                scores = torch.matmul(Q_b, K_expanded[b : b + 1].transpose(2, 3)) * self.scaling
-                if attention_mask is not None:
-                    scores = scores + attention_mask[:, :, pos, :]
-                scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
-                attn_b = torch.matmul(scores, V_expanded[b : b + 1])
+            attn_b = self._run_attention(
+                Q_b,
+                K_new[b : b + 1],
+                V_new[b : b + 1],
+                attention_mask[:, :, pos, :] if attention_mask is not None else None,
+                query_positions=None if attention_mask is not None else pos,
+            )
             attn_heads[b, :, pos, :] = attn_b.squeeze(0).to(attn_heads.dtype)
 
         attn_selected = attn_heads.transpose(1, 2).reshape(B * T, self.num_heads, self.head_dim)[flat_mask]
@@ -1442,6 +1423,148 @@ class AttentionExpertBank(nn.Module):
             "V_fresh": V_fresh,
         }
 
+    def _project_sanity_logical_o(
+        self,
+        attn_output: torch.Tensor,
+        depth_idx: int | None,
+    ) -> torch.Tensor | None:
+        if self.sanity_check_mode != "alternating_global_moe" or depth_idx is None:
+            return None
+        logical_layer = depth_idx // 2
+        logical_o_proj = super().__getattr__("logical_o_proj")[logical_layer]
+        return F.linear(attn_output, logical_o_proj)
+
+    def _apply_logical_head_norm(
+        self,
+        proj: torch.Tensor,
+        norm_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        input_dtype = proj.dtype
+        proj_f = proj.float()
+        variance = proj_f.pow(2).mean(-1, keepdim=True)
+        proj_normed = proj_f * torch.rsqrt(variance + self.eps)
+        return norm_weight * proj_normed.to(input_dtype)
+
+    def _project_and_attend_sanity_logical_dense(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        K_old: torch.Tensor,
+        V_old: torch.Tensor,
+        token_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        depth_idx: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if self.sanity_check_mode != "alternating_global_moe" or depth_idx is None:
+            return None
+        if not bool(token_mask.bool().all().item()):
+            return None
+
+        B, T, H = hidden_states.shape
+        logical_layer = depth_idx // 2
+        if self.per_layer_norm and depth_idx is not None:
+            normed = self.norms[depth_idx](hidden_states)
+        else:
+            normed = self.norm(hidden_states)
+
+        self.last_router_info = {}
+        self._maybe_build_sanity_attention_routing(
+            B * T,
+            self.num_kv_heads,
+            depth_idx,
+            hidden_states.device,
+            dtype=normed.dtype,
+        )
+
+        logical_q_proj = super().__getattr__("logical_q_proj")[logical_layer]
+        logical_k_proj = super().__getattr__("logical_k_proj")[logical_layer]
+        logical_v_proj = super().__getattr__("logical_v_proj")[logical_layer]
+        q_norm_weight = super().__getattr__("logical_q_norm_weight")[logical_layer]
+        k_norm_weight = super().__getattr__("logical_k_norm_weight")[logical_layer]
+
+        Q = F.linear(normed, logical_q_proj).view(B, T, self.num_heads, self.head_dim)
+        K_fresh = F.linear(normed, logical_k_proj).view(B, T, self.num_kv_heads, self.head_dim)
+        V_fresh = F.linear(normed, logical_v_proj).view(B, T, self.num_kv_heads, self.head_dim)
+
+        Q = self._apply_logical_head_norm(Q, q_norm_weight).transpose(1, 2)
+        K_fresh = self._apply_logical_head_norm(K_fresh, k_norm_weight).transpose(1, 2)
+        V_fresh = V_fresh.transpose(1, 2)
+
+        cos, sin = position_embeddings
+        Q, K_fresh = apply_rotary_pos_emb(Q, K_fresh, cos, sin)
+
+        attn_mask_kv = token_mask.unsqueeze(1)
+        K_new = torch.where(attn_mask_kv, K_fresh, K_old)
+        V_new = torch.where(attn_mask_kv, V_fresh, V_old)
+        attn_output = self._run_attention(
+            Q,
+            K_new,
+            V_new,
+            attention_mask,
+        )
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(B, T, self.q_dim)
+        o_out = self._project_sanity_logical_o(attn_output, depth_idx)
+        return o_out, K_new, V_new
+
+    def _run_attention(
+        self,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        *,
+        query_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if attention_mask is None and query_positions is not None:
+            attention_mask = self._build_query_position_mask(
+                query_positions,
+                key_length=K.shape[-2],
+                device=Q.device,
+                dtype=Q.dtype,
+            )
+        return self._run_attention_backend(Q, K, V, attention_mask)
+
+    def _build_query_position_mask(
+        self,
+        query_positions: torch.Tensor,
+        *,
+        key_length: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        key_positions = torch.arange(key_length, device=device)
+        future_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+        mask = torch.zeros(
+            (query_positions.shape[0], key_length),
+            device=device,
+            dtype=dtype,
+        )
+        mask.masked_fill_(future_mask, float("-inf"))
+        return mask.unsqueeze(0).unsqueeze(0)
+
+    def _run_attention_backend(
+        self,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation,
+            eager_attention_forward,
+        )
+        attn_output, _ = attention_interface(
+            self,
+            Q,
+            K,
+            V,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+        )
+        return attn_output.transpose(1, 2).contiguous()
+
     def project_and_attend_per_head_precompute_kv_dense_mixed(
         self,
         hidden_states: torch.Tensor,
@@ -1453,6 +1576,17 @@ class AttentionExpertBank(nn.Module):
         depth_idx: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, _ = hidden_states.shape
+        sanity_dense = self._project_and_attend_sanity_logical_dense(
+            hidden_states,
+            position_embeddings,
+            K_old,
+            V_old,
+            token_mask,
+            attention_mask,
+            depth_idx,
+        )
+        if sanity_dense is not None:
+            return sanity_dense
         self.last_router_info = {}
         tables = self._build_per_head_precompute_kv_tables(
             hidden_states, position_embeddings, depth_idx=depth_idx
@@ -1468,23 +1602,7 @@ class AttentionExpertBank(nn.Module):
         K_new = torch.where(attn_mask_kv, K_fresh, K_old)
         V_new = torch.where(attn_mask_kv, V_fresh, V_old)
 
-        K_expanded = repeat_kv(K_new, self.num_kv_groups)
-        V_expanded = repeat_kv(V_new, self.num_kv_groups)
-        if Q.is_cuda:
-            attn_output = F.scaled_dot_product_attention(
-                Q,
-                K_expanded,
-                V_expanded,
-                attn_mask=attention_mask,
-                dropout_p=0.0,
-                scale=self.scaling,
-            )
-        else:
-            scores = torch.matmul(Q, K_expanded.transpose(2, 3)) * self.scaling
-            if attention_mask is not None:
-                scores = scores + attention_mask
-            scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
-            attn_output = torch.matmul(scores, V_expanded)
+        attn_output = self._run_attention(Q, K_new, V_new, attention_mask)
 
         kv_weight_expanded = (
             kv_weight.view(B, T, self.num_kv_heads)
@@ -1493,7 +1611,12 @@ class AttentionExpertBank(nn.Module):
             .unsqueeze(-1)
         )
         attn_output = attn_output * kv_weight_expanded.to(attn_output.dtype)
-        attn_groups = attn_output.transpose(1, 2).reshape(B * T, self.num_kv_heads, self.q_group_dim)
+        attn_dense = attn_output.transpose(1, 2).contiguous().reshape(B, T, self.q_dim)
+        logical_o = self._project_sanity_logical_o(attn_dense, depth_idx)
+        if logical_o is not None:
+            return logical_o, K_new, V_new
+        attn_flat = attn_dense.reshape(B * T, self.q_dim)
+        attn_groups = attn_flat.view(B * T, self.num_kv_heads, self.q_group_dim)
         o_out = self._project_pair_inputs_grouped(
             attn_groups,
             self.o_proj,
@@ -1593,8 +1716,6 @@ class AttentionExpertBank(nn.Module):
             .unsqueeze(-1)
         )
 
-        K_expanded = repeat_kv(K_new, self.num_kv_groups)
-        V_expanded = repeat_kv(V_new, self.num_kv_groups)
         attn_heads = hidden_states.new_zeros(B, self.num_heads, T, self.head_dim)
         token_mask_2d = token_mask.squeeze(-1).bool()
 
@@ -1603,21 +1724,13 @@ class AttentionExpertBank(nn.Module):
             if pos.numel() == 0:
                 continue
             Q_b = Q[b : b + 1, :, pos, :]
-            if Q_b.is_cuda:
-                attn_b = F.scaled_dot_product_attention(
-                    Q_b,
-                    K_expanded[b : b + 1],
-                    V_expanded[b : b + 1],
-                    attn_mask=attention_mask[:, :, pos, :] if attention_mask is not None else None,
-                    dropout_p=0.0,
-                    scale=self.scaling,
-                )
-            else:
-                scores = torch.matmul(Q_b, K_expanded[b : b + 1].transpose(2, 3)) * self.scaling
-                if attention_mask is not None:
-                    scores = scores + attention_mask[:, :, pos, :]
-                scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
-                attn_b = torch.matmul(scores, V_expanded[b : b + 1])
+            attn_b = self._run_attention(
+                Q_b,
+                K_new[b : b + 1],
+                V_new[b : b + 1],
+                attention_mask[:, :, pos, :] if attention_mask is not None else None,
+                query_positions=None if attention_mask is not None else pos,
+            )
             attn_b = attn_b * kv_weight_expanded[b : b + 1, :, pos, :].to(attn_b.dtype)
             attn_heads[b, :, pos, :] = attn_b.squeeze(0).to(attn_heads.dtype)
 
@@ -1681,24 +1794,7 @@ class AttentionExpertBank(nn.Module):
             K_e_heads = K_e_normed.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
             V_e_heads = V_e.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
             Q_rope, K_e_rope = apply_rotary_pos_emb(Q, K_e_heads, cos, sin)
-            K_e_exp = repeat_kv(K_e_rope, self.num_kv_groups)
-            V_e_exp = repeat_kv(V_e_heads, self.num_kv_groups)
-
-            if Q_rope.is_cuda:
-                attn_e = F.scaled_dot_product_attention(
-                    Q_rope,
-                    K_e_exp,
-                    V_e_exp,
-                    attn_mask=attention_mask,
-                    dropout_p=0.0,
-                    scale=self.scaling,
-                )
-            else:
-                scores = torch.matmul(Q_rope, K_e_exp.transpose(2, 3)) * self.scaling
-                if attention_mask is not None:
-                    scores = scores + attention_mask
-                scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
-                attn_e = torch.matmul(scores, V_e_exp)
+            attn_e = self._run_attention(Q_rope, K_e_rope, V_e_heads, attention_mask)
 
             mask_head = mask_2d.unsqueeze(1).unsqueeze(-1)
             attn_output = attn_output + attn_e * mask_head
@@ -1742,23 +1838,7 @@ class AttentionExpertBank(nn.Module):
         V_fresh = tables["V_fresh"]
         B, _, T, _ = Q.shape
 
-        K_expanded = repeat_kv(K_fresh, self.num_kv_groups)
-        V_expanded = repeat_kv(V_fresh, self.num_kv_groups)
-        if Q.is_cuda:
-            attn_output = F.scaled_dot_product_attention(
-                Q,
-                K_expanded,
-                V_expanded,
-                attn_mask=attention_mask,
-                dropout_p=0.0,
-                scale=self.scaling,
-            )
-        else:
-            scores = torch.matmul(Q, K_expanded.transpose(2, 3)) * self.scaling
-            if attention_mask is not None:
-                scores = scores + attention_mask
-            scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
-            attn_output = torch.matmul(scores, V_expanded)
+        attn_output = self._run_attention(Q, K_fresh, V_fresh, attention_mask)
 
         kv_weight_expanded = (
             kv_weight.view(B, T, self.num_kv_heads)
@@ -1767,8 +1847,13 @@ class AttentionExpertBank(nn.Module):
             .unsqueeze(-1)
         )
         attn_output = attn_output * kv_weight_expanded.to(attn_output.dtype)
+        attn_dense = attn_output.transpose(1, 2).contiguous().reshape(B, T, self.q_dim)
+        logical_o = self._project_sanity_logical_o(attn_dense, depth_idx)
+        if logical_o is not None:
+            return logical_o, K_fresh, V_fresh
+        attn_flat = attn_dense.reshape(B * T, self.q_dim)
         o_out = self._project_pair_inputs_grouped(
-            attn_output.transpose(1, 2).reshape(B * T, self.num_kv_heads, self.q_group_dim),
+            attn_flat.view(B * T, self.num_kv_heads, self.q_group_dim),
             self.o_proj,
             idx,
             w,
@@ -2098,15 +2183,23 @@ class MoEverythingModel(nn.Module):
 
         hidden_states = self.embed_tokens(input_ids)
 
+        cache_position = torch.arange(T, device=input_ids.device)
         if position_ids is None:
-            position_ids = torch.arange(T, device=input_ids.device).unsqueeze(0)
+            position_ids = cache_position.unsqueeze(0)
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
         cos, sin = position_embeddings
 
-        causal_mask = torch.triu(
-            torch.full((T, T), float("-inf"), device=hidden_states.device, dtype=hidden_states.dtype),
-            diagonal=1,
-        ).unsqueeze(0).unsqueeze(0)
+        mask_function = (
+            create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
+        )
+        causal_mask = mask_function(
+            config=self.config,
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=None,
+            position_ids=position_ids,
+        )
 
         K_init = self.init_k_proj(hidden_states)
         V_init = self.init_v_proj(hidden_states)
@@ -2267,13 +2360,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
         attention_router_info = tuple(self.model._all_attn_router_info) or None
 
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            ce_loss = F.cross_entropy(
-                shift_logits.view(-1, self.vocab_size),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+            ce_loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
             loss = ce_loss
 
             if mlp_router_logits is not None:

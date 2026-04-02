@@ -372,6 +372,104 @@ Observed behavior on the exact runs:
   - if the choice is between `4_layers` and `8_layers` for real per-head training on this hardware, `8_layers` is good to run
   - the `8_layers` sanity config is also runnable here, but it has much less headroom than the real 8-layer models
 
+## 4-Layer Shared-Attention BF16 Parity Fix
+
+- Root cause of the remaining `global_moe` vs `alternating_global_moe` sanity drift:
+  - the shared `AttentionExpertBank._run_attention(...)` helper in `mixture_of_everything` was not using the same backend semantics as baseline Qwen attention
+  - on the exact `global_moe` vs `alternating_global_moe` sanity path, that meant bf16 backward was going through a different SDPA/GQA path than the baseline model, which left step-0 forward exact but introduced small `v_proj` / `o_proj` gradient differences that amplified after the first optimizer step under real DDP
+  - independently, the same shared helper had a real CUDA bug for sparse-query calls: when `query_positions` was provided and `attention_mask` was `None`, the GPU path ignored `query_positions`, so sparse per-head attention could silently lose causal masking
+- Fix applied in `src/models/mixture_of_everything.py`:
+  - `_run_attention(...)` is now the shared source of truth and always uses the Transformers attention backend selection (`ALL_ATTENTION_FUNCTIONS.get_interface(..., eager_attention_forward)`) instead of maintaining a second custom SDPA implementation inside `mixture_of_everything`
+  - `_run_attention(...)` now builds an explicit causal mask from `query_positions` before dispatch, so the sparse per-head CUDA paths preserve causality correctly
+  - the backend helper normalizes outputs back to the internal `mixture_of_everything` layout, so the rest of the bank logic stays unchanged
+  - the alternating-global logical-dense sanity branch still uses `mixture_of_everything`’s shared helper; it is no longer special-cased onto a separate attention runner
+- Sanity/unit coverage:
+  - `uv run pytest -q tests/test_models.py -k 'per_head_dense_and_sparse_dispatch_match or run_attention_respects_query_positions_on_cuda or alternating_global_sanity_matches_global_moe or alternating_global_sanity_bf16_attention_path_matches_global_moe or alternating_global_sanity_mixed_precision_bf16_stays_close_to_global_moe'`
+  - result: `6 passed, 139 deselected`
+- Single-process bf16 train-mode check after the fix:
+  - step 0: loss diff `0.0`, logits diff `0.0`, grad diffs `0.0` for all tracked mapped pairs
+  - step 1: loss diff `0.0`, logits diff `0.0`, grad diffs `0.0` for all tracked mapped pairs
+- Real 8-GPU DDP parity is exact again on this machine (`8 x NVIDIA B200`) with the shared helper fix:
+  - note: the side-by-side parity harnesses (`scripts/compare_global_sanity_stepwise_ddp.py` and `scripts/compare_global_sanity_stepwise_zero1.py`) build models directly and do not call `configure_liger_kernels()`, so the matched parity results below are already the no-Liger case
+  - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 20 --data-mode parquet --batch-size 1 --seq-len 128 --amp-bf16 --gradient-checkpointing config --static-graph off --report-every 10`
+    - steps `0`, `10`, and `19`: CE diff `0`, loss diff `0`, logits diff `0`, grad diff `0`, param diff `0`, optimizer diff `0`, selected-expert mismatches `0`
+    - summary: `max_ce_diff=0.000000`, `max_loss_diff=0.000000`
+  - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 100 --data-mode parquet --batch-size 1 --seq-len 128 --amp-bf16 --gradient-checkpointing config --static-graph off --report-every 20`
+    - steps `0`, `20`, `40`, `60`, `80`, and `99`: CE diff `0`, loss diff `0`, logits diff `0`, grad diff `0`, param diff `0`, optimizer diff `0`, selected-expert mismatches `0`
+    - summary: `max_ce_diff=0.000000`, `max_loss_diff=0.000000`
+  - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 20 --data-mode parquet --batch-size 1 --seq-len 128 --amp-bf16 --gradient-checkpointing on --static-graph off --report-every 10`
+    - steps `0`, `10`, and `19`: CE diff `0`, loss diff `0`, logits diff `0`, grad diff `0`, param diff `0`, optimizer diff `0`, selected-expert mismatches `0`
+    - summary: `max_ce_diff=0.000000`, `max_loss_diff=0.000000`
+  - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 2 --data-mode parquet --batch-size 1 --seq-len 1024 --amp-bf16 --gradient-checkpointing config --static-graph off --report-every 1`
+    - step `0`: CE diff `0`, loss diff `0`, logits diff `0`, selected-expert mismatches `0`, but grad/param/optimizer state were already slightly nonzero (`grad_max=1.02e-4`, `param_max=0.002`, `opt_max=1.02e-5`)
+    - step `1`: CE diff `3.2e-5`, loss diff `3.4e-5`, logits max diff `0.635254`, grad max diff `5.01e-4`, param max diff `0.00395`, optimizer diff `5.06e-5`, selected-expert mismatches `5685`
+    - local-rank-0 mismatches by layer at step `1`: `[123, 193, 262, 125]`
+    - summary: `max_ce_diff=0.000032`, `max_loss_diff=0.000034`
+  - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 300 --data-mode parquet --batch-size 1 --seq-len 1024 --amp-bf16 --gradient-checkpointing config --static-graph off --report-every 25 --capture-logits off`
+    - the `seq_len=1024` drift persists over a few hundred real matched steps
+    - selected-expert mismatches climb to roughly `124k`-`130k` by the later checkpoints
+    - representative CE diffs: step `25` `0.022995`, step `75` `0.239699`, step `150` `0.107307`, step `299` `0.073700`
+    - summary: `max_ce_diff=4.398703@step12`, `max_loss_diff=4.398718@step12`
+  - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 300 --data-mode parquet --batch-size 1 --seq-len 1024 --amp-bf16 --gradient-checkpointing config --static-graph off --report-every 25 --capture-logits off --bias-update-rate 0`
+    - disabling expert-bias updates does not eliminate the remaining `seq_len=1024` bf16 drift, but it makes the matched runs materially closer
+    - representative CE diffs: step `25` `0.004215`, step `75` `0.015125`, step `150` `0.101271`, step `299` `0.050544`
+    - summary: `max_ce_diff=0.683054@step12`, `max_loss_diff=0.683065@step12`
+    - read: bias updates are a strong amplifier, not the sole root cause
+  - added a separate ZeRO-1 parity harness at `scripts/compare_global_sanity_stepwise_zero1.py` so DeepSpeed can be tested side-by-side without the `train.py` Liger asymmetry
+  - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_zero1.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 30 --data-mode parquet --batch-size 1 --seq-len 1024 --amp-bf16 --gradient-checkpointing config --report-every 5 --capture-logits off`
+    - ZeRO-1 does not fix the matched `seq_len=1024` drift on this node
+    - representative CE diffs: step `5` `0.000879`, step `10` `0.001350`, step `15` `0.062858`, step `25` `0.032105`, step `29` `0.023605`
+    - summary: `max_ce_diff=9.095173@step12`, `max_loss_diff=9.095204@step12`
+    - note: this harness uses DeepSpeed's built-in bf16 path rather than the outer `torch.autocast`, so the internal numerical path is not identical to the DDP script; the practical result is still that ZeRO-1 did not remove the spike
+  - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 30 --data-mode parquet --batch-size 1 --seq-len 1024 --gradient-checkpointing config --static-graph off --report-every 5 --capture-logits off`
+    - fp32 removes the observed `seq_len=1024` drift on the tested window
+    - steps `0`, `5`, `10`, `15`, `20`, `25`, and `29`: CE diff `0`, loss diff `0`, grad diff `0`, param diff `0`, optimizer diff `0`, selected-expert mismatches `0`
+    - summary: `max_ce_diff=0.000000`, `max_loss_diff=0.000000`
+  - added a symmetric safe-Liger wrapper at `scripts/compare_global_sanity_stepwise_ddp_safe_liger.py`
+  - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp_safe_liger.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 30 --data-mode parquet --batch-size 1 --seq-len 1024 --amp-bf16 --gradient-checkpointing config --static-graph off --report-every 5 --capture-logits off`
+    - this applies the validated-safe Liger subset (`rope+rms_norm`, no `swiglu`, no fused CE) to both models symmetrically
+    - unlike the no-Liger harness, exact parity is already lost at step `0`: CE diff `0.000161`, grad diff `7.65e-4`, selected-expert mismatches `1001`
+    - later representative CE diffs: step `5` `0.001675`, step `10` `0.006875`, step `15` `0.007095`, step `25` `0.000382`, step `29` `0.012565`
+    - summary: `max_ce_diff=0.180929@step12`, `max_loss_diff=0.180935@step12`
+    - read: the safe Liger subset reduces the large mid-run bf16 spike relative to the no-Liger bf16 run, but it destroys exact step-0 parity, so it is not suitable for the sanity/global equivalence harness
+  - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp_safe_liger.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 30 --data-mode parquet --batch-size 1 --seq-len 1024 --gradient-checkpointing off --static-graph off --report-every 5 --capture-logits off`
+    - fp32 with the same symmetric safe-Liger subset is also not exact
+    - step `0`: CE/loss still match, but grad diff `3.26e-08`, param diff `8.75e-05`, optimizer diff `3.26e-09`
+    - representative CE diffs: step `5` `4.1e-05`, step `10` `9.85e-04`, step `15` `0.013474`, step `20` `0.015665`, step `29` `0.022394`
+    - summary: `max_ce_diff=0.048881@step14`, `max_loss_diff=0.048882@step14`
+    - read: unlike the no-Liger fp32 harness, safe-Liger fp32 is not exact, so Liger itself introduces a parity mismatch independent of bf16
+  - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 100 --data-mode parquet --batch-size 4 --seq-len 1024 --amp-bf16 --gradient-checkpointing off --static-graph off --report-every 10 --capture-logits off`
+    - larger micro-batching does not fix the long-run bf16 drift
+    - representative CE diffs: step `10` `0.013202`, step `50` `0.043298`, step `80` `0.173048`, step `99` `0.232381`
+    - summary: `max_ce_diff=11.774851@step12`, `max_loss_diff=11.774869@step12`
+    - read: increasing per-GPU micro-batch from `1` to `4` makes late-step parity worse on the tested 100-step window
+  - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 100 --data-mode parquet --batch-size 1 --seq-len 1024 --amp-bf16 --gradient-checkpointing on --static-graph off --report-every 10 --capture-logits off`
+    - gradient checkpointing does not remove the bf16 drift, but it reduces the early transient spike
+    - representative CE diffs: step `10` `0.007825`, step `50` `0.015156`, step `60` `0.135933`, step `99` `0.237543`
+    - summary: `max_ce_diff=3.154278@step12`, `max_loss_diff=3.154270@step12`
+    - read: checkpointing helps the worst step-12 excursion relative to the no-checkpointing bf16 baseline, but late-step CE drift remains
+  - added `--grad-accum-steps` to `scripts/compare_global_sanity_stepwise_ddp.py` for true parity-harness accumulation tests
+  - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 100 --data-mode parquet --batch-size 1 --grad-accum-steps 4 --seq-len 1024 --amp-bf16 --gradient-checkpointing off --static-graph off --report-every 10 --capture-logits off`
+    - true gradient accumulation is materially better than increasing micro-batch to `4` for the same effective batch size
+    - representative CE diffs: step `10` `0.000192`, step `30` `0.077217`, step `60` `0.020740`, step `99` `0.059988`
+    - summary: `max_ce_diff=1.357561@step12`, `max_loss_diff=1.357558@step12`
+    - read: if a larger effective batch is needed, `batch_size=1` plus accumulation is significantly less harmful to parity than `batch_size=4`
+- Current read:
+  - on this 8-GPU node, short-context (`seq_len=128`) DDP parity is fixed end-to-end on the tested 4-layer harness
+  - the `global_moe` and `alternating_global_moe` sanity models are now logically aligned in forward and in bf16 backward for the short-context harness that originally failed
+  - this is no longer a sanity-only workaround; the fix lives in the shared `mixture_of_everything` attention runner used by the per-head codepaths
+  - the previous long-run blow-up at short context was a real implementation mismatch in the shared attention backend path, not just random bf16 noise
+  - however, full `seq_len=1024` dense parity on real parquet data is still not fully reconciled: step `0` forward stays exact, but optimizer-facing drift reappears by step `1` and still shows large transient CE spikes over longer runs
+  - the best simple knob found so far is `bias_update_rate=0`, which makes the 1024-token runs much closer but does not restore exact parity
+  - fp32 does restore exact parity on the tested `30`-step `seq_len=1024` window, so the remaining issue is specifically in the bf16 path rather than in the mapped initialization or routing logic
+  - for parity/debugging, Liger should stay off: even the symmetric safe subset breaks exact step-0 equivalence
+  - the fp32 Liger result confirms this is not just a mixed-precision artifact: safe-Liger itself is not parity-preserving on the mapped global-vs-sanity harness
+  - among the bf16 training-shape knobs tested so far:
+    - larger micro-batch (`batch_size=4`) is harmful
+    - gradient accumulation (`batch_size=1`, `grad_accum_steps=4`) is much less harmful than larger micro-batch
+    - gradient checkpointing helps the early spike but does not solve long-run drift
+  - DeepSpeed ZeRO-1 is not a fix for this issue on the current harness
+
 ## Remaining Open Items
 
 - No expert parallel implementation yet
