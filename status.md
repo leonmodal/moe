@@ -261,6 +261,24 @@ Observed behavior on the exact runs:
 - The alternating-global sanity harness is now good for implementation/regression checks, but not for requiring near-identical CE at every training step over long runs.
 - In practice the global baseline and sanity harness remain in the same training regime over 1k DDP steps, but they can show transient CE gaps that are much larger than the first-step mapped-init deltas.
 
+## Important Parity-Check Scope Note
+
+- Do not rely only on the reduced-load parity harness shape (`batch_size=1`, `seq_len=128`) when judging whether global-vs-sanity training parity is "good enough".
+- That reduced-load check is still useful for implementation debugging, but it can materially understate drift relative to the actual training token load.
+- For real parity calls, run:
+  - real parquet data from `data/parquet`
+  - the actual depth-matched config family
+  - the actual training token load (`batch_size=32`, `seq_len=1024` for the current depth-matched configs)
+- Evidence for why this matters:
+  - the reduced-load `4_layers` interpolation-restored 500-step DDP run stayed in a modest-gap regime (for example step 100 CE diff `0.027171`, step 499 CE diff `0.096467`)
+  - the full-load `4_layers` interpolation-restored DDP run on real parquet data showed much larger gaps early:
+    - step 0 CE diff `0.000160`
+    - step 50 CE diff `0.120424`
+    - step 100 CE diff `0.343344`
+    - step 150 CE diff `0.441594`
+    - step 200 CE diff `0.449409`
+- So the smaller parity-harness token load should be treated as a debugging signal, not the final answer for training-match quality.
+
 ## Same-Init And Bias-Update Policy
 
 - Mapped init is now a first-class training option instead of living only in debug scripts:
