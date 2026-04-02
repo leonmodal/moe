@@ -155,6 +155,20 @@ Observed behavior on the exact runs:
 - result (`8_layers`, `bf16`):
   - step 0 CE diff: `0.002402`
   - step 1 CE diff: `0.016558`
+- `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/8_layers/global_moe.yaml --sanity-config configs/depth_matched/8_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 100 --data-mode parquet --batch-size 1 --seq-len 128 --amp-bf16 --gradient-checkpointing config --static-graph off --report-every 10`
+- result (`8_layers`, `bf16`, mapped init, pure global bias updates with `alpha=0`):
+  - step 0: `12.095649` vs `12.093246` (CE diff `0.002402`)
+  - step 10: `9.093688` vs `9.015924` (CE diff `0.077764`)
+  - step 20: `8.482841` vs `8.366564` (CE diff `0.116278`)
+  - step 30: `8.297062` vs `8.420064` (CE diff `0.123002`)
+  - step 40: `8.384623` vs `8.397344` (CE diff `0.012721`)
+  - step 50: `7.737661` vs `7.892931` (CE diff `0.155270`)
+  - step 60: `7.416779` vs `7.483973` (CE diff `0.067194`)
+  - step 70: `8.026033` vs `7.991763` (CE diff `0.034270`)
+  - step 80: `7.730869` vs `7.693813` (CE diff `0.037056`)
+  - step 90: `7.917434` vs `7.901228` (CE diff `0.016205`)
+  - step 99: `7.850127` vs `7.856890` (CE diff `0.006763`)
+  - worst observed CE diff: `1.080865` at step `17`
 - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/16_layers/global_moe.yaml --sanity-config configs/depth_matched/16_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 2 --data-mode parquet --batch-size 1 --seq-len 128 --amp-bf16 --report-every 1`
 - result (`16_layers`, `bf16`):
   - step 0 CE diff: `0.002459`

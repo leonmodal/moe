@@ -221,14 +221,21 @@ def main() -> None:
             standard_model, standard_opt, input_ids, amp_bf16=args.amp_bf16
         )
 
-        alpha = bias_alpha_schedule(step)
-        update_expert_biases(global_model, global_cfg["model"]["bias_update_rate"], accelerator, is_global=True, alpha=alpha)
+        global_alpha = bias_alpha_schedule(step) if global_cfg["model"].get("bias_interpolation", False) else 0.0
+        sanity_alpha = bias_alpha_schedule(step) if sanity_cfg["model"].get("bias_interpolation", False) else 0.0
+        update_expert_biases(
+            global_model,
+            global_cfg["model"]["bias_update_rate"],
+            accelerator,
+            is_global=True,
+            alpha=global_alpha,
+        )
         update_expert_biases(
             sanity_model,
             sanity_cfg["model"]["bias_update_rate"],
             accelerator,
             is_global=True,
-            alpha=alpha,
+            alpha=sanity_alpha,
             router_groups=get_bias_update_router_groups(sanity_model, mlp_only=True),
         )
         update_expert_biases(
