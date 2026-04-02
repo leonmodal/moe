@@ -33,6 +33,7 @@ model:
   use_deepseek_routing: true
   per_layer_mlp_router: true
   per_layer_norm: true
+  per_layer_qk_norm: true
   sanity_check_mode: alternating_global_moe
   attention_bias: false
   attention_dropout: 0.0

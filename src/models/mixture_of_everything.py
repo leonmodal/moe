@@ -744,10 +744,11 @@ class AttentionExpertBank(nn.Module):
         self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
 
     def _init_per_head_fully_independent(self):
-        """Flat-bank Q/K/V/O with GQA: Q,O pools = E, K,V pools = E_kv.
+        """Flat-bank Q/K/V/O with GQA: Q,O bundled per KV group, K,V independent.
 
-        Q router picks top-num_heads from E, K/V pick top-num_kv_heads from E_kv,
-        O router picks top-num_heads from E.  GQA via repeat_kv in attend().
+        Q router picks top-num_kv_heads from E (each expert produces q_group_dim),
+        K/V pick top-num_kv_heads from E_kv,
+        O router picks top-num_kv_heads from E (each expert takes q_group_dim).
         """
         if self.routed_norm:
             self.attn_pre_norm = NormExpertBank(self.num_depths, self.hidden_size, eps=self.eps)
@@ -761,19 +762,19 @@ class AttentionExpertBank(nn.Module):
         E_kv = E * self.num_kv_heads // self.num_heads
         self.num_kv_experts = E_kv
         if self.per_layer_attn_router:
-            self.q_routers = nn.ModuleList([self._make_flat_bank_router(self.hidden_size, self.num_heads) for _ in range(self.num_depths)])
+            self.q_routers = nn.ModuleList([self._make_flat_bank_router(self.hidden_size, self.num_kv_heads) for _ in range(self.num_depths)])
             self.k_routers = nn.ModuleList([self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv) for _ in range(self.num_depths)])
             self.v_routers = nn.ModuleList([self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv) for _ in range(self.num_depths)])
-            self.o_routers = nn.ModuleList([self._make_flat_bank_router(self.q_dim, self.num_heads) for _ in range(self.num_depths)])
+            self.o_routers = nn.ModuleList([self._make_flat_bank_router(self.q_dim, self.num_kv_heads) for _ in range(self.num_depths)])
         else:
-            self.q_router = self._make_flat_bank_router(self.hidden_size, self.num_heads)
+            self.q_router = self._make_flat_bank_router(self.hidden_size, self.num_kv_heads)
             self.k_router = self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv)
             self.v_router = self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv)
-            self.o_router = self._make_flat_bank_router(self.q_dim, self.num_heads)
-        self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.head_dim))
+            self.o_router = self._make_flat_bank_router(self.q_dim, self.num_kv_heads)
+        self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_group_dim))
         self.k_proj = nn.Parameter(torch.empty(E_kv, self.hidden_size, self.head_dim))
         self.v_proj = nn.Parameter(torch.empty(E_kv, self.hidden_size, self.head_dim))
-        self.o_proj = nn.Parameter(torch.empty(E, self.head_dim, self.hidden_size))
+        self.o_proj = nn.Parameter(torch.empty(E, self.q_group_dim, self.hidden_size))
         if self.per_layer_qk_norm:
             self.layer_q_norm_weight = nn.Parameter(torch.ones(self.num_depths, self.head_dim))
             self.layer_k_norm_weight = nn.Parameter(torch.ones(self.num_depths, self.head_dim))
@@ -1163,7 +1164,7 @@ class AttentionExpertBank(nn.Module):
             k_router = self._select_router("k_router", depth_idx)
             v_router = self._select_router("v_router", depth_idx)
 
-            q_idx, q_w, q_probs = self._route_flat(q_router, q_flat, self.num_heads)
+            q_idx, q_w, q_probs = self._route_flat(q_router, q_flat, self.num_kv_heads)
             k_idx, k_w, k_probs = self._route_flat(k_router, k_flat, self.num_kv_heads)
             v_idx, v_w, v_probs = self._route_flat(v_router, v_flat, self.num_kv_heads)
             self._store_router_info("q", q_probs, q_idx)
@@ -1172,12 +1173,13 @@ class AttentionExpertBank(nn.Module):
 
             q_norm_weight = self._get_q_norm_weight_bank(depth_idx, self.num_experts)
             k_norm_weight = self._get_k_norm_weight_bank(depth_idx, self.num_kv_experts)
-            # Batched projections: (N, num_heads, head_dim)
-            Q_heads = self._project_heads_batched(q_flat, self.q_proj, q_idx, q_w, q_norm_weight)
+            # Q: bundled per GQA group — (N, num_kv_heads, q_group_dim)
+            Q_groups = self._project_grouped_query_heads_batched(q_flat, self.q_proj, q_idx, q_w, q_norm_weight)
+            # Reshape from (N, num_kv_heads, q_group_dim) to (N, num_heads, head_dim)
+            Q = Q_groups.reshape(B * T, self.num_heads, self.head_dim).reshape(B * T, self.q_dim)
             K_heads = self._project_heads_batched(k_flat, self.k_proj, k_idx, k_w, k_norm_weight)
             V_heads = self._project_heads_batched(v_flat, self.v_proj, v_idx, v_w)
 
-            Q = Q_heads.reshape(B * T, self.num_heads * self.head_dim)
             K = K_heads.reshape(B * T, self.num_kv_heads * self.head_dim)
             V = V_heads.reshape(B * T, self.num_kv_heads * self.head_dim)
 
@@ -1210,13 +1212,14 @@ class AttentionExpertBank(nn.Module):
 
         if self.mode == "per_head_fully_independent":
             N = B * T
-            attn_heads = attn_output.transpose(1, 2).reshape(N, self.num_heads, self.head_dim)
-            attn_flat = attn_heads.reshape(N, self.q_dim)
+            attn_flat = attn_output.transpose(1, 2).reshape(N, self.q_dim)
+            # Reshape to GQA groups: (N, num_kv_heads, q_group_dim)
+            attn_groups = attn_flat.view(N, self.num_kv_heads, self.q_group_dim)
             o_router = self._select_router("o_router", depth_idx)
-            o_idx, o_w, o_probs = self._route_flat(o_router, attn_flat, self.num_heads)
+            o_idx, o_w, o_probs = self._route_flat(o_router, attn_flat, self.num_kv_heads)
             self._store_router_info("o", o_probs, o_idx)
             o_out = self._project_pair_inputs_grouped(
-                attn_heads,
+                attn_groups,
                 self.o_proj,
                 o_idx,
                 o_w,
@@ -1286,10 +1289,10 @@ class AttentionExpertBank(nn.Module):
                 K_old,
                 V_old,
                 [
-                    ("q", self.num_experts, self.num_heads),
+                    ("q", self.num_experts, self.num_kv_heads),
                     ("k", self.num_kv_experts, self.num_kv_heads),
                     ("v", self.num_kv_experts, self.num_kv_heads),
-                    ("o", self.num_experts, self.num_heads),
+                    ("o", self.num_experts, self.num_kv_heads),
                 ],
             )
 
@@ -1313,7 +1316,7 @@ class AttentionExpertBank(nn.Module):
             v_flat = self.v_pre_norm(hidden_selected)
 
         q_router, k_router, v_router, o_router = self._select_attn_routers(depth_idx)
-        q_idx, q_w, q_probs = self._route_flat(q_router, q_flat, self.num_heads)
+        q_idx, q_w, q_probs = self._route_flat(q_router, q_flat, self.num_kv_heads)
         k_idx, k_w, k_probs = self._route_flat(k_router, k_flat, self.num_kv_heads)
         v_idx, v_w, v_probs = self._route_flat(v_router, v_flat, self.num_kv_heads)
         self._store_router_info("q", q_probs, q_idx, token_mask=flat_mask)
@@ -1322,7 +1325,10 @@ class AttentionExpertBank(nn.Module):
 
         q_norm_weight = self._get_q_norm_weight_bank(depth_idx, self.num_experts)
         k_norm_weight = self._get_k_norm_weight_bank(depth_idx, self.num_kv_experts)
-        Q_sel = self._project_heads_batched(q_flat, self.q_proj, q_idx, q_w, q_norm_weight)
+        # Q: bundled per GQA group — (N_sel, num_kv_heads, q_group_dim)
+        Q_groups = self._project_grouped_query_heads_batched(q_flat, self.q_proj, q_idx, q_w, q_norm_weight)
+        # Reshape from (N_sel, num_kv_heads, q_group_dim) to (N_sel, num_heads, head_dim)
+        Q_sel = Q_groups.reshape(-1, self.num_heads, self.head_dim)
         K_sel = self._project_heads_batched(k_flat, self.k_proj, k_idx, k_w, k_norm_weight)
         V_sel = self._project_heads_batched(v_flat, self.v_proj, v_idx, v_w)
 
@@ -1363,11 +1369,13 @@ class AttentionExpertBank(nn.Module):
 
         attn_selected = attn_heads.transpose(1, 2).reshape(B * T, self.num_heads, self.head_dim)[flat_mask]
         attn_flat = attn_selected.reshape(attn_selected.shape[0], self.q_dim)
-        o_idx, o_w, o_probs = self._route_flat(o_router, attn_flat, self.num_heads)
+        # O: bundled per GQA group
+        attn_groups = attn_selected.view(-1, self.num_kv_heads, self.q_group_dim)
+        o_idx, o_w, o_probs = self._route_flat(o_router, attn_flat, self.num_kv_heads)
         self._store_router_info("o", o_probs, o_idx, token_mask=flat_mask)
 
         o_selected = self._project_pair_inputs_grouped(
-            attn_selected,
+            attn_groups,
             self.o_proj,
             o_idx,
             o_w,

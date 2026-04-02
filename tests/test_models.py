@@ -945,11 +945,12 @@ def test_per_head_fully_independent_sparse_o_router_uses_attention_output():
         v_flat = bank.v_pre_norm(hidden_selected)
         q_router, k_router, v_router, _ = bank._select_attn_routers(depth_idx=0)
 
-        q_idx, q_w, _ = original_route_flat(q_router, q_flat, bank.num_heads)
+        q_idx, q_w, _ = original_route_flat(q_router, q_flat, bank.num_kv_heads)
         k_idx, k_w, _ = original_route_flat(k_router, k_flat, bank.num_kv_heads)
         v_idx, v_w, _ = original_route_flat(v_router, v_flat, bank.num_kv_heads)
 
-        Q_sel = bank._project_heads_batched(q_flat, bank.q_proj, q_idx, q_w, bank.q_norm_weight)
+        Q_groups = bank._project_grouped_query_heads_batched(q_flat, bank.q_proj, q_idx, q_w, bank.q_norm_weight)
+        Q_sel = Q_groups.reshape(-1, bank.num_heads, bank.head_dim)
         K_sel = bank._project_heads_batched(k_flat, bank.k_proj, k_idx, k_w, bank.k_norm_weight)
         V_sel = bank._project_heads_batched(v_flat, bank.v_proj, v_idx, v_w)
 
