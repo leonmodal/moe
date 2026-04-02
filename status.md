@@ -151,6 +151,14 @@ Observed behavior on the exact runs:
   - step 0: exact CE/loss match
   - step 99 CE diff: `0.032928`
   - worst observed CE diff in that run: `2.108144` at step 11
+- `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/8_layers/global_moe.yaml --sanity-config configs/depth_matched/8_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 2 --data-mode parquet --batch-size 1 --seq-len 128 --amp-bf16 --report-every 1`
+- result (`8_layers`, `bf16`):
+  - step 0 CE diff: `0.002402`
+  - step 1 CE diff: `0.016558`
+- `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/16_layers/global_moe.yaml --sanity-config configs/depth_matched/16_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 2 --data-mode parquet --batch-size 1 --seq-len 128 --amp-bf16 --report-every 1`
+- result (`16_layers`, `bf16`):
+  - step 0 CE diff: `0.002459`
+  - step 1 CE diff: `0.012911`
 - real 8-GPU `train.py` smoke runs on temporary 2-step copies of the production configs under `configs/depth_matched/4_layers`:
   - `global_moe.yaml` completed
   - `standard_moe.yaml` completed
@@ -172,6 +180,7 @@ Observed behavior on the exact runs:
 - Added `scripts/compare_global_sanity_stepwise_ddp.py` for side-by-side DDP parity checks on real 8-GPU runs, with overrides for `static_graph`, LR, and bias-update rate.
 - Aligned the parity-harness config to the baseline training mode:
   - `moe_everything_per_head_precompute_kv_sanity.yaml` now keeps `gradient_checkpointing: false` by default, matching `global_moe.yaml`
+- Applied the same checkpointing alignment to the `8_layers` and `16_layers` sanity harness configs.
 - After that fix, mapped-init alternating-global sanity now matches the global model exactly through:
   - Q projection
   - K projection
