@@ -120,8 +120,81 @@ Observed behavior on the exact runs:
 
 ## Validation
 
-- `uv run pytest -q tests/test_models.py`
-- result: `134 passed`
+- `uv run pytest -q tests/test_models.py -k 'stores_seq_aux_coef_from_config or alternating_global_sanity_uses_parameterless_branch_router or alternating_global_sanity_bf16_attention_path_matches_global_moe'`
+- result: `4 passed, 140 deselected`
+- `uv run python` single-process mapped-init check on one CUDA batch:
+  - global and sanity total loss match exactly after the seq-aux fix
+  - embed grad max diff: `3.65e-07`
+- `uv run python` manual 8-shard parquet average (no DDP, no bias updates), 2 optimizer steps:
+  - step 0: exact fp32 loss match, embed grad diff `1.19e-07`
+  - step 1: fp32 loss diff `9.54e-07`, embed grad diff `4.74e-06`
+- `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 2 --data-mode parquet --batch-size 1 --seq-len 128 --bias-update-rate 0 --static-graph off`
+- result (`fp32`):
+  - step 0: exact loss match, grad diff `9.97e-08`
+  - step 1: loss diff `2.9e-05`, zero selected-expert mismatches on rank 0
+- `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 3 --data-mode parquet --batch-size 1 --seq-len 128 --amp-bf16 --bias-update-rate 0 --static-graph off`
+- result (`bf16`):
+  - step 0: `|g-s|=0.002599`
+  - step 1: `|g-s|=0.004048`
+  - step 2: `|g-s|=0.001905`
+- real 8-GPU `train.py` smoke runs on temporary 2-step copies of the production configs under `configs/depth_matched/4_layers`:
+  - `global_moe.yaml` completed
+  - `standard_moe.yaml` completed
+  - `moe_everything_per_head_precompute_kv_perlayer_prenorm.yaml` completed
+  - `moe_everything_per_head_independent_perlayer_prenorm.yaml` completed
+  - `moe_everything_per_head_precompute_kv_sanity.yaml` completed
+
+## Alternating Global Sanity Investigation
+
+- Fixed a real bf16 mismatch in the per-head bank path:
+  - the custom Q/K RMSNorm path did not match `Qwen3MoeRMSNorm` numerics
+  - the grouped-matmul fallback also upcast bf16 projection outputs into a fp32 buffer before norm, which hid the true projection dtype and made the mismatch worse
+- Fixed an objective mismatch outside `train.py`:
+  - `build_model()` was not propagating `seq_aux_loss_coef` into the standard/global wrappers
+  - `moe_everything` already had it, so side-by-side diagnostics were comparing different total losses
+- Removed the unused learned branch router from `alternating_global_moe`:
+  - branch routing is deterministic in this sanity mode
+  - leaving a trainable `branch_router.gate.weight` registered created an unused DDP parameter
+- Added `scripts/compare_global_sanity_stepwise_ddp.py` for side-by-side DDP parity checks on real 8-GPU runs, with overrides for `static_graph`, LR, and bias-update rate.
+- After that fix, mapped-init alternating-global sanity now matches the global model exactly through:
+  - Q projection
+  - K projection
+  - V projection
+  - attention output
+- The remaining non-equivalence is small bf16 numerical drift in the split per-head path, not a catastrophic training bug.
+
+## Ready To Run
+
+- The per-head model error that caused the catastrophic 8-GPU drift is resolved.
+- The fix is not limited to the sanity harness:
+  - the bf16 Q/K bank fix is in the shared per-head implementation
+  - the DDP `static_graph=False` fix applies to real `moe_everything` training
+- The configs under `configs/depth_matched/4_layers` are runnable with the current codebase.
+- `moe_everything_per_head_precompute_kv_sanity.yaml` is still only a parity harness, not the real target architecture.
+- For real per-head training, the main configs to use are:
+  - `moe_everything_per_head_precompute_kv_perlayer_prenorm.yaml`
+  - `moe_everything_per_head_independent_perlayer_prenorm.yaml`
+
+## 8-GPU DDP Findings
+
+- The huge step-1 split was a DDP configuration bug, not a forward-path parity failure.
+- Manual 8-shard averaging in one process stayed aligned, which ruled out the model math, optimizer, and bias updates.
+- With `static_graph=False`, DDP either:
+  - stays aligned (`fp32`)
+  - or shows only small expected `bf16` numeric drift
+- With `static_graph=True`, the same mapped-init run diverged immediately after step 0.
+- Disabling `static_graph` also exposed the real DDP contract violation:
+  - the alternating-global sanity model still had an unused `branch_router.gate.weight`
+  - after removing that parameter, DDP with `static_graph=False` runs cleanly
+
+## Current Read
+
+- Gradient checkpointing is not the primary cause here.
+- Liger is not the primary cause of the mapped-init DDP failure.
+- The fixed bank bug was real and removed the Q/K/V/attention mismatch.
+- The catastrophic loss drift came from running `moe_everything` under DDP with `static_graph=True`.
+- The deterministic sanity mode also incorrectly registered an unused learned branch router, which made the DDP setup invalid.
+- After fixing the objective mismatch, removing the unused branch router, and disabling `static_graph` for `moe_everything`, 8-GPU mapped-init parity is restored in `fp32` and close in `bf16`.
 
 ## Remaining Open Items
 

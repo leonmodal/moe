@@ -100,20 +100,27 @@ def copy_global_weights_into_sanity_moe(global_model, sanity_model) -> None:
             q_norm = layer.self_attn.q_norm.weight
             k_norm = layer.self_attn.k_norm.weight
 
+            if hasattr(sanity_inner.attn_bank, "logical_q_proj"):
+                sanity_inner.attn_bank.logical_q_proj[layer_idx].copy_(q_proj)
+                sanity_inner.attn_bank.logical_k_proj[layer_idx].copy_(k_proj)
+                sanity_inner.attn_bank.logical_v_proj[layer_idx].copy_(v_proj)
+                sanity_inner.attn_bank.logical_o_proj[layer_idx].copy_(o_proj)
+
             sanity_inner.attn_bank.logical_q_norm_weight[layer_idx].copy_(q_norm)
             sanity_inner.attn_bank.logical_k_norm_weight[layer_idx].copy_(k_norm)
 
-            for kv_head_idx in range(num_kv_heads):
-                expert_idx = layer_idx * num_kv_heads + kv_head_idx
-                q_start = kv_head_idx * num_kv_groups * head_dim
-                q_end = q_start + num_kv_groups * head_dim
-                kv_start = kv_head_idx * head_dim
-                kv_end = kv_start + head_dim
+            if not hasattr(sanity_inner.attn_bank, "logical_q_proj"):
+                for kv_head_idx in range(num_kv_heads):
+                    expert_idx = layer_idx * num_kv_heads + kv_head_idx
+                    q_start = kv_head_idx * num_kv_groups * head_dim
+                    q_end = q_start + num_kv_groups * head_dim
+                    kv_start = kv_head_idx * head_dim
+                    kv_end = kv_start + head_dim
 
-                sanity_inner.attn_bank.q_proj[expert_idx].copy_(q_proj[q_start:q_end].transpose(0, 1))
-                sanity_inner.attn_bank.k_proj[expert_idx].copy_(k_proj[kv_start:kv_end].transpose(0, 1))
-                sanity_inner.attn_bank.v_proj[expert_idx].copy_(v_proj[kv_start:kv_end].transpose(0, 1))
-                sanity_inner.attn_bank.o_proj[expert_idx].copy_(o_proj[:, q_start:q_end].transpose(0, 1))
+                    sanity_inner.attn_bank.q_proj[expert_idx].copy_(q_proj[q_start:q_end].transpose(0, 1))
+                    sanity_inner.attn_bank.k_proj[expert_idx].copy_(k_proj[kv_start:kv_end].transpose(0, 1))
+                    sanity_inner.attn_bank.v_proj[expert_idx].copy_(v_proj[kv_start:kv_end].transpose(0, 1))
+                    sanity_inner.attn_bank.o_proj[expert_idx].copy_(o_proj[:, q_start:q_end].transpose(0, 1))
 
 
 def build_models(args, device: torch.device, dtype: torch.dtype):
@@ -259,45 +266,79 @@ def build_tensor_maps(global_model, sanity_model) -> list[TensorMap]:
                 )
             )
 
-        for kv_head_idx in range(num_kv_heads):
-            expert_idx = layer_idx * num_kv_heads + kv_head_idx
-            q_start = kv_head_idx * num_kv_groups * head_dim
-            q_end = q_start + num_kv_groups * head_dim
-            kv_start = kv_head_idx * head_dim
-            kv_end = kv_start + head_dim
-
+        if hasattr(sanity_model.model.attn_bank, "logical_q_proj"):
             maps.extend(
                 [
                     TensorMap(
-                        f"layer_{layer_idx}.q_proj.expert_{expert_idx}",
+                        f"layer_{layer_idx}.q_proj",
                         layer.self_attn.q_proj.weight,
-                        sanity_model.model.attn_bank.q_proj,
-                        _q_proj_selector(q_start, q_end),
-                        _row_selector(expert_idx),
+                        sanity_model.model.attn_bank.logical_q_proj[layer_idx],
+                        _identity,
+                        _identity,
                     ),
                     TensorMap(
-                        f"layer_{layer_idx}.k_proj.expert_{expert_idx}",
+                        f"layer_{layer_idx}.k_proj",
                         layer.self_attn.k_proj.weight,
-                        sanity_model.model.attn_bank.k_proj,
-                        _kv_proj_selector(kv_start, kv_end),
-                        _row_selector(expert_idx),
+                        sanity_model.model.attn_bank.logical_k_proj[layer_idx],
+                        _identity,
+                        _identity,
                     ),
                     TensorMap(
-                        f"layer_{layer_idx}.v_proj.expert_{expert_idx}",
+                        f"layer_{layer_idx}.v_proj",
                         layer.self_attn.v_proj.weight,
-                        sanity_model.model.attn_bank.v_proj,
-                        _kv_proj_selector(kv_start, kv_end),
-                        _row_selector(expert_idx),
+                        sanity_model.model.attn_bank.logical_v_proj[layer_idx],
+                        _identity,
+                        _identity,
                     ),
                     TensorMap(
-                        f"layer_{layer_idx}.o_proj.expert_{expert_idx}",
+                        f"layer_{layer_idx}.o_proj",
                         layer.self_attn.o_proj.weight,
-                        sanity_model.model.attn_bank.o_proj,
-                        _o_proj_selector(q_start, q_end),
-                        _row_selector(expert_idx),
+                        sanity_model.model.attn_bank.logical_o_proj[layer_idx],
+                        _identity,
+                        _identity,
                     ),
                 ]
             )
+        else:
+            for kv_head_idx in range(num_kv_heads):
+                expert_idx = layer_idx * num_kv_heads + kv_head_idx
+                q_start = kv_head_idx * num_kv_groups * head_dim
+                q_end = q_start + num_kv_groups * head_dim
+                kv_start = kv_head_idx * head_dim
+                kv_end = kv_start + head_dim
+
+                maps.extend(
+                    [
+                        TensorMap(
+                            f"layer_{layer_idx}.q_proj.expert_{expert_idx}",
+                            layer.self_attn.q_proj.weight,
+                            sanity_model.model.attn_bank.q_proj,
+                            _q_proj_selector(q_start, q_end),
+                            _row_selector(expert_idx),
+                        ),
+                        TensorMap(
+                            f"layer_{layer_idx}.k_proj.expert_{expert_idx}",
+                            layer.self_attn.k_proj.weight,
+                            sanity_model.model.attn_bank.k_proj,
+                            _kv_proj_selector(kv_start, kv_end),
+                            _row_selector(expert_idx),
+                        ),
+                        TensorMap(
+                            f"layer_{layer_idx}.v_proj.expert_{expert_idx}",
+                            layer.self_attn.v_proj.weight,
+                            sanity_model.model.attn_bank.v_proj,
+                            _kv_proj_selector(kv_start, kv_end),
+                            _row_selector(expert_idx),
+                        ),
+                        TensorMap(
+                            f"layer_{layer_idx}.o_proj.expert_{expert_idx}",
+                            layer.self_attn.o_proj.weight,
+                            sanity_model.model.attn_bank.o_proj,
+                            _o_proj_selector(q_start, q_end),
+                            _row_selector(expert_idx),
+                        ),
+                    ]
+                )
 
     return maps
 

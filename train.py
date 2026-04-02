@@ -478,6 +478,7 @@ def build_model(cfg: dict):
         rms_norm_eps=mcfg.get("rms_norm_eps", 1e-6),
         tie_word_embeddings=mcfg.get("tie_word_embeddings", False),
         router_aux_loss_coef=mcfg.get("router_aux_loss_coef", 0.001),
+        seq_aux_loss_coef=mcfg.get("seq_aux_loss_coef", 0.0),
         norm_topk_prob=mcfg.get("norm_topk_prob", True),
         num_experts_per_tok=mcfg["num_experts_per_tok"],
         output_router_logits=True,
@@ -514,7 +515,6 @@ def build_model(cfg: dict):
             topk_scaling_factor=mcfg.get("topk_scaling_factor", None),
             num_groups=mcfg.get("num_groups", None),
             group_topk=mcfg.get("group_topk", None),
-            seq_aux_loss_coef=mcfg.get("seq_aux_loss_coef", 0.0),
             per_layer_router=mcfg.get("per_layer_router", False),
             per_layer_mlp_router=mcfg.get("per_layer_mlp_router", False),
             per_layer_attn_router=mcfg.get("per_layer_attn_router", False),
@@ -704,14 +704,12 @@ def main() -> None:
 
     log_with = "wandb" if train_cfg.wandb_project else None
     ddp_kwargs = []
-    if (
-        cfg["model"]["type"] == "moe_everything"
-        and cfg["model"].get("attn_expert_mode") in (
-            "precompute_kv",
-            "per_head_precompute_kv",
-        )
-    ):
-        ddp_kwargs.append(DistributedDataParallelKwargs(static_graph=True))
+    if cfg["model"]["type"] == "moe_everything":
+        # Shared-parameter MoE paths are not safe under DDP static_graph. In
+        # practice this can silently corrupt training instead of raising the
+        # usual unused-parameter error, especially in sanity modes with
+        # deterministic branch routing.
+        ddp_kwargs.append(DistributedDataParallelKwargs(static_graph=False))
     accelerator = Accelerator(
         mixed_precision=train_cfg.mixed_precision,
         gradient_accumulation_steps=train_cfg.gradient_accumulation,

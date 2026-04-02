@@ -5,5 +5,18 @@ b. have the same data points and lr, seed and etc.
 c. for every single step, check loss, weights difference delta, and optimizer states difference and etc.
 d. ideally everything should be very similar, we have huge gap after 200 steps.
 
+can we check again, we run all here /tmp/moe/configs/depth_matched/4_layers but still mismatch. you can check my wandb and my modal workspace and see logs and to see the stuff. it was killed but you can see stopped app or just wandb and see there are differences. 
 
-can we check this again, we did some check and fixed qk norm. but there are still discrepancy, we want to run for much longer like 200-500 steps to see clear difference why huge gaps between ce loss and just figure out if there are bugs in our per head model codes. run all sanity check and unit test possible. use gpu as you want on this machine, and use uv run and real data to test out, can also create fake synthetic data for unit tests as well.
+I need you to tell me why different, specifically global moe should be the same as per head sanity check, check if any bugs or sth and just fix.
+
+you should be able to run code with gpu, use uv run and stuff. and we are training with 2 node 8 gpu ddp, but now you just have acess to 8 gpu, so just test the single node ddp to figure out all errs. like we basically need per head model sanity check to pass, in the sense that it should be similar to global moe.
+
+potential stuff to check:
+
+a. liger kernel
+b. gradient checkpointing
+c. gemm
+
+basically figure out whats wrong, we need to have similar losses in long run before we can train the per head models successfully, as only then the results are meaningful.
+
+once you finished, update status.md

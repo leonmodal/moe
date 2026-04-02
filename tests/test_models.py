@@ -70,6 +70,20 @@ def test_global_moe_instantiates():
     assert model is not None
 
 
+def test_standard_moe_stores_seq_aux_coef_from_config():
+    cfg = tiny_standard_config()
+    cfg.seq_aux_loss_coef = 0.123
+    model = StandardMoEModel(cfg)
+    assert model._seq_aux_loss_coef == pytest.approx(0.123)
+
+
+def test_global_moe_stores_seq_aux_coef_from_config():
+    cfg = tiny_global_config()
+    cfg.seq_aux_loss_coef = 0.123
+    model = GlobalMoEForCausalLM(cfg)
+    assert model._seq_aux_loss_coef == pytest.approx(0.123)
+
+
 # ── Forward pass produces correct outputs ───────────────────────────────────
 
 @pytest.fixture
@@ -1292,24 +1306,31 @@ def _copy_global_weights_into_sanity_moe(global_model, sanity_model):
             q_norm = layer.self_attn.q_norm.weight
             k_norm = layer.self_attn.k_norm.weight
 
+            if hasattr(sanity_inner.attn_bank, "logical_q_proj"):
+                sanity_inner.attn_bank.logical_q_proj[layer_idx].copy_(q_proj)
+                sanity_inner.attn_bank.logical_k_proj[layer_idx].copy_(k_proj)
+                sanity_inner.attn_bank.logical_v_proj[layer_idx].copy_(v_proj)
+                sanity_inner.attn_bank.logical_o_proj[layer_idx].copy_(o_proj)
+
             if hasattr(sanity_inner.attn_bank, "logical_q_norm_weight"):
                 sanity_inner.attn_bank.logical_q_norm_weight[layer_idx].copy_(q_norm)
                 sanity_inner.attn_bank.logical_k_norm_weight[layer_idx].copy_(k_norm)
 
-            for kv_head_idx in range(num_kv_heads):
-                expert_idx = layer_idx * num_kv_heads + kv_head_idx
-                q_start = kv_head_idx * num_kv_groups * head_dim
-                q_end = q_start + num_kv_groups * head_dim
-                kv_start = kv_head_idx * head_dim
-                kv_end = kv_start + head_dim
+            if not hasattr(sanity_inner.attn_bank, "logical_q_proj"):
+                for kv_head_idx in range(num_kv_heads):
+                    expert_idx = layer_idx * num_kv_heads + kv_head_idx
+                    q_start = kv_head_idx * num_kv_groups * head_dim
+                    q_end = q_start + num_kv_groups * head_dim
+                    kv_start = kv_head_idx * head_dim
+                    kv_end = kv_start + head_dim
 
-                sanity_inner.attn_bank.q_proj[expert_idx].copy_(q_proj[q_start:q_end].t())
-                sanity_inner.attn_bank.k_proj[expert_idx].copy_(k_proj[kv_start:kv_end].t())
-                sanity_inner.attn_bank.v_proj[expert_idx].copy_(v_proj[kv_start:kv_end].t())
-                sanity_inner.attn_bank.o_proj[expert_idx].copy_(o_proj[:, q_start:q_end].t())
-                if hasattr(sanity_inner.attn_bank, "q_norm_weight"):
-                    sanity_inner.attn_bank.q_norm_weight[expert_idx].copy_(q_norm)
-                    sanity_inner.attn_bank.k_norm_weight[expert_idx].copy_(k_norm)
+                    sanity_inner.attn_bank.q_proj[expert_idx].copy_(q_proj[q_start:q_end].t())
+                    sanity_inner.attn_bank.k_proj[expert_idx].copy_(k_proj[kv_start:kv_end].t())
+                    sanity_inner.attn_bank.v_proj[expert_idx].copy_(v_proj[kv_start:kv_end].t())
+                    sanity_inner.attn_bank.o_proj[expert_idx].copy_(o_proj[:, q_start:q_end].t())
+                    if hasattr(sanity_inner.attn_bank, "q_norm_weight"):
+                        sanity_inner.attn_bank.q_norm_weight[expert_idx].copy_(q_norm)
+                        sanity_inner.attn_bank.k_norm_weight[expert_idx].copy_(k_norm)
 
 
 def test_alternating_global_sanity_matches_global_moe():
@@ -1347,6 +1368,65 @@ def test_alternating_global_sanity_mixed_precision_bf16_stays_close_to_global_mo
     assert logit_diff.max().item() < 1.0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_alternating_global_sanity_bf16_attention_path_matches_global_moe():
+    from src.models import DeepSeekGlobalMoEForCausalLM
+
+    device = "cuda"
+
+    global_model = DeepSeekGlobalMoEForCausalLM(_bf16_global_equiv_config()).to(device=device).eval()
+    sanity_model = MoEverythingForCausalLM(_bf16_alternating_sanity_config()).to(device=device).eval()
+    _copy_global_weights_into_sanity_moe(global_model, sanity_model)
+
+    torch.manual_seed(42)
+    ids = torch.randint(0, global_model.config.vocab_size, (1, 64), device=device)
+    layer = global_model.model.layers[0]
+    bank = sanity_model.model.attn_bank
+
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        hidden = global_model.model.embed_tokens(ids)
+        normed = layer.input_layernorm(hidden)
+        position_ids = torch.arange(ids.shape[1], device=device).unsqueeze(0)
+        position_embeddings = global_model.model.rotary_emb(hidden, position_ids=position_ids)
+        cos, sin = position_embeddings
+        causal_mask = torch.triu(
+            torch.full((ids.shape[1], ids.shape[1]), float("-inf"), device=device, dtype=hidden.dtype),
+            diagonal=1,
+        ).unsqueeze(0).unsqueeze(0)
+
+        q_dense = layer.self_attn.q_norm(
+            layer.self_attn.q_proj(normed).view(1, ids.shape[1], bank.num_heads, bank.head_dim)
+        ).transpose(1, 2)
+        k_dense = layer.self_attn.k_norm(
+            layer.self_attn.k_proj(normed).view(1, ids.shape[1], bank.num_kv_heads, bank.head_dim)
+        ).transpose(1, 2)
+        v_dense = layer.self_attn.v_proj(normed).view(1, ids.shape[1], bank.num_kv_heads, bank.head_dim).transpose(1, 2)
+        q_dense, k_dense = apply_rotary_pos_emb(q_dense, k_dense, cos, sin)
+        attn_dense = F.scaled_dot_product_attention(
+            q_dense,
+            repeat_kv(k_dense, bank.num_kv_groups),
+            repeat_kv(v_dense, bank.num_kv_groups),
+            attn_mask=causal_mask,
+            dropout_p=0.0,
+            scale=bank.scaling,
+        )
+
+        tables = bank._build_per_head_precompute_kv_tables(hidden, position_embeddings, depth_idx=0)
+        attn_sanity = F.scaled_dot_product_attention(
+            tables["Q"],
+            repeat_kv(tables["K_fresh"], bank.num_kv_groups),
+            repeat_kv(tables["V_fresh"], bank.num_kv_groups),
+            attn_mask=causal_mask,
+            dropout_p=0.0,
+            scale=bank.scaling,
+        )
+
+    torch.testing.assert_close(tables["Q"], q_dense)
+    torch.testing.assert_close(tables["K_fresh"], k_dense)
+    torch.testing.assert_close(tables["V_fresh"].float(), v_dense.float())
+    torch.testing.assert_close(attn_sanity.float(), attn_dense.float())
+
+
 def test_alternating_global_sanity_uses_logical_attention_norms():
     model = MoEverythingForCausalLM(_tiny_alternating_sanity_config()).eval()
     bank = model.model.attn_bank
@@ -1357,6 +1437,12 @@ def test_alternating_global_sanity_uses_logical_attention_norms():
     assert not hasattr(bank, "k_norm_weight")
     assert bank.logical_q_norm_weight.shape == (model.config.num_hidden_layers // 2, model.config.head_dim)
     assert bank.logical_k_norm_weight.shape == (model.config.num_hidden_layers // 2, model.config.head_dim)
+
+
+def test_alternating_global_sanity_uses_parameterless_branch_router():
+    model = MoEverythingForCausalLM(_tiny_alternating_sanity_config()).eval()
+    branch_param_names = [name for name, _ in model.named_parameters() if "branch_router" in name]
+    assert branch_param_names == []
 
 
 def test_alternating_global_sanity_uses_learned_mlp_gate():

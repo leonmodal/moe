@@ -135,6 +135,32 @@ def _copy_global_to_sanity(global_model, sanity_model) -> list[ParamPair]:
             q_norm = layer.self_attn.q_norm.weight
             k_norm = layer.self_attn.k_norm.weight
 
+            if hasattr(sanity_inner.attn_bank, "logical_q_proj"):
+                sanity_inner.attn_bank.logical_q_proj[layer_idx].copy_(q_proj)
+                sanity_inner.attn_bank.logical_k_proj[layer_idx].copy_(k_proj)
+                sanity_inner.attn_bank.logical_v_proj[layer_idx].copy_(v_proj)
+                sanity_inner.attn_bank.logical_o_proj[layer_idx].copy_(o_proj)
+                add(
+                    f"layer{layer_idx}.q_proj",
+                    q_proj,
+                    sanity_inner.attn_bank.logical_q_proj[layer_idx],
+                )
+                add(
+                    f"layer{layer_idx}.k_proj",
+                    k_proj,
+                    sanity_inner.attn_bank.logical_k_proj[layer_idx],
+                )
+                add(
+                    f"layer{layer_idx}.v_proj",
+                    v_proj,
+                    sanity_inner.attn_bank.logical_v_proj[layer_idx],
+                )
+                add(
+                    f"layer{layer_idx}.o_proj",
+                    o_proj,
+                    sanity_inner.attn_bank.logical_o_proj[layer_idx],
+                )
+
             if hasattr(sanity_inner.attn_bank, "logical_q_norm_weight"):
                 sanity_inner.attn_bank.logical_q_norm_weight[layer_idx].copy_(q_norm)
                 sanity_inner.attn_bank.logical_k_norm_weight[layer_idx].copy_(k_norm)
@@ -151,58 +177,59 @@ def _copy_global_to_sanity(global_model, sanity_model) -> list[ParamPair]:
                     track_grad_and_opt=False,
                 )
 
-            for kv_head_idx in range(num_kv_heads):
-                expert_idx = layer_idx * num_kv_heads + kv_head_idx
-                q_start = kv_head_idx * num_kv_groups * head_dim
-                q_end = q_start + num_kv_groups * head_dim
-                kv_start = kv_head_idx * head_dim
-                kv_end = kv_start + head_dim
+            if not hasattr(sanity_inner.attn_bank, "logical_q_proj"):
+                for kv_head_idx in range(num_kv_heads):
+                    expert_idx = layer_idx * num_kv_heads + kv_head_idx
+                    q_start = kv_head_idx * num_kv_groups * head_dim
+                    q_end = q_start + num_kv_groups * head_dim
+                    kv_start = kv_head_idx * head_dim
+                    kv_end = kv_start + head_dim
 
-                sanity_inner.attn_bank.q_proj[expert_idx].copy_(q_proj[q_start:q_end].t())
-                sanity_inner.attn_bank.k_proj[expert_idx].copy_(k_proj[kv_start:kv_end].t())
-                sanity_inner.attn_bank.v_proj[expert_idx].copy_(v_proj[kv_start:kv_end].t())
-                sanity_inner.attn_bank.o_proj[expert_idx].copy_(o_proj[:, q_start:q_end].t())
+                    sanity_inner.attn_bank.q_proj[expert_idx].copy_(q_proj[q_start:q_end].t())
+                    sanity_inner.attn_bank.k_proj[expert_idx].copy_(k_proj[kv_start:kv_end].t())
+                    sanity_inner.attn_bank.v_proj[expert_idx].copy_(v_proj[kv_start:kv_end].t())
+                    sanity_inner.attn_bank.o_proj[expert_idx].copy_(o_proj[:, q_start:q_end].t())
 
-                add(
-                    f"layer{layer_idx}.kv{kv_head_idx}.q_proj",
-                    q_proj[q_start:q_end].t(),
-                    sanity_inner.attn_bank.q_proj[expert_idx],
-                    track_grad_and_opt=False,
-                )
-                add(
-                    f"layer{layer_idx}.kv{kv_head_idx}.k_proj",
-                    k_proj[kv_start:kv_end].t(),
-                    sanity_inner.attn_bank.k_proj[expert_idx],
-                    track_grad_and_opt=False,
-                )
-                add(
-                    f"layer{layer_idx}.kv{kv_head_idx}.v_proj",
-                    v_proj[kv_start:kv_end].t(),
-                    sanity_inner.attn_bank.v_proj[expert_idx],
-                    track_grad_and_opt=False,
-                )
-                add(
-                    f"layer{layer_idx}.kv{kv_head_idx}.o_proj",
-                    o_proj[:, q_start:q_end].t(),
-                    sanity_inner.attn_bank.o_proj[expert_idx],
-                    track_grad_and_opt=False,
-                )
-
-                if hasattr(sanity_inner.attn_bank, "q_norm_weight"):
-                    sanity_inner.attn_bank.q_norm_weight[expert_idx].copy_(q_norm)
-                    sanity_inner.attn_bank.k_norm_weight[expert_idx].copy_(k_norm)
                     add(
-                        f"layer{layer_idx}.kv{kv_head_idx}.q_norm",
-                        q_norm,
-                        sanity_inner.attn_bank.q_norm_weight[expert_idx],
+                        f"layer{layer_idx}.kv{kv_head_idx}.q_proj",
+                        q_proj[q_start:q_end].t(),
+                        sanity_inner.attn_bank.q_proj[expert_idx],
                         track_grad_and_opt=False,
                     )
                     add(
-                        f"layer{layer_idx}.kv{kv_head_idx}.k_norm",
-                        k_norm,
-                        sanity_inner.attn_bank.k_norm_weight[expert_idx],
+                        f"layer{layer_idx}.kv{kv_head_idx}.k_proj",
+                        k_proj[kv_start:kv_end].t(),
+                        sanity_inner.attn_bank.k_proj[expert_idx],
                         track_grad_and_opt=False,
                     )
+                    add(
+                        f"layer{layer_idx}.kv{kv_head_idx}.v_proj",
+                        v_proj[kv_start:kv_end].t(),
+                        sanity_inner.attn_bank.v_proj[expert_idx],
+                        track_grad_and_opt=False,
+                    )
+                    add(
+                        f"layer{layer_idx}.kv{kv_head_idx}.o_proj",
+                        o_proj[:, q_start:q_end].t(),
+                        sanity_inner.attn_bank.o_proj[expert_idx],
+                        track_grad_and_opt=False,
+                    )
+
+                    if hasattr(sanity_inner.attn_bank, "q_norm_weight"):
+                        sanity_inner.attn_bank.q_norm_weight[expert_idx].copy_(q_norm)
+                        sanity_inner.attn_bank.k_norm_weight[expert_idx].copy_(k_norm)
+                        add(
+                            f"layer{layer_idx}.kv{kv_head_idx}.q_norm",
+                            q_norm,
+                            sanity_inner.attn_bank.q_norm_weight[expert_idx],
+                            track_grad_and_opt=False,
+                        )
+                        add(
+                            f"layer{layer_idx}.kv{kv_head_idx}.k_norm",
+                            k_norm,
+                            sanity_inner.attn_bank.k_norm_weight[expert_idx],
+                            track_grad_and_opt=False,
+                        )
 
     return pairs
 

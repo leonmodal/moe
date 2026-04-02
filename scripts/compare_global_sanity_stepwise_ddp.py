@@ -1,0 +1,380 @@
+"""
+DDP stepwise equivalence check for:
+
+  - DeepSeek global MoE
+  - per-head precompute_kv alternating_global_moe sanity mode
+
+Each rank runs both models on the same local batch. Gradients are synchronized
+within each model via DDP, so rank 0 can report the post-step divergence after
+real multi-GPU training steps.
+
+Examples:
+  uv run torchrun --standalone --nproc_per_node 8 \
+    scripts/compare_global_sanity_stepwise_ddp.py \
+    --global-config configs/depth_matched/4_layers/global_moe.yaml \
+    --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml \
+    --steps 10 --data-mode parquet --batch-size 1 --seq-len 128 --amp-bf16
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import os
+from dataclasses import dataclass
+from typing import Iterator
+
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
+
+torch.backends.cuda.preferred_blas_library("cublaslt")
+
+from scripts.compare_global_sanity_stepwise import (  # noqa: E402
+    GLOBAL_CFG,
+    SANITY_CFG,
+    ParamPair,
+    _build_cfg,
+    _compare_grad_pairs,
+    _compare_optimizer_states,
+    _compare_param_pairs,
+    _copy_global_to_sanity,
+    _selected_expert_mismatches,
+)
+from src.data.parquet_dataset import DataConfig, StatefulParquetDataset  # noqa: E402
+from train import (  # noqa: E402
+    bias_alpha_schedule,
+    build_model,
+    get_bias_update_router_groups,
+    update_expert_biases,
+)
+
+
+@dataclass
+class _FakeAccelerator:
+    num_processes: int
+
+
+def _dist_info() -> tuple[int, int, int, torch.device]:
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    dist.init_process_group("nccl")
+    return rank, world_size, local_rank, device
+
+
+def _make_synthetic_iterator(
+    *,
+    vocab_size: int,
+    batch_size: int,
+    seq_len: int,
+    rank: int,
+    seed: int,
+    device: torch.device,
+) -> Iterator[dict[str, torch.Tensor]]:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed + rank)
+    while True:
+        ids = torch.randint(
+            0,
+            vocab_size,
+            (batch_size, seq_len),
+            generator=generator,
+            dtype=torch.long,
+        )
+        batch = ids.to(device, non_blocking=True)
+        yield {"input_ids": batch, "labels": batch}
+
+
+def _make_parquet_iterator(
+    *,
+    data_dir: str,
+    text_column: str,
+    tokenizer_name: str,
+    batch_size: int,
+    seq_len: int,
+    rank: int,
+    world_size: int,
+    seed: int,
+    device: torch.device,
+) -> Iterator[dict[str, torch.Tensor]]:
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    dataset = StatefulParquetDataset(
+        DataConfig(
+            data_dir=data_dir,
+            text_column=text_column,
+            seq_len=seq_len,
+            tokenizer_name=tokenizer_name,
+            num_workers=0,
+        ),
+        tokenizer=tokenizer,
+        rank=rank,
+        world_size=world_size,
+        seed=seed,
+    )
+    dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=0, pin_memory=True)
+    while True:
+        for batch in dataloader:
+            yield {
+                "input_ids": batch["input_ids"].to(device, non_blocking=True),
+                "labels": batch["labels"].to(device, non_blocking=True),
+            }
+
+
+def _step_model(
+    model,
+    optimizer,
+    batch: dict[str, torch.Tensor],
+    *,
+    amp_bf16: bool,
+) -> tuple[float, torch.Tensor]:
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_bf16):
+        output = model(
+            input_ids=batch["input_ids"],
+            labels=batch["labels"],
+            output_router_logits=True,
+        )
+        loss = output.loss
+    loss.backward()
+    optimizer.step()
+    return float(loss.item()), output.logits.detach()
+
+
+def _reduce_mean(value: float, device: torch.device) -> float:
+    tensor = torch.tensor([value], device=device, dtype=torch.float32)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor /= dist.get_world_size()
+    return float(tensor.item())
+
+
+def _reduce_sum(value: int, device: torch.device) -> int:
+    tensor = torch.tensor([value], device=device, dtype=torch.long)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return int(tensor.item())
+
+
+def _reduce_max(value: float, device: torch.device) -> float:
+    tensor = torch.tensor([value], device=device, dtype=torch.float32)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return float(tensor.item())
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--global-config", default=GLOBAL_CFG)
+    parser.add_argument("--sanity-config", default=SANITY_CFG)
+    parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--data-seed", type=int, default=1234)
+    parser.add_argument("--amp-bf16", action="store_true")
+    parser.add_argument("--data-mode", choices=("synthetic", "parquet"), default="parquet")
+    parser.add_argument("--data-dir", default="./data/parquet")
+    parser.add_argument("--text-column", default="text")
+    parser.add_argument("--tokenizer-name", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--bucket-cap-mb", type=float, default=25.0)
+    parser.add_argument(
+        "--static-graph",
+        choices=("on", "off"),
+        default="off",
+        help="Enable or disable DDP static_graph.",
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help="Override optimizer learning rate for both models.",
+    )
+    parser.add_argument(
+        "--bias-update-rate",
+        type=float,
+        default=None,
+        help="Override expert-bias update rate for both models. Use 0 to disable bias updates.",
+    )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        choices=("config", "off", "on"),
+        default="off",
+        help="Apply checkpointing to both models for this diagnostic.",
+    )
+    args = parser.parse_args()
+
+    rank, world_size, local_rank, device = _dist_info()
+    is_main = rank == 0
+
+    global_cfg = _build_cfg(args.global_config, batch_size=args.batch_size, seq_len=args.seq_len)
+    sanity_cfg = _build_cfg(args.sanity_config, batch_size=args.batch_size, seq_len=args.seq_len)
+
+    if args.gradient_checkpointing != "config":
+        enabled = args.gradient_checkpointing == "on"
+        global_cfg["training"]["gradient_checkpointing"] = enabled
+        sanity_cfg["training"]["gradient_checkpointing"] = enabled
+    if args.learning_rate is not None:
+        global_cfg["training"]["learning_rate"] = args.learning_rate
+        sanity_cfg["training"]["learning_rate"] = args.learning_rate
+    if args.bias_update_rate is not None:
+        global_cfg["model"]["bias_update_rate"] = args.bias_update_rate
+        sanity_cfg["model"]["bias_update_rate"] = args.bias_update_rate
+
+    torch.manual_seed(args.seed)
+    global_model, _ = build_model(copy.deepcopy(global_cfg))
+    torch.manual_seed(args.seed)
+    sanity_model, _ = build_model(copy.deepcopy(sanity_cfg))
+
+    global_model = global_model.to(device).train()
+    sanity_model = sanity_model.to(device).train()
+    pairs: list[ParamPair] = _copy_global_to_sanity(global_model, sanity_model)
+
+    if global_cfg["training"].get("gradient_checkpointing", False):
+        global_model.gradient_checkpointing_enable()
+    if sanity_cfg["training"].get("gradient_checkpointing", False):
+        sanity_model.gradient_checkpointing_enable()
+
+    global_ddp = DDP(
+        global_model,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        static_graph=args.static_graph == "on",
+        bucket_cap_mb=args.bucket_cap_mb,
+    )
+    sanity_ddp = DDP(
+        sanity_model,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        static_graph=args.static_graph == "on",
+        bucket_cap_mb=args.bucket_cap_mb,
+    )
+
+    global_opt = torch.optim.AdamW(
+        global_ddp.parameters(),
+        lr=global_cfg["training"]["learning_rate"],
+        weight_decay=global_cfg["training"]["weight_decay"],
+        betas=(global_cfg["training"]["beta1"], global_cfg["training"]["beta2"]),
+    )
+    sanity_opt = torch.optim.AdamW(
+        sanity_ddp.parameters(),
+        lr=sanity_cfg["training"]["learning_rate"],
+        weight_decay=sanity_cfg["training"]["weight_decay"],
+        betas=(sanity_cfg["training"]["beta1"], sanity_cfg["training"]["beta2"]),
+    )
+
+    if args.data_mode == "synthetic":
+        iterator = _make_synthetic_iterator(
+            vocab_size=global_cfg["model"]["vocab_size"],
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            rank=rank,
+            seed=args.data_seed,
+            device=device,
+        )
+    else:
+        iterator = _make_parquet_iterator(
+            data_dir=args.data_dir,
+            text_column=args.text_column,
+            tokenizer_name=args.tokenizer_name,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            rank=rank,
+            world_size=world_size,
+            seed=args.data_seed,
+            device=device,
+        )
+
+    accelerator = _FakeAccelerator(num_processes=world_size)
+
+    if is_main:
+        print(
+            f"ddp_world_size={world_size} data_mode={args.data_mode} "
+            f"amp_bf16={args.amp_bf16} "
+            f"bucket_cap_mb={args.bucket_cap_mb} "
+            f"static_graph={args.static_graph} "
+            f"learning_rate={global_cfg['training']['learning_rate']} "
+            f"bias_update_rate={global_cfg['model'].get('bias_update_rate', 0.0)} "
+            f"gradient_checkpointing=(global={global_cfg['training'].get('gradient_checkpointing', False)}, "
+            f"sanity={sanity_cfg['training'].get('gradient_checkpointing', False)})"
+        )
+        print(
+            "step  global_loss  sanity_loss  |g-s|  logits_max  grad_max  "
+            "param_max  opt_max  mismatched_selected"
+        )
+
+    for step in range(args.steps):
+        batch = next(iterator)
+
+        global_loss, global_logits = _step_model(
+            global_ddp,
+            global_opt,
+            batch,
+            amp_bf16=args.amp_bf16,
+        )
+        sanity_loss, sanity_logits = _step_model(
+            sanity_ddp,
+            sanity_opt,
+            batch,
+            amp_bf16=args.amp_bf16,
+        )
+
+        if global_cfg["model"].get("bias_update_rate", 0.0) > 0:
+            alpha = bias_alpha_schedule(step)
+            update_expert_biases(
+                global_ddp.module,
+                global_cfg["model"]["bias_update_rate"],
+                accelerator,
+                is_global=True,
+                alpha=alpha,
+            )
+            update_expert_biases(
+                sanity_ddp.module,
+                sanity_cfg["model"]["bias_update_rate"],
+                accelerator,
+                is_global=True,
+                alpha=alpha,
+                router_groups=get_bias_update_router_groups(sanity_ddp.module, mlp_only=True),
+            )
+
+        logits_diff = (global_logits.float() - sanity_logits.float()).abs().max().item()
+        mismatches = _selected_expert_mismatches(global_ddp.module, sanity_ddp.module)
+        selected_total = sum(mismatches)
+
+        mean_global_loss = _reduce_mean(global_loss, device)
+        mean_sanity_loss = _reduce_mean(sanity_loss, device)
+        max_logits_diff = _reduce_max(logits_diff, device)
+        total_selected = _reduce_sum(selected_total, device)
+
+        dist.barrier(device_ids=[local_rank])
+
+        if is_main:
+            grad_name, grad_diff = _compare_grad_pairs(pairs)
+            param_name, param_diff = _compare_param_pairs(pairs)
+            opt_name, opt_key, opt_diff = _compare_optimizer_states(pairs, global_opt, sanity_opt)
+
+            print(
+                f"{step:>4d}  "
+                f"{mean_global_loss:>11.6f}  {mean_sanity_loss:>11.6f}  "
+                f"{abs(mean_global_loss - mean_sanity_loss):>7.6f}  "
+                f"{max_logits_diff:>10.6f}  {grad_diff:>8.3g}  "
+                f"{param_diff:>9.3g}  {opt_diff:>7.3g}  {total_selected:>6d}"
+            )
+            if grad_name:
+                print(f"      worst_grad={grad_name}")
+            if param_name:
+                print(f"      worst_param={param_name}")
+            if opt_name:
+                print(f"      worst_opt={opt_name}:{opt_key}")
+            print(f"      mismatches_by_layer(local_rank0)={mismatches}")
+
+    dist.barrier(device_ids=[local_rank])
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

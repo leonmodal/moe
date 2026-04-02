@@ -154,6 +154,14 @@ class BranchRouter(nn.Module):
         return w_attn, w_mlp, attn_mask, mlp_mask
 
 
+class BranchRouterRecorder(nn.Module):
+    """Parameterless recorder used when branch routing is deterministic."""
+
+    def __init__(self):
+        super().__init__()
+        self.last_probs = None
+
+
 # ─── Routed norm bank ─────────────────────────────────────────────────────── #
 
 class NormExpertBank(nn.Module):
@@ -270,6 +278,53 @@ class AttentionExpertBank(nn.Module):
             )
         getattr(self, f"_init_{self.mode}")()
 
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError as exc:
+            modules = object.__getattribute__(self, "_modules")
+            if name == "q_proj" and "logical_q_proj" in modules:
+                return self._logical_q_proj_bank()
+            if name == "k_proj" and "logical_k_proj" in modules:
+                return self._logical_k_proj_bank()
+            if name == "v_proj" and "logical_v_proj" in modules:
+                return self._logical_v_proj_bank()
+            if name == "o_proj" and "logical_o_proj" in modules:
+                return self._logical_o_proj_bank()
+            raise exc
+
+    def _logical_q_proj_bank(self) -> torch.Tensor:
+        layers = super().__getattr__("logical_q_proj")
+        per_layer = [
+            weight.view(self.num_kv_heads, self.q_group_dim, self.hidden_size).permute(0, 2, 1)
+            for weight in layers
+        ]
+        return torch.stack(per_layer, dim=0).reshape(self.num_experts, self.hidden_size, self.q_group_dim)
+
+    def _logical_k_proj_bank(self) -> torch.Tensor:
+        layers = super().__getattr__("logical_k_proj")
+        per_layer = [
+            weight.view(self.num_kv_heads, self.head_dim, self.hidden_size).permute(0, 2, 1)
+            for weight in layers
+        ]
+        return torch.stack(per_layer, dim=0).reshape(self.num_experts, self.hidden_size, self.head_dim)
+
+    def _logical_v_proj_bank(self) -> torch.Tensor:
+        layers = super().__getattr__("logical_v_proj")
+        per_layer = [
+            weight.view(self.num_kv_heads, self.head_dim, self.hidden_size).permute(0, 2, 1)
+            for weight in layers
+        ]
+        return torch.stack(per_layer, dim=0).reshape(self.num_experts, self.hidden_size, self.head_dim)
+
+    def _logical_o_proj_bank(self) -> torch.Tensor:
+        layers = super().__getattr__("logical_o_proj")
+        per_layer = [
+            weight.view(self.hidden_size, self.num_kv_heads, self.q_group_dim).permute(1, 2, 0)
+            for weight in layers
+        ]
+        return torch.stack(per_layer, dim=0).reshape(self.num_experts, self.q_group_dim, self.hidden_size)
+
     def _make_router(self, input_dim):
         """Create a router for this bank — DeepSeek sigmoid or plain Linear."""
         if self.use_deepseek_routing:
@@ -338,18 +393,18 @@ class AttentionExpertBank(nn.Module):
             mask = expert_idx == e
             proj = flat[mask] @ weight_bank[e]
             if norm_weights is not None:
-                proj_f = proj.float()
-                var = proj_f.pow(2).mean(-1, keepdim=True)
-                proj_normed = proj_f * torch.rsqrt(var + self.eps)
-                proj = (norm_weights[e] * proj_normed).to(flat.dtype)
+                proj = self._apply_single_head_norm(proj, norm_weights[e])
             out[mask] = (proj * expert_weights[mask].unsqueeze(-1)).to(out.dtype)
         return out
 
     def _apply_single_head_norm(self, proj, norm_weight):
+        input_dtype = proj.dtype
         proj_f = proj.float()
         var = proj_f.pow(2).mean(-1, keepdim=True)
         proj_normed = proj_f * torch.rsqrt(var + self.eps)
-        return (norm_weight * proj_normed).to(proj.dtype)
+        # Match Qwen3MoeRMSNorm: round the normalized activations back to the
+        # projection dtype before multiplying by the learned weight.
+        return norm_weight * proj_normed.to(input_dtype)
 
     def _maybe_grouped_mm(
         self,
@@ -384,18 +439,27 @@ class AttentionExpertBank(nn.Module):
         proj = self._maybe_grouped_mm(sorted_inputs, weight_bank, unique_experts, counts)
 
         if proj is None:
-            proj = sorted_inputs.new_empty(sorted_inputs.shape[0], weight_bank.shape[2])
+            proj = None
             start = 0
             for expert, count in zip(unique_experts.tolist(), counts.tolist()):
                 end = start + count
-                proj[start:end] = sorted_inputs[start:end] @ weight_bank[expert]
+                chunk = sorted_inputs[start:end] @ weight_bank[expert]
+                if proj is None:
+                    proj = torch.empty(
+                        sorted_inputs.shape[0],
+                        weight_bank.shape[2],
+                        device=chunk.device,
+                        dtype=chunk.dtype,
+                    )
+                proj[start:end] = chunk
                 start = end
 
         if norm_weights is not None:
+            input_dtype = proj.dtype
             proj_f = proj.float()
             variance = proj_f.pow(2).mean(-1, keepdim=True)
             proj_normed = proj_f * torch.rsqrt(variance + self.eps)
-            proj = (norm_weights.index_select(0, sorted_expert) * proj_normed).to(sorted_inputs.dtype)
+            proj = norm_weights.index_select(0, sorted_expert) * proj_normed.to(input_dtype)
 
         return proj
 
@@ -489,6 +553,7 @@ class AttentionExpertBank(nn.Module):
             weight_bank,
             norm_weights=norm_weights,
         )
+        proj_output_dtype = proj.dtype
         if reduce_tokens:
             proj = proj.to(token_out.dtype)
             proj = proj * sorted_weight.unsqueeze(-1).to(token_out.dtype)
@@ -499,7 +564,7 @@ class AttentionExpertBank(nn.Module):
             pair_out[sort_order] = proj
 
         if reduce_tokens:
-            return token_out.to(inputs.dtype)
+            return token_out.to(proj_output_dtype)
         return pair_out.view(N, num_slots, H_out)
 
     def _project_heads_batched(self, flat, weight_bank, idx, weights, norm_weights=None):
@@ -550,11 +615,12 @@ class AttentionExpertBank(nn.Module):
         )
 
         if norm_weights is not None:
+            input_dtype = proj.dtype
             proj_f = proj.view(-1, self.q_heads_per_kv, self.head_dim).float()
             variance = proj_f.pow(2).mean(-1, keepdim=True)
             proj_normed = proj_f * torch.rsqrt(variance + self.eps)
             gathered = norm_weights.index_select(0, sorted_expert).unsqueeze(1)
-            proj = (gathered * proj_normed).to(sorted_inputs.dtype).view(-1, H_out)
+            proj = (gathered * proj_normed.to(input_dtype)).view(-1, H_out)
 
         proj = proj * sorted_weight.unsqueeze(-1).to(proj.dtype)
         pair_out[sort_order] = proj.to(pair_out.dtype)
@@ -741,12 +807,20 @@ class AttentionExpertBank(nn.Module):
             )
         else:
             self.router = self._make_flat_bank_router(self.hidden_size, self.num_kv_heads)
-        self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_group_dim))
-        self.k_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.head_dim))
-        self.v_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.head_dim))
-        self.o_proj = nn.Parameter(torch.empty(E, self.q_group_dim, self.hidden_size))
         if self.sanity_check_mode == "alternating_global_moe":
             num_logical_layers = max(1, self.num_depths // 2)
+            self.logical_q_proj = nn.ParameterList(
+                [nn.Parameter(torch.empty(self.q_dim, self.hidden_size)) for _ in range(num_logical_layers)]
+            )
+            self.logical_k_proj = nn.ParameterList(
+                [nn.Parameter(torch.empty(self.kv_dim, self.hidden_size)) for _ in range(num_logical_layers)]
+            )
+            self.logical_v_proj = nn.ParameterList(
+                [nn.Parameter(torch.empty(self.kv_dim, self.hidden_size)) for _ in range(num_logical_layers)]
+            )
+            self.logical_o_proj = nn.ParameterList(
+                [nn.Parameter(torch.empty(self.hidden_size, self.q_dim)) for _ in range(num_logical_layers)]
+            )
             self.logical_q_norm_weight = nn.Parameter(torch.ones(num_logical_layers, self.head_dim))
             self.logical_k_norm_weight = nn.Parameter(torch.ones(num_logical_layers, self.head_dim))
             expert_to_layer = torch.arange(E, dtype=torch.long) // max(1, self.num_kv_heads)
@@ -757,12 +831,30 @@ class AttentionExpertBank(nn.Module):
                 persistent=False,
             )
         elif self.per_layer_qk_norm:
+            self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_group_dim))
+            self.k_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.head_dim))
+            self.v_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.head_dim))
+            self.o_proj = nn.Parameter(torch.empty(E, self.q_group_dim, self.hidden_size))
             self.layer_q_norm_weight = nn.Parameter(torch.ones(self.num_depths, self.head_dim))
             self.layer_k_norm_weight = nn.Parameter(torch.ones(self.num_depths, self.head_dim))
         else:
+            self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_group_dim))
+            self.k_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.head_dim))
+            self.v_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.head_dim))
+            self.o_proj = nn.Parameter(torch.empty(E, self.q_group_dim, self.hidden_size))
             self.q_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
             self.k_norm_weight = nn.Parameter(torch.ones(E, self.head_dim))
-        self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
+        if self.sanity_check_mode == "alternating_global_moe":
+            self._init_params(
+                [
+                    *list(self.logical_q_proj),
+                    *list(self.logical_k_proj),
+                    *list(self.logical_v_proj),
+                    *list(self.logical_o_proj),
+                ]
+            )
+        else:
+            self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
 
     def _select_router(self, name: str, depth_idx: int | None = None):
         plural_name = f"{name}s"
@@ -1296,7 +1388,7 @@ class AttentionExpertBank(nn.Module):
         )
 
         attn_out = hidden_states.new_zeros(B * T, self.hidden_size)
-        attn_out[flat_mask] = o_selected
+        attn_out[flat_mask] = o_selected.to(attn_out.dtype)
         return attn_out.view(B, T, self.hidden_size), K_new, V_new
 
     def _build_per_head_precompute_kv_tables(
@@ -1538,7 +1630,7 @@ class AttentionExpertBank(nn.Module):
         )
 
         attn_out = hidden_states.new_zeros(B * T, self.hidden_size)
-        attn_out[flat_mask] = o_selected
+        attn_out[flat_mask] = o_selected.to(attn_out.dtype)
         return attn_out.view(B, T, self.hidden_size), K_new, V_new
 
     def project_and_attend_precompute_kv(
@@ -1760,6 +1852,8 @@ class MlpExpertBank(nn.Module):
                 dummy = self._zero_dummy(hidden_states.device, hidden_states.dtype)
                 return hidden_states.new_zeros(B, T, H) + dummy
             if flat_mask.all():
+                # When every token routes through the MLP, use the same
+                # unmasked aux-loss path as the baseline/global models.
                 token_mask = None
 
         if self.per_layer_norm and depth_idx is not None:
@@ -1833,7 +1927,12 @@ class MoEverythingModel(nn.Module):
 
         # Feature 1: per-layer vs shared branch router
         self.per_layer_router = getattr(config, "per_layer_router", False)
-        if self.per_layer_router:
+        if self.sanity_check_mode == "alternating_global_moe":
+            if self.per_layer_router:
+                self.branch_routers = nn.ModuleList([BranchRouterRecorder() for _ in range(self.num_depths)])
+            else:
+                self.branch_router = BranchRouterRecorder()
+        elif self.per_layer_router:
             self.branch_routers = nn.ModuleList([
                 BranchRouter(config.hidden_size) for _ in range(self.num_depths)
             ])

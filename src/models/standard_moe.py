@@ -18,6 +18,10 @@ StandardMoEConfig = Qwen3MoeConfig
 
 
 class StandardMoEModel(Qwen3MoeForCausalLM):
+    def __init__(self, config: Qwen3MoeConfig):
+        super().__init__(config)
+        self._seq_aux_loss_coef = getattr(config, "seq_aux_loss_coef", 0.0)
+
     def forward(self, **kwargs):
         output = super().forward(**kwargs)
 

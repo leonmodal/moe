@@ -163,6 +163,7 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
         super().__init__(config)
         self.model = GlobalMoEModel(config, router_class=self._router_class)
         self.num_experts = config.num_experts
+        self._seq_aux_loss_coef = getattr(config, "seq_aux_loss_coef", 0.0)
         self.post_init()
 
     def forward(self, **kwargs):
