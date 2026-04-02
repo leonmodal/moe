@@ -62,7 +62,7 @@ class _FakeAccelerator:
 class StepResult:
     loss: float
     ce_loss: float
-    logits: torch.Tensor
+    logits: torch.Tensor | None
 
 
 def _dist_info() -> tuple[int, int, int, torch.device]:
@@ -142,6 +142,7 @@ def _step_model(
     batch: dict[str, torch.Tensor],
     *,
     amp_bf16: bool,
+    capture_logits: bool,
 ) -> StepResult:
     optimizer.zero_grad(set_to_none=True)
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_bf16):
@@ -164,7 +165,7 @@ def _step_model(
     return StepResult(
         loss=float(loss.item()),
         ce_loss=float(ce_loss.item()),
-        logits=output.logits.detach(),
+        logits=output.logits.detach() if capture_logits else None,
     )
 
 
@@ -226,6 +227,12 @@ def main() -> None:
         choices=("config", "off", "on"),
         default="off",
         help="Apply checkpointing to both models for this diagnostic.",
+    )
+    parser.add_argument(
+        "--capture-logits",
+        choices=("on", "off"),
+        default="on",
+        help="Keep full logits and report max absolute logits diff. Disable for very large full-load runs.",
     )
     args = parser.parse_args()
 
@@ -341,12 +348,14 @@ def main() -> None:
             global_opt,
             batch,
             amp_bf16=args.amp_bf16,
+            capture_logits=args.capture_logits == "on",
         )
         sanity_result = _step_model(
             sanity_ddp,
             sanity_opt,
             batch,
             amp_bf16=args.amp_bf16,
+            capture_logits=args.capture_logits == "on",
         )
 
         if global_cfg["model"].get("bias_update_rate", 0.0) > 0:
@@ -382,7 +391,9 @@ def main() -> None:
                 router_groups=get_bias_update_router_groups(sanity_ddp.module, mlp_only=True),
             )
 
-        logits_diff = (global_result.logits.float() - sanity_result.logits.float()).abs().max().item()
+        logits_diff = 0.0
+        if global_result.logits is not None and sanity_result.logits is not None:
+            logits_diff = (global_result.logits.float() - sanity_result.logits.float()).abs().max().item()
         mismatches = _selected_expert_mismatches(global_ddp.module, sanity_ddp.module)
         selected_total = sum(mismatches)
 
