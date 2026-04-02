@@ -20,8 +20,7 @@ model:
   router_aux_loss_coef: 0.0
   seq_aux_loss_coef: 0.0001
   bias_update_rate: 0.001
-  bias_interpolation: true
-  bias_interpolation_warmup_steps: 5000
+  bias_interpolation: false
   topk_scaling_factor: 2.5
   num_groups: 8
   group_topk: 4

@@ -80,6 +80,7 @@ from src.models.load_balancing import (
     normalized_load_balancing_loss_func,
     seq_load_balancing_loss_func,
 )
+from src.models.init_mapping import copy_global_to_alternating_sanity
 from src.utils.training import (
     TrainingConfig,
     build_lr_scheduler,
@@ -438,6 +439,33 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def resolve_related_config_path(config_path: str, related_path: str) -> str:
+    resolved = Path(related_path)
+    if resolved.is_absolute():
+        return str(resolved)
+    return str((Path(config_path).resolve().parent / resolved).resolve())
+
+
+def resolve_initialization_spec(
+    cfg: dict,
+    *,
+    config_path: str,
+    cli_source_config: str | None = None,
+    cli_strategy: str | None = None,
+) -> dict | None:
+    spec = dict(cfg.get("initialization") or {})
+    if cli_source_config is not None:
+        spec["source_config"] = cli_source_config
+    if cli_strategy is not None:
+        spec["strategy"] = cli_strategy
+    if not spec:
+        return None
+    if "source_config" not in spec or "strategy" not in spec:
+        raise ValueError("initialization requires both 'source_config' and 'strategy'")
+    spec["source_config"] = resolve_related_config_path(config_path, spec["source_config"])
+    return spec
+
+
 def build_model(cfg: dict):
     mtype = cfg["model"]["type"]
     mcfg = cfg["model"]
@@ -635,17 +663,36 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--resume", default=None, help="Path to checkpoint directory")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--init-from-config",
+        default=None,
+        help="Optional source config for mapped initialization (resolved relative to --config if needed).",
+    )
+    parser.add_argument(
+        "--init-strategy",
+        choices=("global_to_alternating_sanity",),
+        default=None,
+        help="Optional mapped-initialization strategy override.",
+    )
     parser.add_argument("--auto_resume", action="store_true",
                         help="Auto-find and resume from latest checkpoint in output_dir")
     parser.add_argument("--data_dir", default=None,
                         help="Override data.data_dir from config")
     parser.add_argument("--output_dir", default=None,
                         help="Override training.output_dir from config")
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="Override training.max_steps from config")
     parser.add_argument("--max_checkpoints", type=int, default=0,
                         help="Max checkpoints to keep (0 = unlimited)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    initialization_spec = resolve_initialization_spec(
+        cfg,
+        config_path=args.config,
+        cli_source_config=args.init_from_config,
+        cli_strategy=args.init_strategy,
+    )
     liger_mode = configure_liger_kernels(cfg)
     print(
         f"Liger kernels: {liger_mode} for model type '{cfg['model']['type']}'",
@@ -659,6 +706,8 @@ def main() -> None:
         dcfg_dict["data_dir"] = args.data_dir
     if args.output_dir:
         tcfg_dict["output_dir"] = args.output_dir
+    if args.max_steps is not None:
+        tcfg_dict["max_steps"] = args.max_steps
 
     resume_from = args.resume or cfg.get("checkpoint", {}).get("resume_from")
 
@@ -770,6 +819,22 @@ def main() -> None:
 
     # --- Model --------------------------------------------------------------
     model, model_cfg = build_model(cfg)
+    init_summary = None
+    if initialization_spec is not None:
+        set_seed(args.seed + accelerator.process_index)
+        source_cfg = load_config(initialization_spec["source_config"])
+        source_model, _ = build_model(source_cfg)
+        strategy = initialization_spec["strategy"]
+        if strategy == "global_to_alternating_sanity":
+            pairs = copy_global_to_alternating_sanity(source_model, model)
+        else:
+            raise ValueError(f"Unknown initialization strategy: {strategy}")
+        init_summary = {
+            "strategy": strategy,
+            "source_config": initialization_spec["source_config"],
+            "num_pairs": len(pairs),
+        }
+        del source_model
 
     params = count_parameters(model)
     expert_params = sum(
@@ -802,6 +867,12 @@ def main() -> None:
             accelerator.print("Gradient checkpointing enabled.")
         else:
             accelerator.print("Gradient checkpointing requested, but this model does not expose gradient_checkpointing_enable().")
+    if init_summary is not None:
+        accelerator.print(
+            "Mapped initialization enabled: "
+            f"{init_summary['strategy']} from {init_summary['source_config']} "
+            f"({init_summary['num_pairs']} mapped tensors)"
+        )
 
     accelerator.print(
         f"\n{'='*60}\n"

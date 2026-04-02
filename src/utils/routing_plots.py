@@ -9,10 +9,13 @@ Folder structure:
       branch_histogram.png
       mlp/
         expert_histogram.png
+        per_layer_expert_histograms.png
       q/
         expert_histogram.png
+        per_layer_expert_histograms.png
       k/
         expert_histogram.png
+        per_layer_expert_histograms.png
       ...
       attn_norm/
         expert_histogram.png
@@ -38,19 +41,27 @@ def plot_routing_snapshot(snapshot: dict, step_dir: str, step: int) -> None:
         _plot_branch_histogram(branch, step_dir, step)
 
     # MLP expert histogram
+    mlp_layers = snapshot.get("layers", {})
     global_pool = snapshot.get("global_pool")
-    if global_pool is not None:
+    if global_pool is not None or mlp_layers:
         sub = os.path.join(step_dir, "mlp")
         os.makedirs(sub, exist_ok=True)
-        _plot_expert_histogram(global_pool, sub, step, name="MLP")
+        if global_pool is not None:
+            _plot_expert_histogram(global_pool, sub, step, name="MLP")
+        if mlp_layers:
+            _plot_per_layer_expert_histograms(mlp_layers, sub, step, name="MLP")
 
     # Attention expert histograms (q, k, v, o, or attn)
     for router_name, router_snapshot in sorted(snapshot.get("attention", {}).items()):
+        router_layers = router_snapshot.get("layers", {})
         router_pool = router_snapshot.get("global_pool")
-        if router_pool is not None:
+        if router_pool is not None or router_layers:
             sub = os.path.join(step_dir, router_name)
             os.makedirs(sub, exist_ok=True)
-            _plot_expert_histogram(router_pool, sub, step, name=router_name.upper())
+            if router_pool is not None:
+                _plot_expert_histogram(router_pool, sub, step, name=router_name.upper())
+            if router_layers:
+                _plot_per_layer_expert_histograms(router_layers, sub, step, name=router_name.upper())
 
     # Norm expert histograms (attn_norm, mlp_norm)
     for norm_name, norm_data in sorted(snapshot.get("norms", {}).items()):
@@ -141,4 +152,46 @@ def _plot_expert_histogram(pool: dict, sub_dir: str, step: int, name: str) -> No
 
     fig.tight_layout()
     fig.savefig(os.path.join(sub_dir, "expert_histogram.png"), dpi=100)
+    plt.close(fig)
+
+
+def _plot_per_layer_expert_histograms(layers: dict, sub_dir: str, step: int, name: str) -> None:
+    """Grid of per-layer expert usage histograms for one pool family."""
+    if not layers:
+        return
+
+    layer_keys = sorted(layers.keys(), key=int)
+    num_layers = len(layer_keys)
+    cols = min(4, num_layers)
+    rows = int(np.ceil(num_layers / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 3.5 * rows), squeeze=False)
+
+    for ax in axes.flat:
+        ax.set_visible(False)
+
+    for plot_idx, layer_key in enumerate(layer_keys):
+        ax = axes.flat[plot_idx]
+        ax.set_visible(True)
+
+        layer = layers[layer_key]
+        fracs = np.array(layer["token_fracs"], dtype=float)
+        num_experts = len(fracs)
+        if num_experts == 0:
+            ax.set_title(f"Layer {int(layer_key):02d}")
+            ax.text(0.5, 0.5, "No experts", ha="center", va="center", transform=ax.transAxes)
+            continue
+
+        ideal = 1.0 / num_experts
+        active = int(np.sum(fracs > 0))
+        ax.bar(range(num_experts), fracs, color="#5dade2", width=0.8)
+        ax.axhline(ideal, color="black", linestyle="--", linewidth=1)
+        ax.set_title(f"Layer {int(layer_key):02d} ({active}/{num_experts} active)")
+        ax.set_xlabel("Expert")
+        ax.set_ylabel("Frac")
+        xtick_step = max(1, num_experts // 8)
+        ax.set_xticks(range(0, num_experts, xtick_step))
+
+    fig.suptitle(f"{name} Per-Layer Expert Usage (step {step})", fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(os.path.join(sub_dir, "per_layer_expert_histograms.png"), dpi=100)
     plt.close(fig)

@@ -21,8 +21,8 @@ model:
   router_aux_loss_coef: 0.0
   seq_aux_loss_coef: 0.0001
   bias_update_rate: 0.001
-  bias_interpolation: true
-  bias_interpolation_warmup_steps: 5000
+  bias_interpolation: false
+  global_router_update: true
   topk_scaling_factor: 2.5
   num_groups: 8
   group_topk: 4
@@ -69,6 +69,10 @@ data:
   seq_len: 1024
   tokenizer_name: Qwen/Qwen3-0.6B
   num_workers: 4
+
+initialization:
+  strategy: global_to_alternating_sanity
+  source_config: global_moe.yaml
 
 checkpoint:
   resume_from: null

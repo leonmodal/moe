@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import yaml
 from src.models import Qwen3MoeConfig, StandardMoEModel, GlobalMoEConfig, GlobalMoEForCausalLM
 from src.models.global_moe import GlobalMoEModel
+from src.models.init_mapping import copy_global_to_alternating_sanity
 from src.models.router import DeepSeekRouter
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeExperts,
@@ -1275,62 +1276,7 @@ def _bf16_alternating_sanity_config(logical_layers: int = 4, vocab_size: int = 4
 
 
 def _copy_global_weights_into_sanity_moe(global_model, sanity_model):
-    global_inner = global_model.model
-    sanity_inner = sanity_model.model
-    head_dim = global_model.config.head_dim
-    num_heads = global_model.config.num_attention_heads
-    num_kv_heads = global_model.config.num_key_value_heads
-    num_kv_groups = num_heads // num_kv_heads
-
-    with torch.no_grad():
-        sanity_inner.embed_tokens.weight.copy_(global_inner.embed_tokens.weight)
-        sanity_inner.norm.weight.copy_(global_inner.norm.weight)
-        sanity_model.lm_head.weight.copy_(global_model.lm_head.weight)
-        sanity_inner.mlp_bank.experts.gate_up_proj.copy_(global_inner.global_experts.gate_up_proj)
-        sanity_inner.mlp_bank.experts.down_proj.copy_(global_inner.global_experts.down_proj)
-
-        for layer_idx, layer in enumerate(global_inner.layers):
-            attn_depth = 2 * layer_idx
-            mlp_depth = attn_depth + 1
-            sanity_inner.attn_bank.norms[attn_depth].weight.copy_(layer.input_layernorm.weight)
-            sanity_inner.mlp_bank.norms[mlp_depth].weight.copy_(layer.post_attention_layernorm.weight)
-            if hasattr(sanity_inner.mlp_bank, "gates"):
-                sanity_inner.mlp_bank.gates[layer_idx].weight.copy_(layer.mlp.gate.weight)
-                if hasattr(layer.mlp.gate, "expert_bias"):
-                    sanity_inner.mlp_bank.gates[layer_idx].expert_bias.copy_(layer.mlp.gate.expert_bias)
-
-            q_proj = layer.self_attn.q_proj.weight
-            k_proj = layer.self_attn.k_proj.weight
-            v_proj = layer.self_attn.v_proj.weight
-            o_proj = layer.self_attn.o_proj.weight
-            q_norm = layer.self_attn.q_norm.weight
-            k_norm = layer.self_attn.k_norm.weight
-
-            if hasattr(sanity_inner.attn_bank, "logical_q_proj"):
-                sanity_inner.attn_bank.logical_q_proj[layer_idx].copy_(q_proj)
-                sanity_inner.attn_bank.logical_k_proj[layer_idx].copy_(k_proj)
-                sanity_inner.attn_bank.logical_v_proj[layer_idx].copy_(v_proj)
-                sanity_inner.attn_bank.logical_o_proj[layer_idx].copy_(o_proj)
-
-            if hasattr(sanity_inner.attn_bank, "logical_q_norm_weight"):
-                sanity_inner.attn_bank.logical_q_norm_weight[layer_idx].copy_(q_norm)
-                sanity_inner.attn_bank.logical_k_norm_weight[layer_idx].copy_(k_norm)
-
-            if not hasattr(sanity_inner.attn_bank, "logical_q_proj"):
-                for kv_head_idx in range(num_kv_heads):
-                    expert_idx = layer_idx * num_kv_heads + kv_head_idx
-                    q_start = kv_head_idx * num_kv_groups * head_dim
-                    q_end = q_start + num_kv_groups * head_dim
-                    kv_start = kv_head_idx * head_dim
-                    kv_end = kv_start + head_dim
-
-                    sanity_inner.attn_bank.q_proj[expert_idx].copy_(q_proj[q_start:q_end].t())
-                    sanity_inner.attn_bank.k_proj[expert_idx].copy_(k_proj[kv_start:kv_end].t())
-                    sanity_inner.attn_bank.v_proj[expert_idx].copy_(v_proj[kv_start:kv_end].t())
-                    sanity_inner.attn_bank.o_proj[expert_idx].copy_(o_proj[:, q_start:q_end].t())
-                    if hasattr(sanity_inner.attn_bank, "q_norm_weight"):
-                        sanity_inner.attn_bank.q_norm_weight[expert_idx].copy_(q_norm)
-                        sanity_inner.attn_bank.k_norm_weight[expert_idx].copy_(k_norm)
+    copy_global_to_alternating_sanity(global_model, sanity_model)
 
 
 def test_alternating_global_sanity_matches_global_moe():

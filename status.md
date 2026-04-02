@@ -227,6 +227,61 @@ Observed behavior on the exact runs:
 - The alternating-global sanity harness is now good for implementation/regression checks, but not for requiring near-identical CE at every training step over long runs.
 - In practice the global baseline and sanity harness remain in the same training regime over 1k DDP steps, but they can show transient CE gaps that are much larger than the first-step mapped-init deltas.
 
+## Same-Init And Bias-Update Policy
+
+- Mapped init is now a first-class training option instead of living only in debug scripts:
+  - added `src/models/init_mapping.py` with the shared `global -> alternating_global_moe sanity` weight copy
+  - `train.py` now supports:
+    - config-driven initialization via a top-level `initialization:` block
+    - CLI overrides via `--init-from-config` and `--init-strategy`
+- The depth-matched sanity configs now default to mapped init from their sibling global configs:
+  - `configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml`
+  - `configs/depth_matched/8_layers/moe_everything_per_head_precompute_kv_sanity.yaml`
+  - `configs/depth_matched/16_layers/moe_everything_per_head_precompute_kv_sanity.yaml`
+- Bias updates are now pinned to pure pooled/global behavior across all depth-matched `4_layers`, `8_layers`, and `16_layers` configs:
+  - `bias_interpolation: false`
+  - `global_router_update: true`
+- In other words:
+  - global pooling is always enabled for these configs
+  - alpha is always `0`
+  - there is no longer any per-layer/global interpolation path in the depth-matched runs
+
+## 8-Layer Launch Validation
+
+- Environment: single node, `8 x NVIDIA B200`, real `train.py`, parquet data, actual `8_layers` config settings (`batch_size=32`, `gradient_accumulation=2`, `seq_len=1024`, `bf16`)
+- Added `--max-steps` override to `train.py` so these smokes can exit cleanly after a real optimizer step count.
+- `uv run pytest -q tests/test_models.py -k 'stores_seq_aux_coef_from_config or alternating_global_sanity_matches_global_moe or alternating_global_sanity_bf16_attention_path_matches_global_moe or alternating_global_sanity_uses_parameterless_branch_router'`
+  - result: `5 passed`
+- `uv run python` config-resolution check:
+  - all three sanity configs resolve `initialization.source_config` to their matching absolute `global_moe.yaml` path
+- Real 8-GPU smokes (`--max-steps 2`) all completed without OOM:
+  - `configs/depth_matched/8_layers/global_moe.yaml`
+    - step 1 CE `12.1447`
+    - step 2 CE `12.1474`
+    - observed memory: about `46.8 GiB/GPU` (`46790 MiB`)
+  - `configs/depth_matched/8_layers/standard_moe.yaml`
+    - step 1 CE `12.1431`
+    - step 2 CE `12.1452`
+    - observed memory: about `35.9 GiB/GPU` (`36772 MiB`)
+  - `configs/depth_matched/8_layers/moe_everything_per_head_precompute_kv_perlayer_prenorm.yaml`
+    - step 1 CE `12.1501`
+    - step 2 CE `12.1508`
+    - observed memory: about `116.0 GiB/GPU` (`118800 MiB`)
+  - `configs/depth_matched/8_layers/moe_everything_per_head_independent_perlayer_prenorm.yaml`
+    - step 1 CE `12.1615`
+    - step 2 CE `12.1600`
+    - observed memory: about `119.0 GiB/GPU` (`121844 MiB`)
+  - `configs/depth_matched/8_layers/moe_everything_per_head_precompute_kv_sanity.yaml`
+    - mapped init log: `85 mapped tensors`
+    - step 1 CE `12.1306`
+    - step 2 CE `12.1316`
+    - observed memory: about `167.5 GiB/GPU` (`171532 MiB`)
+- Read on `8_layers`:
+  - the real training configs are comfortably below the B200 limit
+  - the sanity harness also fits on B200, but it is much closer to the ceiling because it doubles depth to emulate 8 logical layers
+  - if the choice is between `4_layers` and `8_layers` for real per-head training on this hardware, `8_layers` is good to run
+  - the `8_layers` sanity config is also runnable here, but it has much less headroom than the real 8-layer models
+
 ## Remaining Open Items
 
 - No expert parallel implementation yet
