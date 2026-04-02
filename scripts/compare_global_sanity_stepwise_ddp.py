@@ -351,10 +351,20 @@ def main() -> None:
 
         if global_cfg["model"].get("bias_update_rate", 0.0) > 0:
             global_alpha = (
-                bias_alpha_schedule(step) if global_cfg["model"].get("bias_interpolation", False) else 0.0
+                bias_alpha_schedule(
+                    step,
+                    warmup_steps=global_cfg["model"].get("bias_interpolation_warmup_steps", 5000),
+                )
+                if global_cfg["model"].get("bias_interpolation", False)
+                else 0.0
             )
             sanity_alpha = (
-                bias_alpha_schedule(step) if sanity_cfg["model"].get("bias_interpolation", False) else 0.0
+                bias_alpha_schedule(
+                    step,
+                    warmup_steps=sanity_cfg["model"].get("bias_interpolation_warmup_steps", 5000),
+                )
+                if sanity_cfg["model"].get("bias_interpolation", False)
+                else 0.0
             )
             update_expert_biases(
                 global_ddp.module,

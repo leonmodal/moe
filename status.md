@@ -142,6 +142,21 @@ Observed behavior on the exact runs:
   - no catastrophic blow-up through 1000 DDP steps
   - representative CE diffs: step 100 `0.055992`, step 500 `0.010468`, step 900 `0.074997`, step 999 `0.012322`
   - worst observed CE diff in that run: `2.535876` at step 15
+- `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config /tmp/moe/tmp_configs/interp_4_layers/global_moe.yaml --sanity-config /tmp/moe/tmp_configs/interp_4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 500 --data-mode parquet --batch-size 1 --seq-len 128 --amp-bf16 --gradient-checkpointing config --static-graph off --report-every 50`
+- result (`4_layers`, `bf16`, real parquet data, interpolation restored with warmup `5000`):
+  - step 0: `12.126092` vs `12.127457` (CE diff `0.001365`)
+  - step 50: `7.744940` vs `7.673828` (CE diff `0.071112`)
+  - step 100: `8.201558` vs `8.174387` (CE diff `0.027171`)
+  - step 150: `7.815928` vs `7.811861` (CE diff `0.004067`)
+  - step 200: `7.640862` vs `7.655036` (CE diff `0.014175`)
+  - step 250: `7.710170` vs `7.687034` (CE diff `0.023136`)
+  - step 300: `7.395101` vs `7.311156` (CE diff `0.083945`)
+  - step 350: `7.696858` vs `7.631919` (CE diff `0.064939`)
+  - step 400: `7.619305` vs `7.556596` (CE diff `0.062709`)
+  - step 450: `7.654131` vs `7.618386` (CE diff `0.035745`)
+  - step 499: `7.613384` vs `7.516917` (CE diff `0.096467`)
+  - worst observed CE diff: `0.653481` at step `12`
+  - note: this parity run uses the real 4-layer configs and real parquet data, but keeps the standard parity-harness batch shape (`batch_size=1`, `seq_len=128`) rather than the full training config token load
 - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 100 --data-mode parquet --batch-size 1 --seq-len 128 --amp-bf16 --gradient-checkpointing off --bias-update-rate 0 --report-every 20`
 - result (`bf16`, checkpointing off, bias updates off):
   - step 99 CE diff: `0.078086`
