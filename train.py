@@ -47,6 +47,10 @@ def configure_liger_kernels(cfg: dict) -> str:
     `Qwen3MoeForCausalLM.forward`. Keep only the validated-safe RoPE and RMSNorm
     patches for that model family.
     """
+    training_cfg = cfg.get("training", {})
+    if training_cfg.get("disable_liger", False) or os.environ.get("MOE_DISABLE_LIGER", "0") == "1":
+        return "disabled"
+
     from liger_kernel.transformers import apply_liger_kernel_to_qwen3_moe
 
     if cfg["model"]["type"] == "moe_everything":
@@ -752,6 +756,7 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
 
     log_with = "wandb" if train_cfg.wandb_project else None
+    accelerator_mixed_precision = "no" if train_cfg.mixed_precision == "fp32" else train_cfg.mixed_precision
     ddp_kwargs = []
     if cfg["model"]["type"] == "moe_everything":
         # Shared-parameter MoE paths are not safe under DDP static_graph. In
@@ -760,7 +765,7 @@ def main() -> None:
         # deterministic branch routing.
         ddp_kwargs.append(DistributedDataParallelKwargs(static_graph=False))
     accelerator = Accelerator(
-        mixed_precision=train_cfg.mixed_precision,
+        mixed_precision=accelerator_mixed_precision,
         gradient_accumulation_steps=train_cfg.gradient_accumulation,
         log_with=log_with,
         project_dir=train_cfg.output_dir,

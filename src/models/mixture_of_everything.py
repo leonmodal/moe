@@ -35,6 +35,7 @@ Design notes:
     each include their own RMSNorm, applied before computation.
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -420,6 +421,11 @@ class AttentionExpertBank(nn.Module):
         unique_experts: torch.Tensor,
         counts: torch.Tensor,
     ) -> torch.Tensor | None:
+        if (
+            os.environ.get("MOE_EVERYTHING_DISABLE_GROUPED_MM", "0") == "1"
+            or os.environ.get("MOE_EVERYTHING_DISABLE_ATTN_GROUPED_MM", "0") == "1"
+        ):
+            return None
         if (
             not sorted_inputs.is_cuda
             or sorted_inputs.dtype not in (torch.bfloat16, torch.float16)

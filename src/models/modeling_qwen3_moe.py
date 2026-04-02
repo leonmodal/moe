@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections.abc import Callable
 from typing import Optional
 
@@ -233,6 +234,11 @@ class Qwen3MoeExperts(nn.Module):
         expert_weights_t: torch.Tensor,
         counts: torch.Tensor,
     ) -> torch.Tensor | None:
+        if (
+            os.environ.get("MOE_EVERYTHING_DISABLE_GROUPED_MM", "0") == "1"
+            or os.environ.get("MOE_EVERYTHING_DISABLE_MLP_GROUPED_MM", "0") == "1"
+        ):
+            return None
         if (
             not sorted_inputs.is_cuda
             or sorted_inputs.dtype not in (torch.bfloat16, torch.float16)

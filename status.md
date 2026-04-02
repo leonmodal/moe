@@ -454,13 +454,82 @@ Observed behavior on the exact runs:
     - representative CE diffs: step `10` `0.000192`, step `30` `0.077217`, step `60` `0.020740`, step `99` `0.059988`
     - summary: `max_ce_diff=1.357561@step12`, `max_loss_diff=1.357558@step12`
     - read: if a larger effective batch is needed, `batch_size=1` plus accumulation is significantly less harmful to parity than `batch_size=4`
+  - added `MOE_EVERYTHING_DISABLE_GROUPED_MM=1` kill-switches in:
+    - `src/models/mixture_of_everything.py` for the attention-bank grouped-matmul fast path
+    - `src/models/modeling_qwen3_moe.py` for the shared `Qwen3MoeExperts` grouped-matmul fast path
+  - apples-to-apples current bf16 baseline (no kill-switch):
+    - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 30 --data-mode parquet --batch-size 1 --seq-len 1024 --amp-bf16 --gradient-checkpointing off --static-graph off --report-every 5 --capture-logits off`
+    - summary: `max_ce_diff=7.688423@step12`, `max_loss_diff=7.688437@step12`
+  - same run with both grouped-matmul fast paths disabled:
+    - `MOE_EVERYTHING_DISABLE_GROUPED_MM=1 uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 30 --data-mode parquet --batch-size 1 --seq-len 1024 --amp-bf16 --gradient-checkpointing off --static-graph off --report-every 5 --capture-logits off`
+    - representative CE diffs improved at the reported checkpoints: step `10` `0.001384`, step `20` `0.011292`, step `25` `0.006100`, step `29` `0.043180`
+    - summary: `max_ce_diff=0.729905@step12`, `max_loss_diff=0.729906@step12`
+  - however, the grouped-matmul kill-switch is not a full fix:
+    - focused reruns remained unstable and still showed catastrophic bf16 spikes
+    - with bias updates enabled:
+      - `MOE_EVERYTHING_DISABLE_GROUPED_MM=1 ... --steps 15 --report-every 1`
+      - summary: `max_ce_diff=9.808236@step13`, `max_loss_diff=9.808259@step13`
+    - with bias updates disabled:
+      - `MOE_EVERYTHING_DISABLE_GROUPED_MM=1 ... --steps 15 --report-every 1 --bias-update-rate 0`
+      - summary: `max_ce_diff=6.138495@step12`, `max_loss_diff=6.138523@step12`
+    - read: grouped matmul is a major bf16 contributor/amplifier, but there is still at least one additional bf16-sensitive mismatch elsewhere
+  - split the grouped-matmul kill-switch into:
+    - `MOE_EVERYTHING_DISABLE_ATTN_GROUPED_MM=1` for the `mixture_of_everything` attention-bank grouped matmuls
+    - `MOE_EVERYTHING_DISABLE_MLP_GROUPED_MM=1` for the shared `Qwen3MoeExperts` grouped matmuls
+  - on the harsher `8 GPU`, `seq_len=1024`, `batch_size=4`, `steps=15`, bf16 no-checkpointing harness:
+    - baseline:
+      - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 15 --data-mode parquet --batch-size 4 --seq-len 1024 --amp-bf16 --gradient-checkpointing off --static-graph off --report-every 1 --capture-logits off`
+      - summary: `max_ce_diff=12.763151@step12`, `max_loss_diff=12.763174@step12`
+    - attention grouped-matmul disabled only:
+      - `MOE_EVERYTHING_DISABLE_ATTN_GROUPED_MM=1 ...`
+      - summary: `max_ce_diff=0.138773@step12`, `max_loss_diff=0.138775@step12`
+      - read: the `mixture_of_everything` per-head attention grouped-matmul path is a major bf16 mismatch source
+    - shared MLP grouped-matmul disabled only:
+      - `MOE_EVERYTHING_DISABLE_MLP_GROUPED_MM=1 ...`
+      - summary: `max_ce_diff=0.062117@step11`, `max_loss_diff=0.062118@step11`
+      - read: the shared `Qwen3MoeExperts` grouped-matmul path is also a strong bf16 amplifier, even though it is common to both models
+    - both grouped-matmul paths disabled together:
+      - `MOE_EVERYTHING_DISABLE_ATTN_GROUPED_MM=1 MOE_EVERYTHING_DISABLE_MLP_GROUPED_MM=1 ...`
+      - summary: `max_ce_diff=6.096264@step12`, `max_loss_diff=6.096291@step12`
+      - read: the bf16 instability is not additive in a simple way; disabling both kernels does not restore parity
+    - attention grouped-matmul disabled with router bias updates turned off:
+      - `MOE_EVERYTHING_DISABLE_ATTN_GROUPED_MM=1 ... --bias-update-rate 0`
+      - summary: `max_ce_diff=11.765869@step12`, `max_loss_diff=11.765894@step12`
+      - read: `bias_update_rate=0` is not a robust fix and does not explain the root cause; the bf16 execution path is still the primary issue
+  - added real fp32/no-Liger train configs under `configs/depth_matched_fp32_no_liger/{4_layers,8_layers,16_layers}`
+    - each copied depth-matched config now sets `training.mixed_precision: fp32`
+    - each sets `training.disable_liger: true`
+    - `train.py` now honors `training.disable_liger: true` (and `MOE_DISABLE_LIGER=1`) so these configs really skip Liger patching
+  - `train.py` also maps repo-facing `mixed_precision: fp32` onto Accelerate full precision (`mixed_precision="no"`), so the fp32 configs actually launch under DDP
+  - all bf16 configs under `configs/depth_matched/{4_layers,8_layers,16_layers}` now also set `training.disable_liger: true`, so the depth-matched folders no longer rely on implicit Liger patching by default
+  - validated 8-layer fp32/no-Liger DDP batch safety on the real folder configs in `configs/depth_matched_fp32_no_liger/8_layers`
+    - target was `64` effective per rank
+    - `batch_size=64`, `gradient_accumulation=1` is too large: on the 8-layer sanity config it OOMs during CE loss after using about `166 GiB` per GPU and trying to allocate another `37.09 GiB`
+    - `batch_size=32`, `gradient_accumulation=2` gives the same `64` effective per rank and is stable
+  - real 8-GPU DDP, `max_steps=10`, `batch_size=32`, `gradient_accumulation=2`, fp32/no-Liger:
+    - `configs/depth_matched_fp32_no_liger/8_layers/global_moe.yaml`
+      - passed through step `10`
+      - representative logs: step `1` CE `12.1337`, step `10` CE `11.7065`
+    - `configs/depth_matched_fp32_no_liger/8_layers/moe_everything_per_head_independent_perlayer_prenorm.yaml`
+      - passed through step `10`
+      - representative logs: step `1` CE `12.1227`, step `10` CE `11.9779`
+    - `configs/depth_matched_fp32_no_liger/8_layers/moe_everything_per_head_precompute_kv_perlayer_prenorm.yaml`
+      - passed through step `10`
+      - representative logs: step `1` CE `12.1081`, step `10` CE `12.0191`
+    - `configs/depth_matched_fp32_no_liger/8_layers/moe_everything_per_head_precompute_kv_sanity.yaml`
+      - passed through step `10`
+      - representative logs: step `1` CE `12.1337`, step `10` CE `11.7065`
+    - `configs/depth_matched_fp32_no_liger/8_layers/standard_moe.yaml`
+      - passed through step `10`
+      - representative logs: step `1` CE `12.1399`, step `10` CE `11.6869`
+    - read: the whole `8_layers` fp32/no-Liger folder is currently validated for at least `10` optimizer steps at `batch_size=32`, `gradient_accumulation=2`
 - Current read:
   - on this 8-GPU node, short-context (`seq_len=128`) DDP parity is fixed end-to-end on the tested 4-layer harness
   - the `global_moe` and `alternating_global_moe` sanity models are now logically aligned in forward and in bf16 backward for the short-context harness that originally failed
   - this is no longer a sanity-only workaround; the fix lives in the shared `mixture_of_everything` attention runner used by the per-head codepaths
   - the previous long-run blow-up at short context was a real implementation mismatch in the shared attention backend path, not just random bf16 noise
   - however, full `seq_len=1024` dense parity on real parquet data is still not fully reconciled: step `0` forward stays exact, but optimizer-facing drift reappears by step `1` and still shows large transient CE spikes over longer runs
-  - the best simple knob found so far is `bias_update_rate=0`, which makes the 1024-token runs much closer but does not restore exact parity
+  - `bias_update_rate=0` is not a robust fix; it helped some earlier probes but worsened the newer `batch_size=4` attention-isolated run
   - fp32 does restore exact parity on the tested `30`-step `seq_len=1024` window, so the remaining issue is specifically in the bf16 path rather than in the mapped initialization or routing logic
   - for parity/debugging, Liger should stay off: even the symmetric safe subset breaks exact step-0 equivalence
   - the fp32 Liger result confirms this is not just a mixed-precision artifact: safe-Liger itself is not parity-preserving on the mapped global-vs-sanity harness
@@ -468,6 +537,13 @@ Observed behavior on the exact runs:
     - larger micro-batch (`batch_size=4`) is harmful
     - gradient accumulation (`batch_size=1`, `grad_accum_steps=4`) is much less harmful than larger micro-batch
     - gradient checkpointing helps the early spike but does not solve long-run drift
+  - the router path itself already runs in fp32; the remaining no-Liger mismatch is more likely in other bf16 execution paths
+  - the strongest MoEverything-specific bf16 suspect now is the attention-bank grouped-matmul path in `mixture_of_everything`
+  - the shared `Qwen3MoeExperts` grouped-matmul path is also a major bf16 amplifier once trajectories begin to separate
+  - those grouped-matmul kernels are not the entire story, because disabling both together still leaves large step-12 spikes
+  - for practical training safety, the 8-layer fp32/no-Liger configs are currently the most validated path:
+    - `64` effective batch per rank via `batch_size=32`, `gradient_accumulation=2`
+    - validated on all five 8-layer configs for `10` optimizer steps on this 8-GPU B200 node
   - DeepSpeed ZeRO-1 is not a fix for this issue on the current harness
 
 ## Remaining Open Items

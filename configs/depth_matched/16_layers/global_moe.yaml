@@ -44,6 +44,7 @@ training:
   batch_size: 16
   gradient_accumulation: 4
   mixed_precision: bf16
+  disable_liger: true
   gradient_checkpointing: false
   log_every: 1
   routing_log_every: 50
