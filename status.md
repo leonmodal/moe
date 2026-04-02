@@ -279,6 +279,44 @@ Observed behavior on the exact runs:
     - step 200 CE diff `0.449409`
 - So the smaller parity-harness token load should be treated as a debugging signal, not the final answer for training-match quality.
 
+## Full-Load Dataset Sensitivity Check
+
+- I checked whether the large full-load `4_layers` parity gap is just a model-side effect or is strongly data-sensitive.
+- The local packed parquet corpus does not look obviously malformed on a basic inspection:
+  - `8192` parquet shards under `data/parquet`
+  - sampled rows are normal natural-language documents
+  - sampled row-length stats are in the same ballpark as an official FineWebEdu sample:
+    - local packed parquet: char-length `p50 ~= 2998`, `p95 ~= 13567`
+    - official FineWebEdu sample parquet: char-length `p50 ~= 2935`, `p95 ~= 13840`
+- So this is not a trivial "empty rows" or "completely broken text column" issue.
+
+- I then ran three full-load controls on `8 x B200`, `batch_size=32`, `seq_len=1024`, interpolation restored (`bias_interpolation: true`, `bias_interpolation_warmup_steps: 5000`, `global_router_update: true`):
+  - current packed parquet (`data/parquet`):
+    - step 0 CE diff `0.000160`
+    - step 50 CE diff `0.120424`
+    - step 100 CE diff `0.343344`
+    - step 150 CE diff `0.441594`
+    - step 200 CE diff `0.449409`
+  - official FineWebEdu sample parquet generated from `HuggingFaceFW/fineweb-edu` `sample-10BT`:
+    - added `scripts/create_official_finewebedu_sample_parquet.py` to materialize a clean local parquet sample
+    - generated `data/parquet_finewebedu_official_sample_8x10k` with `8` shards x `10000` rows
+    - step 0 CE diff `0.000099`
+    - step 50 CE diff `0.008281`
+    - step 100 CE diff `0.286312`
+    - the run later died with a separate OOM / peer-memory failure after step 100, so there is not yet a clean step-200 number on this dataset
+  - synthetic tokens:
+    - step 0 CE diff `0.000331`
+    - step 50 CE diff `0.000346`
+    - step 99 CE diff `0.003066`
+    - summary max CE diff `0.011969 @ step 9`
+
+- Current read:
+  - the large full-load drift is strongly data-sensitive
+  - it is not explained purely by "large batch/sequence length" because synthetic stays tightly matched
+  - it is also not explained purely by "the packed parquet is corrupted" because the official FineWebEdu sample still drifts under real text, just less severely early
+  - the local packed parquet corpus is therefore a likely amplifier of the parity gap, not yet proven to be the sole root cause
+  - the next data-side audit should focus on corpus composition / ordering / duplication differences in `leonli66/latent-cot-finewebedu`, not just row-format correctness
+
 ## Same-Init And Bias-Update Policy
 
 - Mapped init is now a first-class training option instead of living only in debug scripts:
