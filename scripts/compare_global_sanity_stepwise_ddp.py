@@ -26,6 +26,7 @@ from typing import Iterator
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
@@ -55,6 +56,13 @@ from train import (  # noqa: E402
 @dataclass
 class _FakeAccelerator:
     num_processes: int
+
+
+@dataclass
+class StepResult:
+    loss: float
+    ce_loss: float
+    logits: torch.Tensor
 
 
 def _dist_info() -> tuple[int, int, int, torch.device]:
@@ -134,7 +142,7 @@ def _step_model(
     batch: dict[str, torch.Tensor],
     *,
     amp_bf16: bool,
-) -> tuple[float, torch.Tensor]:
+) -> StepResult:
     optimizer.zero_grad(set_to_none=True)
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp_bf16):
         output = model(
@@ -143,9 +151,21 @@ def _step_model(
             output_router_logits=True,
         )
         loss = output.loss
+    with torch.no_grad():
+        shift_logits = output.logits[..., :-1, :].float().contiguous()
+        shift_labels = batch["labels"][..., 1:].contiguous()
+        ce_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.shape[-1]),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
     loss.backward()
     optimizer.step()
-    return float(loss.item()), output.logits.detach()
+    return StepResult(
+        loss=float(loss.item()),
+        ce_loss=float(ce_loss.item()),
+        logits=output.logits.detach(),
+    )
 
 
 def _reduce_mean(value: float, device: torch.device) -> float:
@@ -176,6 +196,7 @@ def main() -> None:
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data-seed", type=int, default=1234)
+    parser.add_argument("--report-every", type=int, default=1)
     parser.add_argument("--amp-bf16", action="store_true")
     parser.add_argument("--data-mode", choices=("synthetic", "parquet"), default="parquet")
     parser.add_argument("--data-dir", default="./data/parquet")
@@ -303,20 +324,25 @@ def main() -> None:
             f"sanity={sanity_cfg['training'].get('gradient_checkpointing', False)})"
         )
         print(
-            "step  global_loss  sanity_loss  |g-s|  logits_max  grad_max  "
-            "param_max  opt_max  mismatched_selected"
+            "step  global_ce  sanity_ce  |ce|  global_loss  sanity_loss  |loss|  "
+            "logits_max  grad_max  param_max  opt_max  mismatched_selected"
         )
+
+    max_ce_diff = 0.0
+    max_ce_step = -1
+    max_loss_diff = 0.0
+    max_loss_step = -1
 
     for step in range(args.steps):
         batch = next(iterator)
 
-        global_loss, global_logits = _step_model(
+        global_result = _step_model(
             global_ddp,
             global_opt,
             batch,
             amp_bf16=args.amp_bf16,
         )
-        sanity_loss, sanity_logits = _step_model(
+        sanity_result = _step_model(
             sanity_ddp,
             sanity_opt,
             batch,
@@ -341,36 +367,58 @@ def main() -> None:
                 router_groups=get_bias_update_router_groups(sanity_ddp.module, mlp_only=True),
             )
 
-        logits_diff = (global_logits.float() - sanity_logits.float()).abs().max().item()
+        logits_diff = (global_result.logits.float() - sanity_result.logits.float()).abs().max().item()
         mismatches = _selected_expert_mismatches(global_ddp.module, sanity_ddp.module)
         selected_total = sum(mismatches)
 
-        mean_global_loss = _reduce_mean(global_loss, device)
-        mean_sanity_loss = _reduce_mean(sanity_loss, device)
+        mean_global_loss = _reduce_mean(global_result.loss, device)
+        mean_sanity_loss = _reduce_mean(sanity_result.loss, device)
+        mean_global_ce = _reduce_mean(global_result.ce_loss, device)
+        mean_sanity_ce = _reduce_mean(sanity_result.ce_loss, device)
         max_logits_diff = _reduce_max(logits_diff, device)
         total_selected = _reduce_sum(selected_total, device)
 
         dist.barrier(device_ids=[local_rank])
 
         if is_main:
+            ce_diff = abs(mean_global_ce - mean_sanity_ce)
+            loss_diff = abs(mean_global_loss - mean_sanity_loss)
+            if ce_diff > max_ce_diff:
+                max_ce_diff = ce_diff
+                max_ce_step = step
+            if loss_diff > max_loss_diff:
+                max_loss_diff = loss_diff
+                max_loss_step = step
             grad_name, grad_diff = _compare_grad_pairs(pairs)
             param_name, param_diff = _compare_param_pairs(pairs)
             opt_name, opt_key, opt_diff = _compare_optimizer_states(pairs, global_opt, sanity_opt)
 
-            print(
-                f"{step:>4d}  "
-                f"{mean_global_loss:>11.6f}  {mean_sanity_loss:>11.6f}  "
-                f"{abs(mean_global_loss - mean_sanity_loss):>7.6f}  "
-                f"{max_logits_diff:>10.6f}  {grad_diff:>8.3g}  "
-                f"{param_diff:>9.3g}  {opt_diff:>7.3g}  {total_selected:>6d}"
+            should_report = (
+                step == 0
+                or step == args.steps - 1
+                or (args.report_every > 0 and step % args.report_every == 0)
             )
-            if grad_name:
-                print(f"      worst_grad={grad_name}")
-            if param_name:
-                print(f"      worst_param={param_name}")
-            if opt_name:
-                print(f"      worst_opt={opt_name}:{opt_key}")
-            print(f"      mismatches_by_layer(local_rank0)={mismatches}")
+            if should_report:
+                print(
+                    f"{step:>4d}  "
+                    f"{mean_global_ce:>9.6f}  {mean_sanity_ce:>9.6f}  {ce_diff:>7.6f}  "
+                    f"{mean_global_loss:>11.6f}  {mean_sanity_loss:>11.6f}  {loss_diff:>7.6f}  "
+                    f"{max_logits_diff:>10.6f}  {grad_diff:>8.3g}  "
+                    f"{param_diff:>9.3g}  {opt_diff:>7.3g}  {total_selected:>6d}"
+                )
+                if grad_name:
+                    print(f"      worst_grad={grad_name}")
+                if param_name:
+                    print(f"      worst_param={param_name}")
+                if opt_name:
+                    print(f"      worst_opt={opt_name}:{opt_key}")
+                print(f"      mismatches_by_layer(local_rank0)={mismatches}")
+
+    if is_main:
+        print(
+            f"summary max_ce_diff={max_ce_diff:.6f}@step{max_ce_step} "
+            f"max_loss_diff={max_loss_diff:.6f}@step{max_loss_step}"
+        )
 
     dist.barrier(device_ids=[local_rank])
     dist.destroy_process_group()

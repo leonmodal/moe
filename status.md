@@ -137,6 +137,20 @@ Observed behavior on the exact runs:
   - step 0: `|g-s|=0.002599`
   - step 1: `|g-s|=0.004048`
   - step 2: `|g-s|=0.001905`
+- `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 1000 --data-mode parquet --batch-size 1 --seq-len 128 --amp-bf16 --gradient-checkpointing config --report-every 100`
+- result (`bf16`, config checkpointing settings):
+  - no catastrophic blow-up through 1000 DDP steps
+  - representative CE diffs: step 100 `0.055992`, step 500 `0.010468`, step 900 `0.074997`, step 999 `0.012322`
+  - worst observed CE diff in that run: `2.535876` at step 15
+- `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 100 --data-mode parquet --batch-size 1 --seq-len 128 --amp-bf16 --gradient-checkpointing off --bias-update-rate 0 --report-every 20`
+- result (`bf16`, checkpointing off, bias updates off):
+  - step 99 CE diff: `0.078086`
+  - worst observed CE diff in that run: `1.916025` at step 16
+- `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 100 --data-mode parquet --batch-size 1 --seq-len 128 --gradient-checkpointing off --bias-update-rate 0 --report-every 20`
+- result (`fp32`, checkpointing off, bias updates off):
+  - step 0: exact CE/loss match
+  - step 99 CE diff: `0.032928`
+  - worst observed CE diff in that run: `2.108144` at step 11
 - real 8-GPU `train.py` smoke runs on temporary 2-step copies of the production configs under `configs/depth_matched/4_layers`:
   - `global_moe.yaml` completed
   - `standard_moe.yaml` completed
@@ -156,12 +170,14 @@ Observed behavior on the exact runs:
   - branch routing is deterministic in this sanity mode
   - leaving a trainable `branch_router.gate.weight` registered created an unused DDP parameter
 - Added `scripts/compare_global_sanity_stepwise_ddp.py` for side-by-side DDP parity checks on real 8-GPU runs, with overrides for `static_graph`, LR, and bias-update rate.
+- Aligned the parity-harness config to the baseline training mode:
+  - `moe_everything_per_head_precompute_kv_sanity.yaml` now keeps `gradient_checkpointing: false` by default, matching `global_moe.yaml`
 - After that fix, mapped-init alternating-global sanity now matches the global model exactly through:
   - Q projection
   - K projection
   - V projection
   - attention output
-- The remaining non-equivalence is small bf16 numerical drift in the split per-head path, not a catastrophic training bug.
+- The remaining non-equivalence is no longer a DDP correctness failure, but it is still enough to create transient CE spikes during longer parity runs.
 
 ## Ready To Run
 
@@ -171,6 +187,7 @@ Observed behavior on the exact runs:
   - the DDP `static_graph=False` fix applies to real `moe_everything` training
 - The configs under `configs/depth_matched/4_layers` are runnable with the current codebase.
 - `moe_everything_per_head_precompute_kv_sanity.yaml` is still only a parity harness, not the real target architecture.
+- The sanity config now defaults to the same checkpointing mode as the global baseline so parity runs are cleaner.
 - For real per-head training, the main configs to use are:
   - `moe_everything_per_head_precompute_kv_perlayer_prenorm.yaml`
   - `moe_everything_per_head_independent_perlayer_prenorm.yaml`
@@ -179,13 +196,16 @@ Observed behavior on the exact runs:
 
 - The huge step-1 split was a DDP configuration bug, not a forward-path parity failure.
 - Manual 8-shard averaging in one process stayed aligned, which ruled out the model math, optimizer, and bias updates.
-- With `static_graph=False`, DDP either:
-  - stays aligned (`fp32`)
-  - or shows only small expected `bf16` numeric drift
+- With `static_graph=False`, mapped-init DDP checks stay aligned through the first steps:
+  - exact at step 0 in `fp32`
+  - close in early-step `bf16`
 - With `static_graph=True`, the same mapped-init run diverged immediately after step 0.
 - Disabling `static_graph` also exposed the real DDP contract violation:
   - the alternating-global sanity model still had an unused `branch_router.gate.weight`
   - after removing that parameter, DDP with `static_graph=False` runs cleanly
+- On longer 100-1000 step runs, the pair remains stable but not stepwise-identical:
+  - later CE values stay in the same ballpark
+  - transient early CE spikes can still appear, even with checkpointing off and bias updates off
 
 ## Current Read
 
@@ -194,7 +214,9 @@ Observed behavior on the exact runs:
 - The fixed bank bug was real and removed the Q/K/V/attention mismatch.
 - The catastrophic loss drift came from running `moe_everything` under DDP with `static_graph=True`.
 - The deterministic sanity mode also incorrectly registered an unused learned branch router, which made the DDP setup invalid.
-- After fixing the objective mismatch, removing the unused branch router, and disabling `static_graph` for `moe_everything`, 8-GPU mapped-init parity is restored in `fp32` and close in `bf16`.
+- After fixing the objective mismatch, removing the unused branch router, and disabling `static_graph` for `moe_everything`, the catastrophic DDP failure is gone.
+- The alternating-global sanity harness is now good for implementation/regression checks, but not for requiring near-identical CE at every training step over long runs.
+- In practice the global baseline and sanity harness remain in the same training regime over 1k DDP steps, but they can show transient CE gaps that are much larger than the first-step mapped-init deltas.
 
 ## Remaining Open Items
 
