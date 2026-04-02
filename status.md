@@ -157,6 +157,11 @@ Observed behavior on the exact runs:
   - step 499: `7.613384` vs `7.516917` (CE diff `0.096467`)
   - worst observed CE diff: `0.653481` at step `12`
   - note: this parity run uses the real 4-layer configs and real parquet data, but keeps the standard parity-harness batch shape (`batch_size=1`, `seq_len=128`) rather than the full training config token load
+- `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config /tmp/moe/tmp_configs/interp_4_layers/global_moe.yaml --sanity-config /tmp/moe/tmp_configs/interp_4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 2 --data-mode parquet --batch-size 32 --seq-len 1024 --amp-bf16 --gradient-checkpointing config --static-graph off --report-every 1`
+- result (`4_layers`, `bf16`, real parquet data, interpolation restored, full training token load):
+  - step 0: `12.083158` vs `12.083319` (CE diff `0.000160`)
+  - step 1: `10.861225` vs `10.861650` (CE diff `0.000425`)
+  - this paired `global + sanity` DDP run did fit on local `8 x B200` at the full config token load
 - `uv run torchrun --standalone --nproc_per_node 8 scripts/compare_global_sanity_stepwise_ddp.py --global-config configs/depth_matched/4_layers/global_moe.yaml --sanity-config configs/depth_matched/4_layers/moe_everything_per_head_precompute_kv_sanity.yaml --steps 100 --data-mode parquet --batch-size 1 --seq-len 128 --amp-bf16 --gradient-checkpointing off --bias-update-rate 0 --report-every 20`
 - result (`bf16`, checkpointing off, bias updates off):
   - step 99 CE diff: `0.078086`
