@@ -76,8 +76,6 @@ Single-node training:
 - **`per_head_precompute_kv`** -- 1 router, Q/K/V/O bundled per expert, per-expert KV tables
 - **`per_head_fully_independent`** -- 4 routers, Q/K/V/O independently routed
 
-Other modes (legacy): `bundled`, `kv_paired`, `qk_paired`, `fully_independent`, `precompute_kv`.
-
 ## Shared Concepts
 
 Both per-head modes use GQA (Grouped Query Attention):

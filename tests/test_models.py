@@ -413,7 +413,7 @@ from src.models.mixture_of_everything import AttentionExpertBank, MoEverythingCo
 from train import get_bias_update_router_groups, get_bias_update_routers, update_expert_biases
 
 
-def tiny_moe_everything_config(mode="bundled"):
+def tiny_moe_everything_config(mode="per_head_fully_independent"):
     return MoEverythingConfig(
         vocab_size=256,
         hidden_size=64,
@@ -436,17 +436,11 @@ def tiny_moe_everything_config(mode="bundled"):
 
 
 MOE_EVERYTHING_MODES = [
-    "bundled",
-    "kv_paired",
-    "qk_paired",
-    "fully_independent",
     "per_head_fully_independent",
-    "precompute_kv",
     "per_head_precompute_kv",
 ]
 
 PRECOMPUTE_KV_MODES = {
-    "precompute_kv",
     "per_head_precompute_kv",
 }
 
@@ -466,7 +460,7 @@ def test_moe_everything_deepseek_router_weights_initialized():
 
 
 def test_moe_everything_supports_experts_implementation_dispatch():
-    model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config("bundled"))
+    model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config("per_head_fully_independent"))
     assert hasattr(model, "set_experts_implementation")
     model.set_experts_implementation("eager")
     assert model.config._experts_implementation == "eager"
@@ -520,7 +514,7 @@ def test_moe_everything_loss_decreases(mode):
 
 # ── MoE-Everything with DeepSeek routing ───────────────────────────────
 
-def tiny_moe_everything_deepseek_config(mode="bundled"):
+def tiny_moe_everything_deepseek_config(mode="per_head_fully_independent"):
     return MoEverythingConfig(
         vocab_size=256,
         hidden_size=64,
@@ -590,15 +584,6 @@ def test_moe_everything_deepseek_loss_decreases(mode):
 def test_moe_everything_deepseek_routers_found():
     """DeepSeekRouter instances should be discoverable for bias updates."""
     from src.models.router import DeepSeekRouter
-    model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config("bundled"))
-    ds_routers = [m for m in model.modules() if isinstance(m, DeepSeekRouter)]
-    # bundled: 1 attn router + 1 MLP gate = 2
-    assert len(ds_routers) == 2, f"Expected 2 DeepSeekRouters, got {len(ds_routers)}"
-
-    model_fi = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config("fully_independent"))
-    ds_routers_fi = [m for m in model_fi.modules() if isinstance(m, DeepSeekRouter)]
-    # fully_independent: 4 attn routers + 1 MLP gate = 5
-    assert len(ds_routers_fi) == 5, f"Expected 5 DeepSeekRouters, got {len(ds_routers_fi)}"
 
     model_phfi = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config("per_head_fully_independent"))
     ds_routers_phfi = [m for m in model_phfi.modules() if isinstance(m, DeepSeekRouter)]
@@ -615,17 +600,9 @@ def test_moe_everything_deepseek_routers_found():
 
 
 def _expected_attn_router_keys(mode: str, num_heads: int = 2, num_kv_heads: int = 1) -> set[str]:
-    if mode in ("bundled", "precompute_kv"):
-        return {"attn"}
     if mode == "per_head_precompute_kv":
         return {"attn"}
     if mode == "per_head_fully_independent":
-        return {"q", "k", "v", "o"}
-    if mode == "kv_paired":
-        return {"kv", "q", "o"}
-    if mode == "qk_paired":
-        return {"qk", "v", "o"}
-    if mode == "fully_independent":
         return {"q", "k", "v", "o"}
     raise ValueError(mode)
 
@@ -651,7 +628,7 @@ def test_moe_everything_output_router_fields(mode):
 def test_moe_everything_deepseek_checkpointing_counts_once():
     from src.models.router import DeepSeekRouter
 
-    model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config("bundled")).train()
+    model = MoEverythingForCausalLM(tiny_moe_everything_deepseek_config("per_head_precompute_kv")).train()
     model.gradient_checkpointing_enable()
     ids, labels = _dummy_batch()
 
@@ -664,20 +641,17 @@ def test_moe_everything_deepseek_checkpointing_counts_once():
     num_tokens = ids.numel()
     num_depths = model.model.num_depths
     mlp_topk = model.config.num_experts_per_tok
-    attn_topk = model.config.num_attn_experts_per_tok
 
-    attn_count = model.model.attn_bank.router.local_tokens_per_expert.sum().item()
     mlp_count = model.model.mlp_bank.gate.local_tokens_per_expert.sum().item()
     mlp_active_tokens = sum(mask.sum().item() for mask in out.router_token_masks if mask is not None)
 
-    assert attn_count == pytest.approx(num_tokens * num_depths * attn_topk)
     assert mlp_count == pytest.approx(mlp_active_tokens * mlp_topk)
 
 
 # ── Per-layer router tests ────────────────────────────────────────────────
 
 def test_per_layer_router_creates_separate_routers():
-    config = tiny_moe_everything_config("bundled")
+    config = tiny_moe_everything_config("per_head_fully_independent")
     config.per_layer_router = True
     model = MoEverythingForCausalLM(config)
     assert hasattr(model.model, "branch_routers")
@@ -686,7 +660,7 @@ def test_per_layer_router_creates_separate_routers():
 
 
 def test_per_layer_router_forward_and_grads():
-    config = tiny_moe_everything_config("bundled")
+    config = tiny_moe_everything_config("per_head_fully_independent")
     config.per_layer_router = True
     model = MoEverythingForCausalLM(config).train()
     ids, labels = _dummy_batch()
@@ -697,8 +671,8 @@ def test_per_layer_router_forward_and_grads():
         assert router.gate.weight.grad is not None
 
 
-def test_per_layer_router_precompute_kv():
-    config = tiny_moe_everything_config("precompute_kv")
+def test_per_layer_router_per_head_precompute_kv():
+    config = tiny_moe_everything_config("per_head_precompute_kv")
     config.per_layer_router = True
     model = MoEverythingForCausalLM(config).train()
     ids, labels = _dummy_batch()
@@ -710,7 +684,7 @@ def test_per_layer_router_precompute_kv():
 # ── Per-layer MLP router tests ────────────────────────────────────────────
 
 def test_per_layer_mlp_router_creates_separate_routers():
-    config = tiny_moe_everything_deepseek_config("bundled")
+    config = tiny_moe_everything_deepseek_config("per_head_fully_independent")
     config.per_layer_mlp_router = True
     model = MoEverythingForCausalLM(config)
     bank = model.model.mlp_bank
@@ -722,7 +696,6 @@ def test_per_layer_mlp_router_creates_separate_routers():
 # ── Per-layer attention router tests ──────────────────────────────────────
 
 PER_HEAD_MODES = ["per_head_fully_independent", "per_head_precompute_kv"]
-NON_PER_HEAD_ATTN_ROUTER_MODES = ["bundled", "kv_paired", "qk_paired", "fully_independent", "precompute_kv"]
 
 
 @pytest.mark.parametrize("mode", PER_HEAD_MODES)
@@ -773,47 +746,6 @@ def test_per_layer_attn_router_loss_decreases(mode):
         out.loss.backward()
         opt.step()
     assert out.loss.item() < first_loss
-
-
-@pytest.mark.parametrize("mode", NON_PER_HEAD_ATTN_ROUTER_MODES)
-def test_non_per_head_per_layer_attn_router_creates_separate_routers(mode):
-    config = tiny_moe_everything_config(mode)
-    config.per_layer_attn_router = True
-    model = MoEverythingForCausalLM(config)
-    bank = model.model.attn_bank
-    if mode in ("bundled", "precompute_kv"):
-        assert hasattr(bank, "routers") and len(bank.routers) == config.num_hidden_layers
-    elif mode == "kv_paired":
-        assert hasattr(bank, "kv_routers") and len(bank.kv_routers) == config.num_hidden_layers
-        assert hasattr(bank, "q_routers") and len(bank.q_routers) == config.num_hidden_layers
-        assert hasattr(bank, "o_routers") and len(bank.o_routers) == config.num_hidden_layers
-    elif mode == "qk_paired":
-        assert hasattr(bank, "qk_routers") and len(bank.qk_routers) == config.num_hidden_layers
-        assert hasattr(bank, "v_routers") and len(bank.v_routers) == config.num_hidden_layers
-        assert hasattr(bank, "o_routers") and len(bank.o_routers) == config.num_hidden_layers
-    elif mode == "fully_independent":
-        assert hasattr(bank, "q_routers") and len(bank.q_routers) == config.num_hidden_layers
-        assert hasattr(bank, "k_routers") and len(bank.k_routers) == config.num_hidden_layers
-        assert hasattr(bank, "v_routers") and len(bank.v_routers) == config.num_hidden_layers
-        assert hasattr(bank, "o_routers") and len(bank.o_routers) == config.num_hidden_layers
-
-
-@pytest.mark.parametrize("mode", NON_PER_HEAD_ATTN_ROUTER_MODES)
-def test_non_per_head_per_layer_attn_router_forward_and_grads(mode):
-    config = tiny_moe_everything_config(mode)
-    config.per_layer_attn_router = True
-    model = MoEverythingForCausalLM(config).train()
-    ids, labels = _dummy_batch()
-    out = model(input_ids=ids, labels=labels)
-    assert out.loss is not None
-    out.loss.backward()
-    skip = {"model.init_k_proj.weight", "model.init_v_proj.weight", "model.init_k_norm.weight"}
-    no_grad = [
-        n for n, p in model.named_parameters()
-        if p.requires_grad and p.grad is None
-        and (mode not in PRECOMPUTE_KV_MODES or n not in skip)
-    ]
-    assert len(no_grad) == 0, f"Params without grad: {no_grad}"
 
 
 # ── Routed norm tests ─────────────────────────────────────────────────────
@@ -1707,7 +1639,7 @@ def test_sanity_config_matches_global_attention_geometry():
 # ── Dynamic depth tests ───────────────────────────────────────────────────
 
 def test_dynamic_depth_training():
-    config = tiny_moe_everything_config("bundled")
+    config = tiny_moe_everything_config("per_head_fully_independent")
     config.dynamic_depth_min = 0.5
     config.dynamic_depth_max = 1.0
     model = MoEverythingForCausalLM(config).train()
@@ -1720,7 +1652,7 @@ def test_dynamic_depth_training():
 
 
 def test_dynamic_depth_eval_uses_full():
-    config = tiny_moe_everything_config("bundled")
+    config = tiny_moe_everything_config("per_head_fully_independent")
     config.dynamic_depth_min = 0.5
     config.dynamic_depth_max = 1.0
     model = MoEverythingForCausalLM(config).eval()
@@ -1732,7 +1664,7 @@ def test_dynamic_depth_eval_uses_full():
 
 
 def test_dynamic_depth_grads():
-    config = tiny_moe_everything_config("bundled")
+    config = tiny_moe_everything_config("per_head_fully_independent")
     config.dynamic_depth_min = 0.5
     config.dynamic_depth_max = 1.0
     model = MoEverythingForCausalLM(config).train()
@@ -1750,7 +1682,7 @@ def test_dynamic_depth_grads():
 # ── Depthwise attention tests ─────────────────────────────────────────────
 
 def test_depthwise_attention_full():
-    config = tiny_moe_everything_config("bundled")
+    config = tiny_moe_everything_config("per_head_fully_independent")
     config.depthwise_attention = True
     model = MoEverythingForCausalLM(config).train()
     ids, labels = _dummy_batch()
@@ -1761,7 +1693,7 @@ def test_depthwise_attention_full():
 
 
 def test_depthwise_attention_block():
-    config = tiny_moe_everything_config("bundled")
+    config = tiny_moe_everything_config("per_head_fully_independent")
     config.num_hidden_layers = 8
     config.depthwise_attention = True
     config.depthwise_block_size = 4
@@ -1776,7 +1708,7 @@ def test_depthwise_attention_block():
 
 
 def test_depthwise_attention_precompute_kv():
-    config = tiny_moe_everything_config("precompute_kv")
+    config = tiny_moe_everything_config("per_head_precompute_kv")
     config.depthwise_attention = True
     model = MoEverythingForCausalLM(config).train()
     ids, labels = _dummy_batch()
@@ -1786,7 +1718,7 @@ def test_depthwise_attention_precompute_kv():
 
 
 def test_depthwise_attention_with_per_layer_router():
-    config = tiny_moe_everything_config("bundled")
+    config = tiny_moe_everything_config("per_head_fully_independent")
     config.per_layer_router = True
     config.depthwise_attention = True
     model = MoEverythingForCausalLM(config).train()
@@ -1799,7 +1731,7 @@ def test_depthwise_attention_with_per_layer_router():
 # ── Combined features test ────────────────────────────────────────────────
 
 def test_all_three_features_combined():
-    config = tiny_moe_everything_config("bundled")
+    config = tiny_moe_everything_config("per_head_fully_independent")
     config.per_layer_router = True
     config.dynamic_depth_min = 0.5
     config.dynamic_depth_max = 1.0
