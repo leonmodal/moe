@@ -26,6 +26,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from src.models.fp32_routing import fp32_index_add, fp32_index_select
+from src.models.triton_grouped_gemm import triton_grouped_gemm_output_input
+
 from ... import initialization as init
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
@@ -231,27 +234,38 @@ class Qwen3MoeExperts(nn.Module):
     def _maybe_grouped_mm(
         self,
         sorted_inputs: torch.Tensor,
-        expert_weights_t: torch.Tensor,
+        weight_bank: torch.Tensor,
+        unique_experts: torch.Tensor,
         counts: torch.Tensor,
     ) -> torch.Tensor | None:
         if (
             os.environ.get("MOE_EVERYTHING_DISABLE_GROUPED_MM", "0") == "1"
-            or os.environ.get("MOE_EVERYTHING_DISABLE_MLP_GROUPED_MM", "0") == "1"
+            or os.environ.get("MOE_EVERYTHING_DISABLE_MLP_GROUPED_MM", "1") == "1"
         ):
             return None
         if (
             not sorted_inputs.is_cuda
             or sorted_inputs.dtype not in (torch.bfloat16, torch.float16)
-            or not is_grouped_mm_available()
-            or not hasattr(torch, "_grouped_mm")
         ):
             return None
 
-        offsets = counts.to(device=sorted_inputs.device, dtype=torch.int32).cumsum(dim=0)
         try:
-            return torch._grouped_mm(sorted_inputs.contiguous(), expert_weights_t.contiguous(), offs=offsets)
+            return triton_grouped_gemm_output_input(
+                sorted_inputs.contiguous(),
+                weight_bank.contiguous(),
+                unique_experts,
+                counts,
+            )
         except RuntimeError:
-            return None
+            if not is_grouped_mm_available() or not hasattr(torch, "_grouped_mm"):
+                return None
+            expert_weights = weight_bank.index_select(0, unique_experts)
+            expert_weights_t = expert_weights.transpose(1, 2).contiguous()
+            offsets = counts.to(device=sorted_inputs.device, dtype=torch.int32).cumsum(dim=0)
+            try:
+                return torch._grouped_mm(sorted_inputs.contiguous(), expert_weights_t, offs=offsets)
+            except RuntimeError:
+                return None
 
     def _run_grouped_expert_linear(
         self,
@@ -260,16 +274,16 @@ class Qwen3MoeExperts(nn.Module):
         counts: torch.Tensor,
         weight_bank: torch.Tensor,
     ) -> torch.Tensor:
-        expert_weights = weight_bank.index_select(0, unique_experts)
-        expert_weights_t = expert_weights.transpose(1, 2)
-        proj = self._maybe_grouped_mm(sorted_inputs, expert_weights_t, counts)
+        proj = self._maybe_grouped_mm(sorted_inputs, weight_bank, unique_experts, counts)
 
         if proj is None:
+            expert_weights = weight_bank.index_select(0, unique_experts)
             proj = sorted_inputs.new_empty(sorted_inputs.shape[0], expert_weights.shape[1])
             start = 0
-            for expert_idx, count in zip(unique_experts.tolist(), counts.tolist()):
+            for weight, count in zip(expert_weights, counts.tolist()):
                 end = start + count
-                proj[start:end] = F.linear(sorted_inputs[start:end], weight_bank[expert_idx])
+                if count > 0:
+                    proj[start:end] = F.linear(sorted_inputs[start:end], weight)
                 start = end
 
         return proj
@@ -299,7 +313,7 @@ class Qwen3MoeExperts(nn.Module):
         sorted_weight = pair_weight[sort_order]
         unique_experts, counts = torch.unique_consecutive(sorted_expert, return_counts=True)
 
-        sorted_inputs = hidden_states.index_select(0, sorted_token_idx)
+        sorted_inputs = fp32_index_select(hidden_states, 0, sorted_token_idx)
         gate_up = self._run_grouped_expert_linear(
             sorted_inputs,
             unique_experts,
@@ -315,7 +329,16 @@ class Qwen3MoeExperts(nn.Module):
             self.down_proj,
         )
         current_hidden_states = current_hidden_states * sorted_weight.unsqueeze(-1).to(current_hidden_states.dtype)
-        final_hidden_states.index_add_(0, sorted_token_idx, current_hidden_states.to(final_hidden_states.dtype))
+        current_hidden_states = current_hidden_states.to(final_hidden_states.dtype)
+        if final_hidden_states.dtype in (torch.float16, torch.bfloat16):
+            final_hidden_states = fp32_index_add(
+                final_hidden_states,
+                0,
+                sorted_token_idx,
+                current_hidden_states,
+            )
+        else:
+            final_hidden_states.index_add_(0, sorted_token_idx, current_hidden_states)
 
         return final_hidden_states
 

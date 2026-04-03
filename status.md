@@ -545,6 +545,35 @@ Observed behavior on the exact runs:
     - `64` effective batch per rank via `batch_size=32`, `gradient_accumulation=2`
     - validated on all five 8-layer configs for `10` optimizer steps on this 8-GPU B200 node
   - DeepSpeed ZeRO-1 is not a fix for this issue on the current harness
+  - `per_head_precompute_kv` now again uses expert-specific KV tables:
+    - a query group routed to expert `e` attends against `e.k_proj(all_tokens)` / `e.v_proj(all_tokens)` rather than against each token's own routed KV
+    - the implementation deliberately keeps one dense attention call per active expert and masks out non-routed query groups, because the faster-looking ragged per-slot variant was materially slower on B200 GPUs
+  - direct GPU checks on the restored `per_head_precompute_kv` path matched an explicit reference in both fp32 and bf16 autocast with `max_diff = 0`
+  - representative single-GPU timing on `B=2`, `T=256`, `16Q/8KV`, `32` experts:
+    - fp32: full `16.344 ms`, mixed-token path `16.711 ms`
+    - bf16 autocast: full `14.895 ms`, mixed-token path `15.200 ms`
+  - the shared `Qwen3MoeExperts` MLP path has now been rewritten around sorted `(token, expert)` pairs instead of the old one-hot expert-mask loop
+    - this required making `src.models` lazy-imported so the runtime `transformers` module can import the local fp32 routing / grouped GEMM helpers without a circular import
+    - focused correctness coverage passes:
+      - `test_qwen3_moe_experts_grouped_mm_matches_legacy_reference`
+      - `test_qwen3_moe_experts_triton_grouped_mm_matches_fallback_on_cuda`
+    - direct CUDA bf16 check at training-like shape (`16384` tokens, `128` experts, `top_k=4`) is exact against the fallback path:
+      - output max diff `0`
+      - hidden-state grad max diff `0`
+      - parameter-grad max diff `0`
+  - the useful performance win in the shared MLP path is the sorted-routing rewrite itself, not the optional grouped GEMM kernel
+    - on a direct bf16 CUDA benchmark (`16384` tokens, `128` experts, `top_k=4`):
+      - current sorted fallback path: `0.08984 s`
+      - original legacy expert-mask loop: `0.13796 s`
+      - read: about `1.54x` faster with exact matching grads/outputs
+    - the optional MLP grouped GEMM backend remains opt-in only (`MOE_EVERYTHING_DISABLE_MLP_GROUPED_MM=1` by default)
+      - Triton-enabled path was still exact but slightly slower than the sorted fallback:
+        - `0.09473 s` vs `0.08979 s` on the same direct CUDA bf16 benchmark
+      - real 8-GPU trainer check on `configs/depth_matched/8_layers/standard_moe.yaml`, `max_steps=1`:
+        - default safe path: `73.7k tok/s`, `7.118 s/step`
+        - MLP grouped GEMM opt-in (`MOE_EVERYTHING_DISABLE_MLP_GROUPED_MM=0`): `72.4k tok/s`, `7.239 s/step`
+      - read: keep the grouped MLP kernel available for future tuning, but do not treat it as a default throughput win on this machine
+  - attempted end-to-end throughput measurement on `configs/depth_matched/8_layers/moe_everything_per_head_independent_perlayer_prenorm.yaml` is currently blocked by a separate device-side assert in the model path (`ScatterGatherKernel` / `seq_load_balancing_loss_func`), so the clean shared-MLP trainer measurement above was taken on `standard_moe` instead
 
 ## Remaining Open Items
 

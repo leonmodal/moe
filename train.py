@@ -563,6 +563,7 @@ def build_model(cfg: dict):
                 "per_head_dense_fraction_threshold", 0.75
             ),
             sanity_check_mode=mcfg.get("sanity_check_mode"),
+            scale_attn_by_routing_weight=mcfg.get("scale_attn_by_routing_weight", False),
             **common,
         )
         model = MoEverythingForCausalLM(config)
@@ -879,15 +880,69 @@ def main() -> None:
             f"({init_summary['num_pairs']} mapped tensors)"
         )
 
-    accelerator.print(
-        f"\n{'='*60}\n"
-        f"  Model     : {cfg['model']['type']}\n"
-        f"  Params    : {params['total']/1e9:.3f}B total  |  {expert_params/1e9:.3f}B expert\n"
-        f"  Dist type : {accelerator.distributed_type}\n"
-        f"  Precision : {train_cfg.mixed_precision}\n"
-        f"  GPUs      : {accelerator.num_processes}\n"
-        f"{'='*60}\n"
+    attn_params = sum(
+        p.numel() for n, p in model.named_parameters()
+        if any(x in n for x in ["q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm", "init_k", "init_v"])
     )
+    router_params = sum(
+        p.numel() for n, p in model.named_parameters()
+        if ("router" in n or "branch" in n or ("gate" in n and "gate_up" not in n and "gate_proj" not in n))
+    )
+    embed_params = sum(p.numel() for n, p in model.named_parameters() if "embed" in n)
+
+    summary_lines = [
+        f"\n{'='*60}",
+        f"  Model     : {cfg['model']['type']}",
+        f"  Params    : {params['total']/1e9:.3f}B total",
+        f"    Embed   : {embed_params/1e6:.1f}M",
+        f"    Attn    : {attn_params/1e6:.1f}M",
+        f"    MLP     : {expert_params/1e6:.1f}M",
+        f"    Router  : {router_params/1e6:.1f}M",
+    ]
+
+    mcfg = cfg["model"]
+    summary_lines.append(f"  Architecture:")
+    summary_lines.append(f"    hidden   : {mcfg['hidden_size']}")
+    summary_lines.append(f"    heads    : {mcfg['num_attention_heads']}Q / {mcfg['num_key_value_heads']}KV")
+    summary_lines.append(f"    head_dim : {mcfg.get('head_dim', mcfg['hidden_size'] // mcfg['num_attention_heads'])}")
+    summary_lines.append(f"    layers   : {mcfg['num_hidden_layers']}")
+    summary_lines.append(f"    MLP exp  : {mcfg['num_experts']} pool, top-{mcfg['num_experts_per_tok']}")
+
+    if is_moe_everything:
+        attn_mode = mcfg.get("attn_expert_mode", "bundled")
+        n_attn_exp = mcfg.get("num_attn_experts", 4)
+        n_attn_top = mcfg.get("num_attn_experts_per_tok", 1)
+        scale_attn = mcfg.get("scale_attn_by_routing_weight", False)
+        summary_lines.append(f"    Attn mode: {attn_mode}")
+        summary_lines.append(f"    Attn exp : {n_attn_exp} pool, top-{n_attn_top}")
+        summary_lines.append(f"    Scale attn by routing weight: {scale_attn}")
+        if attn_mode == "per_head_fully_independent":
+            num_heads = mcfg["num_attention_heads"]
+            num_kv = mcfg["num_key_value_heads"]
+            q_per_kv = num_heads // num_kv
+            e_o = n_attn_exp * q_per_kv
+            summary_lines.append(f"    Q pool   : {n_attn_exp} experts, top-{num_kv} (bundled per KV group)")
+            summary_lines.append(f"    K/V pool : {n_attn_exp} experts, top-{num_kv} (per KV head)")
+            summary_lines.append(f"    O pool   : {e_o} experts, top-{num_heads} (per query head)")
+        elif attn_mode == "per_head_precompute_kv":
+            num_kv = mcfg["num_key_value_heads"]
+            summary_lines.append(f"    QKVO pool: {n_attn_exp} experts, top-{num_kv} (bundled per KV group)")
+        if mcfg.get("per_layer_attn_router"):
+            summary_lines.append(f"    Per-layer attn router: yes")
+        if mcfg.get("per_layer_mlp_router"):
+            summary_lines.append(f"    Per-layer MLP router: yes")
+        if mcfg.get("per_layer_norm"):
+            summary_lines.append(f"    Per-layer norm: yes")
+        if mcfg.get("sanity_check_mode"):
+            summary_lines.append(f"    Sanity   : {mcfg['sanity_check_mode']}")
+
+    summary_lines.append(f"  Training:")
+    summary_lines.append(f"    Dist type: {accelerator.distributed_type}")
+    summary_lines.append(f"    Precision: {train_cfg.mixed_precision}")
+    summary_lines.append(f"    GPUs     : {accelerator.num_processes}")
+    summary_lines.append(f"{'='*60}")
+
+    accelerator.print("\n".join(summary_lines))
 
     # --- Dataset ------------------------------------------------------------
     data_cfg = DataConfig(

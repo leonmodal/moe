@@ -24,9 +24,10 @@ model:
   topk_scaling_factor: 2.5
   num_groups: 8
   group_topk: 4
-  num_attn_experts: 128
+  num_attn_experts: 64
   num_attn_experts_per_tok: 1
   attn_expert_mode: per_head_fully_independent
+  scale_attn_by_routing_weight: false
   per_head_compute_mode: dense
   use_deepseek_routing: true
   per_layer_router: true

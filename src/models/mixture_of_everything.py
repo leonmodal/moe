@@ -39,6 +39,9 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from src.models.fp32_routing import fp32_index_add, fp32_index_put, fp32_index_select
+from src.models.triton_grouped_gemm import triton_grouped_gemm
 from torch.utils.checkpoint import checkpoint
 from transformers import Qwen3MoeConfig
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -105,6 +108,11 @@ class MoEverythingConfig(Qwen3MoeConfig):
         per_head_dense_fraction_threshold: float = 0.75,
         # Deterministic routing mode used for architecture sanity checks
         sanity_check_mode: str | None = None,
+        # Whether to scale attention projections/outputs by routing weights.
+        # False (default): routing is pure selection — experts are placed into
+        # slots without any weighting, like standard per-layer attention.
+        # True: scale projections by the routing softmax weight (MoE-style blending).
+        scale_attn_by_routing_weight: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -127,6 +135,7 @@ class MoEverythingConfig(Qwen3MoeConfig):
         self.per_head_compute_mode = per_head_compute_mode
         self.per_head_dense_fraction_threshold = per_head_dense_fraction_threshold
         self.sanity_check_mode = sanity_check_mode
+        self.scale_attn_by_routing_weight = scale_attn_by_routing_weight
 
 
 # ─── Branch router ─────────────────────────────────────────────────────────── #
@@ -218,6 +227,15 @@ class NormExpertBank(nn.Module):
         return out.reshape(orig_shape)
 
 
+def _straight_through_ones(w: torch.Tensor) -> torch.Tensor:
+    """Return ones in forward, but pass gradients through to w.
+
+    Used when routing is pure selection (no scaling) but we still need
+    the router weights to receive gradients for load-balancing losses.
+    """
+    return w + (1.0 - w).detach()
+
+
 # ─── Attention expert bank ─────────────────────────────────────────────────── #
 
 class AttentionExpertBank(nn.Module):
@@ -261,6 +279,7 @@ class AttentionExpertBank(nn.Module):
             config, "per_head_dense_fraction_threshold", 0.75
         )
         self.sanity_check_mode = getattr(config, "sanity_check_mode", None)
+        self.scale_attn_by_routing_weight = getattr(config, "scale_attn_by_routing_weight", False)
         self.last_router_info = {}
         self._last_routing = None
 
@@ -414,32 +433,6 @@ class AttentionExpertBank(nn.Module):
         # projection dtype before multiplying by the learned weight.
         return norm_weight * proj_normed.to(input_dtype)
 
-    def _maybe_grouped_mm(
-        self,
-        sorted_inputs: torch.Tensor,
-        weight_bank: torch.Tensor,
-        unique_experts: torch.Tensor,
-        counts: torch.Tensor,
-    ) -> torch.Tensor | None:
-        if (
-            os.environ.get("MOE_EVERYTHING_DISABLE_GROUPED_MM", "0") == "1"
-            or os.environ.get("MOE_EVERYTHING_DISABLE_ATTN_GROUPED_MM", "0") == "1"
-        ):
-            return None
-        if (
-            not sorted_inputs.is_cuda
-            or sorted_inputs.dtype not in (torch.bfloat16, torch.float16)
-            or not hasattr(torch, "_grouped_mm")
-        ):
-            return None
-
-        expert_weights = weight_bank.index_select(0, unique_experts).contiguous()
-        offsets = counts.to(device=sorted_inputs.device, dtype=torch.int32).cumsum(dim=0)
-        try:
-            return torch._grouped_mm(sorted_inputs.contiguous(), expert_weights, offs=offsets)
-        except RuntimeError:
-            return None
-
     def _run_grouped_expert_matmul(
         self,
         sorted_inputs: torch.Tensor,
@@ -449,22 +442,25 @@ class AttentionExpertBank(nn.Module):
         weight_bank: torch.Tensor,
         norm_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        proj = self._maybe_grouped_mm(sorted_inputs, weight_bank, unique_experts, counts)
-
-        if proj is None:
-            proj = None
+        if (
+            os.environ.get("MOE_EVERYTHING_DISABLE_GROUPED_MM", "0") == "0"
+            and os.environ.get("MOE_EVERYTHING_DISABLE_ATTN_GROUPED_MM", "0") == "0"
+            and sorted_inputs.is_cuda
+            and sorted_inputs.dtype in (torch.bfloat16, torch.float16)
+        ):
+            proj = triton_grouped_gemm(sorted_inputs.contiguous(), weight_bank.to(sorted_inputs.dtype).contiguous(), unique_experts, counts)
+        else:
+            proj = torch.empty(
+                sorted_inputs.shape[0],
+                weight_bank.shape[2],
+                device=sorted_inputs.device,
+                dtype=sorted_inputs.dtype,
+            )
             start = 0
             for expert, count in zip(unique_experts.tolist(), counts.tolist()):
                 end = start + count
-                chunk = sorted_inputs[start:end] @ weight_bank[expert]
-                if proj is None:
-                    proj = torch.empty(
-                        sorted_inputs.shape[0],
-                        weight_bank.shape[2],
-                        device=chunk.device,
-                        dtype=chunk.dtype,
-                    )
-                proj[start:end] = chunk
+                if count > 0:
+                    proj[start:end] = sorted_inputs[start:end] @ weight_bank[expert]
                 start = end
 
         if norm_weights is not None:
@@ -472,7 +468,7 @@ class AttentionExpertBank(nn.Module):
             proj_f = proj.float()
             variance = proj_f.pow(2).mean(-1, keepdim=True)
             proj_normed = proj_f * torch.rsqrt(variance + self.eps)
-            proj = norm_weights.index_select(0, sorted_expert) * proj_normed.to(input_dtype)
+            proj = fp32_index_select(norm_weights, 0, sorted_expert) * proj_normed.to(input_dtype)
 
         return proj
 
@@ -498,7 +494,7 @@ class AttentionExpertBank(nn.Module):
         sorted_weight = pair_weight[sort_order]
         unique_experts, counts = torch.unique_consecutive(sorted_expert, return_counts=True)
 
-        sorted_inputs = flat.index_select(0, sorted_token_idx)
+        sorted_inputs = fp32_index_select(flat, 0, sorted_token_idx)
         proj = self._run_grouped_expert_matmul(
             sorted_inputs,
             sorted_expert,
@@ -508,7 +504,7 @@ class AttentionExpertBank(nn.Module):
             norm_weights=norm_weights,
         )
         proj = proj * sorted_weight.unsqueeze(-1).to(proj.dtype)
-        pair_out[sort_order] = proj.to(pair_out.dtype)
+        pair_out = fp32_index_put(pair_out, sort_order, proj.to(pair_out.dtype))
 
         return pair_out.view(N, num_slots, H_out)
 
@@ -540,7 +536,7 @@ class AttentionExpertBank(nn.Module):
         )
         sort_order = torch.argsort(pair_expert)
         sorted_expert = pair_expert[sort_order]
-        sorted_inputs = pair_inputs[sort_order]
+        sorted_inputs = fp32_index_select(pair_inputs, 0, sort_order)
         sorted_weight = pair_weight[sort_order]
         sorted_token_idx = token_idx[sort_order]
         unique_experts, counts = torch.unique_consecutive(sorted_expert, return_counts=True)
@@ -570,11 +566,11 @@ class AttentionExpertBank(nn.Module):
         if reduce_tokens:
             proj = proj.to(token_out.dtype)
             proj = proj * sorted_weight.unsqueeze(-1).to(token_out.dtype)
-            token_out.index_add_(0, sorted_token_idx, proj)
+            token_out = fp32_index_add(token_out, 0, sorted_token_idx, proj)
         else:
             proj = proj * sorted_weight.unsqueeze(-1).to(proj.dtype)
             proj = proj.to(inputs.dtype)
-            pair_out[sort_order] = proj
+            pair_out = fp32_index_put(pair_out, sort_order, proj)
 
         if reduce_tokens:
             return token_out.to(proj_output_dtype)
@@ -617,7 +613,7 @@ class AttentionExpertBank(nn.Module):
         sorted_weight = pair_weight[sort_order]
         unique_experts, counts = torch.unique_consecutive(sorted_expert, return_counts=True)
 
-        sorted_inputs = flat.index_select(0, sorted_token_idx)
+        sorted_inputs = fp32_index_select(flat, 0, sorted_token_idx)
         proj = self._run_grouped_expert_matmul(
             sorted_inputs,
             sorted_expert,
@@ -632,11 +628,11 @@ class AttentionExpertBank(nn.Module):
             proj_f = proj.view(-1, self.q_heads_per_kv, self.head_dim).float()
             variance = proj_f.pow(2).mean(-1, keepdim=True)
             proj_normed = proj_f * torch.rsqrt(variance + self.eps)
-            gathered = norm_weights.index_select(0, sorted_expert).unsqueeze(1)
+            gathered = fp32_index_select(norm_weights, 0, sorted_expert).unsqueeze(1)
             proj = (gathered * proj_normed.to(input_dtype)).view(-1, H_out)
 
         proj = proj * sorted_weight.unsqueeze(-1).to(proj.dtype)
-        pair_out[sort_order] = proj.to(pair_out.dtype)
+        pair_out = fp32_index_put(pair_out, sort_order, proj.to(pair_out.dtype))
         return pair_out.view(N, num_slots, H_out)
 
     def _init_bundled(self):
@@ -744,11 +740,11 @@ class AttentionExpertBank(nn.Module):
         self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
 
     def _init_per_head_fully_independent(self):
-        """Flat-bank Q/K/V/O with GQA: Q,O bundled per KV group, K,V independent.
+        """Flat-bank Q/K/V/O with GQA: Q bundled per KV group, K/V/O per head.
 
         Q router picks top-num_kv_heads from E (each expert produces q_group_dim),
-        K/V pick top-num_kv_heads from E_kv,
-        O router picks top-num_kv_heads from E (each expert takes q_group_dim).
+        K/V pick top-num_kv_heads from E,
+        O router picks top-num_heads from E (each expert takes head_dim).
         """
         if self.routed_norm:
             self.attn_pre_norm = NormExpertBank(self.num_depths, self.hidden_size, eps=self.eps)
@@ -759,22 +755,27 @@ class AttentionExpertBank(nn.Module):
             self.k_pre_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
             self.v_pre_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         E = self.num_experts
-        E_kv = E * self.num_kv_heads // self.num_heads
+        # Q routes per KV-group, K/V route per KV-head — same pool size.
+        # O routes per head from a larger pool (E_o = E * heads_per_group)
+        # so that O total params match the standard per-layer O projection.
+        E_kv = E
+        E_o = E * self.q_heads_per_kv
         self.num_kv_experts = E_kv
+        self.num_o_experts = E_o
         if self.per_layer_attn_router:
             self.q_routers = nn.ModuleList([self._make_flat_bank_router(self.hidden_size, self.num_kv_heads) for _ in range(self.num_depths)])
             self.k_routers = nn.ModuleList([self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv) for _ in range(self.num_depths)])
             self.v_routers = nn.ModuleList([self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv) for _ in range(self.num_depths)])
-            self.o_routers = nn.ModuleList([self._make_flat_bank_router(self.q_dim, self.num_kv_heads) for _ in range(self.num_depths)])
+            self.o_routers = nn.ModuleList([self._make_flat_bank_router(self.q_dim, self.num_heads, num_experts=E_o) for _ in range(self.num_depths)])
         else:
             self.q_router = self._make_flat_bank_router(self.hidden_size, self.num_kv_heads)
             self.k_router = self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv)
             self.v_router = self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv)
-            self.o_router = self._make_flat_bank_router(self.q_dim, self.num_kv_heads)
+            self.o_router = self._make_flat_bank_router(self.q_dim, self.num_heads, num_experts=E_o)
         self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_group_dim))
         self.k_proj = nn.Parameter(torch.empty(E_kv, self.hidden_size, self.head_dim))
         self.v_proj = nn.Parameter(torch.empty(E_kv, self.hidden_size, self.head_dim))
-        self.o_proj = nn.Parameter(torch.empty(E, self.q_group_dim, self.hidden_size))
+        self.o_proj = nn.Parameter(torch.empty(E_o, self.head_dim, self.hidden_size))
         if self.per_layer_qk_norm:
             self.layer_q_norm_weight = nn.Parameter(torch.ones(self.num_depths, self.head_dim))
             self.layer_k_norm_weight = nn.Parameter(torch.ones(self.num_depths, self.head_dim))
@@ -1173,12 +1174,15 @@ class AttentionExpertBank(nn.Module):
 
             q_norm_weight = self._get_q_norm_weight_bank(depth_idx, self.num_experts)
             k_norm_weight = self._get_k_norm_weight_bank(depth_idx, self.num_kv_experts)
+            pq_w = q_w if self.scale_attn_by_routing_weight else _straight_through_ones(q_w)
+            pk_w = k_w if self.scale_attn_by_routing_weight else _straight_through_ones(k_w)
+            pv_w = v_w if self.scale_attn_by_routing_weight else _straight_through_ones(v_w)
             # Q: bundled per GQA group — (N, num_kv_heads, q_group_dim)
-            Q_groups = self._project_grouped_query_heads_batched(q_flat, self.q_proj, q_idx, q_w, q_norm_weight)
+            Q_groups = self._project_grouped_query_heads_batched(q_flat, self.q_proj, q_idx, pq_w, q_norm_weight)
             # Reshape from (N, num_kv_heads, q_group_dim) to (N, num_heads, head_dim)
             Q = Q_groups.reshape(B * T, self.num_heads, self.head_dim).reshape(B * T, self.q_dim)
-            K_heads = self._project_heads_batched(k_flat, self.k_proj, k_idx, k_w, k_norm_weight)
-            V_heads = self._project_heads_batched(v_flat, self.v_proj, v_idx, v_w)
+            K_heads = self._project_heads_batched(k_flat, self.k_proj, k_idx, pk_w, k_norm_weight)
+            V_heads = self._project_heads_batched(v_flat, self.v_proj, v_idx, pv_w)
 
             K = K_heads.reshape(B * T, self.num_kv_heads * self.head_dim)
             V = V_heads.reshape(B * T, self.num_kv_heads * self.head_dim)
@@ -1212,17 +1216,17 @@ class AttentionExpertBank(nn.Module):
 
         if self.mode == "per_head_fully_independent":
             N = B * T
-            attn_flat = attn_output.transpose(1, 2).reshape(N, self.q_dim)
-            # Reshape to GQA groups: (N, num_kv_heads, q_group_dim)
-            attn_groups = attn_flat.view(N, self.num_kv_heads, self.q_group_dim)
+            attn_heads = attn_output.transpose(1, 2).reshape(N, self.num_heads, self.head_dim)
+            attn_flat = attn_heads.reshape(N, self.q_dim)
             o_router = self._select_router("o_router", depth_idx)
-            o_idx, o_w, o_probs = self._route_flat(o_router, attn_flat, self.num_kv_heads)
+            o_idx, o_w, o_probs = self._route_flat(o_router, attn_flat, self.num_heads)
             self._store_router_info("o", o_probs, o_idx)
+            po_w = o_w if self.scale_attn_by_routing_weight else _straight_through_ones(o_w)
             o_out = self._project_pair_inputs_grouped(
-                attn_groups,
+                attn_heads,
                 self.o_proj,
                 o_idx,
-                o_w,
+                po_w,
                 reduce_tokens=True,
             )
             return o_out.view(B, T, self.hidden_size)
@@ -1292,7 +1296,7 @@ class AttentionExpertBank(nn.Module):
                     ("q", self.num_experts, self.num_kv_heads),
                     ("k", self.num_kv_experts, self.num_kv_heads),
                     ("v", self.num_kv_experts, self.num_kv_heads),
-                    ("o", self.num_experts, self.num_kv_heads),
+                    ("o", self.num_o_experts, self.num_heads),
                 ],
             )
 
@@ -1325,12 +1329,15 @@ class AttentionExpertBank(nn.Module):
 
         q_norm_weight = self._get_q_norm_weight_bank(depth_idx, self.num_experts)
         k_norm_weight = self._get_k_norm_weight_bank(depth_idx, self.num_kv_experts)
+        pq_w = q_w if self.scale_attn_by_routing_weight else _straight_through_ones(q_w)
+        pk_w = k_w if self.scale_attn_by_routing_weight else _straight_through_ones(k_w)
+        pv_w = v_w if self.scale_attn_by_routing_weight else _straight_through_ones(v_w)
         # Q: bundled per GQA group — (N_sel, num_kv_heads, q_group_dim)
-        Q_groups = self._project_grouped_query_heads_batched(q_flat, self.q_proj, q_idx, q_w, q_norm_weight)
+        Q_groups = self._project_grouped_query_heads_batched(q_flat, self.q_proj, q_idx, pq_w, q_norm_weight)
         # Reshape from (N_sel, num_kv_heads, q_group_dim) to (N_sel, num_heads, head_dim)
         Q_sel = Q_groups.reshape(-1, self.num_heads, self.head_dim)
-        K_sel = self._project_heads_batched(k_flat, self.k_proj, k_idx, k_w, k_norm_weight)
-        V_sel = self._project_heads_batched(v_flat, self.v_proj, v_idx, v_w)
+        K_sel = self._project_heads_batched(k_flat, self.k_proj, k_idx, pk_w, k_norm_weight)
+        V_sel = self._project_heads_batched(v_flat, self.v_proj, v_idx, pv_w)
 
         Q_flat = hidden_states.new_zeros(B * T, self.num_heads, self.head_dim)
         K_flat = hidden_states.new_zeros(B * T, self.num_kv_heads, self.head_dim)
@@ -1369,16 +1376,15 @@ class AttentionExpertBank(nn.Module):
 
         attn_selected = attn_heads.transpose(1, 2).reshape(B * T, self.num_heads, self.head_dim)[flat_mask]
         attn_flat = attn_selected.reshape(attn_selected.shape[0], self.q_dim)
-        # O: bundled per GQA group
-        attn_groups = attn_selected.view(-1, self.num_kv_heads, self.q_group_dim)
-        o_idx, o_w, o_probs = self._route_flat(o_router, attn_flat, self.num_kv_heads)
+        o_idx, o_w, o_probs = self._route_flat(o_router, attn_flat, self.num_heads)
         self._store_router_info("o", o_probs, o_idx, token_mask=flat_mask)
+        po_w = o_w if self.scale_attn_by_routing_weight else _straight_through_ones(o_w)
 
         o_selected = self._project_pair_inputs_grouped(
-            attn_groups,
+            attn_selected,
             self.o_proj,
             o_idx,
-            o_w,
+            po_w,
             reduce_tokens=True,
         )
 
@@ -1412,10 +1418,13 @@ class AttentionExpertBank(nn.Module):
 
         q_norm_weight = self._get_q_norm_weight_bank(depth_idx, self.num_experts)
         k_norm_weight = self._get_k_norm_weight_bank(depth_idx, self.num_experts)
-        Q_groups = self._project_grouped_query_heads_batched(flat, self.q_proj, idx, w, q_norm_weight)
-        ones = torch.ones_like(w)
-        K_heads = self._project_heads_batched(flat, self.k_proj, idx, ones, k_norm_weight)
-        V_heads = self._project_heads_batched(flat, self.v_proj, idx, ones)
+        q_w = w if self.scale_attn_by_routing_weight else _straight_through_ones(w)
+        # K/V always use ones -- they share the same router as Q, so gradients
+        # already flow through q_w. K/V should never be scaled by routing weight.
+        kv_w = _straight_through_ones(w)
+        Q_groups = self._project_grouped_query_heads_batched(flat, self.q_proj, idx, q_w, q_norm_weight)
+        K_heads = self._project_heads_batched(flat, self.k_proj, idx, kv_w, k_norm_weight)
+        V_heads = self._project_heads_batched(flat, self.v_proj, idx, kv_w)
 
         Q = (
             Q_groups.view(B, T, self.num_kv_heads, self.q_heads_per_kv, self.head_dim)
@@ -1447,6 +1456,75 @@ class AttentionExpertBank(nn.Module):
         logical_layer = depth_idx // 2
         logical_o_proj = super().__getattr__("logical_o_proj")[logical_layer]
         return F.linear(attn_output, logical_o_proj)
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def _apply_rotary_pos_emb_k_only(
+        self,
+        k: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        cos, sin = position_embeddings
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        return (k * cos) + (self._rotate_half(k) * sin)
+
+    def _run_per_head_precompute_kv_expert_tables(
+        self,
+        tables: dict[str, torch.Tensor],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        query_token_mask: torch.Tensor | None = None,
+        depth_idx: int | None = None,
+    ) -> torch.Tensor:
+        """Run attention against expert-specific KV tables for routed query groups."""
+        flat = tables["flat"]
+        idx = tables["idx"]
+        Q = tables["Q"]
+        B, _, T, _ = Q.shape
+        N = B * T
+
+        if query_token_mask is None:
+            query_group_mask = torch.ones((B, self.num_kv_heads, T), device=flat.device, dtype=torch.bool)
+        else:
+            query_group_mask = query_token_mask.squeeze(-1).bool().unsqueeze(1).expand(-1, self.num_kv_heads, -1)
+
+        if not query_group_mask.any():
+            return flat.new_zeros(B, self.num_heads, T, self.head_dim)
+
+        active_experts = idx.view(B, T, self.num_kv_heads).permute(0, 2, 1)[query_group_mask].unique()
+        slot_experts = idx.view(B, T, self.num_kv_heads).permute(0, 2, 1)
+        k_norm_weight = self._get_k_norm_weight_bank(depth_idx, self.num_experts)
+
+        attn_output = flat.new_zeros(B, self.num_heads, T, self.head_dim)
+        for expert in active_experts.tolist():
+            K_e = flat @ self.k_proj[expert]
+            V_e = flat @ self.v_proj[expert]
+
+            K_e = self._apply_single_head_norm(K_e, k_norm_weight[expert])
+            K_e_heads = K_e.view(B, T, 1, self.head_dim).transpose(1, 2)
+            V_e_heads = V_e.view(B, T, 1, self.head_dim).transpose(1, 2)
+            K_e_heads = self._apply_rotary_pos_emb_k_only(K_e_heads, position_embeddings)
+            # Dense per-expert attention is intentionally kept here. It does
+            # redundant work on query groups routed to other experts, but on
+            # GPU it is markedly faster than launching many ragged attention
+            # kernels over the routed subsets.
+            attn_e = self._run_attention(
+                Q,
+                K_e_heads.expand(-1, self.num_kv_heads, -1, -1),
+                V_e_heads.expand(-1, self.num_kv_heads, -1, -1),
+                attention_mask,
+            )
+
+            group_mask = (slot_experts == expert) & query_group_mask
+            head_mask = group_mask.unsqueeze(-1).repeat_interleave(self.num_kv_groups, dim=1)
+            attn_output = attn_output + attn_e * head_mask.to(attn_e.dtype)
+
+        return attn_output
 
     def _apply_logical_head_norm(
         self,
@@ -1590,6 +1668,14 @@ class AttentionExpertBank(nn.Module):
         depth_idx: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, _ = hidden_states.shape
+        flat_mask = token_mask.reshape(-1).bool()
+        if not flat_mask.any():
+            return self._empty_sparse_attn_result(
+                hidden_states,
+                K_old,
+                V_old,
+                [("attn", self.num_experts, self.num_kv_heads)],
+            )
         sanity_dense = self._project_and_attend_sanity_logical_dense(
             hidden_states,
             position_embeddings,
@@ -1607,37 +1693,46 @@ class AttentionExpertBank(nn.Module):
         )
         idx = tables["idx"]
         w = tables["weights"]
-        kv_weight = tables["kv_weight"]
-        Q = tables["Q"]
         K_fresh = tables["K_fresh"]
         V_fresh = tables["V_fresh"]
 
         attn_mask_kv = token_mask.unsqueeze(1)
         K_new = torch.where(attn_mask_kv, K_fresh, K_old)
         V_new = torch.where(attn_mask_kv, V_fresh, V_old)
-
-        attn_output = self._run_attention(Q, K_new, V_new, attention_mask)
-
-        kv_weight_expanded = (
-            kv_weight.view(B, T, self.num_kv_heads)
-            .transpose(1, 2)
-            .repeat_interleave(self.num_kv_groups, dim=1)
-            .unsqueeze(-1)
+        self._attach_token_mask_to_last_router_info(token_mask)
+        attn_output = self._run_per_head_precompute_kv_expert_tables(
+            tables,
+            position_embeddings,
+            attention_mask=attention_mask,
+            query_token_mask=token_mask,
+            depth_idx=depth_idx,
         )
-        attn_output = attn_output * kv_weight_expanded.to(attn_output.dtype)
+
+        if self.scale_attn_by_routing_weight:
+            kv_weight = hidden_states.new_zeros(B * T, self.num_kv_heads)
+            kv_weight[flat_mask] = w[flat_mask]
+            kv_weight_expanded = (
+                kv_weight.view(B, T, self.num_kv_heads)
+                .transpose(1, 2)
+                .repeat_interleave(self.num_kv_groups, dim=1)
+                .unsqueeze(-1)
+            )
+            attn_output = attn_output * kv_weight_expanded.to(attn_output.dtype)
         attn_dense = attn_output.transpose(1, 2).contiguous().reshape(B, T, self.q_dim)
         logical_o = self._project_sanity_logical_o(attn_dense, depth_idx)
         if logical_o is not None:
             return logical_o, K_new, V_new
-        attn_flat = attn_dense.reshape(B * T, self.q_dim)
-        attn_groups = attn_flat.view(B * T, self.num_kv_heads, self.q_group_dim)
-        o_out = self._project_pair_inputs_grouped(
-            attn_groups,
+        attn_groups = attn_dense.reshape(B * T, self.num_kv_heads, self.q_group_dim)
+        o_w = w[flat_mask] if self.scale_attn_by_routing_weight else _straight_through_ones(w[flat_mask])
+        o_selected = self._project_pair_inputs_grouped(
+            attn_groups[flat_mask],
             self.o_proj,
-            idx,
-            w,
+            idx[flat_mask],
+            o_w,
             reduce_tokens=True,
         )
+        o_out = hidden_states.new_zeros(B * T, self.hidden_size)
+        o_out[flat_mask] = o_selected.to(o_out.dtype)
         return o_out.view(B, T, self.hidden_size), K_new, V_new
 
     def project_and_attend_per_head_precompute_kv_sparse(
@@ -1650,115 +1745,23 @@ class AttentionExpertBank(nn.Module):
         attention_mask: torch.Tensor | None = None,
         depth_idx: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        B, T, H = hidden_states.shape
-        self.last_router_info = {}
         flat_mask = token_mask.reshape(-1).bool()
-
         if not flat_mask.any():
             return self._empty_sparse_attn_result(
                 hidden_states,
                 K_old,
                 V_old,
-                [("attn", self.num_experts, self.num_heads)],
+                [("attn", self.num_experts, self.num_kv_heads)],
             )
-
-        if flat_mask.all():
-            return self.project_and_attend_per_head_precompute_kv(
-                hidden_states,
-                position_embeddings,
-                attention_mask,
-                depth_idx=depth_idx,
-            )
-
-        flat_hidden = hidden_states.reshape(B * T, H)
-        hidden_selected = flat_hidden[flat_mask]
-
-        if self.per_layer_norm and depth_idx is not None:
-            normed = self.norms[depth_idx](hidden_selected)
-        else:
-            normed = self.norm(hidden_selected)
-
-        routed = self._maybe_build_sanity_attention_routing(
-            normed.shape[0],
-            self.num_kv_heads,
+        return self.project_and_attend_per_head_precompute_kv_dense_mixed(
+            hidden_states,
+            position_embeddings,
+            K_old,
+            V_old,
+            token_mask,
+            attention_mask,
             depth_idx,
-            hidden_states.device,
-            dtype=normed.dtype,
-            token_mask=flat_mask,
         )
-        if routed is None:
-            router = self._select_router("router", depth_idx)
-            idx, w, probs = self._route_flat(router, normed, self.num_kv_heads)
-            self._store_router_info("attn", probs, idx, token_mask=flat_mask)
-        else:
-            idx, w, probs = routed
-
-        q_norm_weight = self._get_q_norm_weight_bank(depth_idx, self.num_experts)
-        k_norm_weight = self._get_k_norm_weight_bank(depth_idx, self.num_experts)
-        Q_sel_groups = self._project_grouped_query_heads_batched(normed, self.q_proj, idx, w, q_norm_weight)
-        Q_sel = Q_sel_groups.view(-1, self.num_heads, self.head_dim)
-        Q_flat = hidden_states.new_zeros(B * T, self.num_heads, self.head_dim)
-        Q_flat[flat_mask] = Q_sel
-        Q = Q_flat.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-
-        kv_weight = w
-        ones = torch.ones_like(idx, dtype=normed.dtype)
-        K_sel = self._project_heads_batched(normed, self.k_proj, idx, ones, k_norm_weight)
-        V_sel = self._project_heads_batched(normed, self.v_proj, idx, ones)
-
-        K_flat = hidden_states.new_zeros(B * T, self.num_kv_heads, self.head_dim)
-        V_flat = hidden_states.new_zeros(B * T, self.num_kv_heads, self.head_dim)
-        K_flat[flat_mask] = K_sel
-        V_flat[flat_mask] = V_sel
-
-        K_fresh = K_flat.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        V_fresh = V_flat.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        Q, K_fresh = apply_rotary_pos_emb(Q, K_fresh, cos, sin)
-
-        attn_mask_kv = token_mask.unsqueeze(1)
-        K_new = torch.where(attn_mask_kv, K_fresh, K_old)
-        V_new = torch.where(attn_mask_kv, V_fresh, V_old)
-
-        kv_weight_flat = hidden_states.new_zeros(B * T, self.num_kv_heads)
-        kv_weight_flat[flat_mask] = kv_weight
-        kv_weight_expanded = (
-            kv_weight_flat.view(B, T, self.num_kv_heads)
-            .transpose(1, 2)
-            .repeat_interleave(self.num_kv_groups, dim=1)
-            .unsqueeze(-1)
-        )
-
-        attn_heads = hidden_states.new_zeros(B, self.num_heads, T, self.head_dim)
-        token_mask_2d = token_mask.squeeze(-1).bool()
-
-        for b in range(B):
-            pos = token_mask_2d[b].nonzero(as_tuple=False).squeeze(-1)
-            if pos.numel() == 0:
-                continue
-            Q_b = Q[b : b + 1, :, pos, :]
-            attn_b = self._run_attention(
-                Q_b,
-                K_new[b : b + 1],
-                V_new[b : b + 1],
-                attention_mask[:, :, pos, :] if attention_mask is not None else None,
-                query_positions=None if attention_mask is not None else pos,
-            )
-            attn_b = attn_b * kv_weight_expanded[b : b + 1, :, pos, :].to(attn_b.dtype)
-            attn_heads[b, :, pos, :] = attn_b.squeeze(0).to(attn_heads.dtype)
-
-        o_selected = self._project_pair_inputs_grouped(
-            attn_heads.transpose(1, 2).reshape(B * T, self.num_kv_heads, self.q_group_dim)[flat_mask],
-            self.o_proj,
-            idx,
-            w,
-            reduce_tokens=True,
-        )
-
-        attn_out = hidden_states.new_zeros(B * T, self.hidden_size)
-        attn_out[flat_mask] = o_selected.to(attn_out.dtype)
-        return attn_out.view(B, T, self.hidden_size), K_new, V_new
 
     def project_and_attend_precompute_kv(
         self,
@@ -1847,30 +1850,36 @@ class AttentionExpertBank(nn.Module):
         idx = tables["idx"]
         w = tables["weights"]
         kv_weight = tables["kv_weight"]
-        Q = tables["Q"]
         K_fresh = tables["K_fresh"]
         V_fresh = tables["V_fresh"]
-        B, _, T, _ = Q.shape
+        B, _, T, _ = tables["Q"].shape
 
-        attn_output = self._run_attention(Q, K_fresh, V_fresh, attention_mask)
-
-        kv_weight_expanded = (
-            kv_weight.view(B, T, self.num_kv_heads)
-            .transpose(1, 2)
-            .repeat_interleave(self.num_kv_groups, dim=1)
-            .unsqueeze(-1)
+        attn_output = self._run_per_head_precompute_kv_expert_tables(
+            tables,
+            position_embeddings,
+            attention_mask=attention_mask,
+            depth_idx=depth_idx,
         )
-        attn_output = attn_output * kv_weight_expanded.to(attn_output.dtype)
+
+        if self.scale_attn_by_routing_weight:
+            kv_weight_expanded = (
+                kv_weight.view(B, T, self.num_kv_heads)
+                .transpose(1, 2)
+                .repeat_interleave(self.num_kv_groups, dim=1)
+                .unsqueeze(-1)
+            )
+            attn_output = attn_output * kv_weight_expanded.to(attn_output.dtype)
         attn_dense = attn_output.transpose(1, 2).contiguous().reshape(B, T, self.q_dim)
         logical_o = self._project_sanity_logical_o(attn_dense, depth_idx)
         if logical_o is not None:
             return logical_o, K_fresh, V_fresh
         attn_flat = attn_dense.reshape(B * T, self.q_dim)
+        o_w = w if self.scale_attn_by_routing_weight else _straight_through_ones(w)
         o_out = self._project_pair_inputs_grouped(
             attn_flat.view(B * T, self.num_kv_heads, self.q_group_dim),
             self.o_proj,
             idx,
-            w,
+            o_w,
             reduce_tokens=True,
         )
 
@@ -2413,15 +2422,23 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                 # Gather per-router logits and selected experts across depths
                 attn_router_names = sorted({n for d in attention_router_info for n in d})
                 num_attn_experts = self.config.num_attn_experts
-                num_kv_experts = num_attn_experts * self.config.num_key_value_heads // self.config.num_attention_heads
+                num_kv_experts = getattr(self.model.attn_bank, "num_kv_experts", num_attn_experts)
+                num_o_experts = getattr(self.model.attn_bank, "num_o_experts", num_attn_experts)
                 for rname in attn_router_names:
                     r_logits = tuple(d[rname]["router_logits"] for d in attention_router_info if rname in d)
                     r_selected = tuple(d[rname]["selected_experts"] for d in attention_router_info if rname in d)
                     r_masks = tuple(d[rname].get("token_mask") for d in attention_router_info if rname in d)
                     if not r_logits:
                         continue
-                    n_experts = num_kv_experts if rname in ("k", "v") else num_attn_experts
-                    n_per_tok = self.config.num_key_value_heads if rname in ("k", "v") else self.config.num_attention_heads
+                    if rname in ("k", "v"):
+                        n_experts = num_kv_experts
+                        n_per_tok = self.config.num_key_value_heads
+                    elif rname == "o":
+                        n_experts = num_o_experts
+                        n_per_tok = self.config.num_attention_heads
+                    else:
+                        n_experts = num_attn_experts
+                        n_per_tok = self.config.num_key_value_heads
                     attn_seq_aux = seq_load_balancing_loss_func(
                         r_logits, n_experts, n_per_tok,
                         batch_size=input_ids.shape[0],

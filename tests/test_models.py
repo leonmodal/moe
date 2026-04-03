@@ -247,9 +247,8 @@ def test_loss_decreases_with_gradient_step():
 
 def test_qwen3_moe_experts_grouped_mm_matches_legacy_reference():
     config = tiny_standard_config()
+    config._experts_implementation = "eager"
     experts = Qwen3MoeExperts(config).eval()
-    assert hasattr(experts, "_maybe_grouped_mm")
-    assert hasattr(experts, "_run_grouped_expert_linear")
     hidden_states = torch.randn(7, config.hidden_size)
     top_k_index = torch.tensor(
         [
@@ -299,21 +298,49 @@ def test_qwen3_moe_experts_grouped_mm_matches_legacy_reference():
 
     torch.testing.assert_close(fallback, expected, atol=1e-6, rtol=1e-6)
 
-    def fake_grouped_mm(self, sorted_inputs, expert_weights_t, counts):
-        outputs = []
-        start = 0
-        for weight_t, count in zip(expert_weights_t, counts.tolist()):
-            end = start + count
-            outputs.append(sorted_inputs[start:end] @ weight_t)
-            start = end
-        return torch.cat(outputs, dim=0)
 
-    experts._maybe_grouped_mm = MethodType(fake_grouped_mm, experts)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_qwen3_moe_experts_triton_grouped_mm_matches_fallback_on_cuda(monkeypatch):
+    torch.manual_seed(0)
+    config = Qwen3MoeConfig(
+        hidden_size=256,
+        intermediate_size=1024,
+        moe_intermediate_size=256,
+        num_experts=32,
+        num_experts_per_tok=4,
+    )
+    config._experts_implementation = "eager"
+    experts = Qwen3MoeExperts(config).to("cuda").train()
+    fallback = Qwen3MoeExperts(config).to("cuda").train()
+    fallback.load_state_dict(experts.state_dict())
 
-    with torch.no_grad():
-        grouped = experts(hidden_states, top_k_index, top_k_weights)
+    hidden_states = torch.randn(2048, config.hidden_size, device="cuda", requires_grad=True)
+    hidden_states_ref = hidden_states.detach().clone().requires_grad_(True)
+    top_k_index = torch.randint(
+        0,
+        config.num_experts,
+        (2048, config.num_experts_per_tok),
+        device="cuda",
+    )
+    top_k_weights = torch.rand(2048, config.num_experts_per_tok, device="cuda")
+    top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+    upstream = torch.randn(2048, config.hidden_size, device="cuda")
 
-    torch.testing.assert_close(grouped, expected, atol=1e-6, rtol=1e-6)
+    monkeypatch.setenv("MOE_EVERYTHING_DISABLE_MLP_GROUPED_MM", "0")
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        out = experts(hidden_states, top_k_index, top_k_weights)
+    (out.float() * upstream).sum().backward()
+
+    monkeypatch.setenv("MOE_EVERYTHING_DISABLE_MLP_GROUPED_MM", "1")
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        out_ref = fallback(hidden_states_ref, top_k_index, top_k_weights)
+    (out_ref.float() * upstream).sum().backward()
+
+    assert (out.float() - out_ref.float()).abs().max().item() == 0.0
+    assert (hidden_states.grad.float() - hidden_states_ref.grad.float()).abs().max().item() == 0.0
+    for name, param in experts.named_parameters():
+        ref_param = dict(fallback.named_parameters())[name]
+        assert (param.grad.float() - ref_param.grad.float()).abs().max().item() == 0.0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1151,6 +1178,90 @@ def test_per_head_precompute_kv_routes_one_slot_per_kv_head():
     assert tables["V_fresh"].shape[1] == config.num_key_value_heads
 
 
+def test_per_head_precompute_kv_uses_expert_specific_kv_tables():
+    config = tiny_moe_everything_config("per_head_precompute_kv")
+    config.num_hidden_layers = 1
+    config.num_experts = 2
+    config.num_attn_experts = 2
+    model = MoEverythingForCausalLM(config).eval()
+    bank = model.model.attn_bank
+
+    hidden_states = torch.randn(2, 4, config.hidden_size)
+    position_ids = torch.arange(hidden_states.shape[1]).unsqueeze(0).expand(hidden_states.shape[0], -1)
+    position_embeddings = model.model.rotary_emb(hidden_states, position_ids=position_ids)
+    N = hidden_states.shape[0] * hidden_states.shape[1]
+    routed_idx = torch.tensor([[0], [1], [0], [1], [1], [0], [1], [0]], dtype=torch.long)
+    routed_weights = torch.ones((N, 1), dtype=hidden_states.dtype)
+    routed_probs = hidden_states.new_zeros((N, config.num_experts))
+    routed_probs.scatter_(1, routed_idx, 1.0)
+    original_route_flat = bank._route_flat
+
+    def wrapped_route_flat(self, router, x, top_k):
+        if x.shape[0] == N and top_k == bank.num_kv_heads:
+            return routed_idx.to(x.device), routed_weights.to(x.device), routed_probs.to(x.device)
+        return original_route_flat(router, x, top_k)
+
+    bank._route_flat = MethodType(wrapped_route_flat, bank)
+
+    with torch.no_grad():
+        actual_out, _, _ = bank.project_and_attend_per_head_precompute_kv(
+            hidden_states,
+            position_embeddings,
+            depth_idx=0,
+        )
+        tables = bank._build_per_head_precompute_kv_tables(
+            hidden_states,
+            position_embeddings,
+            depth_idx=0,
+        )
+
+        old_attn = bank._run_attention(tables["Q"], tables["K_fresh"], tables["V_fresh"], None)
+        old_out = bank._project_pair_inputs_grouped(
+            old_attn.transpose(1, 2).reshape(N, bank.num_kv_heads, bank.q_group_dim),
+            bank.o_proj,
+            tables["idx"],
+            tables["weights"],
+            reduce_tokens=True,
+        ).view(hidden_states.shape[0], hidden_states.shape[1], -1)
+
+        k_norm_weight = bank._get_k_norm_weight_bank(0, bank.num_experts)
+        slot_experts = tables["idx"].view(hidden_states.shape[0], hidden_states.shape[1], bank.num_kv_heads).permute(0, 2, 1)
+        attn_ref = hidden_states.new_zeros(
+            hidden_states.shape[0],
+            bank.num_heads,
+            hidden_states.shape[1],
+            bank.head_dim,
+        )
+        cos, sin = position_embeddings
+        for expert in tables["idx"].unique().tolist():
+            K_e = tables["flat"] @ bank.k_proj[expert]
+            V_e = tables["flat"] @ bank.v_proj[expert]
+            K_e = bank._apply_single_head_norm(K_e, k_norm_weight[expert])
+            K_e = K_e.view(hidden_states.shape[0], hidden_states.shape[1], 1, bank.head_dim).transpose(1, 2)
+            V_e = V_e.view(hidden_states.shape[0], hidden_states.shape[1], 1, bank.head_dim).transpose(1, 2)
+            _, K_e = apply_rotary_pos_emb(tables["Q"][:, :1], K_e, cos, sin)
+            attn_e = bank._run_attention(
+                tables["Q"],
+                K_e.expand(-1, bank.num_kv_heads, -1, -1),
+                V_e.expand(-1, bank.num_kv_heads, -1, -1),
+                None,
+            )
+            group_mask = (slot_experts == expert).unsqueeze(-1)
+            head_mask = group_mask.repeat_interleave(bank.num_kv_groups, dim=1)
+            attn_ref = attn_ref + attn_e * head_mask.to(attn_e.dtype)
+
+        ref_out = bank._project_pair_inputs_grouped(
+            attn_ref.transpose(1, 2).reshape(N, bank.num_kv_heads, bank.q_group_dim),
+            bank.o_proj,
+            tables["idx"],
+            tables["weights"],
+            reduce_tokens=True,
+        ).view(hidden_states.shape[0], hidden_states.shape[1], -1)
+
+    torch.testing.assert_close(actual_out, ref_out)
+    assert not torch.allclose(actual_out, old_out, atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.parametrize(
     ("mode", "attn_tokens", "expected"),
     [
@@ -1169,13 +1280,13 @@ def test_per_head_auto_sparse_thresholds_are_mode_specific(mode, attn_tokens, ex
     assert bank.should_use_sparse_path(token_mask) is expected
 
 
-def test_base_per_head_fully_independent_configs_use_256_attention_experts():
+def test_base_per_head_fully_independent_configs_use_128_attention_experts():
     base_cfg = Path("configs/moe_everything_per_head_fully_independent.yaml").read_text()
     debug_cfg = Path(
         "configs/scaling/debug8_xs_deepseek_moe_everything_per_head_fully_independent.yaml"
     ).read_text()
-    assert "num_attn_experts: 256" in base_cfg
-    assert "num_attn_experts: 256" in debug_cfg
+    assert "num_attn_experts: 128" in base_cfg
+    assert "num_attn_experts: 128" in debug_cfg
 
 
 @pytest.mark.parametrize("mode", PER_HEAD_MODES)
@@ -1521,18 +1632,19 @@ def test_global_router_update_groups_mixed_attention_pools_by_bank():
 
     router_groups = get_bias_update_router_groups(model)
     group_sizes = [[router.num_experts for router in group] for group in router_groups]
-    assert group_sizes == [[4], [4, 4], [2, 2], [2, 2], [4, 4]]
+    # Q: 4 experts, K/V: 4 experts (E_kv=E), O: 8 experts (E_o=E*q_heads_per_kv)
+    assert group_sizes == [[4], [4, 4], [4, 4], [4, 4], [8, 8]]
 
     with torch.no_grad():
         model.model.mlp_bank.gate.local_tokens_per_expert.copy_(torch.tensor([10.0, 0.0, 0.0, 0.0]))
         model.model.attn_bank.q_routers[0].local_tokens_per_expert.copy_(torch.tensor([0.0, 8.0, 0.0, 0.0]))
         model.model.attn_bank.q_routers[1].local_tokens_per_expert.copy_(torch.tensor([0.0, 0.0, 8.0, 0.0]))
-        model.model.attn_bank.k_routers[0].local_tokens_per_expert.copy_(torch.tensor([5.0, 0.0]))
-        model.model.attn_bank.k_routers[1].local_tokens_per_expert.copy_(torch.tensor([0.0, 5.0]))
-        model.model.attn_bank.v_routers[0].local_tokens_per_expert.copy_(torch.tensor([5.0, 0.0]))
-        model.model.attn_bank.v_routers[1].local_tokens_per_expert.copy_(torch.tensor([0.0, 5.0]))
-        model.model.attn_bank.o_routers[0].local_tokens_per_expert.copy_(torch.tensor([0.0, 0.0, 8.0, 0.0]))
-        model.model.attn_bank.o_routers[1].local_tokens_per_expert.copy_(torch.tensor([0.0, 0.0, 0.0, 8.0]))
+        model.model.attn_bank.k_routers[0].local_tokens_per_expert.copy_(torch.tensor([5.0, 0.0, 0.0, 0.0]))
+        model.model.attn_bank.k_routers[1].local_tokens_per_expert.copy_(torch.tensor([0.0, 5.0, 0.0, 0.0]))
+        model.model.attn_bank.v_routers[0].local_tokens_per_expert.copy_(torch.tensor([5.0, 0.0, 0.0, 0.0]))
+        model.model.attn_bank.v_routers[1].local_tokens_per_expert.copy_(torch.tensor([0.0, 5.0, 0.0, 0.0]))
+        model.model.attn_bank.o_routers[0].local_tokens_per_expert.copy_(torch.tensor([0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+        model.model.attn_bank.o_routers[1].local_tokens_per_expert.copy_(torch.tensor([0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0]))
 
     update_expert_biases(
         model,
@@ -1558,8 +1670,9 @@ def test_global_router_update_groups_mixed_attention_pools_by_bank():
         model.model.attn_bank.o_routers[0].expert_bias,
         model.model.attn_bank.o_routers[1].expert_bias,
     )
-    assert model.model.attn_bank.k_routers[0].expert_bias.shape[0] == 2
+    assert model.model.attn_bank.k_routers[0].expert_bias.shape[0] == 4
     assert model.model.attn_bank.q_routers[0].expert_bias.shape[0] == 4
+    assert model.model.attn_bank.o_routers[0].expert_bias.shape[0] == 8
 
 
 def test_representative_experiment_configs_use_expected_gqa_ratios():

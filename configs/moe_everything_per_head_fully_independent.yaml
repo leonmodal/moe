@@ -25,7 +25,7 @@ model:
   num_groups: 8                     # group-limited routing: num expert groups
   group_topk: 4                     # group-limited routing: groups selected per token
   # -- Attention experts (16 depth-equivalent Q/O heads x 16 layers = 256) ----
-  num_attn_experts: 256
+  num_attn_experts: 128
   num_attn_experts_per_tok: 1
   attn_expert_mode: per_head_fully_independent
   per_head_compute_mode: dense

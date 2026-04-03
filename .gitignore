@@ -8,3 +8,4 @@ wandb/
 data/*
 .env
 Megatron-LM/
+profiler_logs/
