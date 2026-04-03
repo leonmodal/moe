@@ -1648,9 +1648,14 @@ class MoEverythingModel(nn.Module):
         self.kv_dim = self.num_kv_heads * head_dim
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.init_k_proj = nn.Linear(config.hidden_size, self.kv_dim, bias=False)
-        self.init_v_proj = nn.Linear(config.hidden_size, self.kv_dim, bias=False)
-        self.init_k_norm = Qwen3MoeRMSNorm(head_dim, eps=config.rms_norm_eps)
+        if config.attn_expert_mode == "per_head_precompute_kv":
+            self.init_k_proj = None
+            self.init_v_proj = None
+            self.init_k_norm = None
+        else:
+            self.init_k_proj = nn.Linear(config.hidden_size, self.kv_dim, bias=False)
+            self.init_v_proj = nn.Linear(config.hidden_size, self.kv_dim, bias=False)
+            self.init_k_norm = Qwen3MoeRMSNorm(head_dim, eps=config.rms_norm_eps)
 
         self.rotary_emb = Qwen3MoeRotaryEmbedding(config=config)
 
@@ -1809,6 +1814,77 @@ class MoEverythingModel(nn.Module):
 
         return hidden_states, K_new, V_new
 
+    def _depth_step_precompute_kv(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        causal_mask: torch.Tensor,
+        depth_idx: int = 0,
+    ) -> torch.Tensor:
+        if self.sanity_check_mode == "alternating_global_moe":
+            w_attn, w_mlp, attn_mask, mlp_mask = self._sanity_branch_route(hidden_states, depth_idx)
+        elif self.per_layer_router:
+            w_attn, w_mlp, attn_mask, mlp_mask = self.branch_routers[depth_idx](hidden_states)
+        else:
+            w_attn, w_mlp, attn_mask, mlp_mask = self.branch_router(hidden_states)
+
+        attn_mask_bool = attn_mask.bool()
+        use_sparse_attn = self.attn_bank.should_use_sparse_path(attn_mask_bool)
+        B, T, _ = hidden_states.shape
+        dummy_k = hidden_states.new_zeros(B, self.num_kv_heads, T, self.head_dim)
+        dummy_v = hidden_states.new_zeros(B, self.num_kv_heads, T, self.head_dim)
+
+        if not bool(attn_mask_bool.any().item()):
+            attn_out, _, _ = self.attn_bank._empty_sparse_attn_result(
+                hidden_states,
+                dummy_k,
+                dummy_v,
+                [("attn", self.attn_bank.num_experts, self.attn_bank.num_kv_heads)],
+            )
+        elif bool(attn_mask_bool.all().item()):
+            attn_out, _, _ = self.attn_bank.project_and_attend_per_head_precompute_kv(
+                hidden_states,
+                position_embeddings,
+                causal_mask,
+                depth_idx=depth_idx,
+            )
+            self.attn_bank._attach_token_mask_to_last_router_info(attn_mask_bool)
+        elif use_sparse_attn:
+            attn_out, _, _ = self.attn_bank.project_and_attend_per_head_precompute_kv_sparse(
+                hidden_states,
+                position_embeddings,
+                dummy_k,
+                dummy_v,
+                attn_mask_bool,
+                causal_mask,
+                depth_idx=depth_idx,
+            )
+            self.attn_bank._attach_token_mask_to_last_router_info(attn_mask_bool)
+        else:
+            attn_out, _, _ = self.attn_bank.project_and_attend_per_head_precompute_kv_dense_mixed(
+                hidden_states,
+                position_embeddings,
+                dummy_k,
+                dummy_v,
+                attn_mask_bool,
+                causal_mask,
+                depth_idx=depth_idx,
+            )
+            self.attn_bank._attach_token_mask_to_last_router_info(attn_mask_bool)
+
+        if self.post_norm:
+            pn = self.attn_post_norms[depth_idx] if hasattr(self, "attn_post_norms") else self.attn_post_norm
+            attn_out = pn(attn_out)
+        hidden_states = hidden_states + w_attn * attn_out
+
+        mlp_out = self.mlp_bank(hidden_states, depth_idx=depth_idx, token_mask=mlp_mask.bool())
+        if self.post_norm:
+            pn = self.mlp_post_norms[depth_idx] if hasattr(self, "mlp_post_norms") else self.mlp_post_norm
+            mlp_out = pn(mlp_out)
+        hidden_states = hidden_states + w_mlp * mlp_out
+
+        return hidden_states
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -1838,16 +1914,18 @@ class MoEverythingModel(nn.Module):
             position_ids=position_ids,
         )
 
-        K_init = self.init_k_proj(hidden_states)
-        V_init = self.init_v_proj(hidden_states)
-        K_init = self.init_k_norm(K_init.view(B, T, self.num_kv_heads, self.head_dim)).transpose(1, 2)
-        V_init = V_init.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        use_precompute_kv = self.attn_bank.mode == "per_head_precompute_kv"
+        if not use_precompute_kv:
+            K_init = self.init_k_proj(hidden_states)
+            V_init = self.init_v_proj(hidden_states)
+            K_init = self.init_k_norm(K_init.view(B, T, self.num_kv_heads, self.head_dim)).transpose(1, 2)
+            V_init = V_init.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        cos_unsq = cos.unsqueeze(1)
-        sin_unsq = sin.unsqueeze(1)
-        K_init = (K_init * cos_unsq) + (self._rotate_half(K_init) * sin_unsq)
+            cos_unsq = cos.unsqueeze(1)
+            sin_unsq = sin.unsqueeze(1)
+            K_init = (K_init * cos_unsq) + (self._rotate_half(K_init) * sin_unsq)
 
-        kv_state = (K_init, V_init)
+            kv_state = (K_init, V_init)
 
         self._all_mlp_router_logits = []
         self._all_mlp_selected_experts = []
@@ -1884,26 +1962,46 @@ class MoEverythingModel(nn.Module):
                             "l b t, l b t h -> b t h", alpha, V_stack
                         )
 
-            K_old, V_old = kv_state
+            if use_precompute_kv:
+                if self.gradient_checkpointing and self.training:
+                    checkpoint_kwargs = dict(self._gradient_checkpointing_kwargs)
+                    checkpoint_kwargs.setdefault("use_reentrant", False)
+                    checkpoint_kwargs.setdefault("context_fn", self._checkpoint_context_fn)
 
-            if self.gradient_checkpointing and self.training:
-                checkpoint_kwargs = dict(self._gradient_checkpointing_kwargs)
-                checkpoint_kwargs.setdefault("use_reentrant", False)
-                checkpoint_kwargs.setdefault("context_fn", self._checkpoint_context_fn)
+                    def depth_step_precompute(h, _depth_idx=d):
+                        return self._depth_step_precompute_kv(
+                            h, position_embeddings, causal_mask, depth_idx=_depth_idx
+                        )
 
-                def depth_step(h, k, v, _depth_idx=d):
-                    return self._depth_step(
-                        h, k, v, position_embeddings, causal_mask, depth_idx=_depth_idx
+                    hidden_states = checkpoint(depth_step_precompute, hidden_states, **checkpoint_kwargs)
+                else:
+                    hidden_states = self._depth_step_precompute_kv(
+                        hidden_states,
+                        position_embeddings,
+                        causal_mask,
+                        depth_idx=d,
                     )
-
-                hidden_states, K_new, V_new = checkpoint(
-                    depth_step, hidden_states, K_old, V_old, **checkpoint_kwargs
-                )
             else:
-                hidden_states, K_new, V_new = self._depth_step(
-                    hidden_states, K_old, V_old, position_embeddings, causal_mask,
-                    depth_idx=d,
-                )
+                K_old, V_old = kv_state
+
+                if self.gradient_checkpointing and self.training:
+                    checkpoint_kwargs = dict(self._gradient_checkpointing_kwargs)
+                    checkpoint_kwargs.setdefault("use_reentrant", False)
+                    checkpoint_kwargs.setdefault("context_fn", self._checkpoint_context_fn)
+
+                    def depth_step(h, k, v, _depth_idx=d):
+                        return self._depth_step(
+                            h, k, v, position_embeddings, causal_mask, depth_idx=_depth_idx
+                        )
+
+                    hidden_states, K_new, V_new = checkpoint(
+                        depth_step, hidden_states, K_old, V_old, **checkpoint_kwargs
+                    )
+                else:
+                    hidden_states, K_new, V_new = self._depth_step(
+                        hidden_states, K_old, V_old, position_embeddings, causal_mask,
+                        depth_idx=d,
+                    )
 
             if self.per_layer_router:
                 self._all_branch_probs.append(self.branch_routers[d].last_probs)
@@ -1914,7 +2012,8 @@ class MoEverythingModel(nn.Module):
             self._all_mlp_token_masks.append(self.mlp_bank.last_token_mask)
             self._all_attn_router_info.append(self.attn_bank.last_router_info)
 
-            kv_state = (K_new, V_new)
+            if not use_precompute_kv:
+                kv_state = (K_new, V_new)
 
             # Store depth output for depthwise attention
             if self.depthwise_attention:

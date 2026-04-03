@@ -512,6 +512,14 @@ def test_moe_everything_loss_decreases(mode):
     assert out2.loss.item() < out1.loss.item(), f"{mode}: loss did not decrease"
 
 
+def test_per_head_precompute_kv_omits_init_kv_params():
+    model = MoEverythingForCausalLM(tiny_moe_everything_config("per_head_precompute_kv"))
+    param_names = {name for name, _ in model.named_parameters()}
+    assert "model.init_k_proj.weight" not in param_names
+    assert "model.init_v_proj.weight" not in param_names
+    assert "model.init_k_norm.weight" not in param_names
+
+
 # ── MoE-Everything with DeepSeek routing ───────────────────────────────
 
 def tiny_moe_everything_deepseek_config(mode="per_head_fully_independent"):
@@ -1192,6 +1200,159 @@ def test_per_head_precompute_kv_uses_expert_specific_kv_tables():
 
     torch.testing.assert_close(actual_out, ref_out)
     assert not torch.allclose(actual_out, old_out, atol=1e-5, rtol=1e-5)
+
+
+def _fixed_router_probs(idx: torch.Tensor, num_experts: int, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    probs = torch.zeros((idx.shape[0], num_experts), device=device, dtype=dtype)
+    probs.scatter_add_(
+        1,
+        idx.to(device),
+        torch.full(idx.shape, 1.0 / max(1, idx.shape[1]), device=device, dtype=dtype),
+    )
+    return probs
+
+
+def test_per_head_precompute_kv_scale_flag_controls_weighting():
+    config = tiny_moe_everything_config("per_head_precompute_kv")
+    config.num_hidden_layers = 1
+    config.num_experts = 2
+    config.num_attn_experts = 2
+    model = MoEverythingForCausalLM(config).eval()
+    bank = model.model.attn_bank
+
+    hidden_states = torch.randn(2, 4, config.hidden_size)
+    position_ids = torch.arange(hidden_states.shape[1]).unsqueeze(0).expand(hidden_states.shape[0], -1)
+    position_embeddings = model.model.rotary_emb(hidden_states, position_ids=position_ids)
+    N = hidden_states.shape[0] * hidden_states.shape[1]
+
+    routed_idx = torch.tensor([[0], [1], [0], [1], [1], [0], [1], [0]], dtype=torch.long)
+    low_w = torch.full((N, 1), 0.2, dtype=hidden_states.dtype)
+    high_w = torch.tensor([[0.9], [0.1], [0.8], [0.2], [0.7], [0.3], [0.6], [0.4]], dtype=hidden_states.dtype)
+    probs = _fixed_router_probs(routed_idx, bank.num_experts, dtype=hidden_states.dtype, device=hidden_states.device)
+    original_route_flat = bank._route_flat
+    current_weights = low_w
+
+    def wrapped_route_flat(self, router, x, top_k):
+        assert top_k == bank.num_kv_heads
+        return routed_idx.to(x.device), current_weights.to(x.device), probs.to(x.device)
+
+    bank._route_flat = MethodType(wrapped_route_flat, bank)
+
+    with torch.no_grad():
+        bank.scale_attn_by_routing_weight = False
+        out_false_low, _, _ = bank.project_and_attend_per_head_precompute_kv(
+            hidden_states,
+            position_embeddings,
+            depth_idx=0,
+        )
+        current_weights = high_w
+        out_false_high, _, _ = bank.project_and_attend_per_head_precompute_kv(
+            hidden_states,
+            position_embeddings,
+            depth_idx=0,
+        )
+
+        bank.scale_attn_by_routing_weight = True
+        current_weights = low_w
+        out_true_low, _, _ = bank.project_and_attend_per_head_precompute_kv(
+            hidden_states,
+            position_embeddings,
+            depth_idx=0,
+        )
+        current_weights = high_w
+        out_true_high, _, _ = bank.project_and_attend_per_head_precompute_kv(
+            hidden_states,
+            position_embeddings,
+            depth_idx=0,
+        )
+
+    bank._route_flat = original_route_flat
+    bank.scale_attn_by_routing_weight = config.scale_attn_by_routing_weight
+
+    torch.testing.assert_close(out_false_low, out_false_high)
+    assert not torch.allclose(out_true_low, out_true_high, atol=1e-5, rtol=1e-5)
+
+
+def test_per_head_fully_independent_scale_flag_controls_weighting():
+    config = tiny_moe_everything_config("per_head_fully_independent")
+    config.num_hidden_layers = 1
+    config.num_experts = 2
+    config.num_attn_experts = 2
+    model = MoEverythingForCausalLM(config).eval()
+    bank = model.model.attn_bank
+
+    hidden_states = torch.randn(2, 4, config.hidden_size)
+    position_ids = torch.arange(hidden_states.shape[1]).unsqueeze(0).expand(hidden_states.shape[0], -1)
+    position_embeddings = model.model.rotary_emb(hidden_states, position_ids=position_ids)
+    N = hidden_states.shape[0] * hidden_states.shape[1]
+
+    q_idx = torch.tensor([[0], [1], [0], [1], [1], [0], [1], [0]], dtype=torch.long)
+    k_idx = torch.tensor([[1], [0], [1], [0], [0], [1], [0], [1]], dtype=torch.long)
+    v_idx = torch.tensor([[0], [0], [1], [1], [1], [1], [0], [0]], dtype=torch.long)
+    o_idx = torch.tensor([[0, 1], [2, 3], [0, 1], [2, 3], [1, 0], [3, 2], [1, 0], [3, 2]], dtype=torch.long)
+    low_specs = {
+        "q": torch.full((N, 1), 0.2, dtype=hidden_states.dtype),
+        "k": torch.full((N, 1), 0.3, dtype=hidden_states.dtype),
+        "v": torch.full((N, 1), 0.4, dtype=hidden_states.dtype),
+        "o": torch.full((N, 2), 0.25, dtype=hidden_states.dtype),
+    }
+    high_specs = {
+        "q": torch.tensor([[0.9], [0.1], [0.8], [0.2], [0.7], [0.3], [0.6], [0.4]], dtype=hidden_states.dtype),
+        "k": torch.tensor([[0.1], [0.9], [0.2], [0.8], [0.3], [0.7], [0.4], [0.6]], dtype=hidden_states.dtype),
+        "v": torch.tensor([[0.6], [0.4], [0.7], [0.3], [0.8], [0.2], [0.9], [0.1]], dtype=hidden_states.dtype),
+        "o": torch.tensor(
+            [[0.1, 0.9], [0.2, 0.8], [0.3, 0.7], [0.4, 0.6], [0.6, 0.4], [0.7, 0.3], [0.8, 0.2], [0.9, 0.1]],
+            dtype=hidden_states.dtype,
+        ),
+    }
+    router_specs = {
+        "q": (q_idx, bank.num_experts),
+        "k": (k_idx, bank.num_kv_experts),
+        "v": (v_idx, bank.num_kv_experts),
+        "o": (o_idx, bank.num_o_experts),
+    }
+    current_specs = low_specs
+    original_route_flat = bank._route_flat
+
+    def wrapped_route_flat(self, router, x, top_k):
+        if router is bank.q_router:
+            name = "q"
+        elif router is bank.k_router:
+            name = "k"
+        elif router is bank.v_router:
+            name = "v"
+        elif router is bank.o_router:
+            name = "o"
+        else:
+            return original_route_flat(router, x, top_k)
+        idx, num_experts = router_specs[name]
+        assert top_k == idx.shape[1]
+        probs = _fixed_router_probs(idx, num_experts, dtype=x.dtype, device=x.device)
+        return idx.to(x.device), current_specs[name].to(x.device), probs
+
+    bank._route_flat = MethodType(wrapped_route_flat, bank)
+
+    with torch.no_grad():
+        bank.scale_attn_by_routing_weight = False
+        Q, K, V = bank.project(hidden_states, position_embeddings, depth_idx=0)
+        out_false_low = bank.attend(Q, K, V, depth_idx=0)
+        current_specs = high_specs
+        Q, K, V = bank.project(hidden_states, position_embeddings, depth_idx=0)
+        out_false_high = bank.attend(Q, K, V, depth_idx=0)
+
+        bank.scale_attn_by_routing_weight = True
+        current_specs = low_specs
+        Q, K, V = bank.project(hidden_states, position_embeddings, depth_idx=0)
+        out_true_low = bank.attend(Q, K, V, depth_idx=0)
+        current_specs = high_specs
+        Q, K, V = bank.project(hidden_states, position_embeddings, depth_idx=0)
+        out_true_high = bank.attend(Q, K, V, depth_idx=0)
+
+    bank._route_flat = original_route_flat
+    bank.scale_attn_by_routing_weight = config.scale_attn_by_routing_weight
+
+    torch.testing.assert_close(out_false_low, out_false_high)
+    assert not torch.allclose(out_true_low, out_true_high, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize(

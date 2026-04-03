@@ -574,6 +574,16 @@ Observed behavior on the exact runs:
         - MLP grouped GEMM opt-in (`MOE_EVERYTHING_DISABLE_MLP_GROUPED_MM=0`): `72.4k tok/s`, `7.239 s/step`
       - read: keep the grouped MLP kernel available for future tuning, but do not treat it as a default throughput win on this machine
   - attempted end-to-end throughput measurement on `configs/depth_matched/8_layers/moe_everything_per_head_independent_perlayer_prenorm.yaml` is currently blocked by a separate device-side assert in the model path (`ScatterGatherKernel` / `seq_load_balancing_loss_func`), so the clean shared-MLP trainer measurement above was taken on `standard_moe` instead
+  - `2026-04-03`: `per_head_precompute_kv` no longer carries a persistent KV state in the actual `MoEverythingModel` runtime path
+    - the model now omits `init_k_proj`, `init_v_proj`, and `init_k_norm` entirely when `attn_expert_mode == "per_head_precompute_kv"`
+    - precompute-KV depths run through a dedicated `_depth_step_precompute_kv(...)` path that recomputes expert-specific KV tables from current hidden states each depth instead of threading `K_old/V_old`
+    - this removes the old DDP unused-parameter failure on the precompute-KV trainer path
+    - validation:
+      - targeted pytest passed for precompute-KV param omission and for `scale_attn_by_routing_weight` control in both `per_head_precompute_kv` and `per_head_fully_independent`
+      - real 8-GPU bf16 run completed cleanly for `train.py --config configs/depth_matched/8_layers/moe_everything_per_head_precompute_kv_perlayer_prenorm.yaml --max-steps 2`
+        - step `1`: `loss=12.1216`, `ce=12.1214`
+        - step `2`: `loss=12.1258`, `ce=12.1256`
+    - note: the helper signatures in `AttentionExpertBank` still accept `K_old/V_old` for interface compatibility, but the live precompute-KV model path now feeds dummy tensors there and does not rely on carried KV state
 
 ## Remaining Open Items
 
