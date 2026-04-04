@@ -1,13 +1,67 @@
 # Status
 
-Updated: 2026-04-01 UTC
+Updated: 2026-04-04 UTC
 
 ## Current State
 
 - The main correctness and stability issues surfaced during the per-head MoE-Everything work are fixed locally.
+- The 16-layer standard MoE quality run has now been pushed further on 8 GPUs with the correct `100000`-step scheduler horizon and NanoGPT-style packed eval metrics.
 - The three target per-head configs from `scripts/launch_all.sh` have now been validated on 8 GPUs with the exact model settings, using DDP, `bf16`, gradient checkpointing, and W&B disabled.
 - The codepath is in a materially better state than the older notes in this repo suggested.
 - I would still not claim that every config in the repo is fully proven; the validation below is specific to the tested configs and codepaths.
+
+## 16-Layer Standard MoE Quality Update
+
+Config:
+
+- `configs/depth_matched/16_layers/standard_moe.yaml`
+- 8 x `NVIDIA B200`
+- DDP, `bf16`, W&B disabled
+- required `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to avoid the allocator-fragmentation OOM seen around step `28`
+
+Important note:
+
+- one intermediate continuation used `--max-steps 2000`, which compressed the cosine schedule and is not apples-to-apples after step `1000`
+- the quality numbers below are the fair schedule numbers from the original config horizon, resumed from `checkpoint-1000`
+
+Held-out eval CE curve:
+
+- step `250`: `6.8019`
+- step `500`: `5.9945`
+- step `750`: `5.4806`
+- step `1000`: `5.1725`
+- step `1250`: `4.9824`
+- step `1500`: `4.8720`
+
+Current answer:
+
+- best held-out CE reached so far is `4.8720`
+- this is still far from the `3.28` target
+- based on the observed curve through step `1500`, I do not see strong evidence of a core training bug in the standard MoE path
+
+Why this does not currently look bug-shaped:
+
+- held-out CE improved smoothly at every measured checkpoint
+- router aux moved down from `4.1451` at step `250` to `1.4883` at step `1500` instead of blowing up
+- gradients stayed finite and unremarkable in the live run
+- no NaNs, router collapse, or distributed instability were observed once the allocator fragmentation issue was handled
+
+Most plausible reasons the run still misses `3.28`:
+
+- token budget is still small for the model size: step `1500` is about `0.786B` tokens at this batch shape
+- the target may be coming from a non-identical setup: different tokenizer, data mix, validation split, sequence length, or eval protocol can move CE materially
+- the current optimization settings may simply be under-tuned for this target (`lr=1e-3`, large global token batch, top-4 standard MoE)
+
+What would make me suspect a real bug later:
+
+- if the held-out curve plateaus early in the high-`4.x` range after several more billions of tokens
+- if a comparable dense or global-MoE baseline improves much faster under the same data/eval setup
+- if router stats stop looking healthy and expert usage collapses while CE stalls
+
+Artifacts:
+
+- fair-schedule log: `outputs/depth_matched/16_layers/standard_moe_8gpu_true_schedule_from1000/train_resume_from1000.log`
+- the fair continuation was stopped manually after the step `1500` eval, so no new `checkpoint-1500` was persisted in that output dir
 
 ## Key Fixes
 
