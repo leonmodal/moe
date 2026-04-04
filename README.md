@@ -86,18 +86,15 @@ Both per-head modes use GQA (Grouped Query Attention):
 - Each token's router fills the 8 KV-group slots with selected experts from the pool
 - An expert is not permanently tied to any KV group -- different tokens can route different experts to the same group
 
-### Routing is pure selection
+### Routing is weighted by default
 
-By default (`scale_attn_by_routing_weight: false`), routing only determines **which** expert fills each slot. The projections are not scaled by the routing probability -- just like standard per-layer attention where there is no "weight" on Q/K/V/O. The router's softmax probabilities are only used for:
+By default (`scale_attn_by_routing_weight: true`), attention experts are weighted by the selected routing weights, matching standard MoE dispatch. If you need the old pure-selection path for ablations, set `scale_attn_by_routing_weight: false`.
 
-1. Top-k selection (which expert wins each slot)
-2. Load-balancing losses (sequence-level aux loss, DeepSeek bias updates)
+The router probabilities now serve three roles:
 
-Gradients still flow to the router weights via a straight-through estimator: in the forward pass the routing weight acts as 1.0, but in the backward pass it carries the gradient.
-
-This was a fix we discovered during development. The original implementation was applying the routing weight to Q projections, then again to the attention output, and again to the O projection -- effectively w^3 scaling. Since attention experts are selected 1-per-slot (not blended like MLP experts), there is nothing to weight-blend, and the scaling was incorrect.
-
-Set `scale_attn_by_routing_weight: true` to restore the old MoE-style blending behavior if desired.
+1. Top-k selection
+2. MoE-style weighting of the selected attention experts
+3. Load-balancing and exploration objectives
 
 ### Q is bundled per GQA group
 
@@ -274,7 +271,8 @@ Config switches:
 - `per_layer_router` -- one branch router per depth
 - `per_layer_attn_router` -- one attention-router set per depth
 - `per_layer_mlp_router` -- one MLP router per depth
-- `scale_attn_by_routing_weight` -- scale attention projections/outputs by routing weight (default: false)
+- `scale_attn_by_routing_weight` -- scale attention projections/outputs by routing weight (default: true)
+- `router_exploration_rate` -- per-token random expert exploration rate during training
 
 ## Q/K Norms
 
@@ -294,10 +292,11 @@ token B: head 0 -> expert 12 -> uses q_norm_weight[12], k_norm_weight[12]
 
 For the current per-head configs:
 
-- `branch_router_aux_loss_coef: 0.0` -- no branch-balance loss
-- `router_aux_loss_coef: 0.0` -- no Switch-style batch aux loss
+- `branch_router_aux_loss_coef: 0.001` -- Switch-style branch balance loss
+- `router_aux_loss_coef: 0.001` -- Switch-style batch aux loss for MLP and attention routers
 - `seq_aux_loss_coef: 0.0001` -- sequence-level aux is active
 - `bias_update_rate: 0.001` -- DeepSeek-style expert-bias updates are active
+- `router_exploration_rate: 0.02` -- random expert exploration is active during training
 
 ---
 
@@ -336,8 +335,9 @@ For `per_head_fully_independent`, `num_attn_experts` is halved relative to `per_
 
 - `train/loss`, `train/ce_loss`
 - `train/aux_loss`, `train/aux_loss_normalized`
-- `train/seq_aux_loss`, `train/branch_aux_loss`
+- `train/seq_aux_loss`, `train/branch_aux_loss`, `train/attention_aux_loss`
 - `train/tokens_per_sec`, `train/sec_per_step`, `train/tokens_seen_B`
+- `eval/loss`, `eval/ce_loss`, `eval/perplexity`
 
 ## Other docs
 

@@ -1,6 +1,7 @@
 """
 Test that the double-softmax bug is fixed and aux loss responds to skewed routing.
 """
+import pytest
 import torch
 import torch.nn.functional as F
 from src.models.load_balancing import (
@@ -60,6 +61,28 @@ def test_normalized_aux_uniform_sigmoid_scores():
     scores = torch.full((1000, 128), 0.5)
     loss = normalized_load_balancing_loss_func((scores,), num_experts=128, top_k=4)
     assert abs(loss.item() - 4.0) < 0.1, f"Expected ~4.0, got {loss.item()}"
+
+
+def test_aux_loss_respects_actual_selected_experts():
+    """Actual routed experts should override top-k(logits) when provided."""
+    probs = torch.tensor([
+        [0.90, 0.10],
+        [0.90, 0.10],
+        [0.90, 0.10],
+        [0.90, 0.10],
+    ])
+    selected = torch.tensor([[1], [1], [1], [1]])
+
+    inferred = load_balancing_loss_func((probs,), num_experts=2, top_k=1)
+    actual = load_balancing_loss_func(
+        (probs,),
+        num_experts=2,
+        top_k=1,
+        selected_experts=(selected,),
+    )
+
+    assert inferred.item() > actual.item()
+    assert actual.item() == pytest.approx(0.2, abs=1e-5)
 
 
 def test_standard_moe_uses_fixed_loss():

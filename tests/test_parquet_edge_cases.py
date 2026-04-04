@@ -255,7 +255,33 @@ def test_multi_rank_sharding():
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  TEST 4: train.py doesn't pass seed to dataset — verify default works
+#  TEST 4: Validation split is deterministic and disjoint
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_holdout_split_is_deterministic_and_disjoint():
+    if not os.path.exists(DATA_DIR):
+        print("  No data — skipping\n")
+        return
+
+    tokenizer = get_tokenizer()
+    train_cfg = DataConfig(data_dir=DATA_DIR, seq_len=128, split="train", holdout_fraction=0.2)
+    val_cfg = DataConfig(data_dir=DATA_DIR, seq_len=128, split="val", holdout_fraction=0.2)
+
+    train_ds = StatefulParquetDataset(train_cfg, tokenizer, rank=0, world_size=1, seed=42)
+    val_ds = StatefulParquetDataset(val_cfg, tokenizer, rank=0, world_size=1, seed=42)
+    train_ds2 = StatefulParquetDataset(train_cfg, tokenizer, rank=0, world_size=1, seed=42)
+    val_ds2 = StatefulParquetDataset(val_cfg, tokenizer, rank=0, world_size=1, seed=42)
+
+    assert train_ds.files == train_ds2.files
+    assert val_ds.files == val_ds2.files
+    assert set(train_ds.files).isdisjoint(set(val_ds.files))
+    assert set(train_ds.files) | set(val_ds.files) == set(
+        StatefulParquetDataset(DataConfig(data_dir=DATA_DIR, seq_len=128), tokenizer, rank=0, world_size=1, seed=42).files
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEST 5: train.py doesn't pass seed to dataset — verify default works
 # ═══════════════════════════════════════════════════════════════════════
 
 def test_train_seed_path():

@@ -15,8 +15,9 @@ model:
   moe_intermediate_size: 768
   intermediate_size: 3072
   norm_topk_prob: true
-  router_aux_loss_coef: 0.0
+  router_aux_loss_coef: 0.001
   seq_aux_loss_coef: 0.0001
+  router_exploration_rate: 0.02
   bias_update_rate: 0.001
   topk_scaling_factor: 2.5
   num_groups: 8
@@ -62,6 +63,13 @@ data:
   seq_len: 1024
   tokenizer_name: Qwen/Qwen3-0.6B
   num_workers: 4
+
+eval:
+  enabled: true
+  every: 1
+  max_batches: 2
+  holdout_fraction: 0.05
+  seed: 1234
 
 checkpoint:
   resume_from: null

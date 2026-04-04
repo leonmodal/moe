@@ -16,8 +16,9 @@ model:
   moe_intermediate_size: 768
   intermediate_size: 3072
   norm_topk_prob: true
-  router_aux_loss_coef: 0.0         # no batch-level aux loss
+  router_aux_loss_coef: 0.001       # Switch-style batch aux loss
   seq_aux_loss_coef: 0.0001         # sequence-level aux loss (DeepSeek V3: α=0.0001)
+  router_exploration_rate: 0.02     # random router exploration during training
   bias_update_rate: 0.001           # expert bias update rate (DeepSeek V3)
   topk_scaling_factor: 2.5          # routing weight scaling (DeepSeek V3)
   num_groups: 8                     # group-limited routing: num expert groups
@@ -57,6 +58,13 @@ data:
   seq_len: 1024
   tokenizer_name: Qwen/Qwen3-0.6B
   num_workers: 4
+
+eval:
+  enabled: true
+  every: 250
+  max_batches: 20
+  holdout_fraction: 0.05
+  seed: 1234
 
 checkpoint:
   resume_from: null

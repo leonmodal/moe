@@ -42,6 +42,7 @@ def load_balancing_loss_func(
     top_k: int = 2,
     attention_mask: torch.Tensor | None = None,
     token_masks: tuple[torch.Tensor] | None = None,
+    selected_experts: tuple[torch.Tensor] | None = None,
 ) -> torch.Tensor | int:
     """
     Computes auxiliary load balancing loss (Switch Transformer).
@@ -52,6 +53,9 @@ def load_balancing_loss_func(
         num_experts: Total number of experts.
         top_k: Number of experts selected per token.
         attention_mask: Optional [batch_size, seq_len] mask.
+        selected_experts: Optional tuple of actual hard assignments [T, K] per layer.
+            When provided, f_i is computed from these assignments instead of
+            recomputing top-k from the router scores.
 
     Returns:
         Scalar load-balancing loss.
@@ -61,29 +65,41 @@ def load_balancing_loss_func(
 
     compute_device = gate_logits[0].device
 
-    if token_masks is not None:
-        filtered = []
-        for layer_idx, layer_gate in enumerate(gate_logits):
-            if layer_idx >= len(token_masks) or token_masks[layer_idx] is None:
-                filtered.append(layer_gate.to(compute_device))
-                continue
+    filtered_logits = []
+    filtered_selected = []
+    for layer_idx, layer_gate in enumerate(gate_logits):
+        layer_scores = layer_gate.to(compute_device)
+        layer_selected = None
+        if selected_experts is not None and layer_idx < len(selected_experts):
+            layer_selected = selected_experts[layer_idx]
+            if layer_selected is not None:
+                layer_selected = layer_selected.to(compute_device)
+
+        if token_masks is not None and layer_idx < len(token_masks) and token_masks[layer_idx] is not None:
             layer_mask = token_masks[layer_idx].reshape(-1).bool().to(layer_gate.device)
-            if layer_mask.any():
-                filtered.append(layer_gate[layer_mask].to(compute_device))
-        if not filtered:
-            return gate_logits[0].new_zeros(())
-        concatenated_gate_logits = torch.cat(filtered, dim=0)
-    else:
-        concatenated_gate_logits = torch.cat(
-            [layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0
-        )
+            if not layer_mask.any():
+                continue
+            layer_scores = layer_scores[layer_mask]
+            if layer_selected is not None:
+                layer_selected = layer_selected[layer_mask]
+
+        if layer_scores.shape[0] == 0:
+            continue
+        if layer_selected is None:
+            _, layer_selected = torch.topk(layer_scores, top_k, dim=-1)
+        filtered_logits.append(layer_scores)
+        filtered_selected.append(layer_selected)
+
+    if not filtered_logits:
+        return gate_logits[0].new_zeros(())
+
+    concatenated_gate_logits = torch.cat(filtered_logits, dim=0)
 
     # gate_logits are already softmax probabilities from the router — use directly.
     routing_weights = concatenated_gate_logits
 
-    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-
-    expert_mask = F.one_hot(selected_experts, num_experts)
+    selected_experts_tensor = torch.cat(filtered_selected, dim=0)
+    expert_mask = F.one_hot(selected_experts_tensor, num_experts)
 
     if attention_mask is None:
         # f_i: fraction of tokens routed to each expert (hard assignment)
@@ -129,6 +145,7 @@ def normalized_load_balancing_loss_func(
     top_k: int = 2,
     attention_mask: torch.Tensor | None = None,
     token_masks: tuple[torch.Tensor] | None = None,
+    selected_experts: tuple[torch.Tensor] | None = None,
 ) -> torch.Tensor | int:
     """Diagnostic batch aux loss using normalized router scores.
 
@@ -142,6 +159,7 @@ def normalized_load_balancing_loss_func(
         top_k=top_k,
         attention_mask=attention_mask,
         token_masks=token_masks,
+        selected_experts=selected_experts,
     )
 
 

@@ -28,6 +28,8 @@ class DataConfig:
     seq_len: int = 2048
     tokenizer_name: str = "gpt2"
     num_workers: int = 4
+    split: str = "all"             # all | train | val
+    holdout_fraction: float = 0.0  # file-level holdout used when split != all
 
 
 class StatefulParquetDataset(IterableDataset):
@@ -63,6 +65,27 @@ class StatefulParquetDataset(IterableDataset):
         # Shuffle with fixed seed — deterministic across runs for resumability
         rng = random.Random(seed)
         rng.shuffle(all_files)
+
+        split = getattr(config, "split", "all")
+        holdout_fraction = float(getattr(config, "holdout_fraction", 0.0) or 0.0)
+        if split not in {"all", "train", "val"}:
+            raise ValueError(f"Unknown dataset split: {split}")
+        if not 0.0 <= holdout_fraction < 1.0:
+            raise ValueError(f"holdout_fraction must be in [0, 1), got {holdout_fraction}")
+        if split != "all" and holdout_fraction > 0.0:
+            min_val_files = min(world_size, max(1, len(all_files) - 1))
+            val_count = max(1, int(round(len(all_files) * holdout_fraction)))
+            val_count = max(val_count, min_val_files)
+            if val_count >= len(all_files):
+                raise ValueError(
+                    f"holdout_fraction={holdout_fraction} leaves no training files in {config.data_dir}"
+                )
+            if split == "val":
+                all_files = all_files[:val_count]
+            else:
+                all_files = all_files[val_count:]
+        elif split == "val":
+            raise ValueError("split='val' requires holdout_fraction > 0 or a dedicated eval data_dir")
 
         # Shard files across ranks deterministically
         self.files = [f for i, f in enumerate(all_files) if i % world_size == rank]

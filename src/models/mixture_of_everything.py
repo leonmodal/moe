@@ -46,14 +46,18 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoePreTrainedModel,
     Qwen3MoeRMSNorm,
     Qwen3MoeRotaryEmbedding,
-    Qwen3MoeTopKRouter,
     apply_rotary_pos_emb,
     eager_attention_forward,
     repeat_kv,
 )
 
 from .load_balancing import load_balancing_loss_func, seq_load_balancing_loss_func
-from .router import DeepSeekRouter, checkpoint_recompute_context, is_checkpoint_recompute
+from .router import (
+    DeepSeekRouter,
+    ExplorationTopKRouter,
+    checkpoint_recompute_context,
+    is_checkpoint_recompute,
+)
 
 DEFAULT_PER_HEAD_DENSE_FRACTION_THRESHOLD = 0.75
 AUTO_PER_HEAD_SPARSE_THRESHOLDS = {
@@ -104,10 +108,20 @@ class MoEverythingConfig(Qwen3MoeConfig):
         # Deterministic routing mode used for architecture sanity checks
         sanity_check_mode: str | None = None,
         # Whether to scale attention projections/outputs by routing weights.
-        # False (default): routing is pure selection — experts are placed into
-        # slots without any weighting, like standard per-layer attention.
-        # True: scale projections by the routing softmax weight (MoE-style blending).
-        scale_attn_by_routing_weight: bool = False,
+        # True (default): scale projections and outputs by the selected routing
+        # weights, matching standard MoE dispatch semantics.
+        # False: use the old pure-selection straight-through path.
+        scale_attn_by_routing_weight: bool = True,
+        # Whether to scale branch outputs by the branch routing probability.
+        # True (default): output *= softmax prob of chosen branch.
+        # False: straight-through (forward sees 1.0, backward gets grad through prob).
+        scale_branch_by_routing_weight: bool = True,
+        # Per-token probability of replacing router top-k selection with a
+        # random expert draw during training.
+        router_exploration_rate: float = 0.0,
+        # Optional override for the branch router. Falls back to
+        # router_exploration_rate when unset.
+        branch_router_exploration_rate: float | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -131,6 +145,13 @@ class MoEverythingConfig(Qwen3MoeConfig):
         self.per_head_dense_fraction_threshold = per_head_dense_fraction_threshold
         self.sanity_check_mode = sanity_check_mode
         self.scale_attn_by_routing_weight = scale_attn_by_routing_weight
+        self.scale_branch_by_routing_weight = scale_branch_by_routing_weight
+        self.router_exploration_rate = router_exploration_rate
+        self.branch_router_exploration_rate = (
+            router_exploration_rate
+            if branch_router_exploration_rate is None
+            else branch_router_exploration_rate
+        )
 
 
 # ─── Branch router ─────────────────────────────────────────────────────────── #
@@ -143,22 +164,38 @@ class BranchRouter(nn.Module):
     for gradient flow (same pattern as MoE expert routing).
     """
 
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, exploration_rate: float = 0.0,
+                 scale_by_routing_weight: bool = True):
         super().__init__()
         self.gate = nn.Linear(hidden_size, 2, bias=False)
+        self.exploration_rate = exploration_rate
+        self.scale_by_routing_weight = scale_by_routing_weight
         self.last_probs = None
+        self.last_selected_experts = None
 
     def forward(self, hidden_states: torch.Tensor):
         logits = self.gate(hidden_states.float())
         probs = F.softmax(logits, dim=-1).to(hidden_states.dtype)
         self.last_probs = probs
+        choice_scores = probs.float()
+        if self.training and self.exploration_rate > 0.0:
+            explore_mask = torch.rand(choice_scores.shape[:-1], device=choice_scores.device) < self.exploration_rate
+            if explore_mask.any():
+                choice_scores = choice_scores.clone()
+                choice_scores[explore_mask] = torch.rand_like(choice_scores[explore_mask])
         # Hard selection: 0 = attn, 1 = mlp
-        choice = probs.argmax(dim=-1)              # (...,)
+        choice = choice_scores.argmax(dim=-1)      # (...,)
+        self.last_selected_experts = choice.unsqueeze(-1).detach()
         attn_mask = (choice == 0).unsqueeze(-1)     # (..., 1)
         mlp_mask = (choice == 1).unsqueeze(-1)      # (..., 1)
         # Weight = probability of selected branch (differentiable)
-        w_attn = probs[..., 0:1] * attn_mask       # (..., 1)
-        w_mlp = probs[..., 1:2] * mlp_mask         # (..., 1)
+        if self.scale_by_routing_weight:
+            w_attn = probs[..., 0:1] * attn_mask       # (..., 1)
+            w_mlp = probs[..., 1:2] * mlp_mask         # (..., 1)
+        else:
+            # Straight-through: forward sees 1.0, backward gets grad through prob
+            w_attn = _straight_through_ones(probs[..., 0:1]) * attn_mask
+            w_mlp = _straight_through_ones(probs[..., 1:2]) * mlp_mask
         return w_attn, w_mlp, attn_mask, mlp_mask
 
 
@@ -168,6 +205,7 @@ class BranchRouterRecorder(nn.Module):
     def __init__(self):
         super().__init__()
         self.last_probs = None
+        self.last_selected_experts = None
 
 
 # ─── Routed norm bank ─────────────────────────────────────────────────────── #
@@ -345,9 +383,17 @@ class AttentionExpertBank(nn.Module):
         """Create a router for flat bank modes — selects top_k experts from the pool."""
         if num_experts is None:
             num_experts = self.num_experts
-        if self.use_deepseek_routing:
-            from types import SimpleNamespace
+        from types import SimpleNamespace
 
+        base_cfg = SimpleNamespace(
+            hidden_size=input_dim,
+            num_local_experts=num_experts,
+            num_experts=num_experts,
+            num_experts_per_tok=top_k,
+            norm_topk_prob=getattr(self.config, "norm_topk_prob", True),
+            router_exploration_rate=getattr(self.config, "router_exploration_rate", 0.0),
+        )
+        if self.use_deepseek_routing:
             num_groups = getattr(self.config, "num_groups", None)
             group_topk = getattr(self.config, "group_topk", None)
             # Disable group-limited routing if it can't provide enough candidates
@@ -357,22 +403,15 @@ class AttentionExpertBank(nn.Module):
                 if max_candidates < top_k:
                     num_groups = None
                     group_topk = None
-            cfg = SimpleNamespace(
-                hidden_size=input_dim,
-                num_local_experts=num_experts,
-                num_experts=num_experts,
-                num_experts_per_tok=top_k,
-                norm_topk_prob=getattr(self.config, "norm_topk_prob", True),
-                topk_scaling_factor=getattr(self.config, "topk_scaling_factor", None),
-                num_groups=num_groups,
-                group_topk=group_topk,
-            )
-            return DeepSeekRouter(cfg)
-        return nn.Linear(input_dim, num_experts, bias=False)
+            base_cfg.topk_scaling_factor = getattr(self.config, "topk_scaling_factor", None)
+            base_cfg.num_groups = num_groups
+            base_cfg.group_topk = group_topk
+            return DeepSeekRouter(base_cfg)
+        return ExplorationTopKRouter(base_cfg)
 
     def _route_flat(self, router, x, top_k):
         """Route with explicit top_k for flat bank."""
-        if isinstance(router, DeepSeekRouter):
+        if isinstance(router, (DeepSeekRouter, ExplorationTopKRouter)):
             router_probs, weights, idx = router(x)
             return idx, weights, router_probs
 
@@ -1540,7 +1579,7 @@ class MlpExpertBank(nn.Module):
     def _make_gate(self, config: MoEverythingConfig):
         if getattr(config, "use_deepseek_routing", False):
             return DeepSeekRouter(config)
-        return Qwen3MoeTopKRouter(config)
+        return ExplorationTopKRouter(config)
 
     def _select_gate(self, depth_idx: int | None):
         if not self.per_layer_gate:
@@ -1661,6 +1700,12 @@ class MoEverythingModel(nn.Module):
 
         # Feature 1: per-layer vs shared branch router
         self.per_layer_router = getattr(config, "per_layer_router", False)
+        branch_exploration_rate = getattr(
+            config,
+            "branch_router_exploration_rate",
+            getattr(config, "router_exploration_rate", 0.0),
+        )
+        scale_branch = getattr(config, "scale_branch_by_routing_weight", True)
         if self.sanity_check_mode == "alternating_global_moe":
             if self.per_layer_router:
                 self.branch_routers = nn.ModuleList([BranchRouterRecorder() for _ in range(self.num_depths)])
@@ -1668,10 +1713,13 @@ class MoEverythingModel(nn.Module):
                 self.branch_router = BranchRouterRecorder()
         elif self.per_layer_router:
             self.branch_routers = nn.ModuleList([
-                BranchRouter(config.hidden_size) for _ in range(self.num_depths)
+                BranchRouter(config.hidden_size, exploration_rate=branch_exploration_rate,
+                             scale_by_routing_weight=scale_branch)
+                for _ in range(self.num_depths)
             ])
         else:
-            self.branch_router = BranchRouter(config.hidden_size)
+            self.branch_router = BranchRouter(config.hidden_size, exploration_rate=branch_exploration_rate,
+                                              scale_by_routing_weight=scale_branch)
 
         self.attn_bank = AttentionExpertBank(config)
         self.mlp_bank = MlpExpertBank(config)
@@ -1708,6 +1756,7 @@ class MoEverythingModel(nn.Module):
         self._all_mlp_selected_experts = []
         self._all_mlp_token_masks = []
         self._all_branch_probs = []
+        self._all_branch_selected_experts = []
         self._all_attn_router_info = []
 
         self.gradient_checkpointing = False
@@ -1752,8 +1801,14 @@ class MoEverythingModel(nn.Module):
         w_mlp = mlp_mask.to(hidden_states.dtype)
         if self.per_layer_router:
             self.branch_routers[depth_idx].last_probs = probs
+            self.branch_routers[depth_idx].last_selected_experts = (
+                hidden_states.new_full((*hidden_states.shape[:2], 1), 0 if choose_attn else 1, dtype=torch.long)
+            )
         else:
             self.branch_router.last_probs = probs
+            self.branch_router.last_selected_experts = (
+                hidden_states.new_full((*hidden_states.shape[:2], 1), 0 if choose_attn else 1, dtype=torch.long)
+            )
         return w_attn, w_mlp, attn_mask, mlp_mask
 
     def _depth_step(
@@ -1931,6 +1986,7 @@ class MoEverythingModel(nn.Module):
         self._all_mlp_selected_experts = []
         self._all_mlp_token_masks = []
         self._all_branch_probs = []
+        self._all_branch_selected_experts = []
         self._all_attn_router_info = []
 
         # Dynamic depth: randomize iteration count during training
@@ -2005,8 +2061,10 @@ class MoEverythingModel(nn.Module):
 
             if self.per_layer_router:
                 self._all_branch_probs.append(self.branch_routers[d].last_probs)
+                self._all_branch_selected_experts.append(self.branch_routers[d].last_selected_experts)
             else:
                 self._all_branch_probs.append(self.branch_router.last_probs)
+                self._all_branch_selected_experts.append(self.branch_router.last_selected_experts)
             self._all_mlp_router_logits.append(self.mlp_bank.last_router_logits)
             self._all_mlp_selected_experts.append(self.mlp_bank.last_selected_experts)
             self._all_mlp_token_masks.append(self.mlp_bank.last_token_mask)
@@ -2088,11 +2146,13 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
         aux_loss = None
         seq_aux_loss = None
         branch_aux_loss = None
+        attention_aux_loss = None
 
         mlp_router_logits = tuple(self.model._all_mlp_router_logits) or None
         mlp_selected_experts = tuple(self.model._all_mlp_selected_experts) or None
         mlp_token_masks = tuple(self.model._all_mlp_token_masks) or None
         branch_prob_tensors = tuple(self.model._all_branch_probs) or None
+        branch_selected_experts = tuple(self.model._all_branch_selected_experts) or None
         attention_router_info = tuple(self.model._all_attn_router_info) or None
 
         if labels is not None:
@@ -2105,6 +2165,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                     self.num_experts,
                     self.num_experts_per_tok,
                     token_masks=mlp_token_masks,
+                    selected_experts=mlp_selected_experts,
                 )
                 if isinstance(mlp_aux, torch.Tensor):
                     aux_loss = mlp_aux
@@ -2124,12 +2185,10 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                     seq_aux_loss = seq_aux
                     loss = loss + seq_aux_coef * seq_aux
 
-            # Attention expert seq aux loss (same coef as MLP).
-            # Skip this in sanity mode because attention routing is deterministic
-            # and would only add a constant term to the loss.
+            # Attention expert router losses.
+            # Skip auxiliary terms in sanity mode because routing is deterministic there.
             if (
-                seq_aux_coef > 0
-                and attention_router_info is not None
+                attention_router_info is not None
                 and getattr(self.config, "sanity_check_mode", None) != "alternating_global_moe"
             ):
                 # Gather per-router logits and selected experts across depths
@@ -2152,18 +2211,43 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                     else:
                         n_experts = num_attn_experts
                         n_per_tok = self.config.num_key_value_heads
-                    attn_seq_aux = seq_load_balancing_loss_func(
-                        r_logits, n_experts, n_per_tok,
-                        batch_size=input_ids.shape[0],
-                        selected_experts=r_selected,
+                    attn_aux = load_balancing_loss_func(
+                        r_logits,
+                        n_experts,
+                        n_per_tok,
                         token_masks=r_masks,
+                        selected_experts=r_selected,
                     )
-                    if isinstance(attn_seq_aux, torch.Tensor):
-                        loss = loss + seq_aux_coef * attn_seq_aux
+                    if isinstance(attn_aux, torch.Tensor):
+                        attention_aux_loss = attn_aux if attention_aux_loss is None else attention_aux_loss + attn_aux
+                    if seq_aux_coef > 0:
+                        attn_seq_aux = seq_load_balancing_loss_func(
+                            r_logits, n_experts, n_per_tok,
+                            batch_size=input_ids.shape[0],
+                            selected_experts=r_selected,
+                            token_masks=r_masks,
+                        )
+                        if isinstance(attn_seq_aux, torch.Tensor):
+                            loss = loss + seq_aux_coef * attn_seq_aux
 
-            # Branch probs are tracked for logging only. We do not force
-            # balance between attention and MLP; the model is free to learn
-            # any branch ratio per depth.
+            if isinstance(attention_aux_loss, torch.Tensor):
+                aux_loss = attention_aux_loss if aux_loss is None else aux_loss + attention_aux_loss
+                loss = loss + self.router_aux_loss_coef * attention_aux_loss
+
+            if branch_prob_tensors is not None:
+                branch_logits = tuple(probs.reshape(-1, 2) for probs in branch_prob_tensors)
+                branch_selected = None
+                if branch_selected_experts is not None:
+                    branch_selected = tuple(selected.reshape(-1, 1) for selected in branch_selected_experts)
+                branch_aux = load_balancing_loss_func(
+                    branch_logits,
+                    num_experts=2,
+                    top_k=1,
+                    selected_experts=branch_selected,
+                )
+                if isinstance(branch_aux, torch.Tensor):
+                    branch_aux_loss = branch_aux
+                    loss = loss + self.branch_router_aux_loss_coef * branch_aux
 
         if output_router_logits:
             router_logits_out = tuple(t.detach() for t in mlp_router_logits) if mlp_router_logits is not None else None
@@ -2198,6 +2282,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
             ce_loss=ce_loss,
             seq_aux_loss=seq_aux_loss,
             branch_aux_loss=branch_aux_loss,
+            attention_aux_loss=attention_aux_loss,
             selected_experts=selected_experts_out,
             router_token_masks=router_token_masks_out,
             branch_probs=branch_probs_out,
@@ -2217,6 +2302,7 @@ class _MoEverythingOutput:
         ce_loss=None,
         seq_aux_loss=None,
         branch_aux_loss=None,
+        attention_aux_loss=None,
         selected_experts=None,
         router_token_masks=None,
         branch_probs=None,
@@ -2229,6 +2315,7 @@ class _MoEverythingOutput:
         self.ce_loss = ce_loss
         self.seq_aux_loss = seq_aux_loss
         self.branch_aux_loss = branch_aux_loss
+        self.attention_aux_loss = attention_aux_loss
         self.selected_experts = selected_experts
         self.router_token_masks = router_token_masks
         self.branch_probs = branch_probs

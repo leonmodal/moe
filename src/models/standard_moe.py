@@ -8,11 +8,10 @@ from transformers import Qwen3MoeConfig
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeForCausalLM,
     Qwen3MoeSparseMoeBlock,
-    MoeCausalLMOutputWithPast,
 )
 
 from .load_balancing import load_balancing_loss_func, seq_load_balancing_loss_func
-from .router import DeepSeekRouter
+from .router import DeepSeekRouter, ExplorationTopKRouter, collect_router_topk_indices
 
 StandardMoEConfig = Qwen3MoeConfig
 
@@ -21,9 +20,29 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
     def __init__(self, config: Qwen3MoeConfig):
         super().__init__(config)
         self._seq_aux_loss_coef = getattr(config, "seq_aux_loss_coef", 0.0)
+        for layer in self.model.layers:
+            if not isinstance(layer.mlp, Qwen3MoeSparseMoeBlock):
+                continue
+            old_gate = getattr(layer.mlp, "gate", None)
+            if isinstance(old_gate, (DeepSeekRouter, ExplorationTopKRouter)) or old_gate is None:
+                continue
+            new_gate = ExplorationTopKRouter(config)
+            new_gate.weight.data.copy_(old_gate.weight.data)
+            layer.mlp.gate = new_gate
+
+    def _collect_selected_experts(self) -> tuple[object, ...] | None:
+        routers = [
+            getattr(getattr(layer, "mlp", None), "gate", None)
+            for layer in self.model.layers
+            if isinstance(getattr(layer, "mlp", None), Qwen3MoeSparseMoeBlock)
+        ]
+        return collect_router_topk_indices(router for router in routers if router is not None)
 
     def forward(self, **kwargs):
         output = super().forward(**kwargs)
+        selected_experts = self._collect_selected_experts()
+        if selected_experts is not None:
+            output.selected_experts = selected_experts
 
         # Recompute aux loss with our fixed loss function
         if output.router_logits is not None and output.aux_loss is not None:
@@ -32,6 +51,7 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
                 output.router_logits,
                 self.num_experts,
                 self.num_experts_per_tok,
+                selected_experts=selected_experts,
             )
             if output.loss is not None:
                 output.loss = output.loss - self.router_aux_loss_coef * old_aux + self.router_aux_loss_coef * new_aux
@@ -42,22 +62,6 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
         if seq_coef > 0 and output.router_logits is not None and output.loss is not None:
             input_ids = kwargs.get("input_ids")
             bsz = input_ids.shape[0] if input_ids is not None else 1
-            # For DeepSeekRouter, use actual routed expert assignments if available
-            # so f_i matches biased routing (scores + expert_bias).
-            selected_experts = None
-            try:
-                selected = []
-                for layer in self.model.layers:
-                    gate = getattr(getattr(layer, "mlp", None), "gate", None)
-                    idx = getattr(gate, "_last_top_k_idx", None)
-                    if idx is None:
-                        selected = None
-                        break
-                    selected.append(idx)
-                if selected is not None and len(selected) == len(output.router_logits):
-                    selected_experts = tuple(selected)
-            except Exception:
-                selected_experts = None
             seq_aux = seq_load_balancing_loss_func(
                 output.router_logits,
                 self.num_experts,
@@ -78,5 +82,7 @@ class DeepSeekStandardMoEModel(StandardMoEModel):
         # Replace each MoE layer's softmax router with DeepSeekRouter
         for layer in self.model.layers:
             if isinstance(layer.mlp, Qwen3MoeSparseMoeBlock):
-                layer.mlp.gate = DeepSeekRouter(config)
-        self.post_init()
+                old_gate = layer.mlp.gate
+                new_gate = DeepSeekRouter(config)
+                new_gate.weight.data.copy_(old_gate.weight.data)
+                layer.mlp.gate = new_gate

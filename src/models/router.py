@@ -12,6 +12,8 @@ Replaces softmax routing with sigmoid + non-gradient expert bias:
 The bias is updated externally by update_expert_biases() in train.py,
 not through gradient descent — this prevents the router from gaming the loss.
 """
+from collections.abc import Iterable
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -88,6 +90,69 @@ def is_checkpoint_recompute() -> bool:
     return _CHECKPOINT_RECOMPUTE.get()
 
 
+def sample_router_exploration_mask(
+    scores: torch.Tensor,
+    exploration_rate: float,
+) -> torch.Tensor | None:
+    """Sample a per-token exploration mask for router top-k selection."""
+    if exploration_rate <= 0.0 or scores.shape[0] == 0:
+        return None
+    return torch.rand(scores.shape[0], device=scores.device) < exploration_rate
+
+
+def apply_router_exploration(
+    selection_scores: torch.Tensor,
+    exploration_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Replace selected tokens' top-k scores with random scores during training."""
+    if exploration_mask is None or not exploration_mask.any():
+        return selection_scores
+
+    explored_scores = selection_scores.clone()
+    explored_scores[exploration_mask] = torch.rand_like(explored_scores[exploration_mask])
+    return explored_scores
+
+
+def collect_router_topk_indices(routers: Iterable[nn.Module]) -> tuple[torch.Tensor, ...] | None:
+    """Collect the most recent top-k expert assignments from a list of routers."""
+    selected = []
+    for router in routers:
+        idx = getattr(router, "_last_top_k_idx", None)
+        if idx is None:
+            return None
+        selected.append(idx)
+    return tuple(selected) if selected else None
+
+
+class ExplorationTopKRouter(Qwen3MoeTopKRouter):
+    """Softmax top-k router with optional random expert exploration."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.exploration_rate = float(getattr(config, "router_exploration_rate", 0.0) or 0.0)
+        self._last_top_k_idx = None
+        self._last_exploration_mask = None
+
+    def forward(self, hidden_states: torch.Tensor):
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            router_logits = F.linear(hidden_states.float(), self.weight.float())
+            router_logits = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+            exploration_mask = None
+            selection_scores = router_logits
+            if self.training and self.exploration_rate > 0.0:
+                exploration_mask = sample_router_exploration_mask(router_logits, self.exploration_rate)
+                selection_scores = apply_router_exploration(router_logits, exploration_mask)
+            _, router_indices = torch.topk(selection_scores, self.top_k, dim=-1)
+            router_top_value = router_logits.gather(1, router_indices)
+        if self.norm_topk_prob:
+            router_top_value /= router_top_value.sum(dim=-1, keepdim=True) + 1e-20
+        router_scores = router_top_value.to(router_logits.dtype)
+        self._last_top_k_idx = router_indices.detach()
+        self._last_exploration_mask = None if exploration_mask is None else exploration_mask.detach()
+        return router_logits, router_scores, router_indices
+
+
 class DeepSeekRouter(Qwen3MoeTopKRouter):
     """
     Sigmoid + expert-bias router (DeepSeek V3 style).
@@ -102,6 +167,7 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
         self.scaling_factor = getattr(config, "topk_scaling_factor", None)
         self.num_groups = getattr(config, "num_groups", None)
         self.group_topk = getattr(config, "group_topk", None)
+        self.exploration_rate = float(getattr(config, "router_exploration_rate", 0.0) or 0.0)
 
         # Persistent buffer: survives checkpointing
         self.register_buffer(
@@ -117,6 +183,7 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
         # Last forward's selected experts (T, K). Used by seq aux loss
         # so f_i matches actual biased routing assignments.
         self._last_top_k_idx = None
+        self._last_exploration_mask = None
 
     def forward(self, hidden_states: torch.Tensor):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
@@ -133,17 +200,22 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
             # 3. Biased top-k selection (with optional group-limited routing)
             bias = self.expert_bias.float()
             biased_scores = scores + bias.unsqueeze(0)  # (T, E)
+            exploration_mask = None
+            selection_scores = biased_scores
+            if self.training and self.exploration_rate > 0.0:
+                exploration_mask = sample_router_exploration_mask(biased_scores, self.exploration_rate)
+                selection_scores = apply_router_exploration(biased_scores, exploration_mask)
 
             if self.num_groups is not None and self.group_topk is not None:
                 # Group-limited top-k: select from top groups only
                 _, top_k_idx = group_limited_topk(
-                    biased_scores,
+                    selection_scores,
                     topk=self.top_k,
                     num_groups=self.num_groups,
                     group_topk=self.group_topk,
                 )
             else:
-                _, top_k_idx = torch.topk(biased_scores, self.top_k, dim=-1)  # (T, K)
+                _, top_k_idx = torch.topk(selection_scores, self.top_k, dim=-1)  # (T, K)
 
             # 4. Gather unbiased scores for selected experts
             router_top_value = scores.gather(1, top_k_idx)  # (T, K)
@@ -157,6 +229,7 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
                 router_top_value = router_top_value * self.scaling_factor
 
         router_top_value = router_top_value.to(hidden_states.dtype)
+        self._last_exploration_mask = None if exploration_mask is None else exploration_mask.detach()
 
         # 6. Accumulate token counts only on the real forward pass.
         # With activation checkpointing, the backward recompute runs the router

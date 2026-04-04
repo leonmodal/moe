@@ -1,26 +1,15 @@
-1. the per head models sanity check still has a huge gap after 200 steps on real 2 node 16 gpus distributed runs compraing to the global moe and standard moe. can you check why, like run and figure out why the discrepancy. Like a few things to check, i want you to make a per step check:
+done
 
-a. have the same weights init as global moe
-b. have the same data points and lr, seed and etc.
-c. for every single step, check loss, weights difference delta, and optimizer states difference and etc.
-d. ideally everything should be very similar, we have huge gap after 200 steps.
+1. attention routers now weight selected experts by routing weights by default (`scale_attn_by_routing_weight: true`) instead of relying on the straight-through pure-selection path.
 
-can we check again, we run all here /tmp/moe/configs/depth_matched/4_layers but still mismatch. you can check my wandb and my modal workspace and see logs and to see the stuff. it was killed but you can see stopped app or just wandb and see there are differences. 
+2. all router families now support Switch-style batch aux loss plus random exploration:
+   - softmax routers gained tracked top-k assignments and exploration
+   - DeepSeek routers gained exploration without losing biased routing
+   - `moe_everything` now applies batch aux to MLP, attention, and branch routers
+   - canonical configs were updated to turn on conservative aux/exploration settings
 
-I need you to tell me why different, specifically global moe should be the same as per head sanity check, check if any bugs or sth and just fix.
-
-you should be able to run code with gpu, use uv run and stuff. and we are training with 2 node 8 gpu ddp, but now you just have acess to 8 gpu, so just test the single node ddp to figure out all errs. like we basically need per head model sanity check to pass, in the sense that it should be similar to global moe.
-
-potential stuff to check:
-
-a. liger kernel
-b. gradient checkpointing
-c. gemm
-
-basically figure out whats wrong, we need to have similar losses in long run before we can train the per head models successfully, as only then the results are meaningful.
-
-once you finished, update status.md
-
-I think the loss are still not reconciled. And there might be a few bugs in the other per head models '/tmp/moe/configs/depth_matched/4_layers' liek for example, for 4 layer models per head should be 8 because split into attention and mlp, am i right.
-
-and check status.md we see that test on finewedu edu we just have huge differences. I need  you to again run ddp code and everything to lockin and fix those stuff. I need you to fix them, before returning to me the sanity check and the global moe should be logically the same and there shoudl not be a gap. if there is a gap then some code must be wrong.
+3. packed-data validation was added to `train.py`:
+   - deterministic held-out eval stream from the parquet shards
+   - `eval/ce_loss` and `eval/perplexity` logging for NanoGPT-style comparison
+   - configs updated to enable eval on the main standard/global/per-head runs
+   - GPU smoke tested with `uv run` on standard training/eval and on a per-head GPU forward/backward path

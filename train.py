@@ -316,6 +316,95 @@ def get_attention_router_topk(model_cfg, router_name: str) -> int:
     return model_cfg.num_attn_experts_per_tok
 
 
+def compute_output_metrics(
+    output,
+    raw_model,
+    model_cfg,
+    input_ids: torch.Tensor,
+    *,
+    seq_aux_loss_coef: float,
+) -> tuple[dict[str, float], tuple[torch.Tensor, ...] | None, tuple[torch.Tensor | None, ...] | None]:
+    router_token_masks = get_output_router_token_masks(output)
+    selected_experts = get_output_selected_experts(output, raw_model)
+
+    aux = getattr(output, "aux_loss", None)
+    aux_value = aux.detach().float().item() if isinstance(aux, torch.Tensor) else float(aux or 0.0)
+
+    aux_normalized = None
+    if getattr(output, "router_logits", None) is not None:
+        aux_normalized = normalized_load_balancing_loss_func(
+            output.router_logits,
+            model_cfg.num_experts,
+            model_cfg.num_experts_per_tok,
+            token_masks=router_token_masks,
+            selected_experts=selected_experts,
+        )
+    if isinstance(aux_normalized, torch.Tensor):
+        aux_normalized_value = aux_normalized.detach().float().item()
+    elif aux_normalized is not None:
+        aux_normalized_value = float(aux_normalized)
+    else:
+        aux_normalized_value = 0.0
+
+    total_value = output.loss.detach().float().item()
+
+    ce_tensor = getattr(output, "ce_loss", None)
+    if isinstance(ce_tensor, torch.Tensor):
+        ce_value = ce_tensor.detach().float().item()
+    elif ce_tensor is not None:
+        ce_value = float(ce_tensor)
+    else:
+        ce_value = total_value - getattr(raw_model, "router_aux_loss_coef", 0.0) * aux_value
+
+    seq_aux = getattr(output, "seq_aux_loss", None)
+    if seq_aux is None and seq_aux_loss_coef > 0 and getattr(output, "router_logits", None) is not None:
+        seq_aux = seq_load_balancing_loss_func(
+            output.router_logits,
+            model_cfg.num_experts,
+            model_cfg.num_experts_per_tok,
+            batch_size=input_ids.shape[0],
+            selected_experts=selected_experts,
+            token_masks=router_token_masks,
+        )
+    if isinstance(seq_aux, torch.Tensor):
+        seq_aux_value = seq_aux.detach().float().item()
+    elif seq_aux is not None:
+        seq_aux_value = float(seq_aux)
+    else:
+        seq_aux_value = 0.0
+
+    branch_aux = getattr(output, "branch_aux_loss", None)
+    if isinstance(branch_aux, torch.Tensor):
+        branch_aux_value = branch_aux.detach().float().item()
+    elif branch_aux is not None:
+        branch_aux_value = float(branch_aux)
+    else:
+        branch_aux_value = 0.0
+
+    attention_aux = getattr(output, "attention_aux_loss", None)
+    if isinstance(attention_aux, torch.Tensor):
+        attention_aux_value = attention_aux.detach().float().item()
+    elif attention_aux is not None:
+        attention_aux_value = float(attention_aux)
+    else:
+        attention_aux_value = 0.0
+
+    if ce_tensor is None:
+        ce_value -= seq_aux_loss_coef * seq_aux_value
+        ce_value -= getattr(raw_model, "branch_router_aux_loss_coef", 0.0) * branch_aux_value
+
+    metrics = {
+        "loss": total_value,
+        "ce_loss": ce_value,
+        "aux_loss": aux_value,
+        "aux_loss_normalized": aux_normalized_value,
+        "seq_aux_loss": seq_aux_value,
+        "branch_aux_loss": branch_aux_value,
+        "attention_aux_loss": attention_aux_value,
+    }
+    return metrics, selected_experts, router_token_masks
+
+
 def reduce_scalar(accelerator: Accelerator, value: float, reduction: str = "mean") -> float:
     tensor = torch.tensor(value, device=accelerator.device, dtype=torch.float64)
     if accelerator.num_processes > 1:
@@ -323,6 +412,71 @@ def reduce_scalar(accelerator: Accelerator, value: float, reduction: str = "mean
         if reduction == "mean":
             tensor /= accelerator.num_processes
     return tensor.item()
+
+
+@torch.no_grad()
+def run_validation(
+    *,
+    accelerator: Accelerator,
+    model,
+    model_cfg,
+    eval_dataloader,
+    max_batches: int,
+    is_dense: bool,
+    seq_aux_loss_coef: float,
+) -> dict[str, float]:
+    if eval_dataloader is None or max_batches <= 0:
+        return {}
+
+    was_training = model.training
+    model.eval()
+    raw_model = accelerator.unwrap_model(model)
+
+    totals = {
+        "loss": 0.0,
+        "ce_loss": 0.0,
+        "aux_loss": 0.0,
+        "aux_loss_normalized": 0.0,
+        "seq_aux_loss": 0.0,
+        "branch_aux_loss": 0.0,
+        "attention_aux_loss": 0.0,
+    }
+    batches = 0
+
+    for batch_idx, batch in enumerate(eval_dataloader):
+        if batch_idx >= max_batches:
+            break
+        input_ids = batch["input_ids"]
+        labels = batch["labels"]
+        output = model(
+            input_ids=input_ids,
+            labels=labels,
+            **({} if is_dense else {"output_router_logits": True}),
+        )
+        metrics, _, _ = compute_output_metrics(
+            output,
+            raw_model,
+            model_cfg,
+            input_ids,
+            seq_aux_loss_coef=seq_aux_loss_coef,
+        )
+        for key in totals:
+            totals[key] += metrics[key]
+        batches += 1
+
+    if was_training:
+        model.train()
+
+    if batches == 0:
+        return {}
+
+    averaged = {
+        f"eval/{key}": reduce_scalar(accelerator, value / batches)
+        for key, value in totals.items()
+    }
+    averaged["eval/perplexity"] = math.exp(min(20.0, averaged["eval/ce_loss"]))
+    averaged["eval/num_batches"] = float(batches)
+    return averaged
 
 
 def counts_accumulator_to_snapshot(
@@ -516,14 +670,20 @@ def build_model(cfg: dict):
         output_router_logits=True,
     )
 
+    def _set_router_params(config, mcfg):
+        """Attach router params that Qwen3MoeConfig doesn't have natively."""
+        config.router_exploration_rate = mcfg.get("router_exploration_rate", 0.0)
+
     def _set_deepseek_router_params(config, mcfg):
         """Attach DeepSeek V3 router params that Qwen3MoeConfig doesn't have natively."""
+        _set_router_params(config, mcfg)
         config.topk_scaling_factor = mcfg.get("topk_scaling_factor", None)
         config.num_groups = mcfg.get("num_groups", None)
         config.group_topk = mcfg.get("group_topk", None)
 
     if mtype == "standard_moe":
         config = Qwen3MoeConfig(num_experts=mcfg["num_experts"], **common)
+        _set_router_params(config, mcfg)
         model = StandardMoEModel(config)
     elif mtype == "deepseek_standard_moe":
         config = Qwen3MoeConfig(num_experts=mcfg["num_experts"], **common)
@@ -531,6 +691,7 @@ def build_model(cfg: dict):
         model = DeepSeekStandardMoEModel(config)
     elif mtype == "global_moe":
         config = GlobalMoEConfig(num_experts=mcfg["num_experts"], **common)
+        _set_router_params(config, mcfg)
         model = GlobalMoEForCausalLM(config)
     elif mtype == "deepseek_global_moe":
         config = GlobalMoEConfig(num_experts=mcfg["num_experts"], **common)
@@ -563,7 +724,10 @@ def build_model(cfg: dict):
                 "per_head_dense_fraction_threshold", 0.75
             ),
             sanity_check_mode=mcfg.get("sanity_check_mode"),
-            scale_attn_by_routing_weight=mcfg.get("scale_attn_by_routing_weight", False),
+            scale_attn_by_routing_weight=mcfg.get("scale_attn_by_routing_weight", True),
+            scale_branch_by_routing_weight=mcfg.get("scale_branch_by_routing_weight", True),
+            router_exploration_rate=mcfg.get("router_exploration_rate", 0.0),
+            branch_router_exploration_rate=mcfg.get("branch_router_exploration_rate"),
             **common,
         )
         model = MoEverythingForCausalLM(config)
@@ -705,6 +869,7 @@ def main() -> None:
     )
     tcfg_dict = cfg["training"]
     dcfg_dict = cfg.get("data", {})
+    eval_cfg_dict = cfg.get("eval", {})
 
     # --- CLI overrides -------------------------------------------------------
     if args.data_dir:
@@ -860,6 +1025,10 @@ def main() -> None:
     bias_interpolation = cfg["model"].get("bias_interpolation", False)
     bias_interpolation_warmup_steps = cfg["model"].get("bias_interpolation_warmup_steps", 5000)
     seq_aux_loss_coef = cfg["model"].get("seq_aux_loss_coef", 0.0)
+    router_exploration_rate = cfg["model"].get("router_exploration_rate", 0.0)
+    eval_enabled = bool(eval_cfg_dict.get("enabled", False))
+    eval_every = max(1, int(eval_cfg_dict.get("every", max(1, train_cfg.save_every))))
+    eval_max_batches = int(eval_cfg_dict.get("max_batches", 0))
 
     # Attach seq_aux_loss_coef to model (read by forward methods)
     if seq_aux_loss_coef > 0:
@@ -912,10 +1081,12 @@ def main() -> None:
         attn_mode = mcfg.get("attn_expert_mode", "bundled")
         n_attn_exp = mcfg.get("num_attn_experts", 4)
         n_attn_top = mcfg.get("num_attn_experts_per_tok", 1)
-        scale_attn = mcfg.get("scale_attn_by_routing_weight", False)
+        scale_attn = mcfg.get("scale_attn_by_routing_weight", True)
         summary_lines.append(f"    Attn mode: {attn_mode}")
         summary_lines.append(f"    Attn exp : {n_attn_exp} pool, top-{n_attn_top}")
+        scale_branch = mcfg.get("scale_branch_by_routing_weight", True)
         summary_lines.append(f"    Scale attn by routing weight: {scale_attn}")
+        summary_lines.append(f"    Scale branch by routing weight: {scale_branch}")
         if attn_mode == "per_head_fully_independent":
             num_heads = mcfg["num_attention_heads"]
             num_kv = mcfg["num_key_value_heads"]
@@ -935,11 +1106,19 @@ def main() -> None:
             summary_lines.append(f"    Per-layer norm: yes")
         if mcfg.get("sanity_check_mode"):
             summary_lines.append(f"    Sanity   : {mcfg['sanity_check_mode']}")
+    summary_lines.append(f"    Router exploration: {router_exploration_rate}")
 
     summary_lines.append(f"  Training:")
     summary_lines.append(f"    Dist type: {accelerator.distributed_type}")
     summary_lines.append(f"    Precision: {train_cfg.mixed_precision}")
     summary_lines.append(f"    GPUs     : {accelerator.num_processes}")
+    if eval_enabled:
+        eval_source = eval_cfg_dict.get("data_dir", dcfg_dict["data_dir"])
+        eval_holdout = eval_cfg_dict.get("holdout_fraction", 0.05)
+        summary_lines.append(
+            f"    Eval     : every {eval_every} steps, {eval_max_batches} batches, "
+            f"holdout={eval_holdout} from {eval_source}"
+        )
     summary_lines.append(f"{'='*60}")
 
     accelerator.print("\n".join(summary_lines))
@@ -951,6 +1130,8 @@ def main() -> None:
         seq_len=dcfg_dict.get("seq_len", 2048),
         tokenizer_name=dcfg_dict.get("tokenizer_name", "gpt2"),
         num_workers=dcfg_dict.get("num_workers", 4),
+        split="all",
+        holdout_fraction=0.0,
     )
     if accelerator.local_process_index == 0:
         print(
@@ -973,6 +1154,7 @@ def main() -> None:
         tokenizer=tokenizer,
         rank=accelerator.process_index,
         world_size=accelerator.num_processes,
+        seed=dcfg_dict.get("seed", 42),
     )
     if accelerator.local_process_index == 0:
         print(
@@ -986,6 +1168,35 @@ def main() -> None:
         num_workers=0,       # must be 0 for IterableDataset state tracking
         pin_memory=True,
     )
+    eval_dataloader = None
+    if eval_enabled:
+        eval_data_dir = eval_cfg_dict.get("data_dir", dcfg_dict["data_dir"])
+        eval_split = eval_cfg_dict.get("split")
+        if eval_split is None:
+            eval_split = "all" if "data_dir" in eval_cfg_dict else "val"
+        eval_data_cfg = DataConfig(
+            data_dir=eval_data_dir,
+            text_column=eval_cfg_dict.get("text_column", dcfg_dict.get("text_column", "text")),
+            seq_len=eval_cfg_dict.get("seq_len", dcfg_dict.get("seq_len", 2048)),
+            tokenizer_name=eval_cfg_dict.get("tokenizer_name", dcfg_dict.get("tokenizer_name", "gpt2")),
+            num_workers=eval_cfg_dict.get("num_workers", 0),
+            split=eval_split,
+            holdout_fraction=eval_cfg_dict.get("holdout_fraction", 0.05 if eval_split == "val" else 0.0),
+        )
+        eval_dataset = StatefulParquetDataset(
+            config=eval_data_cfg,
+            tokenizer=tokenizer,
+            rank=accelerator.process_index,
+            world_size=accelerator.num_processes,
+            seed=eval_cfg_dict.get("seed", 1234),
+        )
+        eval_batch_size = int(eval_cfg_dict.get("batch_size", train_cfg.batch_size))
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            batch_size=eval_batch_size,
+            num_workers=0,
+            pin_memory=True,
+        )
 
     # --- Optimizer & Scheduler ----------------------------------------------
     optimizer = build_optimizer(model, train_cfg)
@@ -993,9 +1204,14 @@ def main() -> None:
 
     # --- Accelerate prepare (wraps model in DDP/FSDP) -----------------------
     accelerator.print("Calling accelerator.prepare()")
-    model, optimizer, dataloader, scheduler = accelerator.prepare(
-        model, optimizer, dataloader, scheduler
-    )
+    if eval_dataloader is not None:
+        model, optimizer, dataloader, eval_dataloader, scheduler = accelerator.prepare(
+            model, optimizer, dataloader, eval_dataloader, scheduler
+        )
+    else:
+        model, optimizer, dataloader, scheduler = accelerator.prepare(
+            model, optimizer, dataloader, scheduler
+        )
     accelerator.print("accelerator.prepare() complete")
 
     # --- Resume -------------------------------------------------------------
@@ -1031,6 +1247,7 @@ def main() -> None:
     aux_normalized_window_sum = 0.0
     seq_aux_window_sum = 0.0
     branch_aux_window_sum = 0.0
+    attention_aux_window_sum = 0.0
     microbatches_in_step = 0
     local_tokens_in_step = 0
 
@@ -1056,74 +1273,24 @@ def main() -> None:
             )
             loss = output.loss
             raw_model = accelerator.unwrap_model(model)
-            router_token_masks = get_output_router_token_masks(output)
+            metrics, selected_experts, router_token_masks = compute_output_metrics(
+                output,
+                raw_model,
+                model_cfg,
+                input_ids,
+                seq_aux_loss_coef=seq_aux_loss_coef,
+            )
 
-            aux = getattr(output, "aux_loss", None)
-            aux_value = aux.detach().float().item() if isinstance(aux, torch.Tensor) else float(aux or 0.0)
-            aux_normalized = None
-            if getattr(output, "router_logits", None) is not None:
-                aux_normalized = normalized_load_balancing_loss_func(
-                    output.router_logits,
-                    model_cfg.num_experts,
-                    model_cfg.num_experts_per_tok,
-                    token_masks=router_token_masks,
-                )
-            if isinstance(aux_normalized, torch.Tensor):
-                aux_normalized_value = aux_normalized.detach().float().item()
-            elif aux_normalized is not None:
-                aux_normalized_value = float(aux_normalized)
-            else:
-                aux_normalized_value = 0.0
-            total_value = loss.detach().float().item()
-
-            ce_tensor = getattr(output, "ce_loss", None)
-            if isinstance(ce_tensor, torch.Tensor):
-                ce_value = ce_tensor.detach().float().item()
-            elif ce_tensor is not None:
-                ce_value = float(ce_tensor)
-            else:
-                ce_value = total_value - getattr(raw_model, "router_aux_loss_coef", 0.0) * aux_value
-
-            seq_aux = getattr(output, "seq_aux_loss", None)
-            if seq_aux is None and seq_aux_loss_coef > 0 and getattr(output, "router_logits", None) is not None:
-                selected_for_seq_aux = get_output_selected_experts(output, raw_model)
-                seq_aux = seq_load_balancing_loss_func(
-                    output.router_logits,
-                    model_cfg.num_experts,
-                    model_cfg.num_experts_per_tok,
-                    batch_size=input_ids.shape[0],
-                    selected_experts=selected_for_seq_aux,
-                    token_masks=router_token_masks,
-                )
-            if isinstance(seq_aux, torch.Tensor):
-                seq_aux_value = seq_aux.detach().float().item()
-            elif seq_aux is not None:
-                seq_aux_value = float(seq_aux)
-            else:
-                seq_aux_value = 0.0
-
-            branch_aux = getattr(output, "branch_aux_loss", None)
-            if isinstance(branch_aux, torch.Tensor):
-                branch_aux_value = branch_aux.detach().float().item()
-            elif branch_aux is not None:
-                branch_aux_value = float(branch_aux)
-            else:
-                branch_aux_value = 0.0
-
-            if ce_tensor is None:
-                ce_value -= seq_aux_loss_coef * seq_aux_value
-                ce_value -= getattr(raw_model, "branch_router_aux_loss_coef", 0.0) * branch_aux_value
-
-            loss_window_sum += total_value
-            ce_window_sum += ce_value
-            aux_window_sum += aux_value
-            aux_normalized_window_sum += aux_normalized_value
-            seq_aux_window_sum += seq_aux_value
-            branch_aux_window_sum += branch_aux_value
+            loss_window_sum += metrics["loss"]
+            ce_window_sum += metrics["ce_loss"]
+            aux_window_sum += metrics["aux_loss"]
+            aux_normalized_window_sum += metrics["aux_loss_normalized"]
+            seq_aux_window_sum += metrics["seq_aux_loss"]
+            branch_aux_window_sum += metrics["branch_aux_loss"]
+            attention_aux_window_sum += metrics["attention_aux_loss"]
             microbatches_in_step += 1
             local_tokens_in_step += input_ids.numel()
 
-            selected_experts = get_output_selected_experts(output, raw_model)
             if getattr(output, "router_logits", None) is not None:
                 expert_count_accum = accumulate_expert_counts(
                     output.router_logits,
@@ -1221,6 +1388,9 @@ def main() -> None:
             )
             avg_seq_aux = reduce_scalar(accelerator, seq_aux_window_sum / max(1, microbatches_in_step))
             avg_branch_aux = reduce_scalar(accelerator, branch_aux_window_sum / max(1, microbatches_in_step))
+            avg_attention_aux = reduce_scalar(
+                accelerator, attention_aux_window_sum / max(1, microbatches_in_step)
+            )
             avg_grad_norm = reduce_scalar(accelerator, grad_norm)
 
             if global_step % train_cfg.log_every == 0 and accelerator.is_main_process:
@@ -1232,6 +1402,7 @@ def main() -> None:
                     "train/aux_loss_normalized": avg_aux_normalized,
                     "train/seq_aux_loss": avg_seq_aux,
                     "train/branch_aux_loss": avg_branch_aux,
+                    "train/attention_aux_loss": avg_attention_aux,
                     "train/grad_norm": avg_grad_norm,
                     "train/lr": lr,
                     "train/tokens_per_sec": step_tokens_per_sec,
@@ -1243,6 +1414,7 @@ def main() -> None:
                     f"loss={avg_total:.4f}  ce={avg_ce:.4f}  aux={avg_aux:.4f}  "
                     f"aux_n={avg_aux_normalized:.4f}  "
                     f"seq_aux={avg_seq_aux:.4f}  branch_aux={avg_branch_aux:.4f}  "
+                    f"attn_aux={avg_attention_aux:.4f}  "
                     f"lr={lr:.2e}  tok/s={step_tokens_per_sec/1e3:.1f}k  "
                     f"sec/step={step_elapsed:.3f}  |g|={avg_grad_norm:.3f}"
                 )
@@ -1250,6 +1422,27 @@ def main() -> None:
                     log_dict.update(bias_stats)
                 if log_with:
                     accelerator.log(log_dict, step=global_step)
+
+            if eval_enabled and eval_dataloader is not None and global_step % eval_every == 0:
+                eval_metrics = run_validation(
+                    accelerator=accelerator,
+                    model=model,
+                    model_cfg=model_cfg,
+                    eval_dataloader=eval_dataloader,
+                    max_batches=eval_max_batches,
+                    is_dense=is_dense,
+                    seq_aux_loss_coef=seq_aux_loss_coef,
+                )
+                if eval_metrics:
+                    if accelerator.is_main_process:
+                        accelerator.print(
+                            f"eval {global_step:6d}  "
+                            f"ce={eval_metrics['eval/ce_loss']:.4f}  "
+                            f"ppl={eval_metrics['eval/perplexity']:.2f}  "
+                            f"aux={eval_metrics['eval/aux_loss']:.4f}"
+                        )
+                    if log_with:
+                        accelerator.log(eval_metrics, step=global_step)
 
             if global_step % routing_log_every == 0:
                 if expert_count_accum is not None and accelerator.num_processes > 1:
@@ -1379,6 +1572,7 @@ def main() -> None:
             aux_normalized_window_sum = 0.0
             seq_aux_window_sum = 0.0
             branch_aux_window_sum = 0.0
+            attention_aux_window_sum = 0.0
             microbatches_in_step = 0
             local_tokens_in_step = 0
 

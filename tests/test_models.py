@@ -478,6 +478,18 @@ def test_moe_everything_forward(mode):
 
 
 @pytest.mark.parametrize("mode", MOE_EVERYTHING_MODES)
+def test_moe_everything_branch_aux_loss_is_computed(mode):
+    config = tiny_moe_everything_config(mode)
+    config.branch_router_aux_loss_coef = 0.01
+    model = MoEverythingForCausalLM(config).eval()
+    ids, labels = _dummy_batch()
+    with torch.no_grad():
+        out = model(input_ids=ids, labels=labels)
+    assert out.branch_aux_loss is not None
+    assert out.branch_aux_loss.item() > 0
+
+
+@pytest.mark.parametrize("mode", MOE_EVERYTHING_MODES)
 def test_moe_everything_all_grads(mode):
     """Every parameter must receive a gradient."""
     model = MoEverythingForCausalLM(tiny_moe_everything_config(mode)).train()
