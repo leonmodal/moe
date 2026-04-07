@@ -96,6 +96,7 @@ from src.models.init_mapping import copy_global_to_alternating_sanity
 from src.utils.training import (
     TrainingConfig,
     build_lr_scheduler,
+    build_muon_optimizer,
     build_optimizer,
     count_parameters,
     get_grad_norm,
@@ -437,7 +438,12 @@ def run_validation(
         return {}
 
     was_training = model.training
-    model.eval()
+    # Skip model.eval() when torch.compile is active — it triggers expensive
+    # recompilation for a new graph.  Since dropout is 0 and we use RMSNorm
+    # (no running stats), eval mode is a no-op for these models.
+    _is_compiled = hasattr(accelerator.unwrap_model(model), "_orig_mod")
+    if not _is_compiled:
+        model.eval()
     raw_model = accelerator.unwrap_model(model)
 
     totals = {
@@ -455,7 +461,7 @@ def run_validation(
         if max_batches > 0 and batch_idx >= max_batches:
             break
         input_ids = batch["input_ids"]
-        labels = batch["labels"]
+        labels = input_ids  # HF CausalLM models shift labels internally
         output = model(
             input_ids=input_ids,
             labels=labels,
@@ -472,7 +478,7 @@ def run_validation(
             totals[key] += metrics[key]
         batches += 1
 
-    if was_training:
+    if was_training and not _is_compiled:
         model.train()
 
     if batches == 0:
@@ -1088,6 +1094,12 @@ def main() -> None:
         }
         del source_model
 
+    # --- torch.compile -------------------------------------------------------
+    if tcfg_dict.get("torch_compile", False):
+        compile_mode = tcfg_dict.get("torch_compile_mode", "default")
+        accelerator.print(f"Compiling model with torch.compile(mode={compile_mode!r})")
+        model = torch.compile(model, dynamic=False, mode=compile_mode)
+
     params = count_parameters(model)
     expert_params = sum(
         p.numel() for n, p in model.named_parameters()
@@ -1315,7 +1327,19 @@ def main() -> None:
         )
 
     # --- Optimizer & Scheduler ----------------------------------------------
-    optimizer = build_optimizer(model, train_cfg)
+    optimizer_type = tcfg_dict.get("optimizer", "adamw")
+    if optimizer_type == "muon":
+        muon_lr = tcfg_dict.get("muon_lr", 0.02)
+        muon_wd = tcfg_dict.get("muon_weight_decay", 0.0)
+        adam_lr = tcfg_dict.get("adam_lr", 3e-4)
+        optimizer = build_muon_optimizer(
+            model, train_cfg, muon_lr=muon_lr, muon_weight_decay=muon_wd, adam_lr=adam_lr,
+        )
+        accelerator.print(
+            f"Using Muon optimizer: muon_lr={muon_lr}, muon_wd={muon_wd}, adam_lr={adam_lr}"
+        )
+    else:
+        optimizer = build_optimizer(model, train_cfg)
     scheduler = build_lr_scheduler(optimizer, scheduler_cfg)
 
     # --- Accelerate prepare (wraps model in DDP/FSDP) -----------------------
@@ -1379,7 +1403,7 @@ def main() -> None:
             batch = next(data_iter)
 
         input_ids = batch["input_ids"]
-        labels = batch["labels"]
+        labels = input_ids  # HF CausalLM models shift labels internally
 
         with accelerator.accumulate(model):
             output = model(
@@ -1489,6 +1513,14 @@ def main() -> None:
                 bias_stats = {}
 
             scheduler.step()
+            # Muon momentum warmup: ramp from 0.85 → 0.95 over first N steps
+            if optimizer_type == "muon":
+                from src.utils.muon import get_muon_momentum
+                warmup = tcfg_dict.get("momentum_warmup_steps", 300)
+                new_mom = get_muon_momentum(global_step, warmup_steps=warmup)
+                for g in optimizer.param_groups:
+                    if g.get("is_muon", False):
+                        g["momentum"] = new_mom
             global_step += 1
             step_elapsed = time.perf_counter() - step_t0
 

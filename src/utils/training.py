@@ -93,3 +93,30 @@ def build_optimizer(model: nn.Module, config: TrainingConfig) -> torch.optim.Ada
         betas=(config.beta1, config.beta2),
         eps=config.eps,
     )
+
+
+def build_muon_optimizer(
+    model: nn.Module,
+    config: TrainingConfig,
+    muon_lr: float = 0.02,
+    muon_weight_decay: float = 0.0,
+    adam_lr: float = 3e-4,
+) -> "Muon":
+    from src.utils.muon import Muon, classify_muon_params
+
+    muon_params, adam_decay, adam_no_decay = classify_muon_params(model)
+    return Muon(
+        muon_params,
+        lr=muon_lr,
+        momentum=0.95,
+        nesterov=True,
+        ns_steps=5,
+        weight_decay=muon_weight_decay,
+        adam_params=[
+            {"params": adam_decay, "weight_decay": config.weight_decay},
+            {"params": adam_no_decay, "weight_decay": 0.0},
+        ],
+        adam_lr=adam_lr,
+        adam_betas=(config.beta1, config.beta2),
+        adam_eps=config.eps,
+    )

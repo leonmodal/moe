@@ -1,15 +1,12 @@
-done
+1. for nano gpt speed run the model is able to reach 3.28 loss. But for ours, we are not able to do that. This might be a codebase issue that we need to fix. Please check what happens please. And we want to be able to have through put as fast as nano gpt speed run. we need to fix the training code please. 
 
-1. attention routers now weight selected experts by routing weights by default (`scale_attn_by_routing_weight: true`) instead of relying on the straight-through pure-selection path.
+we want to make sure:
+a. gpt model and qwen model and reach 3.28 loss on finewed edu dataset
+b. fix the bug we have in our codebase that stop us from reach 3.28 loss
+c. have throughput similar to the speed of nanogpt speedrun, or faster on h200 and b200
 
-2. all router families now support Switch-style batch aux loss plus random exploration:
-   - softmax routers gained tracked top-k assignments and exploration
-   - DeepSeek routers gained exploration without losing biased routing
-   - `moe_everything` now applies batch aux to MLP and attention routers, but never to the branch router
-   - canonical configs were updated to turn on conservative aux/exploration settings
+2. we have checkpoints and data on volumne on modal so might just have to use them there. 
 
-3. packed-data validation was added to `train.py`:
-   - deterministic held-out eval stream from the parquet shards
-   - `eval/ce_loss` and `eval/perplexity` logging for NanoGPT-style comparison
-   - configs updated to enable eval on the main standard/global/per-head runs
-   - GPU smoke tested with `uv run` on standard training/eval and on a per-head GPU forward/backward path
+3. always use modal skills to use gpu debug and etc.
+
+4. for compute, try h200 and b200 and make all compatibal and stuff
