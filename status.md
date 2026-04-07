@@ -1,144 +1,129 @@
 # Status
 
-Updated: 2026-04-07 UTC
+Updated: 2026-04-07 06:21 UTC
 
 ## Current State
 
-- `PLAN.md` item 3 is now implemented in code and config:
-  - branch-router aux loss is no longer applied in `moe_everything`
-  - the shared-router precompute-KV path now uses routing ratios for `K/V` instead of straight-through `1`s
-  - the main per-head configs now use `scale_branch_by_routing_weight: true`, `per_layer_mlp_router: true`, and nonzero router aux for attention + MLP routers
-- The repo now has a runnable experiment matrix under `configs/plan/` for:
-  - standard MoE on our current parquet corpus
-  - standard MoE on a parquetized official FineWebEdu sample corpus
-  - dense Qwen3-0.6B on our current parquet corpus
-  - dense Qwen3-0.6B on the parquetized official FineWebEdu sample corpus
-  - two retrofit per-head `moe_everything` configs
-- A dense-model startup bug in `train.py` was fixed. Dense configs were crashing before training because the summary printer assumed MoE-only fields.
+- The routing-policy work from `PLAN.md` item 3 is still in place and already pushed:
+  - branch-router aux loss is disabled in `moe_everything`
+  - the shared precompute-KV path now uses routing ratios for `K/V`
+  - the main per-head configs now use `scale_branch_by_routing_weight: true` and `per_layer_mlp_router: true`
+- The repo now also has long-run benchmark configs for:
+  - `configs/plan/gpt2_small_speedrun_style_long.yaml`
+  - `configs/plan/qwen3_0_6b_gpt2_tokenizer_speedrun_long.yaml`
+- Both long runs are active on `4 x NVIDIA B200` each.
 
-## Data Setup
+## Benchmark Audit
 
-- Existing corpus:
-  - `data/parquet`
-- Added comparison corpus:
-  - `data/parquet_finewebedu_speedrun`
-  - generated locally as `8` parquet shards x `10,000` rows each (`80,000` rows total)
-  - command used:
-    - `uv run python scripts/create_official_finewebedu_sample_parquet.py --out-dir data/parquet_finewebedu_speedrun --num-shards 8 --rows-per-shard 10000`
+I checked the local setup against the actual `modded-nanogpt` speedrun path (`README.md`, `train_gpt.py`, `data/cached_fineweb10B.py`).
 
-Important limitation:
+Benchmark target facts:
 
-- this comparison corpus is a repo-native parquet sample from official FineWebEdu
-- it is the closest local analogue I could run directly through this repo's parquet pipeline
-- it is not the exact modded-NanoGPT `cached_fineweb10B.py` token cache, which uses FineWeb rather than FineWebEdu
+- The target is still `3.28` validation cross-entropy on FineWeb.
+- The reference pipeline uses cached GPT-2 token `.bin` shards from `kjj0/fineweb10B-gpt2`, not text parquet.
+- The validation target is the fixed FineWeb validation bin (`10,485,760` tokens), not a small file-level holdout from the training directory.
+- As of 2026-04-07 UTC, the current `modded-nanogpt` README no longer describes this as a "`10` minute" result; it reports a much faster current record on `8 x H100`.
 
-## Code Changes
+Conclusion:
 
-- `src/models/mixture_of_everything.py`
-  - removed branch-router aux-loss application from the loss path
-  - changed the shared-router precompute-KV path so `K/V` use routing ratios when attention scaling is enabled
-- `train.py`
-  - fixed dense-config startup by making the architecture summary handle non-MoE models
-- `tests/test_models.py`
-  - updated regression coverage so branch aux stays disabled
-  - extended the precompute-KV weighting test to verify `K_fresh` / `V_fresh` change with routing ratios
-- `configs/moe_everything_per_head_*`
-  - canonical per-head configs now explicitly use ratio scaling on the branch path
-  - canonical per-head configs now use per-layer MLP routers
-  - branch aux coefficients are set to `0.0`
-- `configs/depth_matched/16_layers/*`
-  - same policy updates applied to the depth-matched per-head configs
-- `configs/scaling/*8gpu_100_nowandb.yaml`
-  - enabled router aux for MLP + attention routers and enabled per-layer MLP routing for the per-head validation configs
-- `configs/plan/*`
-  - added the experiment matrix and retrofit configs for this plan
-- `todo.md`
-  - corrected the stale note that claimed branch-router aux was active
+- there is no evidence of one catastrophic training bug in this repo
+- but the current path is not benchmark-equivalent, so earlier comparisons to the `3.28` speedrun were not valid
 
-## Short-Horizon Matrix
+## What Is Not Correct Yet
 
-All runs below used:
+The main mismatches are structural:
 
-- `uv run python train.py ...`
-- `1 x NVIDIA B200`
-- `bf16`
-- `10` optimizer steps
-- eval every `10` steps over `4` batches
+- Data path mismatch:
+  - this repo streams parquet text and tokenizes each document online in `StatefulParquetDataset`
+  - the speedrun uses pretokenized GPT-2 token bins
+- Dataloader mismatch:
+  - `train.py` hard-codes `num_workers=0` for both train and eval because the iterable dataset is resume-stateful
+  - that means config values like `data.num_workers: 4` are currently ignored
+- Eval mismatch:
+  - the local long-run configs evaluate only `20` batches from a parquet holdout
+  - the speedrun evaluates on the fixed FineWeb validation bin, so the loss numbers are not directly comparable
+- Corpus mismatch:
+  - the local comparison corpus is a parquetized FineWebEdu sample
+  - the speedrun target is FineWeb GPT-2 tokens
+- Model mismatch:
+  - local GPT-2 is a real GPT-2 small baseline
+  - local Qwen is a dense Qwen3-0.6B-style baseline with GPT-2 tokenizer/vocab
+  - the speedrun model stack is not a plain GPT-2 or plain Qwen baseline
+- Optimizer / systems mismatch:
+  - this repo uses a general `Accelerate` + `AdamW` training path
+  - the speedrun uses a much more specialized trainer and kernel stack
 
-Results:
+There is also one concrete repo issue that blocks a clean `8 GPU` parquet-holdout run on the current sample:
 
-| Run | Step 1 loss | Step 10 loss | Step 10 eval CE |
-| --- | ---: | ---: | ---: |
-| standard MoE, our data | `12.1792` | `11.7667` | `11.6360` |
-| standard MoE, FineWebEdu sample | `12.1687` | `11.7556` | `11.6344` |
-| dense Qwen3-0.6B, our data | `12.1263` | `11.6046` | `11.4811` |
-| dense Qwen3-0.6B, FineWebEdu sample | `12.1228` | `11.6192` | `11.4998` |
+- `data/parquet_finewebedu_speedrun` currently has `8` parquet shards
+- with `world_size=8` and `holdout_fraction=0.05`, the eval split logic forces `7` validation files so every rank can get a val shard
+- that leaves only `1` train file, which is not enough to shard training across `8` ranks
+- so the current sample/holdout setup is structurally wrong for a single `8 GPU` train+eval job
 
-Short-horizon takeaway:
+## Long-Run Status
 
-- at `10` steps, our current parquet corpus and the official FineWebEdu sample look extremely similar for both standard MoE and dense Qwen
-- dense Qwen3-0.6B is improving slightly faster than the current 16-layer standard MoE baseline in this very short run
-- none of these runs are remotely close to `3.28`; this matrix only answers early-optimization behavior, not the long-horizon target
+Live numbers below are from the active runs as of 2026-04-07 06:21 UTC.
 
-Artifacts:
+GPT-2 small, `4 x B200`:
 
-- `outputs/plan/standard_moe_our_data_step10`
-- `outputs/plan/standard_moe_speedrun_style_finewebedu_step10`
-- `outputs/plan/qwen3_0_6b_dense_our_data_step10`
-- `outputs/plan/qwen3_0_6b_dense_speedrun_style_finewebedu_step10`
+- config: `configs/plan/gpt2_small_speedrun_style_long.yaml`
+- latest observed step: `2133`
+- latest observed train loss: `4.9623`
+- latest observed eval CE: `6.2536` at step `1750`
+- latest checkpoint: step `2000`
+- tokens seen at step `2000`: `522,977,280`
+- steady throughput: about `350k tok/s` (`~0.74s/step`)
 
-## Retrofit Smoke Runs
+Qwen3-0.6B dense with GPT-2 tokenizer, `4 x B200`:
 
-All runs below used:
+- config: `configs/plan/qwen3_0_6b_gpt2_tokenizer_speedrun_long.yaml`
+- latest observed step: `1000`
+- latest observed train loss: `5.1754`
+- latest observed eval CE: `6.1202` at step `1000`
+- latest checkpoint: step `1000`
+- tokens seen at step `1000`: `261,357,568`
+- steady throughput: about `164k tok/s` (`~1.60s/step`)
 
-- `uv run python train.py ...`
-- `1 x NVIDIA B200`
-- `bf16`
-- `2` optimizer steps
+Takeaway:
 
-Precompute-KV retrofit:
+- GPT-2 has already passed the classic `400M`-token scale by step `2000` and is still nowhere near `3.28`
+- that does not prove a hidden math bug
+- it does prove the current local benchmark path is not an apples-to-apples reproduction of the speedrun target
 
-- config: `configs/plan/moe_everything_per_head_precompute_kv_retrofit.yaml`
-- step `1`: total `13.1558`, CE `12.1316`, aux `1024.0377`, attention aux `512.0833`, branch aux `0.0000`
-- step `2`: total `13.1443`, CE `12.1200`, aux `1024.0652`, attention aux `512.0885`, branch aux `0.0000`
-- step times: `126.781s`, `114.322s`
+Throughput sanity check:
 
-Fully independent retrofit:
+- GPT-2 on `4` GPUs is roughly `350k tok/s`
+- if that scaled linearly to `8` GPUs, it would be about `700k tok/s`
+- at that rate, `400M` tokens would take about `9.5` minutes
+- that is much slower than the current `modded-nanogpt` record, but it is broadly consistent with a generic trainer rather than a broken idle-GPU run
 
-- config: `configs/plan/moe_everything_per_head_independent_retrofit.yaml`
-- step `1`: total `16.2214`, CE `12.1237`, aux `4097.1470`, attention aux `3584.9429`, branch aux `0.0000`
-- step `2`: total `16.2209`, CE `12.1237`, aux `4096.7598`, attention aux `3584.6232`, branch aux `0.0000`
-- step times: `93.116s`, `73.306s`
+## Earlier Local Validation
 
-Retrofit takeaway:
+Previously completed and already pushed:
 
-- both retrofitted per-head configs now train cleanly under the requested routing policy
-- branch aux remains disabled in real training logs
-- attention aux is active and dominates the auxiliary term, especially in the fully independent variant
-- these were smoke runs only; they prove launch/trainability, not quality
+- routing-policy code/config updates
+- dense-model startup fix in `train.py`
+- short `10`-step matrix on our parquet corpus vs parquetized FineWebEdu sample
+- `2`-step retrofit smoke runs for the per-head `moe_everything` configs
+- targeted regression tests in `tests/test_models.py`
 
-Artifacts:
+The short-horizon matrix and retrofit smokes were useful for launchability and policy validation, but they do not answer the `3.28` question.
 
-- `outputs/plan/moe_everything_per_head_precompute_kv_retrofit_step2`
-- `outputs/plan/moe_everything_per_head_independent_retrofit_step2`
+## Bottom Line
 
-## Validation
+- Something was indeed "not correct" in the earlier benchmark comparison, but it is mainly a setup-equivalence problem, not an obvious forward/backward bug.
+- The largest benchmark-breaking issues are:
+  - online parquet tokenization
+  - mismatched eval protocol
+  - FineWebEdu parquet sample instead of FineWeb GPT-2 bins
+  - generic trainer/optimizer path instead of the specialized speedrun stack
+  - current sample sharding that does not cleanly support one `8 GPU` train+eval run
 
-- `uv run pytest -q tests/test_models.py -k 'branch_aux_loss_is_disabled or precompute_kv_scale_flag_controls_weighting or per_layer_mlp_router_creates_separate_routers or per_layer_attn_router_forward_and_grads'`
-- result:
-  - `6 passed, 96 deselected`
-- GPU training validations:
-  - standard MoE short run on our parquet corpus
-  - standard MoE short run on the FineWebEdu sample corpus
-  - dense Qwen3-0.6B short run on our parquet corpus
-  - dense Qwen3-0.6B short run on the FineWebEdu sample corpus
-  - per-head precompute-KV retrofit smoke run
-  - per-head fully independent retrofit smoke run
+## Next Steps
 
-## Open Items
+If the goal is a real answer to the `3.28` question, the next work should be:
 
-- The exact modded-NanoGPT speedrun corpus is still not wired into this repo. The current comparison corpus is an official FineWebEdu parquet sample, not the speedrun token-cache pipeline.
-- The `3.28` target is not settled by these runs. The matrix here is intentionally short so the repo has a reproducible local status update and a pushable code state.
-- If we want to answer the original target rigorously, the next step is long-horizon training from the new `configs/plan/` entries, probably starting with:
-  - dense Qwen3-0.6B vs standard MoE on the same corpus
-  - then repeating on the exact NanoGPT/FineWeb token pipeline if we add ingestion support
+1. Add a cached-token dataset path that reads GPT-2 token bins directly.
+2. Use the exact FineWeb validation bin or an exact local copy of that protocol.
+3. Regenerate the local sample with enough shards, or use separate train/eval dirs, so an `8 GPU` run is structurally valid.
+4. Rerun GPT-2 on all `8` GPUs only after the data/eval path is benchmark-equivalent.
