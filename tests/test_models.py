@@ -478,15 +478,14 @@ def test_moe_everything_forward(mode):
 
 
 @pytest.mark.parametrize("mode", MOE_EVERYTHING_MODES)
-def test_moe_everything_branch_aux_loss_is_computed(mode):
+def test_moe_everything_branch_aux_loss_is_disabled(mode):
     config = tiny_moe_everything_config(mode)
     config.branch_router_aux_loss_coef = 0.01
     model = MoEverythingForCausalLM(config).eval()
     ids, labels = _dummy_batch()
     with torch.no_grad():
         out = model(input_ids=ids, labels=labels)
-    assert out.branch_aux_loss is not None
-    assert out.branch_aux_loss.item() > 0
+    assert out.branch_aux_loss is None
 
 
 @pytest.mark.parametrize("mode", MOE_EVERYTHING_MODES)
@@ -1257,8 +1256,18 @@ def test_per_head_precompute_kv_scale_flag_controls_weighting():
             position_embeddings,
             depth_idx=0,
         )
+        tables_false_low = bank._build_per_head_precompute_kv_tables(
+            hidden_states,
+            position_embeddings,
+            depth_idx=0,
+        )
         current_weights = high_w
         out_false_high, _, _ = bank.project_and_attend_per_head_precompute_kv(
+            hidden_states,
+            position_embeddings,
+            depth_idx=0,
+            )
+        tables_false_high = bank._build_per_head_precompute_kv_tables(
             hidden_states,
             position_embeddings,
             depth_idx=0,
@@ -1271,8 +1280,18 @@ def test_per_head_precompute_kv_scale_flag_controls_weighting():
             position_embeddings,
             depth_idx=0,
         )
+        tables_true_low = bank._build_per_head_precompute_kv_tables(
+            hidden_states,
+            position_embeddings,
+            depth_idx=0,
+        )
         current_weights = high_w
         out_true_high, _, _ = bank.project_and_attend_per_head_precompute_kv(
+            hidden_states,
+            position_embeddings,
+            depth_idx=0,
+        )
+        tables_true_high = bank._build_per_head_precompute_kv_tables(
             hidden_states,
             position_embeddings,
             depth_idx=0,
@@ -1282,7 +1301,11 @@ def test_per_head_precompute_kv_scale_flag_controls_weighting():
     bank.scale_attn_by_routing_weight = config.scale_attn_by_routing_weight
 
     torch.testing.assert_close(out_false_low, out_false_high)
+    torch.testing.assert_close(tables_false_low["K_fresh"], tables_false_high["K_fresh"])
+    torch.testing.assert_close(tables_false_low["V_fresh"], tables_false_high["V_fresh"])
     assert not torch.allclose(out_true_low, out_true_high, atol=1e-5, rtol=1e-5)
+    assert not torch.allclose(tables_true_low["K_fresh"], tables_true_high["K_fresh"], atol=1e-5, rtol=1e-5)
+    assert not torch.allclose(tables_true_low["V_fresh"], tables_true_high["V_fresh"], atol=1e-5, rtol=1e-5)
 
 
 def test_per_head_fully_independent_scale_flag_controls_weighting():

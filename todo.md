@@ -5,7 +5,7 @@ done
 2. all router families now support Switch-style batch aux loss plus random exploration:
    - softmax routers gained tracked top-k assignments and exploration
    - DeepSeek routers gained exploration without losing biased routing
-   - `moe_everything` now applies batch aux to MLP, attention, and branch routers
+   - `moe_everything` now applies batch aux to MLP and attention routers, but never to the branch router
    - canonical configs were updated to turn on conservative aux/exploration settings
 
 3. packed-data validation was added to `train.py`:

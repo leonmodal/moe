@@ -1075,7 +1075,10 @@ def main() -> None:
     summary_lines.append(f"    heads    : {mcfg['num_attention_heads']}Q / {mcfg['num_key_value_heads']}KV")
     summary_lines.append(f"    head_dim : {mcfg.get('head_dim', mcfg['hidden_size'] // mcfg['num_attention_heads'])}")
     summary_lines.append(f"    layers   : {mcfg['num_hidden_layers']}")
-    summary_lines.append(f"    MLP exp  : {mcfg['num_experts']} pool, top-{mcfg['num_experts_per_tok']}")
+    if is_dense:
+        summary_lines.append(f"    MLP      : dense FFN (intermediate={mcfg['intermediate_size']})")
+    else:
+        summary_lines.append(f"    MLP exp  : {mcfg['num_experts']} pool, top-{mcfg['num_experts_per_tok']}")
 
     if is_moe_everything:
         attn_mode = mcfg.get("attn_expert_mode", "bundled")

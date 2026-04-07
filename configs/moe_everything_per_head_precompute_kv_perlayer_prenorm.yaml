@@ -14,7 +14,7 @@ model:
   moe_intermediate_size: 768
   intermediate_size: 3072
   norm_topk_prob: true
-  branch_router_aux_loss_coef: 0.001
+  branch_router_aux_loss_coef: 0.0
   router_aux_loss_coef: 0.001
   seq_aux_loss_coef: 0.0001
   router_exploration_rate: 0.02
@@ -27,9 +27,11 @@ model:
   num_attn_experts: 256
   num_attn_experts_per_tok: 1
   attn_expert_mode: per_head_precompute_kv
+  scale_branch_by_routing_weight: true
   per_head_compute_mode: dense
   use_deepseek_routing: true
   per_layer_router: true
+  per_layer_mlp_router: true
   per_layer_attn_router: true
   global_router_update: true
   per_layer_norm: true

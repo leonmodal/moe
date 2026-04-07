@@ -1151,9 +1151,7 @@ class AttentionExpertBank(nn.Module):
         q_norm_weight = self._get_q_norm_weight_bank(depth_idx, self.num_experts)
         k_norm_weight = self._get_k_norm_weight_bank(depth_idx, self.num_experts)
         q_w = w if self.scale_attn_by_routing_weight else _straight_through_ones(w)
-        # K/V always use ones -- they share the same router as Q, so gradients
-        # already flow through q_w. K/V should never be scaled by routing weight.
-        kv_w = _straight_through_ones(w)
+        kv_w = w if self.scale_attn_by_routing_weight else _straight_through_ones(w)
         Q_groups = self._project_grouped_query_heads_batched(flat, self.q_proj, idx, q_w, q_norm_weight)
         K_heads = self._project_heads_batched(flat, self.k_proj, idx, kv_w, k_norm_weight)
         V_heads = self._project_heads_batched(flat, self.v_proj, idx, kv_w)
@@ -2152,7 +2150,6 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
         mlp_selected_experts = tuple(self.model._all_mlp_selected_experts) or None
         mlp_token_masks = tuple(self.model._all_mlp_token_masks) or None
         branch_prob_tensors = tuple(self.model._all_branch_probs) or None
-        branch_selected_experts = tuple(self.model._all_branch_selected_experts) or None
         attention_router_info = tuple(self.model._all_attn_router_info) or None
 
         if labels is not None:
@@ -2234,20 +2231,9 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                 aux_loss = attention_aux_loss if aux_loss is None else aux_loss + attention_aux_loss
                 loss = loss + self.router_aux_loss_coef * attention_aux_loss
 
-            if branch_prob_tensors is not None:
-                branch_logits = tuple(probs.reshape(-1, 2) for probs in branch_prob_tensors)
-                branch_selected = None
-                if branch_selected_experts is not None:
-                    branch_selected = tuple(selected.reshape(-1, 1) for selected in branch_selected_experts)
-                branch_aux = load_balancing_loss_func(
-                    branch_logits,
-                    num_experts=2,
-                    top_k=1,
-                    selected_experts=branch_selected,
-                )
-                if isinstance(branch_aux, torch.Tensor):
-                    branch_aux_loss = branch_aux
-                    loss = loss + self.branch_router_aux_loss_coef * branch_aux
+            # Do not apply auxiliary balancing to the branch router. The
+            # branch split is part of the model behavior we want to observe,
+            # not something we want to regularize toward 50/50 usage.
 
         if output_router_logits:
             router_logits_out = tuple(t.detach() for t in mlp_router_logits) if mlp_router_logits is not None else None
