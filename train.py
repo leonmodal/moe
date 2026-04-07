@@ -32,7 +32,7 @@ torch.backends.cuda.preferred_blas_library("cublaslt")
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel
 
 def configure_liger_kernels(cfg: dict) -> str:
     """Apply the safe Liger subset for the current config and return a summary.
@@ -50,6 +50,9 @@ def configure_liger_kernels(cfg: dict) -> str:
     training_cfg = cfg.get("training", {})
     if training_cfg.get("disable_liger", False) or os.environ.get("MOE_DISABLE_LIGER", "0") == "1":
         return "disabled"
+
+    if cfg["model"]["type"] == "gpt2_dense":
+        return "disabled (unsupported for gpt2_dense)"
 
     from liger_kernel.transformers import apply_liger_kernel_to_qwen3_moe
 
@@ -649,6 +652,26 @@ def build_model(cfg: dict):
         model = Qwen3ForCausalLM(config)
         return model, config
 
+    if mtype == "gpt2_dense":
+        config = GPT2Config(
+            vocab_size=mcfg["vocab_size"],
+            n_embd=mcfg["hidden_size"],
+            n_layer=mcfg["num_hidden_layers"],
+            n_head=mcfg["num_attention_heads"],
+            n_positions=mcfg.get("max_position_embeddings", 1024),
+            n_ctx=mcfg.get("max_position_embeddings", 1024),
+            n_inner=mcfg.get("intermediate_size"),
+            resid_pdrop=mcfg.get("resid_pdrop", 0.0),
+            embd_pdrop=mcfg.get("embd_pdrop", 0.0),
+            attn_pdrop=mcfg.get("attention_dropout", 0.0),
+            layer_norm_epsilon=mcfg.get("layer_norm_epsilon", 1e-5),
+            tie_word_embeddings=mcfg.get("tie_word_embeddings", True),
+        )
+        config.num_experts = 0
+        config.num_experts_per_tok = 0
+        model = GPT2LMHeadModel(config)
+        return model, config
+
     # --- MoE models: shared Qwen3MoEConfig fields ---
     common = dict(
         vocab_size=mcfg["vocab_size"],
@@ -1010,9 +1033,9 @@ def main() -> None:
     params = count_parameters(model)
     expert_params = sum(
         p.numel() for n, p in model.named_parameters()
-        if "gate_up_proj" in n or "down_proj" in n
+        if "gate_up_proj" in n or "down_proj" in n or "mlp.c_fc" in n or "mlp.c_proj" in n
     )
-    is_dense = cfg["model"]["type"] == "dense"
+    is_dense = cfg["model"]["type"] in {"dense", "gpt2_dense"}
     is_global = cfg["model"]["type"] in ("global_moe", "deepseek_global_moe")
     is_moe_everything = cfg["model"]["type"] == "moe_everything"
     shared_mlp_pool = is_global or is_moe_everything
@@ -1051,13 +1074,22 @@ def main() -> None:
 
     attn_params = sum(
         p.numel() for n, p in model.named_parameters()
-        if any(x in n for x in ["q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm", "init_k", "init_v"])
+        if any(
+            x in n
+            for x in [
+                "q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm", "init_k", "init_v",
+                "attn.c_attn", "attn.c_proj",
+            ]
+        )
     )
     router_params = sum(
         p.numel() for n, p in model.named_parameters()
         if ("router" in n or "branch" in n or ("gate" in n and "gate_up" not in n and "gate_proj" not in n))
     )
-    embed_params = sum(p.numel() for n, p in model.named_parameters() if "embed" in n)
+    embed_params = sum(
+        p.numel() for n, p in model.named_parameters()
+        if ("embed" in n or ".wte." in n or ".wpe." in n or n.startswith("transformer.wte") or n.startswith("transformer.wpe"))
+    )
 
     summary_lines = [
         f"\n{'='*60}",

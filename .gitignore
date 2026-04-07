@@ -9,3 +9,4 @@ data/*
 .env
 Megatron-LM/
 profiler_logs/
+run_logs/

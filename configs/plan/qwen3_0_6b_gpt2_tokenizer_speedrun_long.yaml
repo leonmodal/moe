@@ -1,0 +1,59 @@
+# Long-run Qwen3-0.6B-architecture dense baseline for the 3.28 question.
+# Keeps the Qwen3-0.6B backbone but uses the GPT-2 tokenizer/vocab so the loss
+# scale is at least closer to the GPT-2-style benchmark.
+experiment_name: qwen3_0_6b_gpt2_tokenizer_speedrun_long
+
+model:
+  type: dense
+  vocab_size: 50257
+  hidden_size: 1024
+  num_hidden_layers: 28
+  head_dim: 128
+  num_attention_heads: 16
+  num_key_value_heads: 8
+  intermediate_size: 3072
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-6
+  rope_theta: 1000000.0
+  max_position_embeddings: 1024
+  tie_word_embeddings: true
+
+training:
+  learning_rate: 1.0e-3
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 2000
+  max_steps: 40000
+  min_lr_ratio: 0.1
+  batch_size: 32
+  gradient_accumulation: 2
+  mixed_precision: bf16
+  disable_liger: true
+  gradient_checkpointing: false
+  log_every: 1
+  routing_log_every: 250
+  save_every: 1000
+  output_dir: ./outputs/plan/qwen3_0_6b_gpt2_tokenizer_speedrun_long
+  wandb_project: null
+  wandb_run_name: null
+
+data:
+  data_dir: ./data/parquet_finewebedu_speedrun
+  text_column: text
+  seq_len: 1024
+  tokenizer_name: gpt2
+  num_workers: 4
+
+eval:
+  enabled: true
+  every: 250
+  max_batches: 20
+  holdout_fraction: 0.05
+  seed: 1234
+
+checkpoint:
+  resume_from: null
