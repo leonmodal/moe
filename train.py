@@ -69,7 +69,12 @@ def configure_liger_kernels(cfg: dict) -> str:
     apply_liger_kernel_to_qwen3_moe()
     return "full"
 
-from src.data.parquet_dataset import DataConfig, StatefulParquetDataset
+from src.data import (
+    DataConfig as ParquetDataConfig,
+    StatefulParquetDataset,
+    StatefulTokenBinDataset,
+    TokenBinConfig,
+)
 from src.models import (
     Qwen3MoeConfig,
     Qwen3Config,
@@ -428,7 +433,7 @@ def run_validation(
     is_dense: bool,
     seq_aux_loss_coef: float,
 ) -> dict[str, float]:
-    if eval_dataloader is None or max_batches <= 0:
+    if eval_dataloader is None:
         return {}
 
     was_training = model.training
@@ -447,7 +452,7 @@ def run_validation(
     batches = 0
 
     for batch_idx, batch in enumerate(eval_dataloader):
-        if batch_idx >= max_batches:
+        if max_batches > 0 and batch_idx >= max_batches:
             break
         input_ids = batch["input_ids"]
         labels = batch["labels"]
@@ -598,6 +603,59 @@ def branch_accumulator_to_snapshot(accumulator) -> dict | None:
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def get_data_format(cfg_dict: dict) -> str:
+    return cfg_dict.get("format", "parquet")
+
+
+def uses_tokenizer(cfg_dict: dict) -> bool:
+    return get_data_format(cfg_dict) == "parquet"
+
+
+def build_dataset_from_config(
+    cfg_dict: dict,
+    *,
+    rank: int,
+    world_size: int,
+    seed: int,
+    tokenizer=None,
+):
+    data_format = get_data_format(cfg_dict)
+    if data_format == "parquet":
+        data_cfg = ParquetDataConfig(
+            data_dir=cfg_dict["data_dir"],
+            text_column=cfg_dict.get("text_column", "text"),
+            seq_len=cfg_dict.get("seq_len", 2048),
+            tokenizer_name=cfg_dict.get("tokenizer_name", "gpt2"),
+            num_workers=cfg_dict.get("num_workers", 4),
+            split=cfg_dict.get("split", "all"),
+            holdout_fraction=cfg_dict.get("holdout_fraction", 0.0),
+        )
+        return StatefulParquetDataset(
+            config=data_cfg,
+            tokenizer=tokenizer,
+            rank=rank,
+            world_size=world_size,
+            seed=seed,
+        )
+    if data_format == "token_bin":
+        data_cfg = TokenBinConfig(
+            files_glob=cfg_dict["files_glob"],
+            seq_len=cfg_dict.get("seq_len", 2048),
+            header_bytes=cfg_dict.get("header_bytes", 1024),
+            token_dtype=cfg_dict.get("token_dtype", "uint16"),
+            max_tokens=cfg_dict.get("max_tokens"),
+            shuffle_files=cfg_dict.get("shuffle_files", False),
+            repeat=cfg_dict.get("repeat", False),
+        )
+        return StatefulTokenBinDataset(
+            config=data_cfg,
+            rank=rank,
+            world_size=world_size,
+            seed=seed,
+        )
+    raise ValueError(f"Unknown data format: {data_format}")
 
 
 def resolve_related_config_path(config_path: str, related_path: str) -> str:
@@ -1147,55 +1205,78 @@ def main() -> None:
     summary_lines.append(f"    Dist type: {accelerator.distributed_type}")
     summary_lines.append(f"    Precision: {train_cfg.mixed_precision}")
     summary_lines.append(f"    GPUs     : {accelerator.num_processes}")
+    data_format = get_data_format(dcfg_dict)
+    summary_lines.append(f"    Data fmt : {data_format}")
     if eval_enabled:
-        eval_source = eval_cfg_dict.get("data_dir", dcfg_dict["data_dir"])
-        eval_holdout = eval_cfg_dict.get("holdout_fraction", 0.05)
-        summary_lines.append(
-            f"    Eval     : every {eval_every} steps, {eval_max_batches} batches, "
-            f"holdout={eval_holdout} from {eval_source}"
-        )
+        eval_format = get_data_format(eval_cfg_dict or dcfg_dict)
+        if eval_format == "token_bin":
+            eval_source = eval_cfg_dict.get("files_glob", dcfg_dict.get("files_glob"))
+            eval_limit = eval_cfg_dict.get("max_tokens")
+            batch_desc = "full dataset" if eval_max_batches <= 0 else f"{eval_max_batches} batches"
+            summary_lines.append(
+                f"    Eval     : every {eval_every} steps, {batch_desc}, "
+                f"max_tokens={eval_limit} from {eval_source}"
+            )
+        else:
+            eval_source = eval_cfg_dict.get("data_dir", dcfg_dict["data_dir"])
+            eval_holdout = eval_cfg_dict.get("holdout_fraction", 0.05)
+            summary_lines.append(
+                f"    Eval     : every {eval_every} steps, {eval_max_batches} batches, "
+                f"holdout={eval_holdout} from {eval_source}"
+            )
     summary_lines.append(f"{'='*60}")
 
     accelerator.print("\n".join(summary_lines))
 
     # --- Dataset ------------------------------------------------------------
-    data_cfg = DataConfig(
-        data_dir=dcfg_dict["data_dir"],
-        text_column=dcfg_dict.get("text_column", "text"),
-        seq_len=dcfg_dict.get("seq_len", 2048),
-        tokenizer_name=dcfg_dict.get("tokenizer_name", "gpt2"),
-        num_workers=dcfg_dict.get("num_workers", 4),
-        split="all",
-        holdout_fraction=0.0,
-    )
+    tokenizer = None
+    if uses_tokenizer(dcfg_dict):
+        tokenizer_name = dcfg_dict.get("tokenizer_name", "gpt2")
+        if accelerator.local_process_index == 0:
+            print(
+                f"[rank {accelerator.process_index}] Loading tokenizer {tokenizer_name}",
+                flush=True,
+            )
+        with accelerator.main_process_first():
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        if accelerator.local_process_index == 0:
+            print(f"[rank {accelerator.process_index}] Tokenizer ready", flush=True)
+
+    train_source = dcfg_dict.get("data_dir", dcfg_dict.get("files_glob"))
     if accelerator.local_process_index == 0:
         print(
-            f"[rank {accelerator.process_index}] Loading tokenizer {data_cfg.tokenizer_name}",
-            flush=True,
-        )
-    with accelerator.main_process_first():
-        tokenizer = AutoTokenizer.from_pretrained(data_cfg.tokenizer_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    if accelerator.local_process_index == 0:
-        print(f"[rank {accelerator.process_index}] Tokenizer ready", flush=True)
-        print(
-            f"[rank {accelerator.process_index}] Building dataset from {data_cfg.data_dir}",
+            f"[rank {accelerator.process_index}] Building dataset from {train_source}",
             flush=True,
         )
 
-    dataset = StatefulParquetDataset(
-        config=data_cfg,
+    train_data_cfg = dict(dcfg_dict)
+    if get_data_format(train_data_cfg) == "parquet":
+        train_data_cfg["split"] = "all"
+        train_data_cfg["holdout_fraction"] = 0.0
+
+    dataset = build_dataset_from_config(
+        train_data_cfg,
         tokenizer=tokenizer,
         rank=accelerator.process_index,
         world_size=accelerator.num_processes,
         seed=dcfg_dict.get("seed", 42),
     )
     if accelerator.local_process_index == 0:
-        print(
-            f"[rank {accelerator.process_index}] Dataset ready: {len(dataset.files)} shard files",
-            flush=True,
-        )
+        dataset_desc = getattr(dataset, "files", None)
+        if dataset_desc is not None:
+            print(
+                f"[rank {accelerator.process_index}] Dataset ready: {len(dataset.files)} shard files",
+                flush=True,
+            )
+        total_sequences = getattr(dataset, "total_sequences", None)
+        if total_sequences is not None:
+            print(
+                f"[rank {accelerator.process_index}] Dataset ready: {len(dataset.files)} bin shards, "
+                f"{total_sequences} sequences/rank",
+                flush=True,
+            )
 
     dataloader = DataLoader(
         dataset,
@@ -1205,21 +1286,21 @@ def main() -> None:
     )
     eval_dataloader = None
     if eval_enabled:
-        eval_data_dir = eval_cfg_dict.get("data_dir", dcfg_dict["data_dir"])
-        eval_split = eval_cfg_dict.get("split")
-        if eval_split is None:
-            eval_split = "all" if "data_dir" in eval_cfg_dict else "val"
-        eval_data_cfg = DataConfig(
-            data_dir=eval_data_dir,
-            text_column=eval_cfg_dict.get("text_column", dcfg_dict.get("text_column", "text")),
-            seq_len=eval_cfg_dict.get("seq_len", dcfg_dict.get("seq_len", 2048)),
-            tokenizer_name=eval_cfg_dict.get("tokenizer_name", dcfg_dict.get("tokenizer_name", "gpt2")),
-            num_workers=eval_cfg_dict.get("num_workers", 0),
-            split=eval_split,
-            holdout_fraction=eval_cfg_dict.get("holdout_fraction", 0.05 if eval_split == "val" else 0.0),
-        )
-        eval_dataset = StatefulParquetDataset(
-            config=eval_data_cfg,
+        eval_data_cfg = dict(dcfg_dict)
+        eval_data_cfg.update(eval_cfg_dict)
+        if get_data_format(eval_data_cfg) == "parquet":
+            eval_data_dir = eval_cfg_dict.get("data_dir", dcfg_dict["data_dir"])
+            eval_split = eval_cfg_dict.get("split")
+            if eval_split is None:
+                eval_split = "all" if "data_dir" in eval_cfg_dict else "val"
+            eval_data_cfg["data_dir"] = eval_data_dir
+            eval_data_cfg["split"] = eval_split
+            eval_data_cfg["holdout_fraction"] = eval_cfg_dict.get(
+                "holdout_fraction",
+                0.05 if eval_split == "val" else 0.0,
+            )
+        eval_dataset = build_dataset_from_config(
+            eval_data_cfg,
             tokenizer=tokenizer,
             rank=accelerator.process_index,
             world_size=accelerator.num_processes,

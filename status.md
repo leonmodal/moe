@@ -1,145 +1,194 @@
 # Status
 
-Updated: 2026-04-07 06:21 UTC
+Updated: 2026-04-07 07:06 UTC
 
 ## Current State
 
-- The routing-policy work from `PLAN.md` item 3 is still in place and already pushed:
-  - branch-router aux loss is disabled in `moe_everything`
-  - the shared precompute-KV path now uses routing ratios for `K/V`
-  - the main per-head configs now use `scale_branch_by_routing_weight: true` and `per_layer_mlp_router: true`
-- The repo now also has long-run benchmark configs for:
-  - `configs/plan/gpt2_small_speedrun_style_long.yaml`
-  - `configs/plan/qwen3_0_6b_gpt2_tokenizer_speedrun_long.yaml`
-- Both long runs are active on `4 x NVIDIA B200` each.
+- The repo now has a real cached GPT-2 token-bin data path for FineWeb benchmarking.
+- The benchmark path uses official cached FineWeb GPT-2 `.bin` shards plus fixed-token validation, instead of parquet text plus holdout files.
+- I ran corrected benchmark-path experiments for:
+  - GPT-2 small dense
+  - Qwen3-0.6B-style dense with GPT-2 vocab/token ids
+  - per-head `moe_everything` precompute-KV retrofit smoke
 
-## Benchmark Audit
+## What Was Fixed
 
-I checked the local setup against the actual `modded-nanogpt` speedrun path (`README.md`, `train_gpt.py`, `data/cached_fineweb10B.py`).
+The biggest issue was that earlier comparisons to the `3.28` NanoGPT speedrun were not benchmark-equivalent.
 
-Benchmark target facts:
+I fixed the local path by adding:
 
-- The target is still `3.28` validation cross-entropy on FineWeb.
-- The reference pipeline uses cached GPT-2 token `.bin` shards from `kjj0/fineweb10B-gpt2`, not text parquet.
-- The validation target is the fixed FineWeb validation bin (`10,485,760` tokens), not a small file-level holdout from the training directory.
-- As of 2026-04-07 UTC, the current `modded-nanogpt` README no longer describes this as a "`10` minute" result; it reports a much faster current record on `8 x H100`.
-- The current reference model in `train_gpt.py` is not a vanilla GPT-2 small:
-  - `num_layers=11`
-  - `num_heads=6`
-  - `head_dim=128`
-  - `model_dim=768`
-  - plus many benchmark-specific additions called out in the README, including rotary embeddings, QK-norm, ReLU^2, value embeddings, bigram hash embeddings, long-short sliding-window attention, multi-token prediction, custom optimizer logic, and extensive kernel/system tuning
+- `src/data/token_bin_dataset.py`
+  - reads the cached GPT-2 token-bin format used by `modded-nanogpt` / `llm.c`
+  - validates the bin header (`magic=20240520`, `version=1`)
+  - supports deterministic DDP sharding and checkpoint resume state
+  - supports fixed `max_tokens` for exact-style validation slices
+- `train.py`
+  - can now build either parquet datasets or token-bin datasets from config
+  - skips tokenizer loading for token-bin runs
+  - can run full finite validation datasets when `eval.max_batches <= 0`
+- `scripts/download_fineweb10b_gpt2_bins.py`
+  - downloads the official cached FineWeb GPT-2 bins from `kjj0/fineweb10B-gpt2`
+- benchmark configs:
+  - `configs/plan/gpt2_small_fineweb10b_gpt2_bins.yaml`
+  - `configs/plan/qwen3_0_6b_fineweb10b_gpt2_bins.yaml`
+  - `configs/plan/moe_everything_per_head_precompute_kv_fineweb10b_gpt2_bins.yaml`
+- tests:
+  - `tests/test_token_bin_dataset.py`
 
-Conclusion:
+## Data Setup
 
-- there is no evidence of one catastrophic training bug in this repo
-- but the current path is not benchmark-equivalent, so earlier comparisons to the `3.28` speedrun were not valid
-- the user expectation that a plain local GPT-2 small baseline should automatically reproduce the speedrun target was incorrect
+Downloaded locally:
 
-## What Is Not Correct Yet
+- `data/fineweb10B_gpt2/fineweb_val_000000.bin`
+- `data/fineweb10B_gpt2/fineweb_train_000001.bin`
+- `data/fineweb10B_gpt2/fineweb_train_000002.bin`
+- `data/fineweb10B_gpt2/fineweb_train_000003.bin`
+- `data/fineweb10B_gpt2/fineweb_train_000004.bin`
+- `data/fineweb10B_gpt2/fineweb_train_000005.bin`
 
-The main mismatches are structural:
+This gives:
 
-- Data path mismatch:
-  - this repo streams parquet text and tokenizes each document online in `StatefulParquetDataset`
-  - the speedrun uses pretokenized GPT-2 token bins
-- Dataloader mismatch:
-  - `train.py` hard-codes `num_workers=0` for both train and eval because the iterable dataset is resume-stateful
-  - that means config values like `data.num_workers: 4` are currently ignored
-- Eval mismatch:
-  - the local long-run configs evaluate only `20` batches from a parquet holdout
-  - the speedrun evaluates on the fixed FineWeb validation bin, so the loss numbers are not directly comparable
-- Corpus mismatch:
-  - the local comparison corpus is a parquetized FineWebEdu sample
-  - the speedrun target is FineWeb GPT-2 tokens
-- Model mismatch:
-  - local GPT-2 is a real GPT-2 small baseline (`12` layers / `12` heads / `768` hidden, about `124.4M` params)
-  - local Qwen is a dense Qwen3-0.6B-style baseline with GPT-2 tokenizer/vocab
-  - the speedrun model stack is not a plain GPT-2 or plain Qwen baseline
-- Optimizer / systems mismatch:
-  - this repo uses a general `Accelerate` + `AdamW` training path
-  - the speedrun uses a much more specialized trainer and kernel stack
+- `500M` train tokens total
+- exact validation taken from the first `10,485,760` val tokens
 
-There is also one concrete repo issue that blocks a clean `8 GPU` parquet-holdout run on the current sample:
+## Important Benchmark Finding
 
-- `data/parquet_finewebedu_speedrun` currently has `8` parquet shards
-- with `world_size=8` and `holdout_fraction=0.05`, the eval split logic forces `7` validation files so every rank can get a val shard
-- that leaves only `1` train file, which is not enough to shard training across `8` ranks
-- so the current sample/holdout setup is structurally wrong for a single `8 GPU` train+eval job
+The current `modded-nanogpt` speedrun target is still `3.28` val cross-entropy on FineWeb, but the current record model is not vanilla GPT-2 small.
 
-There is also a smaller but important `4 GPU` consequence in the current run:
+From the official `train_gpt.py` / `README.md`:
 
-- with `8` sample shards and `world_size=4`, the current holdout logic still reserves `4` files for validation so every rank gets one val shard
-- that means the GPT-2 long run is training on only `4` of the `8` sample files
-- a quick sample of the corpus puts the full `8`-file sample at roughly `~87M` GPT-2 tokens total, so the train split is only about `~43M` tokens
-- by step `2000`, GPT-2 had already seen `522,977,280` training tokens, so it had effectively cycled that train split about a dozen times
-- the speedrun benchmark, by contrast, trains on a much larger FineWeb token stream and reaches the target in under `400M` tokens without this tiny-sample repeated-epoch behavior
+- the current reference model is custom (`11` layers, `6` heads, `128` head dim, `768` model dim)
+- it also includes many benchmark-specific architecture and optimizer changes
+- so a plain local GPT-2 small baseline should not be expected to match the speedrun result
 
-## Long-Run Status
+That mismatch is real and explains the original confusion.
 
-Live numbers below are from the active runs as of 2026-04-07 06:21 UTC.
+## Config Bug Found During Benchmarking
 
-GPT-2 small, `4 x B200`:
+My first token-bin benchmark attempt copied `warmup_steps: 2000` into a `1000`-step budget run.
 
-- config: `configs/plan/gpt2_small_speedrun_style_long.yaml`
-- latest observed step: `2133`
-- latest observed train loss: `4.9623`
-- latest observed eval CE: `6.2536` at step `1750`
-- latest checkpoint: step `2000`
-- tokens seen at step `2000`: `522,977,280`
-- steady throughput: about `350k tok/s` (`~0.74s/step`)
+That was wrong for the short benchmark:
 
-Qwen3-0.6B dense with GPT-2 tokenizer, `4 x B200`:
+- the run spent effectively the whole budget in warmup
+- the loss curve from that first attempt was not trustworthy
 
-- config: `configs/plan/qwen3_0_6b_gpt2_tokenizer_speedrun_long.yaml`
-- latest observed step: `1000`
-- latest observed train loss: `5.1754`
-- latest observed eval CE: `6.1202` at step `1000`
-- latest checkpoint: step `1000`
-- tokens seen at step `1000`: `261,357,568`
-- steady throughput: about `164k tok/s` (`~1.60s/step`)
+I corrected the benchmark configs to:
+
+- `warmup_steps: 100`
+- `max_steps: 800`
+- exact eval / save every `200` steps
+
+The results below are from the corrected path.
+
+## Validation
+
+Code validation:
+
+- `./.venv/bin/python -m py_compile train.py src/data/token_bin_dataset.py scripts/download_fineweb10b_gpt2_bins.py`
+- result: passed
+
+Dataset tests:
+
+- `./.venv/bin/python -m pytest -q tests/test_token_bin_dataset.py`
+- result: `3 passed`
+
+GPU smoke validations:
+
+- GPT-2 token-bin smoke: `1` step on `1 x B200`
+- Qwen token-bin smoke: `1` step on `1 x B200`
+- per-head token-bin smoke: `2` steps on `8 x B200`
+
+## Corrected Benchmark Results
+
+### GPT-2 Small Dense, `8 x B200`
+
+Config:
+
+- `configs/plan/gpt2_small_fineweb10b_gpt2_bins.yaml`
+
+Run:
+
+- output dir: `outputs/plan/gpt2_small_fineweb10b_gpt2_bins_w100`
+- exact checkpointed eval:
+  - step `200`
+  - tokens seen: `104,448,000`
+  - val CE: `6.9820`
+- later live training signal:
+  - around step `490`, train CE was still about `6.25`
+- steady throughput:
+  - about `1.45M tok/s`
+  - about `0.36s/step`
 
 Takeaway:
 
-- GPT-2 has already passed the classic `400M`-token scale by step `2000` and is still nowhere near `3.28`
-- that does not prove a hidden math bug
-- it does prove the current local benchmark path is not an apples-to-apples reproduction of the speedrun target
+- this is not remotely on a `3.28` trajectory
+- at current speed, `400M` tokens would be about `763` steps and roughly `4.6` minutes of pure train time
+- but the loss is still far too high, so the issue is not throughput anymore; it is model/algorithm mismatch versus the official speedrun
 
-Throughput sanity check:
+### Qwen3-0.6B-Style Dense, `8 x B200`
 
-- GPT-2 on `4` GPUs is roughly `350k tok/s`
-- if that scaled linearly to `8` GPUs, it would be about `700k tok/s`
-- at that rate, `400M` tokens would take about `9.5` minutes
-- that is much slower than the current `modded-nanogpt` record, but it is broadly consistent with a generic trainer rather than a broken idle-GPU run
+Config:
 
-## Earlier Local Validation
+- `configs/plan/qwen3_0_6b_fineweb10b_gpt2_bins.yaml`
 
-Previously completed and already pushed:
+Run:
 
-- routing-policy code/config updates
-- dense-model startup fix in `train.py`
-- short `10`-step matrix on our parquet corpus vs parquetized FineWebEdu sample
-- `2`-step retrofit smoke runs for the per-head `moe_everything` configs
-- targeted regression tests in `tests/test_models.py`
+- output dir: `outputs/plan/qwen3_0_6b_fineweb10b_gpt2_bins_w100`
+- exact checkpointed eval:
+  - step `200`
+  - tokens seen: `104,448,000`
+  - val CE: `6.7938`
+- steady throughput:
+  - about `438k tok/s`
+  - about `1.20s/step`
 
-The short-horizon matrix and retrofit smokes were useful for launchability and policy validation, but they do not answer the `3.28` question.
+Takeaway:
+
+- Qwen is slightly better than plain GPT-2 at the same token budget on this path
+- but it is still nowhere near `3.28`
+
+## Per-Head Retrofit Run
+
+Config:
+
+- `configs/plan/moe_everything_per_head_precompute_kv_fineweb10b_gpt2_bins.yaml`
+
+Smoke run:
+
+- output dir: `outputs/plan/moe_everything_per_head_precompute_kv_fineweb10b_gpt2_bins_smoke2`
+- `8 x B200`
+- `2` steps
+
+Results:
+
+- step `1`: total `12.0469`, CE `11.0225`, aux `1024.1090`, attention aux `511.8111`, branch aux `0.0000`
+- step `2`: total `12.0409`, CE `11.0167`, aux `1024.0363`, attention aux `511.9798`, branch aux `0.0000`
+- tokens seen at step `2`: `1,048,576`
+- throughput:
+  - about `4.0k tok/s` then `4.6k tok/s`
+  - step times `131.539s` and `114.070s`
+
+Takeaway:
+
+- the per-head retrofit now launches and trains on the official token-bin path
+- branch aux remains disabled as intended
+- but this model is far too slow for a speculative long benchmark run until there is evidence that the dense baselines can get meaningfully closer to target
 
 ## Bottom Line
 
-- Something was indeed "not correct" in the earlier benchmark comparison, but it is mainly a setup-equivalence problem, not an obvious forward/backward bug.
-- The largest benchmark-breaking issues are:
-  - treating the current speedrun target as if it were a vanilla GPT-2-small baseline result
-  - online parquet tokenization
-  - mismatched eval protocol
-  - FineWebEdu parquet sample instead of FineWeb GPT-2 bins
-  - generic trainer/optimizer path instead of the specialized speedrun stack
-  - current sample sharding that does not cleanly support one `8 GPU` train+eval run
+- The benchmark path itself is now fixed enough to answer the original question.
+- On the corrected official-bin path:
+  - GPT-2 small dense did not get close to `3.28`
+  - Qwen3-0.6B-style dense also did not get close to `3.28`
+- So the answer is:
+  - no, these local dense baselines do not currently look capable of reaching `3.28` under this repo's trainer
+  - the remaining gap is no longer “we used the wrong data/eval path”
+  - the remaining gap is model/training-stack mismatch versus the actual `modded-nanogpt` speedrun
 
-## Next Steps
+## Source Reference
 
-If the goal is a real answer to the `3.28` question, the next work should be:
+Primary reference used for the benchmark target and dataset format:
 
-1. Add a cached-token dataset path that reads GPT-2 token bins directly.
-2. Use the exact FineWeb validation bin or an exact local copy of that protocol.
-3. Regenerate the local sample with enough shards, or use separate train/eval dirs, so an `8 GPU` run is structurally valid.
-4. Rerun GPT-2 on all `8` GPUs only after the data/eval path is benchmark-equivalent.
+- `https://raw.githubusercontent.com/KellerJordan/modded-nanogpt/master/README.md`
+- `https://raw.githubusercontent.com/KellerJordan/modded-nanogpt/master/train_gpt.py`
+- `https://raw.githubusercontent.com/KellerJordan/modded-nanogpt/master/data/cached_fineweb10B.py`
