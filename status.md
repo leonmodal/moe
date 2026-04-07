@@ -23,11 +23,18 @@ Benchmark target facts:
 - The reference pipeline uses cached GPT-2 token `.bin` shards from `kjj0/fineweb10B-gpt2`, not text parquet.
 - The validation target is the fixed FineWeb validation bin (`10,485,760` tokens), not a small file-level holdout from the training directory.
 - As of 2026-04-07 UTC, the current `modded-nanogpt` README no longer describes this as a "`10` minute" result; it reports a much faster current record on `8 x H100`.
+- The current reference model in `train_gpt.py` is not a vanilla GPT-2 small:
+  - `num_layers=11`
+  - `num_heads=6`
+  - `head_dim=128`
+  - `model_dim=768`
+  - plus many benchmark-specific additions called out in the README, including rotary embeddings, QK-norm, ReLU^2, value embeddings, bigram hash embeddings, long-short sliding-window attention, multi-token prediction, custom optimizer logic, and extensive kernel/system tuning
 
 Conclusion:
 
 - there is no evidence of one catastrophic training bug in this repo
 - but the current path is not benchmark-equivalent, so earlier comparisons to the `3.28` speedrun were not valid
+- the user expectation that a plain local GPT-2 small baseline should automatically reproduce the speedrun target was incorrect
 
 ## What Is Not Correct Yet
 
@@ -46,7 +53,7 @@ The main mismatches are structural:
   - the local comparison corpus is a parquetized FineWebEdu sample
   - the speedrun target is FineWeb GPT-2 tokens
 - Model mismatch:
-  - local GPT-2 is a real GPT-2 small baseline
+  - local GPT-2 is a real GPT-2 small baseline (`12` layers / `12` heads / `768` hidden, about `124.4M` params)
   - local Qwen is a dense Qwen3-0.6B-style baseline with GPT-2 tokenizer/vocab
   - the speedrun model stack is not a plain GPT-2 or plain Qwen baseline
 - Optimizer / systems mismatch:
@@ -59,6 +66,14 @@ There is also one concrete repo issue that blocks a clean `8 GPU` parquet-holdou
 - with `world_size=8` and `holdout_fraction=0.05`, the eval split logic forces `7` validation files so every rank can get a val shard
 - that leaves only `1` train file, which is not enough to shard training across `8` ranks
 - so the current sample/holdout setup is structurally wrong for a single `8 GPU` train+eval job
+
+There is also a smaller but important `4 GPU` consequence in the current run:
+
+- with `8` sample shards and `world_size=4`, the current holdout logic still reserves `4` files for validation so every rank gets one val shard
+- that means the GPT-2 long run is training on only `4` of the `8` sample files
+- a quick sample of the corpus puts the full `8`-file sample at roughly `~87M` GPT-2 tokens total, so the train split is only about `~43M` tokens
+- by step `2000`, GPT-2 had already seen `522,977,280` training tokens, so it had effectively cycled that train split about a dozen times
+- the speedrun benchmark, by contrast, trains on a much larger FineWeb token stream and reaches the target in under `400M` tokens without this tiny-sample repeated-epoch behavior
 
 ## Long-Run Status
 
@@ -113,6 +128,7 @@ The short-horizon matrix and retrofit smokes were useful for launchability and p
 
 - Something was indeed "not correct" in the earlier benchmark comparison, but it is mainly a setup-equivalence problem, not an obvious forward/backward bug.
 - The largest benchmark-breaking issues are:
+  - treating the current speedrun target as if it were a vanilla GPT-2-small baseline result
   - online parquet tokenization
   - mismatched eval protocol
   - FineWebEdu parquet sample instead of FineWeb GPT-2 bins
