@@ -20,8 +20,20 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     repeat_kv,
 )
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU-only tests")
 
-# ── Tiny config for fast CPU tests ──────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _force_cuda_default_device():
+    prev = torch.get_default_device()
+    torch.set_default_device("cuda")
+    try:
+        yield
+    finally:
+        torch.set_default_device(prev)
+
+
+# ── Tiny config for fast GPU tests ──────────────────────────────────────────
 
 def tiny_standard_config():
     return Qwen3MoeConfig(

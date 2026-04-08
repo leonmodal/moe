@@ -12,6 +12,7 @@ Tests:
 import copy
 import math
 
+import pytest
 import torch
 
 from src.models import (
@@ -24,6 +25,18 @@ from src.models import (
 )
 from src.models.load_balancing import seq_load_balancing_loss_func
 from src.models.router import DeepSeekRouter
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU-only tests")
+
+
+@pytest.fixture(autouse=True)
+def _force_cuda_default_device():
+    prev = torch.get_default_device()
+    torch.set_default_device("cuda")
+    try:
+        yield
+    finally:
+        torch.set_default_device(prev)
 
 
 # ── Shared tiny config ─────────────────────────────────────────────────

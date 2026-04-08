@@ -86,6 +86,8 @@ from src.models import (
     DeepSeekGlobalMoEForCausalLM,
     MoEverythingConfig,
     MoEverythingForCausalLM,
+    SpeedrunMoEverythingConfig,
+    SpeedrunMoEverythingForCausalLM,
 )
 from src.models.router import DeepSeekRouter
 from src.models.load_balancing import (
@@ -654,6 +656,7 @@ def build_dataset_from_config(
             max_tokens=cfg_dict.get("max_tokens"),
             shuffle_files=cfg_dict.get("shuffle_files", False),
             repeat=cfg_dict.get("repeat", False),
+            align_to_bos=cfg_dict.get("align_to_bos", False),
         )
         return StatefulTokenBinDataset(
             config=data_cfg,
@@ -821,6 +824,40 @@ def build_model(cfg: dict):
             **common,
         )
         model = MoEverythingForCausalLM(config)
+    elif mtype == "speedrun_moe_everything":
+        config = SpeedrunMoEverythingConfig(
+            num_experts=mcfg["num_experts"],
+            num_attn_experts=mcfg.get("num_attn_experts", 4),
+            num_attn_experts_per_tok=mcfg.get("num_attn_experts_per_tok", 1),
+            attn_expert_mode=mcfg.get("attn_expert_mode", "bundled"),
+            branch_router_aux_loss_coef=mcfg.get("branch_router_aux_loss_coef", 0.0),
+            use_deepseek_routing=mcfg.get("use_deepseek_routing", False),
+            topk_scaling_factor=mcfg.get("topk_scaling_factor", None),
+            num_groups=mcfg.get("num_groups", None),
+            group_topk=mcfg.get("group_topk", None),
+            per_layer_router=mcfg.get("per_layer_router", False),
+            per_layer_mlp_router=mcfg.get("per_layer_mlp_router", False),
+            per_layer_attn_router=mcfg.get("per_layer_attn_router", False),
+            routed_norm=mcfg.get("routed_norm", False),
+            per_layer_norm=mcfg.get("per_layer_norm", False),
+            per_layer_qk_norm=mcfg.get("per_layer_qk_norm", False),
+            post_norm=mcfg.get("post_norm", False),
+            dynamic_depth_min=mcfg.get("dynamic_depth_min", 1.0),
+            dynamic_depth_max=mcfg.get("dynamic_depth_max", 1.0),
+            depthwise_attention=mcfg.get("depthwise_attention", False),
+            depthwise_block_size=mcfg.get("depthwise_block_size", 0),
+            per_head_compute_mode=mcfg.get("per_head_compute_mode", "auto"),
+            per_head_dense_fraction_threshold=mcfg.get(
+                "per_head_dense_fraction_threshold", 0.75
+            ),
+            sanity_check_mode=mcfg.get("sanity_check_mode"),
+            scale_attn_by_routing_weight=mcfg.get("scale_attn_by_routing_weight", True),
+            scale_branch_by_routing_weight=mcfg.get("scale_branch_by_routing_weight", True),
+            router_exploration_rate=mcfg.get("router_exploration_rate", 0.0),
+            branch_router_exploration_rate=mcfg.get("branch_router_exploration_rate"),
+            **common,
+        )
+        model = SpeedrunMoEverythingForCausalLM(config)
     else:
         raise ValueError(f"Unknown model type: {mtype}")
 

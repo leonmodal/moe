@@ -34,6 +34,8 @@ from src.models.speedrun_gpt import (
 )
 from src.models.triton_grouped_gemm import triton_grouped_gemm
 from src.models.router import DeepSeekRouter
+from src.models.load_balancing import seq_load_balancing_loss_func
+from src.models.fp32_routing import fp32_index_put, fp32_index_select
 from src.utils.routing_loss import switch_load_balancing_loss
 
 
@@ -45,15 +47,37 @@ class RoutingStats:
     """Accumulates routing statistics during a forward pass."""
     aux_losses: list[Tensor] = field(default_factory=list)
     router_records: list[tuple[str, Tensor, int]] = field(default_factory=list)
+    branch_records: list[Tensor] = field(default_factory=list)
+    seq_router_records: list[tuple[Tensor, Tensor, int]] = field(default_factory=list)
 
     def add(self, name: str, expert_ids: Tensor, probs: Tensor, num_experts: int):
         self.aux_losses.append(switch_load_balancing_loss(expert_ids, probs, num_experts))
         self.router_records.append((name, expert_ids.detach(), num_experts))
+        self.seq_router_records.append((probs, expert_ids.unsqueeze(-1), num_experts))
 
     def total_aux_loss(self) -> Tensor:
         if not self.aux_losses:
             return torch.tensor(0.0)
         return sum(self.aux_losses) / len(self.aux_losses)
+
+    def add_branch(self, probs: Tensor):
+        self.branch_records.append(probs.detach())
+
+    def total_seq_aux_loss(self, batch_size: int) -> Tensor:
+        if not self.seq_router_records:
+            return torch.tensor(0.0)
+        seq_terms: list[Tensor] = []
+        for probs, selected, num_experts in self.seq_router_records:
+            seq_terms.append(
+                seq_load_balancing_loss_func(
+                    (probs,),
+                    num_experts=num_experts,
+                    top_k=1,
+                    batch_size=batch_size,
+                    selected_experts=(selected,),
+                )
+            )
+        return sum(seq_terms) / len(seq_terms)
 
     def summary(self) -> dict[str, float]:
         if not self.router_records:
@@ -70,7 +94,44 @@ class RoutingStats:
             entropy = -(fracs * (fracs + 1e-10).log()).sum()
             max_entropy = torch.tensor(E, dtype=torch.float32).log()
             stats[f"routing/{name}_entropy"] = (entropy / max_entropy).item()
+        if self.branch_records:
+            probs = torch.cat([p.reshape(-1, 2) for p in self.branch_records], dim=0)
+            mean_probs = probs.mean(dim=0)
+            stats["routing/branch_attn_frac"] = mean_probs[0].item()
+            stats["routing/branch_mlp_frac"] = mean_probs[1].item()
         return stats
+
+
+class BranchRouter(nn.Module):
+    """Binary argmax router: choose attention or MLP per token."""
+
+    def __init__(self, hidden_size: int, exploration_rate: float = 0.0):
+        super().__init__()
+        self.gate = nn.Linear(hidden_size, 2, bias=False)
+        self.exploration_rate = exploration_rate
+        self.last_probs = None
+        self.last_selected = None
+
+    def forward(self, hidden_states: Tensor):
+        device_type = hidden_states.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            logits = self.gate(hidden_states.float())
+            probs = F.softmax(logits, dim=-1)
+            choice_scores = probs.float()
+            if self.training and self.exploration_rate > 0.0:
+                explore = torch.rand(choice_scores.shape[:-1], device=choice_scores.device) < self.exploration_rate
+                if explore.any():
+                    choice_scores = choice_scores.clone()
+                    choice_scores[explore] = torch.rand_like(choice_scores[explore])
+            choice = choice_scores.argmax(dim=-1)
+        attn_mask = (choice == 0).unsqueeze(-1)
+        mlp_mask = ~attn_mask
+        probs_out = probs.to(hidden_states.dtype)
+        w_attn = probs_out[..., 0:1] * attn_mask
+        w_mlp = probs_out[..., 1:2] * mlp_mask
+        self.last_probs = probs_out
+        self.last_selected = choice.unsqueeze(-1).detach()
+        return w_attn, w_mlp, attn_mask, mlp_mask
 
 
 # ---------------------------------------------------------------------------
@@ -110,19 +171,17 @@ def _grouped_project(x: Tensor, weight_bank: Tensor, expert_ids: Tensor, weights
     """Sort by expert, Triton grouped GEMM, weight, unsort."""
     sort_order = expert_ids.argsort()
     sorted_expert = expert_ids[sort_order]
-    sorted_inputs = x[sort_order].contiguous()
+    sorted_inputs = fp32_index_select(x, 0, sort_order).contiguous()
     unique_experts, counts = sorted_expert.unique_consecutive(return_counts=True)
 
     proj = triton_grouped_gemm(sorted_inputs, weight_bank.to(x.dtype), unique_experts, counts)
     proj = proj * weights[sort_order].unsqueeze(-1).to(proj.dtype)
 
     out = proj.new_zeros(x.shape[0], proj.shape[-1])
-    out[sort_order] = proj
-    return out
+    return fp32_index_put(out, sort_order, proj)
 
 
 def _route_and_project_heads(routers: nn.ModuleList, x: Tensor, weight_bank: Tensor,
-                             norm_weights: Tensor | None = None,
                              stats: RoutingStats | None = None,
                              name_prefix: str = "") -> Tensor:
     """Per-head-slot top-1 routing + projection."""
@@ -131,12 +190,7 @@ def _route_and_project_heads(routers: nn.ModuleList, x: Tensor, weight_bank: Ten
     for h in range(H):
         eid, ew = _route_top1(routers[h], x, stats, f"{name_prefix}_h{h}")
         proj = _grouped_project(x, weight_bank, eid, ew)
-        if norm_weights is not None:
-            proj_f = proj.float()
-            var = proj_f.pow(2).mean(-1, keepdim=True)
-            proj_normed = proj_f * torch.rsqrt(var + 1e-6)
-            nw = norm_weights[eid].to(proj.dtype)
-            proj = (nw * proj_normed.to(proj.dtype))
+        proj = norm(proj)
         results.append(proj)
     return torch.stack(results, dim=1)
 
@@ -176,16 +230,12 @@ class AttentionExpertBank(nn.Module):
             self.k_proj = nn.Parameter(torch.empty(E, D, HD))
             self.v_proj = nn.Parameter(torch.empty(E, D, HD))
             self.o_proj = nn.Parameter(torch.empty(E, HD, D))
-            self.q_norm = nn.Parameter(torch.ones(E, HD))
-            self.k_norm = nn.Parameter(torch.ones(E, HD))
         elif mode == "per_head_precompute_kv":
             self.routers = nn.ModuleList([_make_router(D, E, exploration_rate) for _ in range(H)])
             self.q_proj = nn.Parameter(torch.empty(E, D, HD))
             self.k_proj = nn.Parameter(torch.empty(E, D, HD))
             self.v_proj = nn.Parameter(torch.empty(E, D, HD))
             self.o_proj = nn.Parameter(torch.empty(E, HD, D))
-            self.q_norm = nn.Parameter(torch.ones(E, HD))
-            self.k_norm = nn.Parameter(torch.ones(E, HD))
         else:
             raise ValueError(f"Unknown mode: {mode}")
         self._init_weights(dim)
@@ -260,9 +310,9 @@ class RoutedAttentionFullyIndependent(nn.Module):
         flat = x.reshape(B * T, D)
         dp = f"d{depth_idx}"
 
-        q = _route_and_project_heads(bank.q_routers, flat, bank.q_proj, bank.q_norm, stats, f"q_{dp}")
-        k = _route_and_project_heads(bank.k_routers, flat, bank.k_proj, bank.k_norm, stats, f"k_{dp}")
-        v = _route_and_project_heads(bank.v_routers, flat, bank.v_proj, None, stats, f"v_{dp}")
+        q = _route_and_project_heads(bank.q_routers, flat, bank.q_proj, stats, f"q_{dp}")
+        k = _route_and_project_heads(bank.k_routers, flat, bank.k_proj, stats, f"k_{dp}")
+        v = _route_and_project_heads(bank.v_routers, flat, bank.v_proj, stats, f"v_{dp}")
 
         if ve is not None:
             v = lambdas[0] * v + lambdas[1] * ve.reshape(B * T, H, HD).to(v.dtype)
@@ -315,11 +365,7 @@ class RoutedAttentionPrecomputeKV(nn.Module):
         q_parts = []
         for h in range(H):
             proj = _grouped_project(flat, bank.q_proj, head_eids[h], head_ews[h])
-            proj_f = proj.float()
-            var = proj_f.pow(2).mean(-1, keepdim=True)
-            proj_normed = proj_f * torch.rsqrt(var + 1e-6)
-            nw = bank.q_norm[head_eids[h]].to(proj.dtype)
-            q_parts.append((nw * proj_normed.to(proj.dtype)))
+            q_parts.append(norm(proj))
         q = torch.stack(q_parts, dim=1)
 
         q_4d = q.view(B, T, H, HD).transpose(1, 2)
@@ -335,9 +381,7 @@ class RoutedAttentionPrecomputeKV(nn.Module):
 
             for e in active_experts:
                 k_e = flat @ bank.k_proj[e].to(flat.dtype)
-                k_f = k_e.float()
-                k_normed = (k_f * torch.rsqrt(k_f.pow(2).mean(-1, keepdim=True) + 1e-6)).to(k_e.dtype)
-                k_normed = k_normed * bank.k_norm[e].to(k_e.dtype)
+                k_normed = norm(k_e)
                 v_e = flat @ bank.v_proj[e].to(flat.dtype)
 
                 k_4d = self.rotary(k_normed.view(B, T, 1, HD)).view(B, 1, T, HD)
@@ -371,15 +415,12 @@ class RoutedAttentionPrecomputeKV(nn.Module):
 # ---------------------------------------------------------------------------
 # Block and full model
 
-class MoEBlock(nn.Module):
+class BranchRoutedDepthStep(nn.Module):
     def __init__(self, attn_bank: AttentionExpertBank, mlp_bank: MLPExpertBank,
-                 num_heads: int, head_dim: int, max_seq_len: int, layer_idx: int, mode: str,
-                 skip_attn: bool = False):
+                 num_heads: int, head_dim: int, max_seq_len: int, depth_idx: int, mode: str):
         super().__init__()
-        self.layer_idx = layer_idx
-        if skip_attn:
-            self.attn = None
-        elif mode == "per_head_fully_independent":
+        self.depth_idx = depth_idx
+        if mode == "per_head_fully_independent":
             self.attn = RoutedAttentionFullyIndependent(attn_bank, num_heads, head_dim, max_seq_len)
         elif mode == "per_head_precompute_kv":
             self.attn = RoutedAttentionPrecomputeKV(attn_bank, num_heads, head_dim, max_seq_len)
@@ -388,12 +429,16 @@ class MoEBlock(nn.Module):
         self.mlp_bank = mlp_bank
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor,
-                sa_lambdas: Tensor, stats: RoutingStats | None = None):
+                sa_lambdas: Tensor, branch_router: BranchRouter, stats: RoutingStats | None = None):
         B, T, D = x.shape
         x = lambdas[0] * x + lambdas[1] * x0
-        if self.attn is not None:
-            x = x + self.attn(norm(x), ve, sa_lambdas, stats, self.layer_idx)
-        x = x + self.mlp_bank(norm(x).reshape(-1, D), stats, self.layer_idx).view(B, T, D)
+        x_norm = norm(x)
+        w_attn, w_mlp, _, _ = branch_router(x)
+        if stats is not None and branch_router.last_probs is not None:
+            stats.add_branch(branch_router.last_probs)
+        attn_out = self.attn(x_norm, ve, sa_lambdas, stats, self.depth_idx)
+        mlp_out = self.mlp_bank(x_norm.reshape(-1, D), stats, self.depth_idx).view(B, T, D)
+        x = x + w_attn * attn_out + w_mlp * mlp_out
         return x
 
 
@@ -410,19 +455,21 @@ class SpeedrunMoEGPT(nn.Module):
                  num_attn_experts: int = 66, num_mlp_experts: int = 12,
                  exploration_rate: float = 0.02):
         super().__init__()
-        self.num_layers = num_layers
+        self.num_blocks = num_layers
+        self.num_depths = num_layers * 2
         self.model_dim = model_dim
         self.mode = mode
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
+        self.branch_router = BranchRouter(model_dim, exploration_rate=exploration_rate)
 
         self.attn_bank = AttentionExpertBank(num_attn_experts, model_dim, num_heads, head_dim, mode, exploration_rate)
         self.mlp_bank = MLPExpertBank(num_mlp_experts, model_dim, exploration_rate)
 
         self.blocks = nn.ModuleList([
-            MoEBlock(self.attn_bank, self.mlp_bank, num_heads, head_dim, max_seq_len, i, mode)
-            for i in range(num_layers)
+            BranchRoutedDepthStep(self.attn_bank, self.mlp_bank, num_heads, head_dim, max_seq_len, i, mode)
+            for i in range(self.num_depths)
         ])
 
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
@@ -430,12 +477,12 @@ class SpeedrunMoEGPT(nn.Module):
                                      x_s=(model_dim ** 0.5) / 448, w_s=2 ** -9, grad_s=1 / 448)
         self.lm_head.weight.detach().zero_()
 
-        assert num_layers % 2 == 0
-        pad = (-num_layers * 5) % max(dist.get_world_size(), 1)
+        assert self.num_depths % 2 == 0
+        pad = (-self.num_depths * 5) % max(dist.get_world_size(), 1)
         self.scalars = nn.Parameter(torch.cat([
-            torch.ones(num_layers),
-            *[torch.tensor([1.0, 0.0]) for _ in range(num_layers)],
-            *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)],
+            torch.ones(self.num_depths),
+            *[torch.tensor([1.0, 0.0]) for _ in range(self.num_depths)],
+            *[torch.tensor([0.5, 0.5]) for _ in range(self.num_depths)],
             torch.ones(max(pad, 0)),
         ]))
 
@@ -447,6 +494,7 @@ class SpeedrunMoEGPT(nn.Module):
         self.scalars.lr_mul = 5.0
 
         self._aux_loss = torch.tensor(0.0)
+        self._seq_aux_loss = torch.tensor(0.0)
         self._routing_stats = {}
 
     def get_all_routers(self) -> list[DeepSeekRouter]:
@@ -458,20 +506,21 @@ class SpeedrunMoEGPT(nn.Module):
         stats = RoutingStats() if self.training else None
 
         ve = [vemb(input_ids) for vemb in self.value_embeds]
-        ve = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 6) + [ve[0], ve[1], ve[2]]
+        old_schedule = [ve[0], ve[1], ve[2]] + [None] * (self.num_blocks - 6) + [ve[0], ve[1], ve[2]]
+        ve = [v for item in old_schedule for v in (item, item)]
 
         x = x0 = norm(self.embed(input_ids))
 
         skip_connections = []
-        skip_weights = self.scalars[:self.num_layers // 2]
-        lambdas = self.scalars[1 * self.num_layers:3 * self.num_layers].view(-1, 2)
-        sa_lambdas = self.scalars[3 * self.num_layers:5 * self.num_layers].view(-1, 2)
-        n = self.num_layers // 2
+        skip_weights = self.scalars[:self.num_depths // 2]
+        lambdas = self.scalars[1 * self.num_depths:3 * self.num_depths].view(-1, 2)
+        sa_lambdas = self.scalars[3 * self.num_depths:5 * self.num_depths].view(-1, 2)
+        n = self.num_depths // 2
 
-        for i in range(self.num_layers):
+        for i in range(self.num_depths):
             if i >= n:
                 x = x + skip_weights[i - n] * skip_connections.pop()
-            x = self.blocks[i](x, ve[i], x0, lambdas[i], sa_lambdas[i], stats)
+            x = self.blocks[i](x, ve[i], x0, lambdas[i], sa_lambdas[i], self.branch_router, stats)
             if i < n:
                 skip_connections.append(x)
 
@@ -483,9 +532,11 @@ class SpeedrunMoEGPT(nn.Module):
 
         if stats is not None:
             self._aux_loss = stats.total_aux_loss()
+            self._seq_aux_loss = stats.total_seq_aux_loss(batch_size=B)
             self._routing_stats = stats.summary()
         else:
             self._aux_loss = torch.tensor(0.0, device=loss.device)
+            self._seq_aux_loss = torch.tensor(0.0, device=loss.device)
             self._routing_stats = {}
 
         return loss

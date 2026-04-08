@@ -42,6 +42,8 @@ class TokenBinConfig:
     max_tokens: int | None = None
     shuffle_files: bool = False
     repeat: bool = False
+    align_to_bos: bool = False
+    bos_token_id: int = 50256
 
 
 def _dtype_from_name(name: str) -> np.dtype:
@@ -127,7 +129,7 @@ class StatefulTokenBinDataset(IterableDataset):
         self.total_tokens = int(sum(token_limits))
         self.total_sequences = int(sum(self._num_sequences_in_file(n_tokens) for n_tokens in token_limits))
 
-        self._default_token_pos = self.rank * self.config.seq_len
+        self._default_token_pos = 0 if self.config.align_to_bos else self.rank * self.config.seq_len
         self._start_file_idx = 0
         self._start_token_pos = self._default_token_pos
         self._cur_file_idx = 0
@@ -135,12 +137,44 @@ class StatefulTokenBinDataset(IterableDataset):
 
     def _num_sequences_in_file(self, token_count: int) -> int:
         seq_len = self.config.seq_len
+        if self.config.align_to_bos:
+            stride = self.world_size * seq_len
+            if token_count < seq_len + 1:
+                return 0
+            # Conservative upper bound for metadata; aligned iteration scans actual BOS boundaries.
+            return max(0, 1 + (max(0, token_count - (seq_len + 1))) // max(1, stride))
         start = self.rank * seq_len
         max_start = token_count - (seq_len + 1)
         stride = self.world_size * seq_len
         if max_start < start:
             return 0
         return 1 + (max_start - start) // stride
+
+    def _find_aligned_starts(
+        self,
+        tokens: np.memmap,
+        token_pos: int,
+        token_count: int,
+    ) -> tuple[list[int], int] | None:
+        seq_len = self.config.seq_len
+        bos_token = self.config.bos_token_id
+        if token_pos >= token_count:
+            return None
+
+        boundary_positions = np.flatnonzero(tokens[token_pos:token_count] == bos_token)
+        if boundary_positions.size == 0:
+            return None
+        boundary_positions = (boundary_positions + token_pos).tolist()
+
+        start = boundary_positions[0]
+        starts: list[int] = []
+        for end in boundary_positions[1:]:
+            if end - start >= seq_len:
+                starts.append(start)
+                if len(starts) == self.world_size:
+                    return starts, end - token_pos
+                start = end
+        return None
 
     def get_state(self) -> dict:
         return {
@@ -183,6 +217,33 @@ class StatefulTokenBinDataset(IterableDataset):
                     offset=self.config.header_bytes,
                     shape=(token_count,),
                 )
+
+                if self.config.align_to_bos:
+                    while True:
+                        aligned = self._find_aligned_starts(tokens, token_pos, token_count)
+                        if aligned is None:
+                            break
+
+                        starts, consumed = aligned
+                        start_idx = starts[self.rank]
+                        next_file_idx = file_idx
+                        next_token_pos = token_pos + consumed
+                        if next_token_pos >= token_count:
+                            next_file_idx += 1
+                            next_token_pos = self._default_token_pos
+                        self._cur_file_idx = next_file_idx
+                        self._cur_token_pos = next_token_pos
+
+                        chunk = np.asarray(tokens[start_idx : start_idx + seq_len + 1], dtype=np.int64)
+                        yield {
+                            "input_ids": torch.from_numpy(chunk[:-1].copy()).to(torch.long),
+                            "labels": torch.from_numpy(chunk[1:].copy()).to(torch.long),
+                        }
+                        token_pos = next_token_pos if next_file_idx == file_idx else token_count
+
+                    file_idx += 1
+                    self._start_token_pos = self._default_token_pos
+                    continue
 
                 while token_pos <= max_start:
                     next_file_idx, next_token_pos = self._next_state(file_idx, token_pos + stride, max_start)

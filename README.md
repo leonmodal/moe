@@ -2,6 +2,11 @@
 
 This repo contains three model families for pretraining routed language models built on Qwen3/Qwen3-MoE components.
 
+For the speedrun MoE variants, the dense 12-block speedrun backbone is decomposed into
+24 effective branch-router depths. Each original transformer block is split into two
+sequential decision points, so the routed model performs 24 branch decisions for a
+12-block baseline.
+
 ## Setup
 
 ```bash
@@ -69,6 +74,26 @@ Single-node training:
 - Attention experts and MLP experts live in shared banks (weights shared across all depths)
 - KV state persists across depth -- tokens that take MLP keep their old KV state
 
+## `speedrun_moe_*`
+
+- `src/models/speedrun_moe_gpt.py`
+- Speedrun-backed routed model family
+- The original 12-block speedrun backbone is treated as **24 effective depths**
+- At each depth, a **branch router chooses `attention` or `mlp` via argmax**
+- Attention experts and MLP experts live in shared banks reused across all depths
+- The two attention-bank modes are `per_head_precompute_kv` and `per_head_fully_independent`
+- Expert routers are top-1 DeepSeek-style routers with expert-bias updates
+- Current speedrun configs use `router_aux_loss_coef: 0.0` and `seq_aux_loss_coef: 0.01`
+- The branch router has no balancing loss and no branch-bias updates
+
+## `speedrun_moe_everything`
+
+- `src/models/speedrun_mixture_of_everything.py`
+- Separate speedrun-style variant of `moe_everything`
+- Keeps the branch-routed shared-bank architecture of `moe_everything`
+- Uses speedrun-style functional RMS norm instead of learned RMSNorm modules
+- Does not support learned `routed_norm`
+
 ---
 
 # MoE-Everything Attention Modes
@@ -98,6 +123,9 @@ Both per-head modes share these ideas:
 - Each head slot has its **own dedicated router** that picks **top-1** from the expert pool
 - An expert is not permanently tied to any head slot -- different tokens can route different experts to the same slot
 - **MLP expert pool**: a bank of reusable MLP weight sets, also shared across all depths, with its own top-1 router
+- In the speedrun MoE variants, a branch router first chooses **attention or MLP** at
+  each of the 24 effective depths; the chosen branch then uses the expert routing
+  described below
 
 ### Per-head-slot top-1 routing
 
@@ -251,27 +279,26 @@ Two router concepts in the speedrun MoE models:
 
 - **Attention routers**: per-head-slot top-1 routers that choose attention experts
 - **MLP router**: top-1 router that chooses MLP experts
+- **Branch router**: top-1 router that chooses `attention` or `mlp` at each effective depth
 
-Each head slot has its own dedicated `nn.Linear(dim, E)` router. The routing weight (softmax probability of the selected expert) is multiplied into the expert output.
+Each head slot has its own dedicated router. In the speedrun MoE models these are DeepSeek-style sigmoid-plus-bias routers with top-1 argmax selection. The selected routing weight is multiplied into the expert output.
 
 ## Q/K Norms
 
-Two norm layers in the per-head path:
+In the speedrun family, Q and K follow dense speedrun GPT:
 
 - Input pre-norm (RMS norm) on the token hidden state before routing/projection
-- Expert-specific `q_norm_weight` and `k_norm_weight` on the projected head vectors
+- Functional RMS norm on projected Q and K
+- No learned per-expert `q_norm_weight` or `k_norm_weight` in the speedrun variants
 
-The expert-specific norms follow the selected expert, not the fixed head id:
-
-```text
-token A: head 0 -> expert 37 -> uses q_norm_weight[37], k_norm_weight[37]
-token B: head 0 -> expert 12 -> uses q_norm_weight[12], k_norm_weight[12]
-```
+This differs from the original Qwen-based `moe_everything` family, which can use learned RMSNorm modules and optional routed norms.
 
 ## Load Balancing
 
 - `router_aux_loss_coef` -- Switch-style batch aux loss for attention and MLP routers
+- `seq_aux_loss_coef` -- sequence-level aux loss for attention and MLP expert routers
 - `router_exploration_rate` -- per-token random expert exploration rate during training
+- The speedrun branch router has no balancing loss
 
 ---
 

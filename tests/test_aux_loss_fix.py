@@ -9,6 +9,22 @@ from src.models.load_balancing import (
     normalized_load_balancing_loss_func,
 )
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU-only tests")
+
+
+@pytest.fixture(autouse=True)
+def _force_cuda_default_device():
+    prev = torch.get_default_device()
+    torch.set_default_device("cuda")
+    try:
+        yield
+    finally:
+        torch.set_default_device(prev)
+
+
+def _preferred_device() -> torch.device:
+    return torch.device("cuda")
+
 
 def test_uniform_routing():
     """Uniform routing should give aux_loss = top_k."""
@@ -89,14 +105,15 @@ def test_standard_moe_uses_fixed_loss():
     """StandardMoEModel.forward should use our fixed loss."""
     from src.models import StandardMoEModel, Qwen3MoeConfig
 
+    device = _preferred_device()
     config = Qwen3MoeConfig(
         vocab_size=151936, hidden_size=1024, num_hidden_layers=2,
         head_dim=128, num_attention_heads=16, num_key_value_heads=8,
         num_experts=16, num_experts_per_tok=4, moe_intermediate_size=768,
         intermediate_size=3072, router_aux_loss_coef=0.1,
     )
-    model = StandardMoEModel(config)
-    ids = torch.randint(0, 1000, (2, 32))
+    model = StandardMoEModel(config).to(device)
+    ids = torch.randint(0, 1000, (2, 32), device=device)
     out = model(input_ids=ids, labels=ids, output_router_logits=True)
     print(f"Standard MoE aux_loss:         {out.aux_loss.item():.4f}")
     assert out.aux_loss is not None
@@ -107,14 +124,15 @@ def test_global_moe_uses_fixed_loss():
     """GlobalMoEForCausalLM.forward should use our fixed loss."""
     from src.models import GlobalMoEConfig, GlobalMoEForCausalLM
 
+    device = _preferred_device()
     config = GlobalMoEConfig(
         vocab_size=151936, hidden_size=1024, num_hidden_layers=2,
         head_dim=128, num_attention_heads=16, num_key_value_heads=8,
         num_experts=128, num_experts_per_tok=4, moe_intermediate_size=768,
         intermediate_size=3072, router_aux_loss_coef=0.1,
     )
-    model = GlobalMoEForCausalLM(config)
-    ids = torch.randint(0, 1000, (2, 32))
+    model = GlobalMoEForCausalLM(config).to(device)
+    ids = torch.randint(0, 1000, (2, 32), device=device)
     out = model(input_ids=ids, labels=ids, output_router_logits=True)
     print(f"Global MoE aux_loss:           {out.aux_loss.item():.4f}")
     assert out.aux_loss is not None

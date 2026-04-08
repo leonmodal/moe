@@ -47,6 +47,8 @@ from src.models import (
     DeepSeekGlobalMoEForCausalLM,
     MoEverythingConfig,
     MoEverythingForCausalLM,
+    SpeedrunMoEverythingConfig,
+    SpeedrunMoEverythingForCausalLM,
 )
 from src.models.speedrun_gpt import GPT as SpeedrunGPT
 from src.models.speedrun_moe_gpt import SpeedrunMoEGPT
@@ -160,6 +162,7 @@ def build_dataset_from_config(
             max_tokens=cfg_dict.get("max_tokens"),
             shuffle_files=cfg_dict.get("shuffle_files", False),
             repeat=cfg_dict.get("repeat", False),
+            align_to_bos=cfg_dict.get("align_to_bos", False),
         )
         return StatefulTokenBinDataset(
             config=data_cfg,
@@ -335,6 +338,38 @@ def build_model(cfg: dict):
             **common,
         )
         model = MoEverythingForCausalLM(config)
+    elif mtype == "speedrun_moe_everything":
+        config = SpeedrunMoEverythingConfig(
+            num_experts=mcfg["num_experts"],
+            num_attn_experts=mcfg.get("num_attn_experts", 4),
+            num_attn_experts_per_tok=mcfg.get("num_attn_experts_per_tok", 1),
+            attn_expert_mode=mcfg.get("attn_expert_mode", "bundled"),
+            branch_router_aux_loss_coef=mcfg.get("branch_router_aux_loss_coef", 0.0),
+            use_deepseek_routing=mcfg.get("use_deepseek_routing", False),
+            topk_scaling_factor=mcfg.get("topk_scaling_factor", None),
+            num_groups=mcfg.get("num_groups", None),
+            group_topk=mcfg.get("group_topk", None),
+            per_layer_router=mcfg.get("per_layer_router", False),
+            per_layer_mlp_router=mcfg.get("per_layer_mlp_router", False),
+            per_layer_attn_router=mcfg.get("per_layer_attn_router", False),
+            routed_norm=mcfg.get("routed_norm", False),
+            per_layer_norm=mcfg.get("per_layer_norm", False),
+            per_layer_qk_norm=mcfg.get("per_layer_qk_norm", False),
+            post_norm=mcfg.get("post_norm", False),
+            dynamic_depth_min=mcfg.get("dynamic_depth_min", 1.0),
+            dynamic_depth_max=mcfg.get("dynamic_depth_max", 1.0),
+            depthwise_attention=mcfg.get("depthwise_attention", False),
+            depthwise_block_size=mcfg.get("depthwise_block_size", 0),
+            per_head_compute_mode=mcfg.get("per_head_compute_mode", "auto"),
+            per_head_dense_fraction_threshold=mcfg.get("per_head_dense_fraction_threshold", 0.75),
+            sanity_check_mode=mcfg.get("sanity_check_mode"),
+            scale_attn_by_routing_weight=mcfg.get("scale_attn_by_routing_weight", True),
+            scale_branch_by_routing_weight=mcfg.get("scale_branch_by_routing_weight", True),
+            router_exploration_rate=mcfg.get("router_exploration_rate", 0.0),
+            branch_router_exploration_rate=mcfg.get("branch_router_exploration_rate"),
+            **common,
+        )
+        model = SpeedrunMoEverythingForCausalLM(config)
     else:
         raise ValueError(f"Unknown model type: {mtype}")
 
@@ -946,14 +981,16 @@ def run_speedrun_training(args, cfg) -> None:
         _train_ds = StatefulTokenBinDataset(
             TokenBinConfig(files_glob=train_files, seq_len=train_seq_len,
                            header_bytes=1024, token_dtype="uint16",
-                           shuffle_files=False, repeat=True),
+                           shuffle_files=False, repeat=True,
+                           align_to_bos=train_align_to_bos),
             rank=rank, world_size=world_size, seed=42,
         )
         _train_dl = DataLoader(_train_ds, batch_size=batch_size, num_workers=0, pin_memory=True)
         _val_ds = StatefulTokenBinDataset(
             TokenBinConfig(files_glob=val_files, seq_len=val_seq_len,
                            header_bytes=1024, token_dtype="uint16",
-                           shuffle_files=False, repeat=False),
+                           shuffle_files=False, repeat=False,
+                           align_to_bos=eval_cfg_dict.get("align_to_bos", False)),
             rank=rank, world_size=world_size, seed=1234,
         )
         _val_dl = DataLoader(_val_ds, batch_size=batch_size, num_workers=0, pin_memory=True)
@@ -992,7 +1029,10 @@ def run_speedrun_training(args, cfg) -> None:
             targets = batch["labels"].cuda(non_blocking=True)
         else:
             inputs, targets = batch
-        _moe_forward(model, inputs, targets, 1).backward()
+        warmup_dtype = infer_dtype(tcfg_dict.get("mixed_precision", "fp32"))
+        warmup_enabled = warmup_dtype is not None
+        with torch.autocast(device_type="cuda", dtype=warmup_dtype, enabled=warmup_enabled):
+            _moe_forward(model, inputs, targets, 1).backward()
         for opt in optimizers:
             opt.step()
         model.zero_grad(set_to_none=True)
@@ -1007,6 +1047,8 @@ def run_speedrun_training(args, cfg) -> None:
     training_time_ms = 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+    autocast_dtype = infer_dtype(tcfg_dict.get("mixed_precision", "fp32"))
+    autocast_enabled = autocast_dtype is not None
 
     train_steps = num_iterations
     for step in range(train_steps + 1):
@@ -1030,7 +1072,8 @@ def run_speedrun_training(args, cfg) -> None:
                         vtargets = vbatch["labels"].cuda(non_blocking=True)
                     else:
                         vinputs, vtargets = vbatch
-                    vloss = _moe_forward(model, vinputs, vtargets, step)
+                    with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_enabled):
+                        vloss = _moe_forward(model, vinputs, vtargets, step)
                     # Model uses mean-reduction in eval mode, so vloss is already per-token
                     val_loss += vloss.item()
                     val_tokens_seen += 1
@@ -1063,12 +1106,14 @@ def run_speedrun_training(args, cfg) -> None:
                 targets = batch["labels"].cuda(non_blocking=True)
             else:
                 inputs, targets = batch
-            ce_loss = _moe_forward(model, inputs, targets, step)
+            with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_enabled):
+                ce_loss = _moe_forward(model, inputs, targets, step)
             # Add aux loss for MoE models
             if is_moe and hasattr(model, '_aux_loss'):
                 raw_model_ref = model._orig_mod if hasattr(model, '_orig_mod') else model
                 aux_coef = tcfg_dict.get("router_aux_loss_coef", 0.01)
-                total_loss = ce_loss + aux_coef * raw_model_ref._aux_loss
+                seq_aux_coef = tcfg_dict.get("seq_aux_loss_coef", 0.0)
+                total_loss = ce_loss + aux_coef * raw_model_ref._aux_loss + seq_aux_coef * getattr(raw_model_ref, "_seq_aux_loss", 0.0)
             else:
                 total_loss = ce_loss
             total_loss.backward()
@@ -1118,6 +1163,8 @@ def run_speedrun_training(args, cfg) -> None:
                         log_dict.update(raw_model_ref._routing_stats)
                     if hasattr(raw_model_ref, '_aux_loss'):
                         log_dict["train/aux_loss"] = raw_model_ref._aux_loss.item()
+                    if hasattr(raw_model_ref, '_seq_aux_loss'):
+                        log_dict["train/seq_aux_loss"] = raw_model_ref._seq_aux_loss.item()
                 wandb_run.log(log_dict, step=step)
 
         # Save checkpoint

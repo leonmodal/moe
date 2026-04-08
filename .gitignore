@@ -10,3 +10,5 @@ data/*
 Megatron-LM/
 profiler_logs/
 run_logs/
+nmoe
+modal-nmoe

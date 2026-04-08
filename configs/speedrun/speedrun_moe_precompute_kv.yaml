@@ -1,0 +1,55 @@
+experiment_name: speedrun_moe_precompute_kv
+
+model:
+  type: speedrun_moe_precompute_kv
+  vocab_size: 50257
+  num_layers: 12
+  num_heads: 6
+  model_dim: 768
+  head_dim: 128
+  num_attn_experts: 66
+  num_mlp_experts: 12
+  exploration_rate: 0.02
+
+training:
+  optimizer: speedrun
+  muon_lr: 0.05
+  adam_lr: 0.008
+  adam_betas: [0.8, 0.95]
+  adam_eps: 1.0e-10
+  weight_decay: 0.0
+  momentum_warmup_steps: 300
+  max_grad_norm: 0.0
+  lr_scheduler: stable_decay
+  cooldown_frac: 0.45
+  warmup_steps: 0
+  max_steps: 10000
+  min_lr_ratio: 0.1
+  learning_rate: 0.05
+  batch_size: 4
+  gradient_accumulation: 1
+  mixed_precision: bf16
+  router_aux_loss_coef: 0.0
+  seq_aux_loss_coef: 0.01
+  bias_update_rate: 0.001
+  torch_compile: true
+  log_every: 10
+  save_every: 500
+  output_dir: ./outputs/plan/speedrun_moe_precompute_kv
+
+data:
+  format: token_bin
+  files_glob: ./data/fineweb10B_gpt2/fineweb_train_*.bin
+  seq_len: 1024
+  align_to_bos: true
+  header_bytes: 1024
+  token_dtype: uint16
+
+eval:
+  enabled: true
+  every: 500
+  files_glob: ./data/fineweb10B_gpt2/fineweb_val_*.bin
+  max_tokens: 10485760
+  seq_len: 1024
+  batch_size: 4
+  align_to_bos: true
