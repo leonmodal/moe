@@ -19,7 +19,7 @@ training:
   lr_scheduler: stable_decay
   cooldown_frac: 0.45
   warmup_steps: 0
-  max_steps: 1695
+  max_steps: 10000
   min_lr_ratio: 0.1
   learning_rate: 0.05
   batch_size: 1

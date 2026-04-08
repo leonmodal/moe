@@ -9,6 +9,7 @@ model:
   head_dim: 128
   num_attn_experts: 66   # matches 11 attn layers x 6 heads from baseline
   num_mlp_experts: 12    # matches 12 MLP layers from baseline
+  exploration_rate: 0.02
 
 training:
   optimizer: speedrun
@@ -22,16 +23,17 @@ training:
   lr_scheduler: stable_decay
   cooldown_frac: 0.45
   warmup_steps: 0
-  max_steps: 1695
+  max_steps: 10000
   min_lr_ratio: 0.1
   learning_rate: 0.05
   batch_size: 4
   gradient_accumulation: 1
   mixed_precision: bf16
   router_aux_loss_coef: 0.01
-  torch_compile: false
-  log_every: 1
-  save_every: 125
+  bias_update_rate: 0.001
+  torch_compile: true
+  log_every: 10
+  save_every: 500
   output_dir: ./outputs/plan/speedrun_moe_fully_independent
 
 data:
@@ -44,7 +46,7 @@ data:
 
 eval:
   enabled: true
-  every: 125
+  every: 500
   files_glob: ./data/fineweb10B_gpt2/fineweb_val_*.bin
   max_tokens: 10485760
   seq_len: 1024

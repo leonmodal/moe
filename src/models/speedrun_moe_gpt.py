@@ -2,11 +2,12 @@
 SpeedrunMoEGPT: Speedrun GPT with per-head routed attention + shared MLP experts.
 
 Routing design:
-- Each head slot has its own top-1 router (NOT one router picking top-K)
+- Each head slot has its own top-1 DeepSeek-style router (sigmoid + expert bias)
 - per_head_fully_independent: 4H routers (Q/K/V independent, O on attn output)
 - per_head_precompute_kv: H routers (QKVO bundled)
 - Shared MLP expert bank with top-1 routing
 - Switch-style aux loss for load balancing
+- Expert bias updates (DeepSeek V3 style)
 
 Uses Triton grouped GEMM for efficient dispatch.
 Supports batched (B, T) inputs with SDPA attention.
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -31,6 +33,7 @@ from src.models.speedrun_gpt import (
     next_multiple_of_n,
 )
 from src.models.triton_grouped_gemm import triton_grouped_gemm
+from src.models.router import DeepSeekRouter
 from src.utils.routing_loss import switch_load_balancing_loss
 
 
@@ -41,7 +44,6 @@ from src.utils.routing_loss import switch_load_balancing_loss
 class RoutingStats:
     """Accumulates routing statistics during a forward pass."""
     aux_losses: list[Tensor] = field(default_factory=list)
-    # Per-router: (router_name, expert_ids, num_experts)
     router_records: list[tuple[str, Tensor, int]] = field(default_factory=list)
 
     def add(self, name: str, expert_ids: Tensor, probs: Tensor, num_experts: int):
@@ -54,7 +56,6 @@ class RoutingStats:
         return sum(self.aux_losses) / len(self.aux_losses)
 
     def summary(self) -> dict[str, float]:
-        """Compute summary stats for wandb logging."""
         if not self.router_records:
             return {}
         stats = {}
@@ -64,12 +65,8 @@ class RoutingStats:
             if total == 0:
                 continue
             fracs = counts / total
-            # Load balance ratio: 1.0 = perfectly balanced, 0.0 = all on one expert
-            # Defined as E * min(fracs) — equals 1.0 when uniform
             stats[f"routing/{name}_balance"] = (E * fracs.min()).item()
-            # Utilization: fraction of experts that received at least 1 token
             stats[f"routing/{name}_utilization"] = (counts > 0).float().mean().item()
-            # Entropy of routing distribution (normalized by log(E))
             entropy = -(fracs * (fracs + 1e-10).log()).sum()
             max_entropy = torch.tensor(E, dtype=torch.float32).log()
             stats[f"routing/{name}_entropy"] = (entropy / max_entropy).item()
@@ -77,19 +74,36 @@ class RoutingStats:
 
 
 # ---------------------------------------------------------------------------
+# DeepSeek router factory
+
+def _make_router(input_dim: int, num_experts: int, exploration_rate: float = 0.02) -> DeepSeekRouter:
+    """Create a DeepSeek-style sigmoid + expert-bias router."""
+    cfg = SimpleNamespace(
+        hidden_size=input_dim,
+        num_local_experts=num_experts,
+        num_experts=num_experts,
+        num_experts_per_tok=1,  # top-1
+        norm_topk_prob=True,
+        router_exploration_rate=exploration_rate,
+        topk_scaling_factor=None,
+        num_groups=None,
+        group_topk=None,
+    )
+    return DeepSeekRouter(cfg)
+
+
+# ---------------------------------------------------------------------------
 # Per-head-slot top-1 routing + grouped GEMM projection
 
-def _route_top1(router: nn.Linear, x: Tensor, stats: RoutingStats | None = None,
+def _route_top1(router: DeepSeekRouter, x: Tensor, stats: RoutingStats | None = None,
                 router_name: str = ""):
-    """Top-1 routing with optional stats/aux-loss collection."""
-    with torch.autocast(device_type=x.device.type, enabled=False):
-        logits = router(x.float())
-        probs = F.softmax(logits, dim=-1, dtype=torch.float32)
-        expert_ids = probs.argmax(dim=-1)  # (N,)
-        weights = probs.gather(-1, expert_ids.unsqueeze(-1)).squeeze(-1)  # (N,)
+    """Top-1 DeepSeek routing with optional stats collection."""
+    probs, weights, indices = router(x)  # probs: (N, E), weights: (N, 1), indices: (N, 1)
+    expert_ids = indices.squeeze(-1)  # (N,)
+    expert_weights = weights.squeeze(-1)  # (N,)
     if stats is not None:
-        stats.add(router_name, expert_ids, probs, logits.shape[-1])
-    return expert_ids, weights
+        stats.add(router_name, expert_ids, probs, probs.shape[-1])
+    return expert_ids, expert_weights
 
 
 def _grouped_project(x: Tensor, weight_bank: Tensor, expert_ids: Tensor, weights: Tensor):
@@ -146,17 +160,18 @@ def _route_and_project_reduce(routers: nn.ModuleList, x: Tensor, weight_bank: Te
 # Attention Expert Bank
 
 class AttentionExpertBank(nn.Module):
-    def __init__(self, num_experts: int, dim: int, num_heads: int, head_dim: int, mode: str):
+    def __init__(self, num_experts: int, dim: int, num_heads: int, head_dim: int, mode: str,
+                 exploration_rate: float = 0.02):
         super().__init__()
         self.mode = mode
         self.num_experts = num_experts
         E, D, HD, H = num_experts, dim, head_dim, num_heads
 
         if mode == "per_head_fully_independent":
-            self.q_routers = nn.ModuleList([nn.Linear(D, E, bias=False) for _ in range(H)])
-            self.k_routers = nn.ModuleList([nn.Linear(D, E, bias=False) for _ in range(H)])
-            self.v_routers = nn.ModuleList([nn.Linear(D, E, bias=False) for _ in range(H)])
-            self.o_routers = nn.ModuleList([nn.Linear(HD, E, bias=False) for _ in range(H)])
+            self.q_routers = nn.ModuleList([_make_router(D, E, exploration_rate) for _ in range(H)])
+            self.k_routers = nn.ModuleList([_make_router(D, E, exploration_rate) for _ in range(H)])
+            self.v_routers = nn.ModuleList([_make_router(D, E, exploration_rate) for _ in range(H)])
+            self.o_routers = nn.ModuleList([_make_router(HD, E, exploration_rate) for _ in range(H)])
             self.q_proj = nn.Parameter(torch.empty(E, D, HD))
             self.k_proj = nn.Parameter(torch.empty(E, D, HD))
             self.v_proj = nn.Parameter(torch.empty(E, D, HD))
@@ -164,7 +179,7 @@ class AttentionExpertBank(nn.Module):
             self.q_norm = nn.Parameter(torch.ones(E, HD))
             self.k_norm = nn.Parameter(torch.ones(E, HD))
         elif mode == "per_head_precompute_kv":
-            self.routers = nn.ModuleList([nn.Linear(D, E, bias=False) for _ in range(H)])
+            self.routers = nn.ModuleList([_make_router(D, E, exploration_rate) for _ in range(H)])
             self.q_proj = nn.Parameter(torch.empty(E, D, HD))
             self.k_proj = nn.Parameter(torch.empty(E, D, HD))
             self.v_proj = nn.Parameter(torch.empty(E, D, HD))
@@ -182,16 +197,25 @@ class AttentionExpertBank(nn.Module):
             nn.init.uniform_(proj, -bound, bound)
         nn.init.zeros_(self.o_proj)
 
+    def get_all_routers(self) -> list[DeepSeekRouter]:
+        """Return all DeepSeek routers for bias updates."""
+        routers = []
+        for attr in ["q_routers", "k_routers", "v_routers", "o_routers", "routers"]:
+            module_list = getattr(self, attr, None)
+            if module_list is not None:
+                routers.extend(module_list)
+        return routers
+
 
 # ---------------------------------------------------------------------------
 # MLP Expert Bank
 
 class MLPExpertBank(nn.Module):
-    def __init__(self, num_experts: int, dim: int):
+    def __init__(self, num_experts: int, dim: int, exploration_rate: float = 0.02):
         super().__init__()
         hdim = 4 * dim
         self.num_experts = num_experts
-        self.router = nn.Linear(dim, num_experts, bias=False)
+        self.router = _make_router(dim, num_experts, exploration_rate)
         self.c_fc = nn.Parameter(torch.empty(num_experts, dim, hdim))
         self.c_proj = nn.Parameter(torch.empty(num_experts, hdim, dim))
         self._init_weights(dim)
@@ -208,6 +232,9 @@ class MLPExpertBank(nn.Module):
         h = F.relu(h).square()
         out = _grouped_project(h, self.c_proj, eid, ew)
         return out
+
+    def get_all_routers(self) -> list[DeepSeekRouter]:
+        return [self.router]
 
 
 # ---------------------------------------------------------------------------
@@ -279,14 +306,12 @@ class RoutedAttentionPrecomputeKV(nn.Module):
         flat = x.reshape(B * T, D)
         dp = f"d{depth_idx}"
 
-        # Route per head slot (QKVO bundled)
         head_eids, head_ews = [], []
         for h in range(H):
             eid, ew = _route_top1(bank.routers[h], flat, stats, f"qkvo_{dp}_h{h}")
             head_eids.append(eid)
             head_ews.append(ew)
 
-        # Project Q
         q_parts = []
         for h in range(H):
             proj = _grouped_project(flat, bank.q_proj, head_eids[h], head_ews[h])
@@ -334,7 +359,6 @@ class RoutedAttentionPrecomputeKV(nn.Module):
         gate = torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_dim]))
         y = y * gate.unsqueeze(-1)
 
-        # O projection (same routing as QKV — bundled)
         y_flat = y.reshape(B * T, H, HD)
         o_parts = []
         for h in range(H):
@@ -383,7 +407,8 @@ class SpeedrunMoEGPT(nn.Module):
 
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int,
                  head_dim: int, max_seq_len: int, mode: str,
-                 num_attn_experts: int = 66, num_mlp_experts: int = 12):
+                 num_attn_experts: int = 66, num_mlp_experts: int = 12,
+                 exploration_rate: float = 0.02):
         super().__init__()
         self.num_layers = num_layers
         self.model_dim = model_dim
@@ -392,8 +417,8 @@ class SpeedrunMoEGPT(nn.Module):
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
 
-        self.attn_bank = AttentionExpertBank(num_attn_experts, model_dim, num_heads, head_dim, mode)
-        self.mlp_bank = MLPExpertBank(num_mlp_experts, model_dim)
+        self.attn_bank = AttentionExpertBank(num_attn_experts, model_dim, num_heads, head_dim, mode, exploration_rate)
+        self.mlp_bank = MLPExpertBank(num_mlp_experts, model_dim, exploration_rate)
 
         self.blocks = nn.ModuleList([
             MoEBlock(self.attn_bank, self.mlp_bank, num_heads, head_dim, max_seq_len, i, mode)
@@ -421,9 +446,12 @@ class SpeedrunMoEGPT(nn.Module):
         self.lm_head.weight.lr_mul = 1.0
         self.scalars.lr_mul = 5.0
 
-        # Populated after each forward
         self._aux_loss = torch.tensor(0.0)
         self._routing_stats = {}
+
+    def get_all_routers(self) -> list[DeepSeekRouter]:
+        """Return all DeepSeek routers for bias updates."""
+        return self.attn_bank.get_all_routers() + self.mlp_bank.get_all_routers()
 
     def forward(self, input_ids: Tensor, labels: Tensor):
         B, T = input_ids.shape

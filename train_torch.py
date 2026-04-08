@@ -857,6 +857,7 @@ def run_speedrun_training(args, cfg) -> None:
             mode=mode_map[mtype],
             num_attn_experts=mcfg.get("num_attn_experts", 66),
             num_mlp_experts=mcfg.get("num_mlp_experts", 12),
+            exploration_rate=mcfg.get("exploration_rate", 0.02),
         ).cuda()
     else:
         raise ValueError(f"Unknown speedrun model type: {mtype}")
@@ -1085,6 +1086,21 @@ def run_speedrun_training(args, cfg) -> None:
         for opt in optimizers:
             opt.step()
         model.zero_grad(set_to_none=True)
+
+        # Expert bias update (DeepSeek V3 style) for MoE models
+        if is_moe:
+            raw_model_ref = model._orig_mod if hasattr(model, '_orig_mod') else model
+            bias_rate = tcfg_dict.get("bias_update_rate", 0.001)
+            if bias_rate > 0 and hasattr(raw_model_ref, 'get_all_routers'):
+                from src.models.router import DeepSeekRouter
+                for router in raw_model_ref.get_all_routers():
+                    if isinstance(router, DeepSeekRouter):
+                        with torch.no_grad():
+                            counts = router.local_tokens_per_expert
+                            if counts.sum() > 0:
+                                avg = counts.mean()
+                                router.expert_bias += torch.sign(avg - counts) * bias_rate
+                            router.local_tokens_per_expert.zero_()
 
         # Logging
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
