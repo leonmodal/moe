@@ -41,6 +41,115 @@ Notes:
 - FSDP checkpointing currently uses `FSDP.state_dict_type(...)`, which works but emits deprecation warnings in this torch version.
 - This is a runtime rewrite checkpoint, not the final speedrun benchmark replacement yet. The next step is to move the actual benchmark recipe onto `train_torch.py` and compare against the modded-nanogpt reference again.
 
+## Torch-Native Benchmark Update
+
+I then ran the actual 8x B200 speedrun-style dense benchmark through `train_torch.py`.
+
+Key runtime change:
+
+- `train_torch.py` no longer uses `FSDP(..., use_orig_params=True)`.
+
+Optimizers available in the Torch-native trainer:
+
+- `optimizer: adamw`
+- `optimizer: muon`
+  - supports `muon_lr`
+  - supports `muon_weight_decay`
+  - supports `adam_lr`
+  - keeps the Muon momentum warmup path
+
+### Main 1150-step Torch-native run
+
+Run:
+
+- config: `/tmp/moe/configs/plan/speedrun_dense_fineweb_gpt2_bins.yaml`
+- launcher: `train_torch.py --dist-strategy ddp`
+- log: `/tmp/moe/outputs/plan/speedrun_dense_fineweb_gpt2_bins_torch.log`
+- checkpoint dir: `/tmp/moe/outputs/plan/speedrun_dense_fineweb_gpt2_bins_torch`
+
+Observed results:
+
+- completed all `1150` steps
+- final validation CE: `3.5600`
+- average throughput from step `50+`: about `1.234M tok/s`
+- median throughput from step `50+`: about `1.234M tok/s`
+
+Validation curve:
+
+- `50`: `6.2333`
+- `100`: `5.4135`
+- `150`: `4.9889`
+- `200`: `4.7188`
+- `250`: `4.4139`
+- `400`: `4.0413`
+- `700`: `3.7192`
+- `950`: `3.5874`
+- `1000`: `3.5735`
+- `1050`: `3.5649`
+- `1100`: `3.5607`
+- `1150`: `3.5600`
+
+Interpretation:
+
+- rewriting the runtime in raw torch did **not** produce a major throughput improvement
+- it **did** materially improve convergence versus the older trainer on the same recipe
+- this is still not enough to hit the `3.28` target
+
+For comparison:
+
+- old trainer at roughly the same benchmark point: `eval@1000 = 3.7176`, throughput about `1.16M-1.19M tok/s`
+- new Torch-native trainer: `eval@1000 = 3.5735`, throughput about `1.234M tok/s`
+
+So the rewrite bought:
+
+- roughly `3-6%` more throughput
+- roughly `0.14` lower validation CE at step `1000`
+
+### Failed extension attempt: resume to 1700 with non-zero floor
+
+Run:
+
+- config: `/tmp/moe/configs/plan/speedrun_dense_fineweb_gpt2_bins_torch_resume1700.yaml`
+- log: `/tmp/moe/outputs/plan/speedrun_dense_fineweb_gpt2_bins_torch_resume1700.log`
+
+Result:
+
+- resumed from step `1150` with `max_steps: 1700` and `min_lr_ratio: 0.1`
+- this reintroduced LR too aggressively
+- `eval@1250 = 3.7106`, clearly worse than the `3.5600` floor from the completed 1150-step run
+- I terminated this branch early
+
+### Failed fresh attempt: 1695-step run from scratch with non-zero floor
+
+Run:
+
+- config: `/tmp/moe/configs/plan/speedrun_dense_fineweb_gpt2_bins_torch_fresh1695.yaml`
+- log: `/tmp/moe/outputs/plan/speedrun_dense_fineweb_gpt2_bins_torch_fresh1695.log`
+
+Observed partial curve before termination:
+
+- `100`: `5.4275`
+- `150`: `5.0017`
+- `200`: `4.7166`
+- `250`: `4.4086`
+- `300`: `4.2545`
+- `650`: `3.7917`
+- `700`: `3.7583`
+- `750`: `3.7330`
+- `800`: `3.7037`
+- `850`: `3.6773`
+
+Interpretation:
+
+- this was consistently behind the better zero-floor Torch-native run at the same steps
+- I terminated it rather than spend the rest of the budget on a losing schedule
+
+Current conclusion:
+
+- the Torch-native rewrite is the right direction and is measurably better than the old trainer
+- but the speedrun target is still not met
+- the remaining gap to the modded-nanogpt reference is now mostly about model/training recipe quality, not just Accelerate overhead
+
 ## Goal
 
 Match the FineWeb GPT-2 speedrun target on the local 8x B200 box:

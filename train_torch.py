@@ -526,7 +526,6 @@ def wrap_model(model, *, strategy: str, local_rank: int, mixed_precision_name: s
             device_id=torch.device("cuda", local_rank),
             mixed_precision=build_fsdp_mixed_precision(mixed_precision_name),
             sharding_strategy=ShardingStrategy.FULL_SHARD,
-            use_orig_params=True,
             sync_module_states=True,
         )
     raise ValueError(f"Unknown strategy: {strategy}")

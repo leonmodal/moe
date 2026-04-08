@@ -1,0 +1,67 @@
+# Torch-native fresh long run on the speedrun-style dense benchmark.
+# Mirrors the extended reference horizon while keeping a non-zero cosine floor.
+experiment_name: speedrun_dense_fineweb_gpt2_bins_torch_fresh1695
+
+model:
+  type: dense
+  vocab_size: 50257
+  hidden_size: 768
+  num_hidden_layers: 12
+  head_dim: 64
+  num_attention_heads: 12
+  num_key_value_heads: 12
+  intermediate_size: 3072
+  rms_norm_eps: 1.0e-6
+  rope_theta: 10000.0
+  max_position_embeddings: 1024
+  tie_word_embeddings: true
+
+training:
+  optimizer: muon
+  muon_lr: 0.02
+  muon_weight_decay: 0.02
+  adam_lr: 0.008
+  momentum_warmup_steps: 300
+  learning_rate: 0.02
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 200
+  max_steps: 1695
+  min_lr_ratio: 0.1
+  batch_size: 64
+  gradient_accumulation: 1
+  mixed_precision: bf16
+  torch_compile: false
+  gradient_checkpointing: false
+  log_every: 1
+  routing_log_every: 250
+  save_every: 100
+  output_dir: /tmp/moe/outputs/plan/speedrun_dense_fineweb_gpt2_bins_torch_fresh1695
+  wandb_project: null
+  wandb_run_name: null
+
+data:
+  format: token_bin
+  files_glob: ./data/fineweb10B_gpt2/fineweb_train_*.bin
+  seq_len: 1024
+  header_bytes: 1024
+  token_dtype: uint16
+  shuffle_files: false
+  repeat: true
+
+eval:
+  enabled: true
+  every: 50
+  max_batches: 0
+  format: token_bin
+  files_glob: ./data/fineweb10B_gpt2/fineweb_val_*.bin
+  max_tokens: 10485760
+  seq_len: 1024
+  batch_size: 64
+  repeat: false
+
+checkpoint:
+  resume_from: null
