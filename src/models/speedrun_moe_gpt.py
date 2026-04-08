@@ -38,6 +38,11 @@ from src.models.load_balancing import seq_load_balancing_loss_func
 from src.models.fp32_routing import fp32_index_put, fp32_index_select
 from src.utils.routing_loss import switch_load_balancing_loss
 
+AUTO_QUERY_SPARSE_THRESHOLDS = {
+    "per_head_fully_independent": 0.75,
+    "per_head_precompute_kv": 0.25,
+}
+
 
 # ---------------------------------------------------------------------------
 # Routing stats collector
@@ -48,12 +53,31 @@ class RoutingStats:
     aux_losses: list[Tensor] = field(default_factory=list)
     router_records: list[tuple[str, Tensor, int]] = field(default_factory=list)
     branch_records: list[Tensor] = field(default_factory=list)
-    seq_router_records: list[tuple[Tensor, Tensor, int]] = field(default_factory=list)
+    seq_router_records: list[tuple[Tensor, Tensor, int, Tensor | None]] = field(default_factory=list)
 
-    def add(self, name: str, expert_ids: Tensor, probs: Tensor, num_experts: int):
+    def add(
+        self,
+        name: str,
+        expert_ids: Tensor,
+        probs: Tensor,
+        num_experts: int,
+        token_mask: Tensor | None = None,
+    ):
         self.aux_losses.append(switch_load_balancing_loss(expert_ids, probs, num_experts))
         self.router_records.append((name, expert_ids.detach(), num_experts))
-        self.seq_router_records.append((probs, expert_ids.unsqueeze(-1), num_experts))
+        probs_for_seq = probs
+        selected_for_seq = expert_ids.unsqueeze(-1)
+        token_mask_for_seq = None
+        if token_mask is not None:
+            flat_mask = token_mask.reshape(-1).bool()
+            if probs.shape[0] != flat_mask.numel():
+                selected_idx = flat_mask.nonzero(as_tuple=False).squeeze(-1)
+                probs_for_seq = probs.new_zeros(flat_mask.numel(), num_experts)
+                probs_for_seq = fp32_index_put(probs_for_seq, selected_idx, probs)
+                selected_for_seq = expert_ids.new_zeros(flat_mask.numel(), 1)
+                selected_for_seq = fp32_index_put(selected_for_seq, selected_idx, expert_ids.unsqueeze(-1))
+                token_mask_for_seq = flat_mask
+        self.seq_router_records.append((probs_for_seq, selected_for_seq, num_experts, token_mask_for_seq))
 
     def total_aux_loss(self) -> Tensor:
         if not self.aux_losses:
@@ -67,7 +91,7 @@ class RoutingStats:
         if not self.seq_router_records:
             return torch.tensor(0.0)
         seq_terms: list[Tensor] = []
-        for probs, selected, num_experts in self.seq_router_records:
+        for probs, selected, num_experts, token_mask in self.seq_router_records:
             seq_terms.append(
                 seq_load_balancing_loss_func(
                     (probs,),
@@ -75,6 +99,7 @@ class RoutingStats:
                     top_k=1,
                     batch_size=batch_size,
                     selected_experts=(selected,),
+                    token_masks=((token_mask,) if token_mask is not None else None),
                 )
             )
         return sum(seq_terms) / len(seq_terms)
@@ -157,13 +182,13 @@ def _make_router(input_dim: int, num_experts: int, exploration_rate: float = 0.0
 # Per-head-slot top-1 routing + grouped GEMM projection
 
 def _route_top1(router: DeepSeekRouter, x: Tensor, stats: RoutingStats | None = None,
-                router_name: str = ""):
+                router_name: str = "", token_mask: Tensor | None = None):
     """Top-1 DeepSeek routing with optional stats collection."""
     probs, weights, indices = router(x)  # probs: (N, E), weights: (N, 1), indices: (N, 1)
     expert_ids = indices.squeeze(-1)  # (N,)
     expert_weights = weights.squeeze(-1)  # (N,)
     if stats is not None:
-        stats.add(router_name, expert_ids, probs, probs.shape[-1])
+        stats.add(router_name, expert_ids, probs, probs.shape[-1], token_mask=token_mask)
     return expert_ids, expert_weights
 
 
@@ -183,12 +208,13 @@ def _grouped_project(x: Tensor, weight_bank: Tensor, expert_ids: Tensor, weights
 
 def _route_and_project_heads(routers: nn.ModuleList, x: Tensor, weight_bank: Tensor,
                              stats: RoutingStats | None = None,
-                             name_prefix: str = "") -> Tensor:
+                             name_prefix: str = "",
+                             token_mask: Tensor | None = None) -> Tensor:
     """Per-head-slot top-1 routing + projection."""
     H = len(routers)
     results = []
     for h in range(H):
-        eid, ew = _route_top1(routers[h], x, stats, f"{name_prefix}_h{h}")
+        eid, ew = _route_top1(routers[h], x, stats, f"{name_prefix}_h{h}", token_mask=token_mask)
         proj = _grouped_project(x, weight_bank, eid, ew)
         proj = norm(proj)
         results.append(proj)
@@ -197,17 +223,45 @@ def _route_and_project_heads(routers: nn.ModuleList, x: Tensor, weight_bank: Ten
 
 def _route_and_project_reduce(routers: nn.ModuleList, x: Tensor, weight_bank: Tensor,
                               stats: RoutingStats | None = None,
-                              name_prefix: str = "") -> Tensor:
+                              name_prefix: str = "",
+                              token_mask: Tensor | None = None) -> Tensor:
     """Per-head-slot top-1 routing on per-head inputs, sum across heads."""
     N, H, _ = x.shape
     dim = weight_bank.shape[2]
     token_out = torch.zeros(N, dim, device=x.device, dtype=torch.float32)
     for h in range(H):
         x_h = x[:, h].contiguous()
-        eid, ew = _route_top1(routers[h], x_h, stats, f"{name_prefix}_h{h}")
+        eid, ew = _route_top1(routers[h], x_h, stats, f"{name_prefix}_h{h}", token_mask=token_mask)
         proj = _grouped_project(x_h, weight_bank, eid, ew)
         token_out = token_out + proj.float()
     return token_out.to(x.dtype)
+
+
+def _apply_rotary_at_positions(rotary: Rotary, x_QHD: Tensor, positions: Tensor) -> Tensor:
+    """Apply speedrun RoPE to query vectors at explicit sequence positions."""
+    cos = fp32_index_select(rotary.cos, 0, positions).unsqueeze(1)
+    sin = fp32_index_select(rotary.sin, 0, positions).unsqueeze(1)
+    x1, x2 = x_QHD.to(dtype=torch.float32).chunk(2, dim=-1)
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat((y1, y2), dim=-1).type_as(x_QHD)
+
+
+def _build_query_position_mask(query_positions: Tensor, key_length: int, *, device, dtype) -> Tensor:
+    key_positions = torch.arange(key_length, device=device)
+    future_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+    mask = torch.zeros((query_positions.shape[0], key_length), device=device, dtype=dtype)
+    mask.masked_fill_(future_mask, float("-inf"))
+    return mask.unsqueeze(0).unsqueeze(0)
+
+
+def _should_use_sparse_query_path(token_mask: Tensor, threshold: float) -> bool:
+    flat_mask = token_mask.reshape(-1).bool()
+    if not flat_mask.any():
+        return True
+    if flat_mask.all():
+        return False
+    return flat_mask.float().mean().item() < threshold
 
 
 # ---------------------------------------------------------------------------
@@ -276,12 +330,36 @@ class MLPExpertBank(nn.Module):
         nn.init.uniform_(self.c_fc, -bound, bound)
         nn.init.zeros_(self.c_proj)
 
-    def forward(self, x: Tensor, stats: RoutingStats | None = None, depth_idx: int = 0) -> Tensor:
-        eid, ew = _route_top1(self.router, x, stats, f"mlp_d{depth_idx}")
-        h = _grouped_project(x, self.c_fc, eid, torch.ones_like(ew))
+    def forward(
+        self,
+        x: Tensor,
+        stats: RoutingStats | None = None,
+        depth_idx: int = 0,
+        token_mask: Tensor | None = None,
+    ) -> Tensor:
+        if token_mask is None:
+            selected_idx = None
+            x_selected = x
+        else:
+            flat_mask = token_mask.reshape(-1).bool()
+            if not flat_mask.any():
+                return x.new_zeros(x.shape[0], x.shape[1])
+            if flat_mask.all():
+                selected_idx = None
+                x_selected = x
+            else:
+                selected_idx = flat_mask.nonzero(as_tuple=False).squeeze(-1)
+                x_selected = fp32_index_select(x, 0, selected_idx)
+
+        seq_token_mask = None if selected_idx is None else token_mask
+        eid, ew = _route_top1(self.router, x_selected, stats, f"mlp_d{depth_idx}", token_mask=seq_token_mask)
+        h = _grouped_project(x_selected, self.c_fc, eid, torch.ones_like(ew))
         h = F.relu(h).square()
         out = _grouped_project(h, self.c_proj, eid, ew)
-        return out
+        if selected_idx is None:
+            return out
+        dense_out = x.new_zeros(x.shape[0], x.shape[1])
+        return fp32_index_put(dense_out, selected_idx, out)
 
     def get_all_routers(self) -> list[DeepSeekRouter]:
         return [self.router]
@@ -301,14 +379,166 @@ class RoutedAttentionFullyIndependent(nn.Module):
         self.attn_gate_dim = 12
         self.attn_gate = CastedLinear(self.attn_gate_dim, num_heads)
         self.attn_gate.weight.detach().zero_()
+        self.query_sparse_fraction_threshold = AUTO_QUERY_SPARSE_THRESHOLDS["per_head_fully_independent"]
 
-    def forward(self, x: Tensor, ve: Tensor | None, lambdas: Tensor,
-                stats: RoutingStats | None = None, depth_idx: int = 0):
+    def _forward_sparse_queries(
+        self,
+        x: Tensor,
+        flat: Tensor,
+        token_mask: Tensor,
+        ve: Tensor | None,
+        lambdas: Tensor,
+        stats: RoutingStats | None,
+        dp: str,
+    ) -> Tensor:
+        B, T, D = x.shape
+        H, HD = self.num_heads, self.head_dim
+        bank = self.bank
+        flat_mask = token_mask.reshape(-1).bool()
+        selected_idx = flat_mask.nonzero(as_tuple=False).squeeze(-1)
+        flat_selected = fp32_index_select(flat, 0, selected_idx)
+
+        q_selected = _route_and_project_heads(
+            bank.q_routers,
+            flat_selected,
+            bank.q_proj,
+            stats,
+            f"q_{dp}",
+            token_mask=flat_mask,
+        )
+        k = _route_and_project_heads(bank.k_routers, flat, bank.k_proj, stats, f"k_{dp}")
+        v = _route_and_project_heads(bank.v_routers, flat, bank.v_proj, stats, f"v_{dp}")
+
+        if ve is not None:
+            v = lambdas[0] * v + lambdas[1] * ve.reshape(B * T, H, HD).to(v.dtype)
+        else:
+            v = lambdas[0] * v
+
+        k = k.view(B, T, H, HD).transpose(1, 2)
+        v = v.view(B, T, H, HD).transpose(1, 2)
+        k = self.rotary(k.transpose(1, 2)).transpose(1, 2)
+
+        attn_heads = x.new_zeros(B, H, T, HD)
+        token_mask_2d = token_mask.squeeze(-1).bool()
+        offset = 0
+        for b in range(B):
+            pos = token_mask_2d[b].nonzero(as_tuple=False).squeeze(-1)
+            if pos.numel() == 0:
+                continue
+            q_b = q_selected[offset:offset + pos.numel()]
+            q_b = _apply_rotary_at_positions(self.rotary, q_b, pos).transpose(0, 1).unsqueeze(0)
+            attn_mask = _build_query_position_mask(pos, T, device=q_b.device, dtype=q_b.dtype)
+            attn_b = F.scaled_dot_product_attention(
+                q_b,
+                k[b:b + 1],
+                v[b:b + 1],
+                attn_mask=attn_mask,
+                scale=self.attn_scale,
+            )
+            attn_heads[b, :, pos, :] = attn_b.squeeze(0).to(attn_heads.dtype)
+            offset += pos.numel()
+
+        gate = torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_dim]))
+        attn_selected = fp32_index_select(
+            attn_heads.transpose(1, 2).reshape(B * T, H, HD),
+            0,
+            selected_idx,
+        )
+        gate_selected = fp32_index_select(gate.reshape(B * T, H), 0, selected_idx).unsqueeze(-1)
+        y_selected = attn_selected * gate_selected.to(attn_selected.dtype)
+        out_selected = _route_and_project_reduce(
+            bank.o_routers,
+            y_selected,
+            bank.o_proj,
+            stats,
+            f"o_{dp}",
+            token_mask=flat_mask,
+        )
+        out = x.new_zeros(B * T, D)
+        out = fp32_index_put(out, selected_idx, out_selected)
+        return out.view(B, T, D)
+
+    def _forward_dense_queries(
+        self,
+        x: Tensor,
+        flat: Tensor,
+        token_mask: Tensor,
+        ve: Tensor | None,
+        lambdas: Tensor,
+        stats: RoutingStats | None,
+        dp: str,
+    ) -> Tensor:
+        B, T, D = x.shape
+        H, HD = self.num_heads, self.head_dim
+        bank = self.bank
+        flat_mask = token_mask.reshape(-1).bool()
+        selected_idx = flat_mask.nonzero(as_tuple=False).squeeze(-1)
+        flat_selected = fp32_index_select(flat, 0, selected_idx)
+
+        q_selected = _route_and_project_heads(
+            bank.q_routers,
+            flat_selected,
+            bank.q_proj,
+            stats,
+            f"q_{dp}",
+            token_mask=flat_mask,
+        )
+        k = _route_and_project_heads(bank.k_routers, flat, bank.k_proj, stats, f"k_{dp}")
+        v = _route_and_project_heads(bank.v_routers, flat, bank.v_proj, stats, f"v_{dp}")
+
+        if ve is not None:
+            v = lambdas[0] * v + lambdas[1] * ve.reshape(B * T, H, HD).to(v.dtype)
+        else:
+            v = lambdas[0] * v
+
+        q_flat = flat.new_zeros(B * T, H, HD)
+        q_flat = fp32_index_put(q_flat, selected_idx, q_selected)
+
+        q = q_flat.view(B, T, H, HD).transpose(1, 2)
+        k = k.view(B, T, H, HD).transpose(1, 2)
+        v = v.view(B, T, H, HD).transpose(1, 2)
+        q = self.rotary(q.transpose(1, 2)).transpose(1, 2)
+        k = self.rotary(k.transpose(1, 2)).transpose(1, 2)
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.attn_scale)
+        gate = torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_dim]))
+        y = y.transpose(1, 2)
+        y_selected = fp32_index_select((y * gate.unsqueeze(-1)).reshape(B * T, H, HD), 0, selected_idx)
+        out_selected = _route_and_project_reduce(
+            bank.o_routers,
+            y_selected,
+            bank.o_proj,
+            stats,
+            f"o_{dp}",
+            token_mask=flat_mask,
+        )
+        out = x.new_zeros(B * T, D)
+        out = fp32_index_put(out, selected_idx, out_selected)
+        return out.view(B, T, D)
+
+    def forward(
+        self,
+        x: Tensor,
+        ve: Tensor | None,
+        lambdas: Tensor,
+        stats: RoutingStats | None = None,
+        depth_idx: int = 0,
+        token_mask: Tensor | None = None,
+    ):
         B, T, D = x.shape
         H, HD = self.num_heads, self.head_dim
         bank = self.bank
         flat = x.reshape(B * T, D)
         dp = f"d{depth_idx}"
+
+        if token_mask is not None:
+            flat_mask = token_mask.reshape(-1).bool()
+            if not flat_mask.any():
+                return x.new_zeros(B, T, D)
+            if not flat_mask.all():
+                if _should_use_sparse_query_path(token_mask, self.query_sparse_fraction_threshold):
+                    return self._forward_sparse_queries(x, flat, token_mask, ve, lambdas, stats, dp)
+                return self._forward_dense_queries(x, flat, token_mask, ve, lambdas, stats, dp)
 
         q = _route_and_project_heads(bank.q_routers, flat, bank.q_proj, stats, f"q_{dp}")
         k = _route_and_project_heads(bank.k_routers, flat, bank.k_proj, stats, f"k_{dp}")
@@ -347,14 +577,215 @@ class RoutedAttentionPrecomputeKV(nn.Module):
         self.attn_gate_dim = 12
         self.attn_gate = CastedLinear(self.attn_gate_dim, num_heads)
         self.attn_gate.weight.detach().zero_()
+        self.query_sparse_fraction_threshold = AUTO_QUERY_SPARSE_THRESHOLDS["per_head_precompute_kv"]
 
-    def forward(self, x: Tensor, ve: Tensor | None, lambdas: Tensor,
-                stats: RoutingStats | None = None, depth_idx: int = 0):
+    def _route_selected_queries(
+        self,
+        flat: Tensor,
+        token_mask: Tensor,
+        stats: RoutingStats | None,
+        dp: str,
+    ) -> tuple[Tensor, list[Tensor], list[Tensor], Tensor]:
+        B, T, _ = token_mask.shape
+        H = self.num_heads
+        bank = self.bank
+        flat_mask = token_mask.reshape(-1).bool()
+        selected_idx = flat_mask.nonzero(as_tuple=False).squeeze(-1)
+        flat_selected = fp32_index_select(flat, 0, selected_idx)
+
+        head_eids, head_ews = [], []
+        for h in range(H):
+            eid, ew = _route_top1(
+                bank.routers[h],
+                flat_selected,
+                stats,
+                f"qkvo_{dp}_h{h}",
+                token_mask=flat_mask,
+            )
+            head_eids.append(eid)
+            head_ews.append(ew)
+
+        q_parts = []
+        for h in range(H):
+            proj = _grouped_project(flat_selected, bank.q_proj, head_eids[h], head_ews[h])
+            q_parts.append(norm(proj))
+        q_selected = torch.stack(q_parts, dim=1)
+        return selected_idx, head_eids, head_ews, q_selected
+
+    def _forward_sparse_queries(
+        self,
+        x: Tensor,
+        flat: Tensor,
+        token_mask: Tensor,
+        ve: Tensor | None,
+        lambdas: Tensor,
+        stats: RoutingStats | None,
+        dp: str,
+    ) -> Tensor:
+        B, T, D = x.shape
+        H, HD = self.num_heads, self.head_dim
+        bank = self.bank
+        token_mask_2d = token_mask.squeeze(-1).bool()
+        ve_heads = None if ve is None else ve.view(B, T, H, HD).transpose(1, 2)
+        selected_idx, head_eids, head_ews, q_selected = self._route_selected_queries(flat, token_mask, stats, dp)
+        attn_selected = q_selected.new_zeros(q_selected.shape[0], H, HD)
+
+        batch_slices: list[tuple[int, Tensor, int, int]] = []
+        offset = 0
+        for b in range(B):
+            pos = token_mask_2d[b].nonzero(as_tuple=False).squeeze(-1)
+            q_count = pos.numel()
+            batch_slices.append((b, pos, offset, offset + q_count))
+            offset += q_count
+
+        for h in range(H):
+            eid = head_eids[h]
+            ew = head_ews[h]
+            q_h = q_selected[:, h:h + 1, :]
+            for e in eid.unique().tolist():
+                k_e = flat @ bank.k_proj[e].to(flat.dtype)
+                k_normed = norm(k_e)
+                v_e = flat @ bank.v_proj[e].to(flat.dtype)
+
+                k_4d = self.rotary(k_normed.view(B, T, 1, HD))
+                v_4d = v_e.view(B, T, 1, HD).transpose(1, 2)
+                if ve_heads is not None:
+                    v_4d = lambdas[0] * v_4d + lambdas[1] * ve_heads[:, h:h + 1].to(v_4d.dtype)
+                else:
+                    v_4d = lambdas[0] * v_4d
+
+                for b, pos, start, end in batch_slices:
+                    if pos.numel() == 0:
+                        continue
+                    eid_b = eid[start:end]
+                    match = eid_b == e
+                    if not match.any():
+                        continue
+                    local_idx = torch.arange(start, end, device=flat.device)[match]
+                    pos_e = pos[match]
+                    q_b = q_h[local_idx]
+                    q_b = _apply_rotary_at_positions(self.rotary, q_b, pos_e).transpose(0, 1).unsqueeze(0)
+                    attn_mask = _build_query_position_mask(pos_e, T, device=q_b.device, dtype=q_b.dtype)
+                    attn_e = F.scaled_dot_product_attention(
+                        q_b,
+                        k_4d[b:b + 1].transpose(1, 2),
+                        v_4d[b:b + 1],
+                        attn_mask=attn_mask,
+                        scale=self.attn_scale,
+                    )
+                    weighted = attn_e.squeeze(0).squeeze(0) * ew[local_idx].unsqueeze(-1).to(attn_e.dtype)
+                    attn_selected[local_idx, h] = weighted.to(attn_selected.dtype)
+
+        gate = torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_dim]))
+        gate_selected = fp32_index_select(gate.reshape(B * T, H), 0, selected_idx).unsqueeze(-1)
+        y_selected = attn_selected * gate_selected.to(attn_selected.dtype)
+
+        out_parts = []
+        for h in range(H):
+            o_h = _grouped_project(
+                y_selected[:, h].contiguous(),
+                bank.o_proj,
+                head_eids[h],
+                head_ews[h],
+            )
+            out_parts.append(o_h.float())
+        out_selected = sum(out_parts).to(x.dtype)
+        out = x.new_zeros(B * T, D)
+        out = fp32_index_put(out, selected_idx, out_selected)
+        return out.view(B, T, D)
+
+    def _forward_dense_queries(
+        self,
+        x: Tensor,
+        flat: Tensor,
+        token_mask: Tensor,
+        ve: Tensor | None,
+        lambdas: Tensor,
+        stats: RoutingStats | None,
+        dp: str,
+    ) -> Tensor:
+        B, T, D = x.shape
+        H, HD = self.num_heads, self.head_dim
+        bank = self.bank
+        flat_mask = token_mask.reshape(-1).bool()
+        selected_idx, head_eids, head_ews, q_selected = self._route_selected_queries(flat, token_mask, stats, dp)
+        q_flat = flat.new_zeros(B * T, H, HD)
+        q_flat = fp32_index_put(q_flat, selected_idx, q_selected)
+        q_4d = q_flat.view(B, T, H, HD).transpose(1, 2)
+        q_4d = self.rotary(q_4d.transpose(1, 2)).transpose(1, 2)
+        output = torch.zeros(B, H, T, HD, device=flat.device, dtype=flat.dtype)
+
+        for h in range(H):
+            eid, ew = head_eids[h], head_ews[h]
+            active_experts = eid.unique().tolist()
+            q_h = q_4d[:, h:h + 1]
+            attn_h = torch.zeros(B, 1, T, HD, device=flat.device, dtype=flat.dtype)
+
+            for e in active_experts:
+                k_e = flat @ bank.k_proj[e].to(flat.dtype)
+                k_normed = norm(k_e)
+                v_e = flat @ bank.v_proj[e].to(flat.dtype)
+
+                k_4d = self.rotary(k_normed.view(B, T, 1, HD)).view(B, 1, T, HD)
+                v_4d = v_e.view(B, 1, T, HD)
+
+                if ve is not None:
+                    ve_h = ve.view(B, T, H, HD)[:, :, h:h + 1].transpose(1, 2).to(v_4d.dtype)
+                    v_4d = lambdas[0] * v_4d + lambdas[1] * ve_h
+                else:
+                    v_4d = lambdas[0] * v_4d
+
+                attn_e = F.scaled_dot_product_attention(q_h, k_4d, v_4d, is_causal=True, scale=self.attn_scale)
+                mask_w = flat.new_zeros(B * T, dtype=ew.dtype)
+                selected_mask_w = ew * (eid == e).float()
+                mask_w = fp32_index_put(mask_w, selected_idx, selected_mask_w)
+                mask_w = mask_w.view(B, T).unsqueeze(1).unsqueeze(-1)
+                attn_h = attn_h + attn_e * mask_w.to(attn_e.dtype)
+
+            output[:, h:h + 1] = attn_h
+
+        y = output.transpose(1, 2)
+        gate = torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_dim]))
+        y = y * gate.unsqueeze(-1)
+        y_selected = fp32_index_select(y.reshape(B * T, H, HD), 0, selected_idx)
+
+        out_parts = []
+        for h in range(H):
+            o_h = _grouped_project(
+                y_selected[:, h].contiguous(),
+                bank.o_proj,
+                head_eids[h],
+                head_ews[h],
+            )
+            out_parts.append(o_h.float())
+        out_selected = sum(out_parts).to(x.dtype)
+        out = x.new_zeros(B * T, D)
+        out = fp32_index_put(out, selected_idx, out_selected)
+        return out.view(B, T, D)
+
+    def forward(
+        self,
+        x: Tensor,
+        ve: Tensor | None,
+        lambdas: Tensor,
+        stats: RoutingStats | None = None,
+        depth_idx: int = 0,
+        token_mask: Tensor | None = None,
+    ):
         B, T, D = x.shape
         H, HD = self.num_heads, self.head_dim
         bank = self.bank
         flat = x.reshape(B * T, D)
         dp = f"d{depth_idx}"
+
+        if token_mask is not None:
+            flat_mask = token_mask.reshape(-1).bool()
+            if not flat_mask.any():
+                return x.new_zeros(B, T, D)
+            if not flat_mask.all():
+                if _should_use_sparse_query_path(token_mask, self.query_sparse_fraction_threshold):
+                    return self._forward_sparse_queries(x, flat, token_mask, ve, lambdas, stats, dp)
+                return self._forward_dense_queries(x, flat, token_mask, ve, lambdas, stats, dp)
 
         head_eids, head_ews = [], []
         for h in range(H):
@@ -436,8 +867,20 @@ class BranchRoutedDepthStep(nn.Module):
         w_attn, w_mlp, _, _ = branch_router(x)
         if stats is not None and branch_router.last_probs is not None:
             stats.add_branch(branch_router.last_probs)
-        attn_out = self.attn(x_norm, ve, sa_lambdas, stats, self.depth_idx)
-        mlp_out = self.mlp_bank(x_norm.reshape(-1, D), stats, self.depth_idx).view(B, T, D)
+        attn_out = self.attn(
+            x_norm,
+            ve,
+            sa_lambdas,
+            stats,
+            self.depth_idx,
+            token_mask=w_attn.bool(),
+        )
+        mlp_out = self.mlp_bank(
+            x_norm.reshape(-1, D),
+            stats,
+            self.depth_idx,
+            token_mask=w_mlp.bool(),
+        ).view(B, T, D)
         x = x + w_attn * attn_out + w_mlp * mlp_out
         return x
 
