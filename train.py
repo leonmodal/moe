@@ -694,6 +694,7 @@ def resolve_initialization_spec(
 def build_model(cfg: dict):
     mtype = cfg["model"]["type"]
     mcfg = cfg["model"]
+    attn_impl = mcfg.get("attn_implementation", "sdpa")
 
     # --- Dense (non-MoE) early return ---
     if mtype == "dense":
@@ -710,6 +711,7 @@ def build_model(cfg: dict):
             rms_norm_eps=mcfg.get("rms_norm_eps", 1e-6),
             tie_word_embeddings=mcfg.get("tie_word_embeddings", False),
         )
+        config._attn_implementation = attn_impl
         # Dense model has no MoE fields — set dummies for compatibility
         config.num_experts = 0
         config.num_experts_per_tok = 0
@@ -755,6 +757,7 @@ def build_model(cfg: dict):
         norm_topk_prob=mcfg.get("norm_topk_prob", True),
         num_experts_per_tok=mcfg["num_experts_per_tok"],
         output_router_logits=True,
+        attn_implementation=attn_impl,
     )
 
     def _set_router_params(config, mcfg):
@@ -1300,6 +1303,8 @@ def main() -> None:
     if eval_enabled:
         eval_data_cfg = dict(dcfg_dict)
         eval_data_cfg.update(eval_cfg_dict)
+        if get_data_format(eval_data_cfg) == "token_bin":
+            eval_data_cfg["repeat"] = bool(eval_cfg_dict.get("repeat", False))
         if get_data_format(eval_data_cfg) == "parquet":
             eval_data_dir = eval_cfg_dict.get("data_dir", dcfg_dict["data_dir"])
             eval_split = eval_cfg_dict.get("split")

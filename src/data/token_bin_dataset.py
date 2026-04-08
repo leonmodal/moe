@@ -161,48 +161,48 @@ class StatefulTokenBinDataset(IterableDataset):
         seq_len = self.config.seq_len
         stride = self.world_size * seq_len
 
-        file_idx = self._start_file_idx
-        while file_idx < len(self.files):
-            path = self.files[file_idx]
-            token_count = self.file_token_counts[file_idx]
-            if token_count < seq_len + 1:
+        while True:
+            file_idx = self._start_file_idx
+            while file_idx < len(self.files):
+                path = self.files[file_idx]
+                token_count = self.file_token_counts[file_idx]
+                if token_count < seq_len + 1:
+                    file_idx += 1
+                    continue
+
+                token_pos = self._start_token_pos if file_idx == self._start_file_idx else self._default_token_pos
+                max_start = token_count - (seq_len + 1)
+                if token_pos > max_start:
+                    file_idx += 1
+                    continue
+
+                tokens = np.memmap(
+                    path,
+                    mode="r",
+                    dtype=self._token_dtype,
+                    offset=self.config.header_bytes,
+                    shape=(token_count,),
+                )
+
+                while token_pos <= max_start:
+                    next_file_idx, next_token_pos = self._next_state(file_idx, token_pos + stride, max_start)
+                    self._cur_file_idx = next_file_idx
+                    self._cur_token_pos = next_token_pos
+
+                    chunk = np.asarray(tokens[token_pos : token_pos + seq_len + 1], dtype=np.int64)
+                    yield {
+                        "input_ids": torch.from_numpy(chunk[:-1].copy()).to(torch.long),
+                        "labels": torch.from_numpy(chunk[1:].copy()).to(torch.long),
+                    }
+                    token_pos += stride
+
                 file_idx += 1
-                continue
+                self._start_token_pos = self._default_token_pos
 
-            token_pos = self._start_token_pos if file_idx == self._start_file_idx else self._default_token_pos
-            max_start = token_count - (seq_len + 1)
-            if token_pos > max_start:
-                file_idx += 1
-                continue
+            if not self.config.repeat:
+                self._cur_file_idx = len(self.files)
+                self._cur_token_pos = self._default_token_pos
+                return
 
-            tokens = np.memmap(
-                path,
-                mode="r",
-                dtype=self._token_dtype,
-                offset=self.config.header_bytes,
-                shape=(token_count,),
-            )
-
-            while token_pos <= max_start:
-                next_file_idx, next_token_pos = self._next_state(file_idx, token_pos + stride, max_start)
-                self._cur_file_idx = next_file_idx
-                self._cur_token_pos = next_token_pos
-
-                chunk = np.asarray(tokens[token_pos : token_pos + seq_len + 1], dtype=np.int64)
-                yield {
-                    "input_ids": torch.from_numpy(chunk[:-1].copy()).to(torch.long),
-                    "labels": torch.from_numpy(chunk[1:].copy()).to(torch.long),
-                }
-                token_pos += stride
-
-            file_idx += 1
-            self._start_token_pos = self._default_token_pos
-
-        if self.config.repeat:
             self._start_file_idx = 0
             self._start_token_pos = self._default_token_pos
-            yield from self.__iter__()
-            return
-
-        self._cur_file_idx = len(self.files)
-        self._cur_token_pos = self._default_token_pos
