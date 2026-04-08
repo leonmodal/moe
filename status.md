@@ -150,6 +150,166 @@ Current conclusion:
 - but the speedrun target is still not met
 - the remaining gap to the modded-nanogpt reference is now mostly about model/training recipe quality, not just Accelerate overhead
 
+## Side-by-Side Code Diagnosis vs modded-nanogpt
+
+I compared the working pre-FA3 reference in `/tmp/modded-nanogpt-prefa3/train_gpt.py`
+against this repo's Torch-native dense path.
+
+### 1. We are not training the same model class
+
+Reference model:
+
+- `/tmp/modded-nanogpt-prefa3/train_gpt.py`
+- custom GPT block with:
+  - merged QKVO parameter tensor and zero-init output projection
+  - ReLU^2 MLP with zero-init projection
+  - token value embeddings
+  - U-net / skip-connection scalar routing
+  - one skipped attention layer
+  - fixed attention scale `0.12`
+  - gated attention output
+  - logit soft-cap before CE
+
+Relevant lines:
+
+- attention block: `578-617`
+- MLP: `619-637`
+- custom GPT body: `659-764`
+
+Current repo dense model:
+
+- `train_torch.py` builds `transformers.Qwen3ForCausalLM`
+- standard Qwen3 decoder:
+  - separate Q/K/V/O projections
+  - standard residual decoder blocks
+  - SwiGLU MLP
+  - no value-embedding path
+  - no U-net skip structure
+  - no logit soft-cap
+  - standard HF init
+
+Relevant lines:
+
+- Qwen3 MLP: `/tmp/moe/.venv/lib64/python3.12/site-packages/transformers/models/qwen3/modeling_qwen3.py:70-83`
+- Qwen3 attention: `/tmp/moe/.venv/lib64/python3.12/site-packages/transformers/models/qwen3/modeling_qwen3.py:221-294`
+- Qwen3 decoder/model/LM head: `/tmp/moe/.venv/lib64/python3.12/site-packages/transformers/models/qwen3/modeling_qwen3.py:297-524`
+- HF generic init: `/tmp/moe/.venv/lib64/python3.12/site-packages/transformers/modeling_utils.py:2251-2291`
+
+Conclusion:
+
+- the current "speedrun" benchmark is not a trainer-only comparison
+- it is a different model architecture with different init behavior
+
+### 2. The optimizer and LR schedule are materially different
+
+Reference:
+
+- Adam branch: `lr=0.008`, `betas=(0.8, 0.95)`, `eps=1e-10`, `weight_decay=0.0`
+- Muon branch: `lr=0.05`, `weight_decay=0.0`
+- per-parameter `lr_mul` on embeddings and scalar params
+- constant LR for the first `55%` of training, then linear decay to `0.1x`
+- no grad clipping
+
+Relevant lines:
+
+- optimizer implementations: `/tmp/modded-nanogpt-prefa3/train_gpt.py:386-537`
+- optimizer setup + schedule: `/tmp/modded-nanogpt-prefa3/train_gpt.py:892-916`
+- train step: `/tmp/modded-nanogpt-prefa3/train_gpt.py:998-1013`
+
+Current repo benchmark config:
+
+- Muon `0.02`, Muon WD `0.02`
+- Adam WD `0.1`
+- `beta1=0.9`
+- cosine decay
+- `warmup_steps=200`
+- grad clipping at `1.0`
+- no parameter-specific `lr_mul` / `wd_mul`
+
+Relevant lines:
+
+- benchmark config: `/tmp/moe/configs/plan/speedrun_dense_fineweb_gpt2_bins.yaml:20-35`
+- training loop / clipping / scheduler step: `/tmp/moe/train_torch.py:816-980`
+- current Muon implementation: `/tmp/moe/src/utils/muon.py:61-248`
+
+Conclusion:
+
+- even if the model were identical, the optimization recipe still is not
+- the current benchmark is using a substantially different optimizer regime
+
+### 3. Loss scaling is different
+
+Reference:
+
+- training CE uses `reduction="sum"` during training and `"mean"` during eval
+
+Relevant line:
+
+- `/tmp/modded-nanogpt-prefa3/train_gpt.py:763`
+
+Current repo:
+
+- Qwen3 uses HF `ForCausalLMLoss`
+- HF defaults to mean reduction when `num_items_in_batch` is not provided
+
+Relevant lines:
+
+- Qwen3 loss call: `/tmp/moe/.venv/lib64/python3.12/site-packages/transformers/models/qwen3/modeling_qwen3.py:522-524`
+- HF loss dispatch: `/tmp/moe/.venv/lib64/python3.12/site-packages/transformers/modeling_utils.py:4361-4373`
+- HF causal LM loss implementation: `/tmp/moe/.venv/lib64/python3.12/site-packages/transformers/loss/loss_utils.py:25-61`
+
+Conclusion:
+
+- this changes the effective gradient scale substantially
+- reference optimizer hyperparameters cannot be ported directly into the current HF dense path
+
+### 4. The token pipeline is not equivalent
+
+Reference:
+
+- trains with `train_seq_len = 48 * 1024`
+- each rank gets one long sequence
+- training samples are aligned to BOS token `50256`
+- document boundaries are enforced inside attention masks
+
+Relevant lines:
+
+- BOS-aligned batch start search: `/tmp/modded-nanogpt-prefa3/train_gpt.py:781-820`
+- doc-boundary masking: `/tmp/modded-nanogpt-prefa3/train_gpt.py:690-728`
+- training hyperparameters: `/tmp/modded-nanogpt-prefa3/train_gpt.py:825-835`
+
+Current repo:
+
+- benchmark config uses `seq_len: 1024`
+- token-bin dataset walks fixed strided windows through the shard
+- no BOS alignment
+- no document-boundary masking for dense runs
+
+Relevant lines:
+
+- token-bin benchmark config: `/tmp/moe/configs/plan/speedrun_dense_fineweb_gpt2_bins.yaml:47-64`
+- token-bin dataset iteration: `/tmp/moe/src/data/token_bin_dataset.py:67-208`
+
+Conclusion:
+
+- we are feeding a different context structure to the model
+- this is both a quality difference and a major throughput difference versus the FlexAttention reference
+
+### Bottom line
+
+The current repo does not miss `3.28` because of one hidden bug in DDP or FSDP.
+It misses because the current "speedrun dense" path is not actually the modded-nanogpt recipe:
+
+- different model
+- different init
+- different optimizer math
+- different LR schedule
+- different loss scaling
+- different sequence packing and masking
+
+If the goal is truly to match the reference, the next step is not more tuning on top of the HF Qwen dense path.
+The next step is to build an in-repo reference-style dense path that copies the modded-nanogpt model/data/optimizer semantics much more directly.
+
 ## Goal
 
 Match the FineWeb GPT-2 speedrun target on the local 8x B200 box:
@@ -447,17 +607,68 @@ Main reasons:
    - it gains some throughput
    - but its validation loss is catastrophically worse than the Qwen-based baseline
 
-## Bottom Line
+## SpeedrunGPT Port — Target Reached
 
-The current state is:
+Updated: 2026-04-08
 
-- the reference speedrun works on this machine only if you back off from the current FA3 `HEAD`
-- the reference reaches the target
-- this repo does not
-- I fixed the concrete correctness bugs I found, but the repo is still not close enough in either throughput or validation loss
-- additional ablations did not uncover an easy optimizer or schedule fix
+I ported the full modded-nanogpt reference model and training recipe into this repo as a new model type `speedrun_gpt`.
 
-If the objective is truly to match the speedrun, the next step is not more blind training on the current stack. The next step is to either:
+### What was ported
 
-1. port the reference architecture/training recipe much more faithfully, or
-2. stop comparing this HF/Qwen-style stack to the speedrun target as if they were equivalent
+New files:
+
+- `src/models/speedrun_gpt.py` — full GPT model: merged QKVO, ReLU², value embeddings, U-net skips, gated attention, logit softcapping, FlexAttention with doc masking + sliding window, FP8 lm_head
+- `src/utils/triton_newton_schulz.py` — Triton kernels for Newton-Schulz orthogonalization
+- `src/utils/dist_optimizers.py` — DistAdam + DistMuon (distributed optimizers with built-in gradient sync, no DDP wrapper)
+- `configs/plan/speedrun_gpt_fineweb_gpt2_bins.yaml` — benchmark config
+
+Modified files:
+
+- `train_torch.py` — added `speedrun_gpt` model type in `build_model()`, added `run_speedrun_training()` function with BOS-aligned data generator, sliding window schedule, kernel warmup, and reference validation loop
+- `src/utils/training.py` — added `stable_decay` LR schedule (constant then linear cooldown)
+
+### Benchmark result: 8x B200
+
+Run:
+
+- command: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True uv run torchrun --nproc_per_node=8 train_torch.py --config configs/plan/speedrun_gpt_fineweb_gpt2_bins.yaml --dist-strategy none`
+
+Validation curve:
+
+- step `0`: `10.8258`
+- step `125`: `4.6008`
+- step `250`: `4.0727`
+- step `500`: `3.7298`
+- step `750`: `3.5825`
+- step `1000`: `3.4885`
+- step `1250`: `3.3913`
+- step `1500`: `3.3165`
+- step `1625`: `3.2877`
+- step `1695`: **`3.2748`**
+
+Performance:
+
+- step avg: `65.5 ms`
+- throughput: `~6.0M tok/s` (matching reference)
+- peak memory: `35,210 MiB` allocated, `50,900 MiB` reserved
+- total training time: `~111 seconds`
+
+### Comparison with reference
+
+| Step | Reference | This Repo | Delta |
+|------|-----------|-----------|-------|
+| 125  | 4.6065    | 4.6008    | -0.006 |
+| 250  | 4.0721    | 4.0727    | +0.001 |
+| 1250 | 3.3930    | 3.3913    | -0.002 |
+| 1500 | 3.3180    | 3.3165    | -0.002 |
+| 1625 | 3.2888    | 3.2877    | -0.001 |
+| 1695 | 3.2762    | 3.2748    | -0.001 |
+
+The loss curve matches the reference to within `0.006` at every checkpoint. Final loss `3.2748` is slightly better than the reference `3.2762`.
+
+### Bottom line
+
+- **Target met.** `3.2748 <= 3.28`.
+- Throughput matches reference (`~6.0M tok/s`).
+- The previous HF Qwen dense path (`3.56` final loss) was an apples-to-oranges comparison — different model, optimizer, loss scaling, schedule, and data pipeline.
+- The new `speedrun_gpt` path faithfully replicates the reference recipe and achieves equivalent results.

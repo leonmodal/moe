@@ -18,10 +18,11 @@ class TrainingConfig:
     eps: float = 1e-8
     max_grad_norm: float = 1.0
     # Schedule
-    lr_scheduler: str = "cosine"  # cosine | linear | constant
+    lr_scheduler: str = "cosine"  # cosine | linear | constant | stable_decay
     warmup_steps: int = 2000
     max_steps: int = 100_000
     min_lr_ratio: float = 0.1
+    cooldown_frac: float = 0.45
     # Batch
     batch_size: int = 4          # per GPU
     gradient_accumulation: int = 4
@@ -52,6 +53,14 @@ def build_lr_scheduler(optimizer: Optimizer, config: TrainingConfig) -> LambdaLR
             return min_ratio + 0.5 * (1 - min_ratio) * (1 + math.cos(math.pi * progress))
         if config.lr_scheduler == "linear":
             return max(min_ratio, 1.0 - progress * (1 - min_ratio))
+        if config.lr_scheduler == "stable_decay":
+            # Constant LR then linear cooldown (no warmup)
+            x = step / max(1, total)
+            cooldown_frac = config.cooldown_frac
+            if x < 1 - cooldown_frac:
+                return 1.0
+            w = (1 - x) / cooldown_frac
+            return w * 1.0 + (1 - w) * min_ratio
         return 1.0
 
     return LambdaLR(optimizer, lr_lambda)

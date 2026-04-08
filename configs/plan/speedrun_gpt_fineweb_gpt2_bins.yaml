@@ -1,0 +1,48 @@
+experiment_name: speedrun_gpt_fineweb_gpt2_bins
+
+model:
+  type: speedrun_gpt
+  vocab_size: 50257
+  num_layers: 12
+  num_heads: 6
+  model_dim: 768
+
+training:
+  optimizer: speedrun
+  muon_lr: 0.05
+  adam_lr: 0.008
+  adam_betas: [0.8, 0.95]
+  adam_eps: 1.0e-10
+  weight_decay: 0.0
+  momentum_warmup_steps: 300
+  max_grad_norm: 0.0
+  lr_scheduler: stable_decay
+  cooldown_frac: 0.45
+  warmup_steps: 0
+  max_steps: 1695
+  min_lr_ratio: 0.1
+  learning_rate: 0.05
+  batch_size: 1
+  gradient_accumulation: 1
+  mixed_precision: bf16
+  torch_compile: true
+  log_every: 1
+  save_every: 125
+  output_dir: ./outputs/plan/speedrun_gpt_fineweb_gpt2_bins
+
+data:
+  format: token_bin
+  files_glob: ./data/fineweb10B_gpt2/fineweb_train_*.bin
+  seq_len: 49152
+  align_to_bos: true
+  header_bytes: 1024
+  token_dtype: uint16
+
+eval:
+  enabled: true
+  every: 125
+  files_glob: ./data/fineweb10B_gpt2/fineweb_val_*.bin
+  max_tokens: 10485760
+  seq_len: 262144
+  batch_size: 1
+  align_to_bos: false

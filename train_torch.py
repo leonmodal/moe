@@ -48,6 +48,7 @@ from src.models import (
     MoEverythingConfig,
     MoEverythingForCausalLM,
 )
+from src.models.speedrun_gpt import GPT as SpeedrunGPT
 from src.models.init_mapping import copy_global_to_alternating_sanity
 from src.models.load_balancing import (
     normalized_load_balancing_loss_func,
@@ -199,6 +200,21 @@ def build_model(cfg: dict):
     mtype = cfg["model"]["type"]
     mcfg = cfg["model"]
     attn_impl = mcfg.get("attn_implementation", "sdpa")
+
+    if mtype == "speedrun_gpt":
+        max_seq_len = max(mcfg.get("train_seq_len", 48 * 1024), mcfg.get("val_seq_len", 4 * 64 * 1024))
+        model = SpeedrunGPT(
+            vocab_size=mcfg.get("vocab_size", 50257),
+            num_layers=mcfg.get("num_layers", 12),
+            num_heads=mcfg.get("num_heads", 6),
+            model_dim=mcfg.get("model_dim", 768),
+            max_seq_len=max_seq_len,
+        )
+        # Return a simple namespace as config for compatibility
+        class _Cfg:
+            num_experts = 0
+            num_experts_per_tok = 0
+        return model, _Cfg()
 
     if mtype == "dense":
         config = Qwen3Config(
@@ -698,6 +714,285 @@ def run_validation(
     }
 
 
+# ---------------------------------------------------------------------------
+# Speedrun-specific data generator and training loop
+# Ported from /tmp/modded-nanogpt-prefa3/train_gpt.py
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32)
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2])
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy())
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+
+def _find_batch_starts(tokens, pos, seq_len, token_window):
+    boundary_mask = tokens[pos:pos + token_window] == 50256
+    boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(-1) + pos
+    start = boundary_positions[0].item()
+    starts = []
+    for i in range(1, len(boundary_positions)):
+        end = boundary_positions[i].item()
+        if end - start >= seq_len:
+            starts.append(start)
+            if len(starts) == dist.get_world_size():
+                return starts, end - pos
+            start = end
+    assert False, "increase token_window if necessary"
+
+
+def _distributed_data_generator(filename_pattern, seq_len, grad_accum_steps, align_to_bos):
+    import glob as _glob
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    batch_size = seq_len * world_size
+    files = [Path(f) for f in sorted(_glob.glob(filename_pattern))]
+    file_iter = iter(files)
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        token_window = grad_accum_steps * (2 * batch_size if align_to_bos else batch_size)
+        if pos + token_window + 1 >= len(tokens):
+            tokens = _load_data_shard(next(file_iter))
+            pos = 0
+        for _ in range(grad_accum_steps):
+            if align_to_bos:
+                batch_starts, tokens_consumed = _find_batch_starts(tokens, pos, seq_len, token_window)
+                start_idx = batch_starts[rank]
+            else:
+                tokens_consumed = batch_size
+                start_idx = pos + rank * seq_len
+            buf = tokens[start_idx:][:seq_len + 1]
+            inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+            targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+            pos += tokens_consumed
+            token_window -= tokens_consumed
+            yield inputs, targets
+
+
+def _next_multiple_of_n(v, *, n):
+    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+
+
+def _get_window_size_blocks(step, num_iterations):
+    from functools import lru_cache
+
+    @lru_cache(1)
+    def _helper(window_size):
+        return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+    x = step / num_iterations
+    window_size = _next_multiple_of_n(1728 * x, n=128)
+    return _helper(window_size)
+
+
+def run_speedrun_training(args, cfg) -> None:
+    """Full training loop for the speedrun_gpt model type."""
+    import copy
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    distributed = world_size > 1
+    if distributed:
+        device = torch.device("cuda", local_rank)
+        torch.cuda.set_device(device)
+        dist.init_process_group(backend="nccl", device_id=device)
+        dist.barrier()
+    else:
+        torch.cuda.set_device(0)
+        device = torch.device("cuda", 0)
+    master_process = rank == 0
+
+    def print0(s, console=True):
+        if master_process:
+            if console:
+                print(s, flush=True)
+
+    tcfg_dict = cfg["training"]
+    dcfg_dict = cfg.get("data", {})
+    eval_cfg_dict = cfg.get("eval", {})
+    mcfg = cfg["model"]
+
+    num_iterations = tcfg_dict["max_steps"]
+    cooldown_frac = tcfg_dict.get("cooldown_frac", 0.45)
+    train_seq_len = dcfg_dict.get("seq_len", 48 * 1024)
+    val_seq_len = eval_cfg_dict.get("seq_len", 4 * 64 * 1024)
+    val_tokens = eval_cfg_dict.get("max_tokens", 10485760)
+    val_loss_every = int(eval_cfg_dict.get("every", 125))
+    grad_accum_steps = tcfg_dict.get("gradient_accumulation", 8 // world_size)
+    output_dir = tcfg_dict.get("output_dir", "./outputs/plan/speedrun_gpt")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Build model
+    max_seq_len = max(train_seq_len, val_seq_len)
+    model = SpeedrunGPT(
+        vocab_size=mcfg.get("vocab_size", 50257),
+        num_layers=mcfg.get("num_layers", 12),
+        num_heads=mcfg.get("num_heads", 6),
+        model_dim=mcfg.get("model_dim", 768),
+        max_seq_len=max_seq_len,
+    ).cuda()
+
+    # Cast embeddings to bf16
+    for m in model.modules():
+        if isinstance(m, torch.nn.Embedding):
+            m.bfloat16()
+
+    # Broadcast parameters
+    if distributed:
+        for param in model.parameters():
+            dist.broadcast(param.detach(), 0)
+
+    params_total = sum(p.numel() for p in model.parameters())
+    print0(f"SpeedrunGPT: {params_total / 1e6:.1f}M params, {model.num_layers} layers, seq_len={train_seq_len}")
+
+    # Build optimizers
+    from src.utils.dist_optimizers import DistAdam, DistMuon
+
+    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+    scalar_params = [p for p in model.parameters() if p.ndim < 2]
+    head_params = [model.lm_head.weight]
+
+    adam_lr = tcfg_dict.get("adam_lr", 0.008)
+    adam_betas = tuple(tcfg_dict.get("adam_betas", [0.8, 0.95]))
+    adam_eps = tcfg_dict.get("adam_eps", 1e-10)
+    muon_lr = tcfg_dict.get("muon_lr", 0.05)
+    muon_wd = tcfg_dict.get("weight_decay", 0.0)
+
+    optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=adam_lr, betas=adam_betas, eps=adam_eps, weight_decay=muon_wd)
+    optimizer2 = DistMuon(hidden_matrix_params, lr=muon_lr, momentum=0.95, weight_decay=muon_wd)
+    optimizers = [optimizer1, optimizer2]
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["initial_lr"] = group["lr"]
+
+    # LR schedule: stable then decay
+    def get_lr(step):
+        x = step / num_iterations
+        if x < 1 - cooldown_frac:
+            return 1.0
+        else:
+            w = (1 - x) / cooldown_frac
+            return w * 1.0 + (1 - w) * 0.1
+
+    # Compile model
+    if tcfg_dict.get("torch_compile", True):
+        print0("Compiling model with torch.compile(dynamic=False, fullgraph=True)")
+        model = torch.compile(model, dynamic=False, fullgraph=True)
+
+    # WandB
+    wandb_run = None
+    if tcfg_dict.get("wandb_project") and master_process:
+        import wandb
+        wandb_run = wandb.init(
+            project=tcfg_dict["wandb_project"],
+            name=tcfg_dict.get("wandb_run_name", cfg.get("experiment_name")),
+            config=cfg,
+            dir=output_dir,
+        )
+
+    # Kernel warmup
+    print0("Warming up kernels (10 steps)...")
+    warmup_steps = 10
+    initial_state = dict(
+        model=copy.deepcopy(model.state_dict()),
+        optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers],
+    )
+    train_files = dcfg_dict.get("files_glob", "data/fineweb10B_gpt2/fineweb_train_*.bin")
+    val_files = eval_cfg_dict.get("files_glob", "data/fineweb10B_gpt2/fineweb_val_*.bin")
+
+    train_loader = _distributed_data_generator(train_files, train_seq_len, grad_accum_steps, align_to_bos=True)
+    for _ in range(warmup_steps):
+        inputs, targets = next(train_loader)
+        model(inputs, targets, _get_window_size_blocks(1, num_iterations)).backward()
+        for opt in optimizers:
+            opt.step()
+        model.zero_grad(set_to_none=True)
+    model.load_state_dict(initial_state["model"])
+    for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
+        opt.load_state_dict(opt_state)
+    del train_loader, initial_state
+    print0("Kernel warmup complete.")
+
+    # Training
+    train_loader = _distributed_data_generator(train_files, train_seq_len, grad_accum_steps, align_to_bos=True)
+    training_time_ms = 0
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    train_steps = num_iterations
+    for step in range(train_steps + 1):
+        last_step = (step == train_steps)
+
+        # Validation
+        if last_step or (val_loss_every > 0 and step % val_loss_every == 0):
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            model.eval()
+            val_batch_size = world_size * val_seq_len
+            assert val_tokens % val_batch_size == 0
+            val_steps = val_tokens // val_batch_size
+            val_loader = _distributed_data_generator(val_files, val_seq_len, grad_accum_steps, align_to_bos=False)
+            val_loss = 0
+            with torch.no_grad():
+                for _ in range(val_steps):
+                    inputs, targets = next(val_loader)
+                    val_loss += model(inputs, targets, _get_window_size_blocks(step, num_iterations))
+            val_loss /= val_steps
+            del val_loader
+            if distributed:
+                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            val_loss_val = val_loss.item()
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss_val:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms")
+            if wandb_run is not None:
+                wandb_run.log({"eval/ce_loss": val_loss_val, "eval/perplexity": math.exp(min(20.0, val_loss_val))}, step=step)
+            model.train()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        if last_step:
+            break
+
+        # Training step
+        for _ in range(grad_accum_steps):
+            inputs, targets = next(train_loader)
+            model(inputs, targets, _get_window_size_blocks(step, num_iterations)).backward()
+
+        # Set LR
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * get_lr(step)
+        # Momentum warmup for Muon
+        frac = min(step / 300, 1)
+        for group in optimizer2.param_groups:
+            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+
+        # Step optimizers
+        for opt in optimizers:
+            opt.step()
+        model.zero_grad(set_to_none=True)
+
+        # Logging
+        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+        if step % int(tcfg_dict.get("log_every", 1)) == 0:
+            print0(f"step:{step + 1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / (step + 1):.2f}ms")
+
+    print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+           f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")
+
+    if wandb_run is not None:
+        wandb_run.finish()
+    if distributed:
+        dist.destroy_process_group()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -714,6 +1009,11 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+
+    # Dispatch to speedrun training loop if model type is speedrun_gpt
+    if cfg["model"]["type"] == "speedrun_gpt":
+        return run_speedrun_training(args, cfg)
+
     initialization_spec = resolve_initialization_spec(
         cfg,
         config_path=args.config,
