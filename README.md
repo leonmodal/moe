@@ -38,6 +38,8 @@ Single-node training:
 
 - `NPROC_PER_NODE=8 ./scripts/train.sh ...` runs 8-way DDP on one node
 - `LAUNCHER=accelerate ./scripts/train.sh ...` uses the older Accelerate launcher path
+- `TRAIN_ENTRYPOINT=train_torch.py ./scripts/train.sh ...` uses the new raw-torch trainer
+- `TRAIN_ENTRYPOINT=train_torch.py ./scripts/train.sh ... --dist-strategy fsdp` enables FSDP in the new trainer
 
 ---
 

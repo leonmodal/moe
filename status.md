@@ -1,6 +1,45 @@
 # Status
 
-Updated: 2026-04-08 00:03 UTC
+Updated: 2026-04-08 01:53 UTC
+
+## Torch-Native Rewrite Checkpoint
+
+I started the in-repo replacement for the Accelerate trainer.
+
+New files / entrypoints:
+
+- `/tmp/moe/train_torch.py`
+- `TRAIN_ENTRYPOINT=train_torch.py ./scripts/train.sh ...`
+
+What is working now:
+
+- raw `torch.distributed` launch, no Accelerate dependency
+- `--dist-strategy none|ddp|fsdp`
+- dense + GPT-2 dense + standard/global/moe-everything model builders
+- parquet and GPT-2 token-bin dataset paths
+- optimizer/scheduler reuse from existing utils, including Muon
+- gradient accumulation, checkpoint save/load, auto-resume, eval, wandb
+- mapped init path for `global_to_alternating_sanity`
+
+Smoke tests completed on this machine:
+
+- single-process GPT-2 bin run: `1` step completed
+- 2-rank DDP GPT-2 bin run: `1` step completed
+- 2-rank FSDP GPT-2 bin run: `1` step completed
+- 2-rank DDP DeepSeek standard MoE parquet run: `1` train step + eval completed
+
+Representative logs:
+
+- `/tmp/moe/outputs/train_torch_smoke.log`
+- `/tmp/moe/outputs/train_torch_smoke_ddp.log`
+- `/tmp/moe/outputs/train_torch_smoke_fsdp3.log`
+- `/tmp/moe/outputs/train_torch_moe_smoke.log`
+- `/tmp/moe/outputs/train_torch_script_smoke.log`
+
+Notes:
+
+- FSDP checkpointing currently uses `FSDP.state_dict_type(...)`, which works but emits deprecation warnings in this torch version.
+- This is a runtime rewrite checkpoint, not the final speedrun benchmark replacement yet. The next step is to move the actual benchmark recipe onto `train_torch.py` and compare against the modded-nanogpt reference again.
 
 ## Goal
 

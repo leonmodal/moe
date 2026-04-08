@@ -44,11 +44,17 @@ echo "  Extra  : ${EXTRA_ARGS[*]:-none}"
 echo "========================================"
 
 LAUNCHER="${LAUNCHER:-torchrun}"
+TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-train.py}"
+
+if [[ ! -f "$TRAIN_ENTRYPOINT" ]]; then
+  echo "ERROR: train entrypoint not found: $TRAIN_ENTRYPOINT"
+  exit 1
+fi
 
 if [[ "$LAUNCHER" == "accelerate" ]]; then
   uv run accelerate launch \
     --config_file accelerate_configs/ddp_8gpu.yaml \
-    train.py \
+    "$TRAIN_ENTRYPOINT" \
     --config "$CONFIG" \
     "${EXTRA_ARGS[@]}"
   exit 0
@@ -66,11 +72,11 @@ if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
   uv run torchrun \
     --standalone \
     --nproc_per_node "${NPROC_PER_NODE}" \
-    train.py \
+    "$TRAIN_ENTRYPOINT" \
     --config "$CONFIG" \
     "${EXTRA_ARGS[@]}"
 else
-  uv run python train.py \
+  uv run python "$TRAIN_ENTRYPOINT" \
     --config "$CONFIG" \
     "${EXTRA_ARGS[@]}"
 fi
