@@ -81,6 +81,7 @@ image = (
         'python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained(\'Qwen/Qwen3-0.6B\')"'
     )
     .add_local_file(str(moe_dir / "train.py"), remote_path="/root/moe/train.py")
+    .add_local_file(str(moe_dir / "train_torch.py"), remote_path="/root/moe/train_torch.py")
     .add_local_dir(str(moe_dir / "src"), remote_path="/root/moe/src")
     .add_local_dir(str(moe_dir / "configs"), remote_path="/root/moe/configs")
     .add_local_python_source("torchrun_util")
@@ -148,20 +149,34 @@ def train(config: str = CONFIG_FILE):
     print(f"  Master     : {cluster_info.container_ips[0]}")
     print(f"  GPUs       : {N_NODES} x {GPUS_PER_NODE} = {N_NODES * GPUS_PER_NODE}")
 
+    # Use train_torch.py for speedrun model types, train.py for others
+    speedrun_types = {"speedrun_gpt", "speedrun_moe_fully_independent", "speedrun_moe_precompute_kv"}
+    model_type = cfg.get("model", {}).get("type", "")
+    if model_type in speedrun_types:
+        training_script = "/root/moe/train_torch.py"
+        script_args = [
+            "--config", f"/root/moe/{config}",
+            "--output_dir", output_dir,
+            "--dist-strategy", "none",  # speedrun models use DistAdam/DistMuon (no DDP)
+        ]
+    else:
+        training_script = "/root/moe/train.py"
+        script_args = [
+            "--config", f"/root/moe/{config}",
+            "--auto_resume",
+            "--data_dir", "/data/parquet",
+            "--output_dir", output_dir,
+            "--max_checkpoints", str(MAX_CHECKPOINTS),
+        ]
+
     torchrun.run(
         node_rank=cluster_info.rank,
         master_addr=cluster_info.container_ips[0],
         master_port=1234,
         nnodes=str(N_NODES),
         nproc_per_node=str(GPUS_PER_NODE),
-        training_script="/root/moe/train.py",
-        training_script_args=[
-            "--config", f"/root/moe/{config}",
-            "--auto_resume",
-            "--data_dir", "/data/parquet",
-            "--output_dir", output_dir,
-            "--max_checkpoints", str(MAX_CHECKPOINTS),
-        ],
+        training_script=training_script,
+        training_script_args=script_args,
     )
 
 

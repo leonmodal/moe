@@ -672,3 +672,61 @@ The loss curve matches the reference to within `0.006` at every checkpoint. Fina
 - Throughput matches reference (`~6.0M tok/s`).
 - The previous HF Qwen dense path (`3.56` final loss) was an apples-to-oranges comparison — different model, optimizer, loss scaling, schedule, and data pipeline.
 - The new `speedrun_gpt` path faithfully replicates the reference recipe and achieves equivalent results.
+
+## SpeedrunMoEGPT — Per-Head Routed Attention + Shared MLP
+
+Updated: 2026-04-08
+
+Built two MoE variants of the speedrun model that replace per-layer fixed attention/MLP weights with shared expert banks + per-head-slot routing.
+
+### Architecture
+
+Both variants keep the speedrun recipe (ReLU² MLP, value embeddings, U-net skips, logit softcapping, gated attention, sum loss, DistAdam+DistMuon).
+
+**Routing design**: Each head slot has its **own dedicated router** doing **top-1** from the expert pool. NOT one router picking top-K — K separate routers each picking top-1.
+
+**Expert counts** (parameter-matched to baseline):
+- Attention experts: `66` (matching 11 attn layers × 6 heads = 66 unique head weight sets)
+- MLP experts: `12` (matching 12 MLP layers)
+- Both banks shared across all depths
+
+**`speedrun_moe_fully_independent`**:
+- 4H routers per depth: 6 Q-routers + 6 K-routers + 6 V-routers + 6 O-routers = 24 per depth
+- Q/K/V route independently on input hidden state
+- O routes independently on attention output
+- ONE attention call per depth (standard SDPA)
+- Total: 276.7M params
+
+**`speedrun_moe_precompute_kv`**:
+- H routers per depth: 6 QKVO-routers = 6 per depth (bundled — one decision picks Q+K+V+O)
+- Per-expert KV tables ensure Q-K subspace alignment
+- E_active attention calls per depth
+- Total: 276.1M params
+
+### New files
+
+- `src/models/speedrun_moe_gpt.py` — SpeedrunMoEGPT model with AttentionExpertBank, MLPExpertBank, per-head-slot routing
+- `src/utils/routing_loss.py` — Switch-style aux load balancing loss
+- `configs/plan/speedrun_moe_fully_independent.yaml`
+- `configs/plan/speedrun_moe_precompute_kv.yaml`
+
+### Features
+
+- **Triton grouped GEMM**: Uses existing `src/models/triton_grouped_gemm.py` for efficient routed projections
+- **Switch aux loss**: `router_aux_loss_coef` in config, applied to all routers (attention + MLP)
+- **Routing stats**: Per-router load balance ratio, expert utilization, routing entropy logged to wandb
+- **Checkpoint saving**: Model + optimizer state saved at `save_every` steps
+- **Modal multinode**: `modal_train.py` updated to dispatch speedrun model types to `train_torch.py`
+
+### Verification
+
+- Single-GPU forward/backward verified for both modes
+- Aux loss working (init ~1.0, expected for uniform routing)
+- Routing stats: balance 0.7+, utilization 1.0, entropy 0.99+ at init
+- 8-GPU distributed run requires Triton kernel warmup (autotuning on first launch)
+
+### Known issues
+
+- First 8-GPU launch is slow (Triton autotuning for grouped GEMM + Newton-Schulz across many parameter shapes)
+- `precompute_kv` is memory-heavy due to per-expert attention loops — needs smaller batch than `fully_independent`
+- Batch size limited by distributed optimizer NCCL buffer overhead (~46GB non-PyTorch per GPU)

@@ -49,6 +49,7 @@ from src.models import (
     MoEverythingForCausalLM,
 )
 from src.models.speedrun_gpt import GPT as SpeedrunGPT
+from src.models.speedrun_moe_gpt import SpeedrunMoEGPT
 from src.models.init_mapping import copy_global_to_alternating_sanity
 from src.models.load_balancing import (
     normalized_load_balancing_loss_func,
@@ -825,19 +826,40 @@ def run_speedrun_training(args, cfg) -> None:
     val_tokens = eval_cfg_dict.get("max_tokens", 10485760)
     val_loss_every = int(eval_cfg_dict.get("every", 125))
     grad_accum_steps = tcfg_dict.get("gradient_accumulation", 8 // world_size)
+    train_align_to_bos = dcfg_dict.get("align_to_bos", True)
     output_dir = tcfg_dict.get("output_dir", "./outputs/plan/speedrun_gpt")
 
     os.makedirs(output_dir, exist_ok=True)
 
     # Build model
+    mtype = mcfg["type"]
     max_seq_len = max(train_seq_len, val_seq_len)
-    model = SpeedrunGPT(
-        vocab_size=mcfg.get("vocab_size", 50257),
-        num_layers=mcfg.get("num_layers", 12),
-        num_heads=mcfg.get("num_heads", 6),
-        model_dim=mcfg.get("model_dim", 768),
-        max_seq_len=max_seq_len,
-    ).cuda()
+    if mtype == "speedrun_gpt":
+        model = SpeedrunGPT(
+            vocab_size=mcfg.get("vocab_size", 50257),
+            num_layers=mcfg.get("num_layers", 12),
+            num_heads=mcfg.get("num_heads", 6),
+            model_dim=mcfg.get("model_dim", 768),
+            max_seq_len=max_seq_len,
+        ).cuda()
+    elif mtype in ("speedrun_moe_fully_independent", "speedrun_moe_precompute_kv"):
+        mode_map = {
+            "speedrun_moe_fully_independent": "per_head_fully_independent",
+            "speedrun_moe_precompute_kv": "per_head_precompute_kv",
+        }
+        model = SpeedrunMoEGPT(
+            vocab_size=mcfg.get("vocab_size", 50257),
+            num_layers=mcfg.get("num_layers", 12),
+            num_heads=mcfg.get("num_heads", 6),
+            model_dim=mcfg.get("model_dim", 768),
+            head_dim=mcfg.get("head_dim", 128),
+            max_seq_len=max_seq_len,
+            mode=mode_map[mtype],
+            num_attn_experts=mcfg.get("num_attn_experts", 66),
+            num_mlp_experts=mcfg.get("num_mlp_experts", 12),
+        ).cuda()
+    else:
+        raise ValueError(f"Unknown speedrun model type: {mtype}")
 
     # Cast embeddings to bf16
     for m in model.modules():
@@ -850,12 +872,15 @@ def run_speedrun_training(args, cfg) -> None:
             dist.broadcast(param.detach(), 0)
 
     params_total = sum(p.numel() for p in model.parameters())
-    print0(f"SpeedrunGPT: {params_total / 1e6:.1f}M params, {model.num_layers} layers, seq_len={train_seq_len}")
+    print0(f"{mtype}: {params_total / 1e6:.1f}M params, seq_len={train_seq_len}")
 
     # Build optimizers
     from src.utils.dist_optimizers import DistAdam, DistMuon
 
+    # Collect hidden matrix params from blocks AND attn_bank (for MoE models)
     hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+    if hasattr(model, "attn_bank"):
+        hidden_matrix_params += [p for n, p in model.attn_bank.named_parameters() if p.ndim >= 2]
     embed_params = [p for n, p in model.named_parameters() if "embed" in n]
     scalar_params = [p for p in model.parameters() if p.ndim < 2]
     head_params = [model.lm_head.weight]
@@ -882,10 +907,14 @@ def run_speedrun_training(args, cfg) -> None:
             w = (1 - x) / cooldown_frac
             return w * 1.0 + (1 - w) * 0.1
 
-    # Compile model
-    if tcfg_dict.get("torch_compile", True):
+    # Compile model (MoE models use dynamic control flow, so skip fullgraph)
+    is_moe = mtype in ("speedrun_moe_fully_independent", "speedrun_moe_precompute_kv")
+    if tcfg_dict.get("torch_compile", True) and not is_moe:
         print0("Compiling model with torch.compile(dynamic=False, fullgraph=True)")
         model = torch.compile(model, dynamic=False, fullgraph=True)
+    elif tcfg_dict.get("torch_compile", True) and is_moe:
+        print0("Compiling model with torch.compile(dynamic=False) [no fullgraph for MoE]")
+        model = torch.compile(model, dynamic=False)
 
     # WandB
     wandb_run = None
@@ -908,10 +937,61 @@ def run_speedrun_training(args, cfg) -> None:
     train_files = dcfg_dict.get("files_glob", "data/fineweb10B_gpt2/fineweb_train_*.bin")
     val_files = eval_cfg_dict.get("files_glob", "data/fineweb10B_gpt2/fineweb_val_*.bin")
 
-    train_loader = _distributed_data_generator(train_files, train_seq_len, grad_accum_steps, align_to_bos=True)
+    # For MoE models: use batched DataLoader; for speedrun_gpt: use 1D generator
+    batch_size = tcfg_dict.get("batch_size", 1)
+    if is_moe and batch_size > 1:
+        # Build a DataLoader-based pipeline for batched MoE training
+        from src.data import StatefulTokenBinDataset, TokenBinConfig
+        _train_ds = StatefulTokenBinDataset(
+            TokenBinConfig(files_glob=train_files, seq_len=train_seq_len,
+                           header_bytes=1024, token_dtype="uint16",
+                           shuffle_files=False, repeat=True),
+            rank=rank, world_size=world_size, seed=42,
+        )
+        _train_dl = DataLoader(_train_ds, batch_size=batch_size, num_workers=0, pin_memory=True)
+        _val_ds = StatefulTokenBinDataset(
+            TokenBinConfig(files_glob=val_files, seq_len=val_seq_len,
+                           header_bytes=1024, token_dtype="uint16",
+                           shuffle_files=False, repeat=False),
+            rank=rank, world_size=world_size, seed=1234,
+        )
+        _val_dl = DataLoader(_val_ds, batch_size=batch_size, num_workers=0, pin_memory=True)
+
+        def _moe_forward(model, inputs, targets, step):
+            return model(inputs, targets)
+
+        def _make_train_iter():
+            return iter(_train_dl)
+
+        def _make_val_iter():
+            return iter(_val_dl)
+
+        def _val_step_count():
+            return max(1, val_tokens // (world_size * batch_size * val_seq_len))
+    else:
+        # Original 1D generator path for speedrun_gpt
+        def _moe_forward(model, inputs, targets, step):
+            return model(inputs, targets, _get_window_size_blocks(step, num_iterations))
+
+        def _make_train_iter():
+            return _distributed_data_generator(train_files, train_seq_len, grad_accum_steps, align_to_bos=train_align_to_bos)
+
+        def _make_val_iter():
+            return _distributed_data_generator(val_files, val_seq_len, grad_accum_steps, align_to_bos=False)
+
+        def _val_step_count():
+            val_batch_size = world_size * val_seq_len
+            return val_tokens // val_batch_size
+
+    train_loader = _make_train_iter()
     for _ in range(warmup_steps):
-        inputs, targets = next(train_loader)
-        model(inputs, targets, _get_window_size_blocks(1, num_iterations)).backward()
+        batch = next(train_loader)
+        if isinstance(batch, dict):
+            inputs = batch["input_ids"].cuda(non_blocking=True)
+            targets = batch["labels"].cuda(non_blocking=True)
+        else:
+            inputs, targets = batch
+        _moe_forward(model, inputs, targets, 1).backward()
         for opt in optimizers:
             opt.step()
         model.zero_grad(set_to_none=True)
@@ -922,7 +1002,7 @@ def run_speedrun_training(args, cfg) -> None:
     print0("Kernel warmup complete.")
 
     # Training
-    train_loader = _distributed_data_generator(train_files, train_seq_len, grad_accum_steps, align_to_bos=True)
+    train_loader = _make_train_iter()
     training_time_ms = 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -936,23 +1016,33 @@ def run_speedrun_training(args, cfg) -> None:
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
             model.eval()
-            val_batch_size = world_size * val_seq_len
-            assert val_tokens % val_batch_size == 0
-            val_steps = val_tokens // val_batch_size
-            val_loader = _distributed_data_generator(val_files, val_seq_len, grad_accum_steps, align_to_bos=False)
+            val_steps = _val_step_count()
+            val_loader = _make_val_iter()
             val_loss = 0
+            val_tokens_seen = 0
             with torch.no_grad():
-                for _ in range(val_steps):
-                    inputs, targets = next(val_loader)
-                    val_loss += model(inputs, targets, _get_window_size_blocks(step, num_iterations))
-            val_loss /= val_steps
+                for vi, vbatch in enumerate(val_loader):
+                    if vi >= val_steps:
+                        break
+                    if isinstance(vbatch, dict):
+                        vinputs = vbatch["input_ids"].cuda(non_blocking=True)
+                        vtargets = vbatch["labels"].cuda(non_blocking=True)
+                    else:
+                        vinputs, vtargets = vbatch
+                    vloss = _moe_forward(model, vinputs, vtargets, step)
+                    # Model uses mean-reduction in eval mode, so vloss is already per-token
+                    val_loss += vloss.item()
+                    val_tokens_seen += 1
+            if val_tokens_seen > 0:
+                val_loss /= val_tokens_seen
             del val_loader
             if distributed:
-                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-            val_loss_val = val_loss.item()
-            print0(f"step:{step}/{train_steps} val_loss:{val_loss_val:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms")
+                val_loss_t = torch.tensor(val_loss, device=device)
+                dist.all_reduce(val_loss_t, op=dist.ReduceOp.AVG)
+                val_loss = val_loss_t.item()
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms")
             if wandb_run is not None:
-                wandb_run.log({"eval/ce_loss": val_loss_val, "eval/perplexity": math.exp(min(20.0, val_loss_val))}, step=step)
+                wandb_run.log({"eval/ce_loss": val_loss, "eval/perplexity": math.exp(min(20.0, val_loss))}, step=step)
             model.train()
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -962,8 +1052,25 @@ def run_speedrun_training(args, cfg) -> None:
 
         # Training step
         for _ in range(grad_accum_steps):
-            inputs, targets = next(train_loader)
-            model(inputs, targets, _get_window_size_blocks(step, num_iterations)).backward()
+            try:
+                batch = next(train_loader)
+            except StopIteration:
+                train_loader = _make_train_iter()
+                batch = next(train_loader)
+            if isinstance(batch, dict):
+                inputs = batch["input_ids"].cuda(non_blocking=True)
+                targets = batch["labels"].cuda(non_blocking=True)
+            else:
+                inputs, targets = batch
+            ce_loss = _moe_forward(model, inputs, targets, step)
+            # Add aux loss for MoE models
+            if is_moe and hasattr(model, '_aux_loss'):
+                raw_model_ref = model._orig_mod if hasattr(model, '_orig_mod') else model
+                aux_coef = tcfg_dict.get("router_aux_loss_coef", 0.01)
+                total_loss = ce_loss + aux_coef * raw_model_ref._aux_loss
+            else:
+                total_loss = ce_loss
+            total_loss.backward()
 
         # Set LR
         for opt in optimizers:
@@ -981,8 +1088,46 @@ def run_speedrun_training(args, cfg) -> None:
 
         # Logging
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-        if step % int(tcfg_dict.get("log_every", 1)) == 0:
+        log_every = int(tcfg_dict.get("log_every", 1))
+        if step % log_every == 0:
             print0(f"step:{step + 1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / (step + 1):.2f}ms")
+            if wandb_run is not None:
+                log_dict = {
+                    "train/step_time_ms": approx_training_time_ms / (step + 1),
+                }
+                # Log routing stats for MoE models
+                if is_moe:
+                    raw_model_ref = model._orig_mod if hasattr(model, '_orig_mod') else model
+                    if hasattr(raw_model_ref, '_routing_stats'):
+                        log_dict.update(raw_model_ref._routing_stats)
+                    if hasattr(raw_model_ref, '_aux_loss'):
+                        log_dict["train/aux_loss"] = raw_model_ref._aux_loss.item()
+                wandb_run.log(log_dict, step=step)
+
+        # Save checkpoint
+        save_every = int(tcfg_dict.get("save_every", 125))
+        if save_every > 0 and step > 0 and step % save_every == 0 and master_process:
+            ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            raw_model_ref = model._orig_mod if hasattr(model, '_orig_mod') else model
+            torch.save({
+                "model": raw_model_ref.state_dict(),
+                "optimizers": [opt.state_dict() for opt in optimizers],
+                "step": step,
+            }, os.path.join(ckpt_dir, "trainer.pt"))
+            print0(f"Saved checkpoint to {ckpt_dir}")
+
+    # Final checkpoint
+    if master_process:
+        ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        raw_model_ref = model._orig_mod if hasattr(model, '_orig_mod') else model
+        torch.save({
+            "model": raw_model_ref.state_dict(),
+            "optimizers": [opt.state_dict() for opt in optimizers],
+            "step": step,
+        }, os.path.join(ckpt_dir, "trainer.pt"))
+        print0(f"Saved final checkpoint to {ckpt_dir}")
 
     print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
            f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")
@@ -1010,8 +1155,8 @@ def main() -> None:
 
     cfg = load_config(args.config)
 
-    # Dispatch to speedrun training loop if model type is speedrun_gpt
-    if cfg["model"]["type"] == "speedrun_gpt":
+    # Dispatch to speedrun training loop for speedrun model types
+    if cfg["model"]["type"] in ("speedrun_gpt", "speedrun_moe_fully_independent", "speedrun_moe_precompute_kv"):
         return run_speedrun_training(args, cfg)
 
     initialization_spec = resolve_initialization_spec(
