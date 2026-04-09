@@ -1095,6 +1095,10 @@ def run_speedrun_training(args, cfg) -> None:
             break
 
         # Training step
+        step_t0 = time.perf_counter()
+        accum_ce = 0.0
+        accum_total = 0.0
+        step_tokens = 0
         for _ in range(grad_accum_steps):
             try:
                 batch = next(train_loader)
@@ -1117,11 +1121,24 @@ def run_speedrun_training(args, cfg) -> None:
             else:
                 total_loss = ce_loss
             total_loss.backward()
+            num_tokens = inputs.numel()
+            accum_ce += ce_loss.detach().item() / num_tokens
+            accum_total += total_loss.detach().item() / num_tokens
+            step_tokens += num_tokens
+
+        # Average over accumulation steps
+        accum_ce /= grad_accum_steps
+        accum_total /= grad_accum_steps
+
+        # Grad norm
+        raw_model_ref = model._orig_mod if hasattr(model, '_orig_mod') else model
+        grad_norm = get_grad_norm(raw_model_ref)
 
         # Set LR
+        current_lr = get_lr(step)
         for opt in optimizers:
             for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * get_lr(step)
+                group["lr"] = group["initial_lr"] * current_lr
         # Momentum warmup for Muon
         frac = min(step / 300, 1)
         for group in optimizer2.param_groups:
@@ -1148,12 +1165,26 @@ def run_speedrun_training(args, cfg) -> None:
                             router.local_tokens_per_expert.zero_()
 
         # Logging
+        torch.cuda.synchronize()
+        step_elapsed = time.perf_counter() - step_t0
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+        step_tok_per_s = (step_tokens * world_size) / max(step_elapsed, 1e-9)
         log_every = int(tcfg_dict.get("log_every", 1))
         if step % log_every == 0:
-            print0(f"step:{step + 1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / (step + 1):.2f}ms")
+            print0(
+                f"step:{step + 1}/{train_steps} "
+                f"ce={accum_ce:.4f} loss={accum_total:.4f} "
+                f"|g|={grad_norm:.3f} lr={current_lr * optimizers[0].param_groups[0]['initial_lr']:.2e} "
+                f"tok/s={step_tok_per_s/1e3:.1f}k "
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / (step + 1):.2f}ms"
+            )
             if wandb_run is not None:
                 log_dict = {
+                    "train/ce_loss": accum_ce,
+                    "train/loss": accum_total,
+                    "train/grad_norm": grad_norm,
+                    "train/lr": current_lr * optimizers[0].param_groups[0]["initial_lr"],
+                    "train/tok_per_s": step_tok_per_s,
                     "train/step_time_ms": approx_training_time_ms / (step + 1),
                 }
                 # Log routing stats for MoE models
@@ -1166,6 +1197,17 @@ def run_speedrun_training(args, cfg) -> None:
                     if hasattr(raw_model_ref, '_seq_aux_loss'):
                         log_dict["train/seq_aux_loss"] = raw_model_ref._seq_aux_loss.item()
                 wandb_run.log(log_dict, step=step)
+
+        # Expert heatmap plots for MoE models
+        heatmap_every = int(tcfg_dict.get("heatmap_every", val_loss_every))
+        if is_moe and master_process and heatmap_every > 0 and step > 0 and step % heatmap_every == 0:
+            raw_model_ref = model._orig_mod if hasattr(model, '_orig_mod') else model
+            if hasattr(raw_model_ref, '_routing_stats_obj'):
+                from src.utils.routing_plots import plot_expert_heatmaps
+                heatmap_dir = os.path.join(output_dir, "routing_logs", f"step_{step:08d}")
+                os.makedirs(heatmap_dir, exist_ok=True)
+                heatmap_data = raw_model_ref._routing_stats_obj.expert_heatmap_data()
+                plot_expert_heatmaps(heatmap_data, heatmap_dir, step)
 
         # Save checkpoint
         save_every = int(tcfg_dict.get("save_every", 125))

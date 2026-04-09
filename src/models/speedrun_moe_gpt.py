@@ -126,6 +126,42 @@ class RoutingStats:
             stats["routing/branch_mlp_frac"] = mean_probs[1].item()
         return stats
 
+    def expert_heatmap_data(self) -> dict[str, list[list[float]]]:
+        """Return per-router-family heatmap data: {family: [[fracs per expert] per layer]}.
+
+        Router names like ``mlp_d0``, ``qkvo_d0_h0`` are grouped by prefix
+        (``mlp``, ``qkvo_h0``, etc.) with one row per depth index, suitable for
+        plotting as a 2-D heatmap (y=depth, x=expert).
+        """
+        import re
+        if not self.router_records:
+            return {}
+
+        # Group records by family
+        # mlp_d{depth} -> family="mlp"
+        # qkvo_d{depth}_h{head} -> family="qkvo_h{head}"
+        families: dict[str, dict[int, torch.Tensor]] = {}
+        for name, eids, E in self.router_records:
+            m = re.match(r"^(\w+?)_d(\d+)(?:_h(\d+))?$", name)
+            if not m:
+                continue
+            prefix, depth_str, head_str = m.group(1), m.group(2), m.group(3)
+            depth = int(depth_str)
+            if head_str is not None:
+                family = f"{prefix}_h{head_str}"
+            else:
+                family = prefix
+            counts = torch.bincount(eids, minlength=E).float()
+            total = counts.sum()
+            fracs = (counts / total) if total > 0 else counts
+            families.setdefault(family, {})[depth] = fracs
+
+        result: dict[str, list[list[float]]] = {}
+        for family, depth_map in families.items():
+            depths = sorted(depth_map.keys())
+            result[family] = [depth_map[d].cpu().tolist() for d in depths]
+        return result
+
 
 class BranchRouter(nn.Module):
     """Binary argmax router: choose attention or MLP per token."""
@@ -939,6 +975,7 @@ class SpeedrunMoEGPT(nn.Module):
         self._aux_loss = torch.tensor(0.0)
         self._seq_aux_loss = torch.tensor(0.0)
         self._routing_stats = {}
+        self._routing_stats_obj = None
 
     def get_all_routers(self) -> list[DeepSeekRouter]:
         """Return all DeepSeek routers for bias updates."""
@@ -977,9 +1014,11 @@ class SpeedrunMoEGPT(nn.Module):
             self._aux_loss = stats.total_aux_loss()
             self._seq_aux_loss = stats.total_seq_aux_loss(batch_size=B)
             self._routing_stats = stats.summary()
+            self._routing_stats_obj = stats
         else:
             self._aux_loss = torch.tensor(0.0, device=loss.device)
             self._seq_aux_loss = torch.tensor(0.0, device=loss.device)
             self._routing_stats = {}
+            self._routing_stats_obj = None
 
         return loss

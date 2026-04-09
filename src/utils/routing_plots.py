@@ -195,3 +195,44 @@ def _plot_per_layer_expert_histograms(layers: dict, sub_dir: str, step: int, nam
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(os.path.join(sub_dir, "per_layer_expert_histograms.png"), dpi=100)
     plt.close(fig)
+
+
+def plot_expert_heatmaps(
+    heatmap_data: dict[str, list[list[float]]],
+    step_dir: str,
+    step: int,
+) -> None:
+    """Plot expert-activation heatmaps from ``RoutingStats.expert_heatmap_data()``.
+
+    For each router family (e.g. ``mlp``, ``qkvo_h0``), produces a heatmap where
+    the x-axis is the expert index and y-axis is the layer/depth index.  The cell
+    colour encodes the fraction of tokens routed to that expert at that depth.
+    """
+    if not heatmap_data:
+        return
+
+    for family, rows in heatmap_data.items():
+        mat = np.array(rows, dtype=float)  # (num_depths, num_experts)
+        if mat.size == 0:
+            continue
+
+        num_depths, num_experts = mat.shape
+        fig_w = max(6, num_experts * 0.25 + 2)
+        fig_h = max(4, num_depths * 0.35 + 2)
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+        im = ax.imshow(mat, aspect="auto", cmap="YlOrRd", interpolation="nearest")
+        fig.colorbar(im, ax=ax, label="Token Fraction")
+
+        ax.set_xlabel("Expert Index")
+        ax.set_ylabel("Depth")
+        ax.set_title(f"{family} Expert Activation Heatmap (step {step})")
+
+        # Tick labels
+        xtick_step = max(1, num_experts // 20)
+        ax.set_xticks(range(0, num_experts, xtick_step))
+        ax.set_yticks(range(num_depths))
+
+        fig.tight_layout()
+        fig.savefig(os.path.join(step_dir, f"{family}_expert_heatmap.png"), dpi=100)
+        plt.close(fig)
