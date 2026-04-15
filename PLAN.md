@@ -1,10 +1,12 @@
-for nano gpt speed run the model is able to reach 3.28 loss. But for ours, we are not able to do that. This might be a codebase issue that we need to fix. Please check what happens please. And we want to be able to have through put as fast as nano gpt speed run. we need to fix the training code please. 
+First take a look and docs and the codebase. correct anything thats not correct in the docs.
 
-we want to make sure:
-a. gpt model and qwen model and reach 3.28 loss on finewed edu dataset
-b. fix the bug we have in our codebase that stop us from reach 3.28 loss
-c. have throughput similar to the speed of nanogpt speedrun
+Now the second thing is that i think now the codebase is really messy and not organized. I want you to really organize the code in a clean way and there is only one unified training function and stuff. We also want to stay away from speedrun model for training and now just train our normal models like moe and stuff.
 
-first check the last commit cluade code make and confirm those are correct.
+a few other codebases to take a look at are:
+Megatron-LM
+modal-nmoe
+nmoe
 
-use uv run to run stuff and use gpu whenever possible. you have 8x b200
+take a look at those moe training and see any tricks can help us to train better. include stuff like gemm to have faster throughput and etc.
+
+When you finish make a git push please.
