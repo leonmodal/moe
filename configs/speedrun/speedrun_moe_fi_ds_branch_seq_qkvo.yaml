@@ -1,4 +1,4 @@
-experiment_name: speedrun_moe_fully_independent
+experiment_name: speedrun_moe_fi_ds_branch_seq_qkvo
 
 model:
   type: speedrun_moe_fully_independent
@@ -10,6 +10,10 @@ model:
   num_attn_experts: 66
   num_mlp_experts: 12
   exploration_rate: 0.02
+  branch_level: seq
+  branch_deepseek: true
+  attn_routing_level: seq
+  global_load_balancing: true
 
 training:
   optimizer: speedrun
@@ -33,12 +37,14 @@ training:
   router_aux_loss_coef: 0.0
   seq_aux_loss_coef: 0.01
   bias_update_rate: 0.001
+  bias_warmup_start: 0.001
+  bias_warmup_steps: 0
   torch_compile: true
   wandb_project: speedrun-moe
   log_every: 1
   save_every: 100
   heatmap_every: 50
-  output_dir: /checkpoints/speedrun_moe_fully_independent
+  output_dir: /checkpoints/speedrun_moe_fi_ds_branch_seq_qkvo
 
 data:
   format: token_bin

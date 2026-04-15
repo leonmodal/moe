@@ -26,13 +26,14 @@ training:
   gradient_accumulation: 1
   mixed_precision: bf16
   torch_compile: true
+  wandb_project: speedrun-moe
   log_every: 1
   save_every: 125
-  output_dir: ./outputs/plan/speedrun_gpt_fineweb_gpt2_bins
+  output_dir: /checkpoints/speedrun_gpt_fineweb_gpt2_bins
 
 data:
   format: token_bin
-  files_glob: ./data/fineweb10B_gpt2/fineweb_train_*.bin
+  files_glob: /data/fineweb10B_gpt2/fineweb_train_*.bin
   seq_len: 49152
   align_to_bos: true
   header_bytes: 1024
@@ -41,7 +42,7 @@ data:
 eval:
   enabled: true
   every: 125
-  files_glob: ./data/fineweb10B_gpt2/fineweb_val_*.bin
+  files_glob: /data/fineweb10B_gpt2/fineweb_val_*.bin
   max_tokens: 10485760
   seq_len: 262144
   batch_size: 1

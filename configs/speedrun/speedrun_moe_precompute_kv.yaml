@@ -26,20 +26,23 @@ training:
   max_steps: 10000
   min_lr_ratio: 0.1
   learning_rate: 0.05
-  batch_size: 4
+  batch_size: 64
   gradient_accumulation: 1
+  gradient_checkpointing: true
   mixed_precision: bf16
   router_aux_loss_coef: 0.0
   seq_aux_loss_coef: 0.01
   bias_update_rate: 0.001
   torch_compile: true
-  log_every: 10
-  save_every: 500
-  output_dir: ./outputs/plan/speedrun_moe_precompute_kv
+  wandb_project: speedrun-moe
+  log_every: 1
+  save_every: 100
+  heatmap_every: 50
+  output_dir: /checkpoints/speedrun_moe_precompute_kv
 
 data:
   format: token_bin
-  files_glob: ./data/fineweb10B_gpt2/fineweb_train_*.bin
+  files_glob: /data/fineweb10B_gpt2/fineweb_train_*.bin
   seq_len: 1024
   align_to_bos: true
   header_bytes: 1024
@@ -47,8 +50,8 @@ data:
 
 eval:
   enabled: true
-  every: 500
-  files_glob: ./data/fineweb10B_gpt2/fineweb_val_*.bin
+  every: 50
+  files_glob: /data/fineweb10B_gpt2/fineweb_val_*.bin
   max_tokens: 10485760
   seq_len: 1024
   batch_size: 4

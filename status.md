@@ -730,3 +730,73 @@ Both variants keep the speedrun recipe (ReLU² MLP, value embeddings, U-net skip
 - First 8-GPU launch is slow (Triton autotuning for grouped GEMM + Newton-Schulz across many parameter shapes)
 - `precompute_kv` is memory-heavy due to per-expert attention loops — needs smaller batch than `fully_independent`
 - Batch size limited by distributed optimizer NCCL buffer overhead (~46GB non-PyTorch per GPU)
+
+## Modal Training Runs (2026-04-14)
+
+### Active Runs (v2 — zero-sum bias, per-projection rates)
+
+All runs: single-node 8x H200, grad_ckpt (use_reentrant=True), W&B project: `speedrun-moe`
+
+| Experiment | Branch | Attn Routing | BS | Grad Accum | W&B Name |
+|---|---|---|---|---|---|
+| fi_ds_branch_token_attn_v2 | seq DeepSeek | token Q/K/V/O | 64 | 1 | `speedrun_moe_fi_ds_branch_token_attn_v2` |
+| pkv_ds_branch_v2 | seq DeepSeek | bundled QKVO precompute KV | 32 | 2 | `speedrun_moe_pkv_ds_branch_v2` |
+
+### Stopped (v1 — old bias with drift, checkpoints preserved on volume)
+
+| Experiment | W&B Name |
+|---|---|
+| ds_branch_token_attn | `speedrun_moe_fi_ds_branch_token_attn` |
+| ds_branch_seq_qkvo | `speedrun_moe_fi_ds_branch_seq_qkvo` |
+| ds_branch_seq_qk | `speedrun_moe_fi_ds_branch_seq_qk` |
+| pkv_ds_branch | `speedrun_moe_pkv_ds_branch` |
+
+### Completed
+
+| Experiment | Val Loss | W&B Name |
+|---|---|---|
+| baseline speedrun_gpt (dense) | 3.3799 (10K steps, 8x H200) | `speedrun_gpt_fineweb_gpt2_bins` |
+
+### Previous Runs (checkpoints deleted, W&B logs preserved)
+
+- `speedrun_moe_fully_independent` — token branch, token attn, per-router LB
+- `speedrun_moe_precompute_kv` — token branch, bundled QKVO routing
+- `speedrun_moe_fi_branch_sampling` — token branch (sampling), token attn
+- `speedrun_moe_fi_global_lb` — token branch, token attn, global LB (single bias — bug)
+- `speedrun_moe_fi_seq_branch` — seq branch (softmax), token attn, global LB
+- `speedrun_moe_fi_seq_branch_seq_qkvo` — seq branch (softmax), seq attn, global LB
+- `speedrun_moe_fi_seq_branch_seq_qk` — seq branch (softmax), seq QK, global LB
+- `speedrun_moe_fi_alternating_seq_qk` — alternating attn/mlp, seq QK
+- Earlier ds_branch runs with wrong single `_global_attn_bias`
+
+### Architecture Details (Current Runs)
+
+- 12 layers → 24 depth steps (each depth: attn OR mlp via branch router)
+- 66 attention experts, 12 MLP experts (shared projection banks across depths)
+- Per-depth routers (separate weights per depth), per-depth branch router
+- DeepSeek-style branch router: sigmoid + per-depth bias, seq-level (mean pool)
+- DeepSeek-style expert routers: sigmoid + bias, top-1, NO normalization (preserves gradient flow to router)
+- Global load balancing: per-projection-type bias (Q/K/V/O/MLP each separate), all-reduced across ranks
+- Branch bias: per-depth (not global), updated from per-depth counts (also all-reduced)
+- Constant bias update rate: 0.001 (no warmup schedule)
+- Gradient checkpointing: use_reentrant=True (required for shared param banks)
+- Auto-resume from checkpoints on Modal volume
+- Kaiming uniform router weight init
+
+### Key Fixes Applied
+
+1. Per-projection global bias (Q/K/V/O/MLP separate, not one shared attn bias)
+2. All-reduce token counts across ranks before bias update (keeps biases synchronized)
+3. Skip top-1 normalization to preserve router gradient flow (norm only for top-K, K>1)
+4. None-grad handling in DistMuon/DistAdam for branch routing edge cases
+5. Gradient checkpointing stats dedup (prevent double-counting during recompute)
+6. Per-depth routers (not shared across depths)
+7. Router kaiming init (not zero init)
+8. Seq-level branch routing skips sparse query path (needs full B*T for correct mean pool)
+9. Zero-sum bias update: `s - s.mean()` prevents bias drift (from nmoe reference)
+10. Per-projection bias rates: Q/K=0.005, V/O/MLP=0.003, branch=0.001
+11. Bias clamp ±16 safety bound
+12. Branch ratio plots use hard routing decisions (sums to 1.0), not soft sigmoid scores
+13. Aux loss correctly accumulated across gradient accumulation steps
+14. Bias plots: global expert biases (Q/K/V/O/MLP) + branch bias by depth
+15. 4-row branch_routing.png: token fraction, attn/mlp ratio, sigmoid weights, branch bias

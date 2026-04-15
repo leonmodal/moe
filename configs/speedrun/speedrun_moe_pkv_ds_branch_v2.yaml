@@ -1,7 +1,7 @@
-experiment_name: speedrun_moe_fully_independent
+experiment_name: speedrun_moe_pkv_ds_branch_v2
 
 model:
-  type: speedrun_moe_fully_independent
+  type: speedrun_moe_precompute_kv
   vocab_size: 50257
   num_layers: 12
   num_heads: 6
@@ -10,6 +10,9 @@ model:
   num_attn_experts: 66
   num_mlp_experts: 12
   exploration_rate: 0.02
+  branch_level: seq
+  branch_deepseek: true
+  global_load_balancing: true
 
 training:
   optimizer: speedrun
@@ -26,19 +29,27 @@ training:
   max_steps: 10000
   min_lr_ratio: 0.1
   learning_rate: 0.05
-  batch_size: 64
-  gradient_accumulation: 1
+  batch_size: 32
+  gradient_accumulation: 2
   gradient_checkpointing: true
   mixed_precision: bf16
   router_aux_loss_coef: 0.0
   seq_aux_loss_coef: 0.01
   bias_update_rate: 0.001
+  bias_rate_q: 0.005
+  bias_rate_k: 0.005
+  bias_rate_v: 0.003
+  bias_rate_o: 0.003
+  bias_rate_mlp: 0.003
+  bias_rate_branch: 0.001
+  bias_warmup_start: 0.001
+  bias_warmup_steps: 0
   torch_compile: true
   wandb_project: speedrun-moe
   log_every: 1
   save_every: 100
   heatmap_every: 50
-  output_dir: /checkpoints/speedrun_moe_fully_independent
+  output_dir: /checkpoints/speedrun_moe_pkv_ds_branch_v2
 
 data:
   format: token_bin

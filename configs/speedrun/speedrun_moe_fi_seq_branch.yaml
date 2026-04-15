@@ -1,4 +1,4 @@
-experiment_name: speedrun_moe_fully_independent
+experiment_name: speedrun_moe_fi_seq_branch
 
 model:
   type: speedrun_moe_fully_independent
@@ -10,6 +10,9 @@ model:
   num_attn_experts: 66
   num_mlp_experts: 12
   exploration_rate: 0.02
+  branch_level: seq
+  attn_routing_level: token
+  global_load_balancing: true
 
 training:
   optimizer: speedrun
@@ -38,7 +41,7 @@ training:
   log_every: 1
   save_every: 100
   heatmap_every: 50
-  output_dir: /checkpoints/speedrun_moe_fully_independent
+  output_dir: /checkpoints/speedrun_moe_fi_seq_branch
 
 data:
   format: token_bin

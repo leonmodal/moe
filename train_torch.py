@@ -893,9 +893,27 @@ def run_speedrun_training(args, cfg) -> None:
             num_attn_experts=mcfg.get("num_attn_experts", 66),
             num_mlp_experts=mcfg.get("num_mlp_experts", 12),
             exploration_rate=mcfg.get("exploration_rate", 0.02),
+            branch_sampling=mcfg.get("branch_sampling", False),
+            branch_level=mcfg.get("branch_level", "token"),
+            branch_mode=mcfg.get("branch_mode", "router"),
+            branch_deepseek=mcfg.get("branch_deepseek", False),
+            attn_routing_level=mcfg.get("attn_routing_level", "token"),
+            global_load_balancing=mcfg.get("global_load_balancing", False),
         ).cuda()
     else:
         raise ValueError(f"Unknown speedrun model type: {mtype}")
+
+    # Gradient checkpointing for speedrun MoE models
+    if tcfg_dict.get("gradient_checkpointing", False) and isinstance(model, SpeedrunMoEGPT):
+        from torch.utils.checkpoint import checkpoint
+        for block in model.blocks:
+            orig_forward = block.forward
+            def make_ckpt_forward(fn):
+                def ckpt_forward(*args):
+                    return checkpoint(fn, *args, use_reentrant=True)
+                return ckpt_forward
+            block.forward = make_ckpt_forward(orig_forward)
+        print0("Gradient checkpointing enabled (use_reentrant=True) for SpeedrunMoEGPT")
 
     # Cast embeddings to bf16
     for m in model.modules():
@@ -974,6 +992,7 @@ def run_speedrun_training(args, cfg) -> None:
     val_files = eval_cfg_dict.get("files_glob", "data/fineweb10B_gpt2/fineweb_val_*.bin")
 
     # For MoE models: use batched DataLoader; for speedrun_gpt: use 1D generator
+    _train_ds = None
     batch_size = tcfg_dict.get("batch_size", 1)
     if is_moe and batch_size > 1:
         # Build a DataLoader-based pipeline for batched MoE training
@@ -1042,6 +1061,34 @@ def run_speedrun_training(args, cfg) -> None:
     del train_loader, initial_state
     print0("Kernel warmup complete.")
 
+    # Auto-resume from latest checkpoint
+    start_step = 0
+    resume_from = getattr(args, "resume", None)
+    if getattr(args, "auto_resume", False) and not resume_from:
+        resume_from = find_latest_checkpoint(output_dir)
+    if resume_from:
+        print0(f"Resuming from {resume_from}")
+        raw_model_ref = model._orig_mod if hasattr(model, '_orig_mod') else model
+        ckpt = torch.load(os.path.join(resume_from, "trainer.pt"), map_location="cpu", weights_only=False)
+        raw_model_ref.load_state_dict(ckpt["model"])
+        # Try to restore optimizer state; skip if world_size changed (sharded state incompatible)
+        ckpt_world_size = ckpt.get("world_size", None)
+        if ckpt_world_size is not None and ckpt_world_size != world_size:
+            print0(f"World size changed ({ckpt_world_size} -> {world_size}), skipping optimizer state")
+        else:
+            try:
+                for opt, opt_state in zip(optimizers, ckpt["optimizers"]):
+                    opt.load_state_dict(opt_state)
+                print0("Restored optimizer state")
+            except Exception as e:
+                print0(f"Could not restore optimizer state: {e}, reinitializing")
+        start_step = ckpt["step"]
+        if "dataset_state" in ckpt and _train_ds is not None and hasattr(_train_ds, 'set_state'):
+            _train_ds.set_state(ckpt["dataset_state"])
+            print0(f"Restored dataset state: {ckpt['dataset_state']}")
+        print0(f"Resumed from step {start_step}")
+        del ckpt
+
     # Training
     train_loader = _make_train_iter()
     training_time_ms = 0
@@ -1051,7 +1098,7 @@ def run_speedrun_training(args, cfg) -> None:
     autocast_enabled = autocast_dtype is not None
 
     train_steps = num_iterations
-    for step in range(train_steps + 1):
+    for step in range(start_step, train_steps + 1):
         last_step = (step == train_steps)
 
         # Validation
@@ -1099,7 +1146,9 @@ def run_speedrun_training(args, cfg) -> None:
         accum_ce = 0.0
         accum_total = 0.0
         step_tokens = 0
-        for _ in range(grad_accum_steps):
+        accum_aux = 0.0
+        accum_seq_aux = 0.0
+        for ga_i in range(grad_accum_steps):
             try:
                 batch = next(train_loader)
             except StopIteration:
@@ -1118,6 +1167,8 @@ def run_speedrun_training(args, cfg) -> None:
                 aux_coef = tcfg_dict.get("router_aux_loss_coef", 0.01)
                 seq_aux_coef = tcfg_dict.get("seq_aux_loss_coef", 0.0)
                 total_loss = ce_loss + aux_coef * raw_model_ref._aux_loss + seq_aux_coef * getattr(raw_model_ref, "_seq_aux_loss", 0.0)
+                accum_aux += raw_model_ref._aux_loss.detach().item()
+                accum_seq_aux += getattr(raw_model_ref, "_seq_aux_loss", torch.tensor(0.0)).detach().item()
             else:
                 total_loss = ce_loss
             total_loss.backward()
@@ -1125,6 +1176,14 @@ def run_speedrun_training(args, cfg) -> None:
             accum_ce += ce_loss.detach().item() / num_tokens
             accum_total += total_loss.detach().item() / num_tokens
             step_tokens += num_tokens
+            # Merge routing stats from this micro-batch into the first one
+            if is_moe and ga_i > 0:
+                raw_model_ref = model._orig_mod if hasattr(model, '_orig_mod') else model
+                if hasattr(raw_model_ref, '_routing_stats_obj') and raw_model_ref._routing_stats_obj is not None:
+                    # The stats from the last micro-batch are in _routing_stats_obj
+                    # For simplicity, we keep the last micro-batch's stats for plotting
+                    # (bias counts are already accumulated in router.local_tokens_per_expert)
+                    pass
 
         # Average over accumulation steps
         accum_ce /= grad_accum_steps
@@ -1152,17 +1211,56 @@ def run_speedrun_training(args, cfg) -> None:
         # Expert bias update (DeepSeek V3 style) for MoE models
         if is_moe:
             raw_model_ref = model._orig_mod if hasattr(model, '_orig_mod') else model
-            bias_rate = tcfg_dict.get("bias_update_rate", 0.001)
-            if bias_rate > 0 and hasattr(raw_model_ref, 'get_all_routers'):
-                from src.models.router import DeepSeekRouter
-                for router in raw_model_ref.get_all_routers():
-                    if isinstance(router, DeepSeekRouter):
-                        with torch.no_grad():
-                            counts = router.local_tokens_per_expert
-                            if counts.sum() > 0:
-                                avg = counts.mean()
-                                router.expert_bias += torch.sign(avg - counts) * bias_rate
-                            router.local_tokens_per_expert.zero_()
+            base_bias_rate = tcfg_dict.get("bias_update_rate", 0.001)
+            if base_bias_rate > 0:
+                # Schedule: linear decay from bias_warmup_start to base rate over bias_warmup_steps
+                if hasattr(raw_model_ref, 'get_bias_rate'):
+                    warmup_start = tcfg_dict.get("bias_warmup_start", base_bias_rate)
+                    warmup_steps = tcfg_dict.get("bias_warmup_steps", 0)
+                    bias_rate = raw_model_ref.get_bias_rate(step, base_bias_rate, warmup_start, warmup_steps)
+                else:
+                    bias_rate = base_bias_rate
+                if hasattr(raw_model_ref, 'update_global_bias') and getattr(raw_model_ref, 'global_load_balancing', False):
+                    per_proj_rates = {
+                        "q": tcfg_dict.get("bias_rate_q", bias_rate),
+                        "k": tcfg_dict.get("bias_rate_k", bias_rate),
+                        "v": tcfg_dict.get("bias_rate_v", bias_rate),
+                        "o": tcfg_dict.get("bias_rate_o", bias_rate),
+                        "mlp": tcfg_dict.get("bias_rate_mlp", bias_rate),
+                        "branch": tcfg_dict.get("bias_rate_branch", bias_rate),
+                    }
+                    raw_model_ref.update_global_bias(bias_rate, bias_rates=per_proj_rates)
+                elif hasattr(raw_model_ref, 'get_all_routers'):
+                    from src.models.router import DeepSeekRouter
+                    for router in raw_model_ref.get_all_routers():
+                        if isinstance(router, DeepSeekRouter):
+                            with torch.no_grad():
+                                counts = router.local_tokens_per_expert
+                                if distributed:
+                                    dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+                                if counts.sum() > 0:
+                                    total = counts.sum()
+                                    loads = counts / total
+                                    expected = 1.0 / counts.shape[0]
+                                    s = torch.sign(loads - expected)
+                                    router.expert_bias -= (s - s.mean()) * bias_rate
+                                    router.expert_bias.clamp_(-16.0, 16.0)
+                                router.local_tokens_per_expert.zero_()
+                    # Also update branch router biases if DeepSeek-style
+                    if hasattr(raw_model_ref, 'branch_routers'):
+                        for br in raw_model_ref.branch_routers:
+                            if hasattr(br, 'branch_bias') and hasattr(br, 'local_counts'):
+                                with torch.no_grad():
+                                    if distributed:
+                                        dist.all_reduce(br.local_counts, op=dist.ReduceOp.SUM)
+                                    if br.local_counts.sum() > 0:
+                                        total = br.local_counts.sum()
+                                        loads = br.local_counts / total
+                                        expected = 1.0 / br.local_counts.shape[0]
+                                        s = torch.sign(loads - expected)
+                                        br.branch_bias -= (s - s.mean()) * bias_rate
+                                        br.branch_bias.clamp_(-16.0, 16.0)
+                                    br.local_counts.zero_()
 
         # Logging
         torch.cuda.synchronize()
@@ -1192,10 +1290,9 @@ def run_speedrun_training(args, cfg) -> None:
                     raw_model_ref = model._orig_mod if hasattr(model, '_orig_mod') else model
                     if hasattr(raw_model_ref, '_routing_stats'):
                         log_dict.update(raw_model_ref._routing_stats)
-                    if hasattr(raw_model_ref, '_aux_loss'):
-                        log_dict["train/aux_loss"] = raw_model_ref._aux_loss.item()
-                    if hasattr(raw_model_ref, '_seq_aux_loss'):
-                        log_dict["train/seq_aux_loss"] = raw_model_ref._seq_aux_loss.item()
+                    # Use accumulated aux losses averaged over grad_accum steps
+                    log_dict["train/aux_loss"] = accum_aux / grad_accum_steps
+                    log_dict["train/seq_aux_loss"] = accum_seq_aux / grad_accum_steps
                 wandb_run.log(log_dict, step=step)
 
         # Expert heatmap plots for MoE models
@@ -1203,11 +1300,36 @@ def run_speedrun_training(args, cfg) -> None:
         if is_moe and master_process and heatmap_every > 0 and step > 0 and step % heatmap_every == 0:
             raw_model_ref = model._orig_mod if hasattr(model, '_orig_mod') else model
             if hasattr(raw_model_ref, '_routing_stats_obj'):
-                from src.utils.routing_plots import plot_expert_heatmaps
+                from src.utils.routing_plots import plot_expert_heatmaps, plot_routing_snapshot
+                stats_obj = raw_model_ref._routing_stats_obj
                 heatmap_dir = os.path.join(output_dir, "routing_logs", f"step_{step:08d}")
                 os.makedirs(heatmap_dir, exist_ok=True)
-                heatmap_data = raw_model_ref._routing_stats_obj.expert_heatmap_data()
+                # Heatmaps (depth x expert)
+                heatmap_data = stats_obj.expert_heatmap_data()
                 plot_expert_heatmaps(heatmap_data, heatmap_dir, step)
+                # Histograms (expert usage bars, branch ratios)
+                if hasattr(stats_obj, 'routing_snapshot'):
+                    snapshot = stats_obj.routing_snapshot()
+                    # Collect bias data for plotting
+                    bias_data = {}
+                    if hasattr(raw_model_ref, '_global_q_bias'):
+                        bias_data["expert_biases"] = {
+                            "Q": raw_model_ref._global_q_bias.detach().cpu().numpy(),
+                            "K": raw_model_ref._global_k_bias.detach().cpu().numpy(),
+                            "V": raw_model_ref._global_v_bias.detach().cpu().numpy(),
+                            "O": raw_model_ref._global_o_bias.detach().cpu().numpy(),
+                            "MLP": raw_model_ref._global_mlp_bias.detach().cpu().numpy(),
+                        }
+                    if hasattr(raw_model_ref, 'branch_routers'):
+                        attn_b, mlp_b = [], []
+                        for br in raw_model_ref.branch_routers:
+                            if hasattr(br, 'branch_bias'):
+                                b = br.branch_bias.detach().cpu().numpy()
+                                attn_b.append(float(b[0]))
+                                mlp_b.append(float(b[1]))
+                        if attn_b:
+                            bias_data["branch_bias"] = {"attn": attn_b, "mlp": mlp_b}
+                    plot_routing_snapshot(snapshot, heatmap_dir, step, bias_data=bias_data)
 
         # Save checkpoint
         save_every = int(tcfg_dict.get("save_every", 125))
@@ -1215,11 +1337,15 @@ def run_speedrun_training(args, cfg) -> None:
             ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
             os.makedirs(ckpt_dir, exist_ok=True)
             raw_model_ref = model._orig_mod if hasattr(model, '_orig_mod') else model
-            torch.save({
+            ckpt_data = {
                 "model": raw_model_ref.state_dict(),
                 "optimizers": [opt.state_dict() for opt in optimizers],
                 "step": step,
-            }, os.path.join(ckpt_dir, "trainer.pt"))
+                "world_size": world_size,
+            }
+            if _train_ds is not None and hasattr(_train_ds, 'get_state'):
+                ckpt_data["dataset_state"] = _train_ds.get_state()
+            torch.save(ckpt_data, os.path.join(ckpt_dir, "trainer.pt"))
             print0(f"Saved checkpoint to {ckpt_dir}")
 
     # Final checkpoint
@@ -1227,11 +1353,14 @@ def run_speedrun_training(args, cfg) -> None:
         ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
         os.makedirs(ckpt_dir, exist_ok=True)
         raw_model_ref = model._orig_mod if hasattr(model, '_orig_mod') else model
-        torch.save({
+        ckpt_data = {
             "model": raw_model_ref.state_dict(),
             "optimizers": [opt.state_dict() for opt in optimizers],
             "step": step,
-        }, os.path.join(ckpt_dir, "trainer.pt"))
+        }
+        if _train_ds is not None and hasattr(_train_ds, 'get_state'):
+            ckpt_data["dataset_state"] = _train_ds.get_state()
+        torch.save(ckpt_data, os.path.join(ckpt_dir, "trainer.pt"))
         print0(f"Saved final checkpoint to {ckpt_dir}")
 
     print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "

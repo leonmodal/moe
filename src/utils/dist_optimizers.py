@@ -46,10 +46,11 @@ class DistMuon(torch.optim.Optimizer):
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             grad = torch.empty_like(params[-1])
-            grad_pad = [param.grad for param in params] + [torch.zeros_like(params[-1])] * world_size
+            grad_pad = [(param.grad if param.grad is not None else torch.zeros_like(param)) for param in params] + [torch.zeros_like(params[-1])] * world_size
             for base_i in range(0, len(params), world_size):
                 if base_i + rank < len(params):
-                    grad = params[base_i + rank].grad
+                    p_grad = params[base_i + rank].grad
+                    grad = p_grad if p_grad is not None else torch.zeros_like(params[base_i + rank])
                 reduce_scatter_futures.append(
                     dist.reduce_scatter(grad, grad_pad[base_i:base_i + world_size], op=dist.ReduceOp.AVG, async_op=True).get_future()
                 )
@@ -63,7 +64,7 @@ class DistMuon(torch.optim.Optimizer):
                 reduce_scatter_futures[idx].wait()
                 if base_i + rank < len(params):
                     p = params[base_i + rank]
-                    grad = p.grad
+                    grad = p.grad if p.grad is not None else torch.zeros_like(p)
                     eff_lr = group["lr"] * max(1, p.size(-2) / p.size(-1)) ** 0.5 * getattr(p, "lr_mul", 1.0)
                     eff_weight_decay = group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)
                     state = self.state[p]
@@ -115,6 +116,8 @@ class DistAdam(torch.optim.Optimizer):
             params: list[Tensor] = group["params"]
             for base_i in range(len(params)):
                 grad = params[base_i].grad
+                if grad is None:
+                    grad = torch.zeros_like(params[base_i])
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
                 reduce_scatter_futures.append(

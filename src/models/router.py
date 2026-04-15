@@ -221,7 +221,9 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
             router_top_value = scores.gather(1, top_k_idx)  # (T, K)
 
             # 5. Normalize + scaling factor
-            if self.norm_topk_prob:
+            # Skip normalization for top-1: w/w=1.0 kills gradient.
+            # For top-K (K>1), normalize so weights sum to 1.
+            if self.norm_topk_prob and self.top_k > 1:
                 router_top_value = router_top_value / (
                     router_top_value.sum(dim=-1, keepdim=True) + 1e-20
                 )

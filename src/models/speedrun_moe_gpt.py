@@ -15,6 +15,7 @@ Supports batched (B, T) inputs with SDPA attention.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -52,7 +53,7 @@ class RoutingStats:
     """Accumulates routing statistics during a forward pass."""
     aux_losses: list[Tensor] = field(default_factory=list)
     router_records: list[tuple[str, Tensor, int]] = field(default_factory=list)
-    branch_records: list[Tensor] = field(default_factory=list)
+    branch_records: list[tuple[Tensor, Tensor]] = field(default_factory=list)
     seq_router_records: list[tuple[Tensor, Tensor, int, Tensor | None]] = field(default_factory=list)
 
     def add(
@@ -84,8 +85,13 @@ class RoutingStats:
             return torch.tensor(0.0)
         return sum(self.aux_losses) / len(self.aux_losses)
 
-    def add_branch(self, probs: Tensor):
-        self.branch_records.append(probs.detach())
+    def add_branch(self, probs: Tensor, selected: Tensor):
+        """Record branch routing.
+
+        probs: soft scores (B, T, 2) or (B*T, 2)
+        selected: hard decisions (B, T, 1) or (B*T, 1), 0=attn, 1=mlp
+        """
+        self.branch_records.append((probs.detach(), selected.detach()))
 
     def total_seq_aux_loss(self, batch_size: int) -> Tensor:
         if not self.seq_router_records:
@@ -120,11 +126,125 @@ class RoutingStats:
             max_entropy = torch.tensor(E, dtype=torch.float32).log()
             stats[f"routing/{name}_entropy"] = (entropy / max_entropy).item()
         if self.branch_records:
-            probs = torch.cat([p.reshape(-1, 2) for p in self.branch_records], dim=0)
-            mean_probs = probs.mean(dim=0)
-            stats["routing/branch_attn_frac"] = mean_probs[0].item()
-            stats["routing/branch_mlp_frac"] = mean_probs[1].item()
+            all_selected = torch.cat([s.reshape(-1) for _, s in self.branch_records], dim=0)
+            n = all_selected.numel()
+            stats["routing/branch_attn_frac"] = (all_selected == 0).sum().item() / max(n, 1)
+            stats["routing/branch_mlp_frac"] = (all_selected == 1).sum().item() / max(n, 1)
         return stats
+
+    def routing_snapshot(self) -> dict:
+        """Build a snapshot dict compatible with plot_routing_snapshot()."""
+        import re
+        snapshot: dict = {}
+
+        # Branch data — use hard routing decisions for fractions
+        if self.branch_records:
+            layers = {}
+            total_attn = 0
+            total_mlp = 0
+            total_tokens = 0
+            total_attn_weight_sum = 0.0
+            total_mlp_weight_sum = 0.0
+            total_attn_count = 0
+            total_mlp_count = 0
+            for i, (probs, selected) in enumerate(self.branch_records):
+                sel_flat = selected.reshape(-1)  # 0=attn, 1=mlp
+                p_flat = probs.reshape(-1, 2)
+                n = sel_flat.numel()
+                attn_mask = (sel_flat == 0)
+                mlp_mask = (sel_flat == 1)
+                n_attn = attn_mask.sum().item()
+                n_mlp = mlp_mask.sum().item()
+                attn_f = n_attn / max(n, 1)
+                mlp_f = n_mlp / max(n, 1)
+                # Mean sigmoid weight for tokens that chose each branch
+                mean_attn_w = p_flat[attn_mask, 0].mean().item() if n_attn > 0 else 0.0
+                mean_mlp_w = p_flat[mlp_mask, 1].mean().item() if n_mlp > 0 else 0.0
+                layers[str(i)] = {
+                    "attn_frac": attn_f,
+                    "mlp_frac": mlp_f,
+                    "attn_to_mlp_ratio": attn_f / max(mlp_f, 1e-10),
+                    "mean_attn_weight": mean_attn_w,
+                    "mean_mlp_weight": mean_mlp_w,
+                }
+                total_attn += n_attn
+                total_mlp += n_mlp
+                total_tokens += n
+                total_attn_weight_sum += mean_attn_w * n_attn
+                total_mlp_weight_sum += mean_mlp_w * n_mlp
+                total_attn_count += n_attn
+                total_mlp_count += n_mlp
+            total_attn_f = total_attn / max(total_tokens, 1)
+            total_mlp_f = total_mlp / max(total_tokens, 1)
+            snapshot["branch"] = {
+                "layers": layers,
+                "total": {
+                    "attn_frac": total_attn_f,
+                    "mlp_frac": total_mlp_f,
+                    "attn_to_mlp_ratio": total_attn_f / max(total_mlp_f, 1e-10),
+                    "mean_attn_weight": total_attn_weight_sum / max(total_attn_count, 1),
+                    "mean_mlp_weight": total_mlp_weight_sum / max(total_mlp_count, 1),
+                },
+            }
+
+        # Expert histograms grouped by family
+        families: dict[str, dict[int, dict]] = {}
+        global_pools: dict[str, list] = {}
+        for name, eids, E in self.router_records:
+            m = re.match(r"^(\w+?)_d(\d+)(?:_h(\d+))?$", name)
+            if not m:
+                continue
+            prefix, depth_str, head_str = m.group(1), m.group(2), m.group(3)
+            depth = int(depth_str)
+            family = f"{prefix}_h{head_str}" if head_str is not None else prefix
+            counts = torch.bincount(eids, minlength=E).float()
+            total = counts.sum()
+            fracs = (counts / total).tolist() if total > 0 else [0.0] * E
+            families.setdefault(family, {})[depth] = {"token_fracs": fracs}
+            global_pools.setdefault(family, torch.zeros(E, device=counts.device))
+            global_pools[family] += counts
+
+        # MLP histograms
+        if "mlp" in families:
+            mlp_pool = global_pools["mlp"]
+            mlp_total = mlp_pool.sum()
+            snapshot["layers"] = families["mlp"]
+            snapshot["global_pool"] = {
+                "token_fracs": (mlp_pool / max(mlp_total.item(), 1e-10)).tolist()
+            }
+
+        # Attention histograms
+        attn_families = {k: v for k, v in families.items() if k != "mlp"}
+        if attn_families:
+            snapshot["attention"] = {}
+            for family, depth_map in attn_families.items():
+                pool = global_pools[family]
+                pool_total = pool.sum()
+                snapshot["attention"][family] = {
+                    "layers": depth_map,
+                    "global_pool": {
+                        "token_fracs": (pool / max(pool_total.item(), 1e-10)).tolist()
+                    },
+                }
+
+        # Global per-projection-type pools (aggregate across all heads)
+        proj_pools: dict[str, torch.Tensor] = {}
+        for name, eids, E in self.router_records:
+            m = re.match(r"^(\w+?)_d(\d+)(?:_h(\d+))?$", name)
+            if not m:
+                continue
+            prefix = m.group(1)  # "q", "k", "v", "o", "mlp", "qkvo"
+            if prefix not in proj_pools:
+                proj_pools[prefix] = torch.zeros(E, device=eids.device)
+            proj_pools[prefix] += torch.bincount(eids, minlength=E).float()
+        snapshot["global_projection_pools"] = {}
+        for prefix, counts in proj_pools.items():
+            total = counts.sum()
+            snapshot["global_projection_pools"][prefix] = {
+                "token_fracs": (counts / max(total.item(), 1e-10)).tolist()
+            }
+
+        return snapshot
 
     def expert_heatmap_data(self) -> dict[str, list[list[float]]]:
         """Return per-router-family heatmap data: {family: [[fracs per expert] per layer]}.
@@ -164,27 +284,80 @@ class RoutingStats:
 
 
 class BranchRouter(nn.Module):
-    """Binary argmax router: choose attention or MLP per token."""
+    """Binary router: choose attention or MLP per token.
 
-    def __init__(self, hidden_size: int, exploration_rate: float = 0.0):
+    Args:
+        use_sampling: If True, sample from the softmax distribution during training.
+        use_seq_level: If True, mean-pool tokens and make one decision per sequence.
+        use_deepseek_style: If True, use sigmoid + bias (DeepSeek V3 style) instead of softmax.
+    """
+
+    def __init__(self, hidden_size: int, exploration_rate: float = 0.0,
+                 use_sampling: bool = False, use_seq_level: bool = False,
+                 use_deepseek_style: bool = False):
         super().__init__()
         self.gate = nn.Linear(hidden_size, 2, bias=False)
+        nn.init.kaiming_uniform_(self.gate.weight, a=math.sqrt(5))
         self.exploration_rate = exploration_rate
+        self.use_sampling = use_sampling
+        self.use_seq_level = use_seq_level
+        self.use_deepseek_style = use_deepseek_style
         self.last_probs = None
         self.last_selected = None
+        if use_deepseek_style:
+            self.register_buffer("branch_bias", torch.zeros(2))
+            self.register_buffer("local_counts", torch.zeros(2), persistent=False)
 
     def forward(self, hidden_states: Tensor):
+        # hidden_states: (B, T, D) or (B*T, D)
         device_type = hidden_states.device.type
         with torch.autocast(device_type=device_type, enabled=False):
-            logits = self.gate(hidden_states.float())
-            probs = F.softmax(logits, dim=-1)
-            choice_scores = probs.float()
-            if self.training and self.exploration_rate > 0.0:
-                explore = torch.rand(choice_scores.shape[:-1], device=choice_scores.device) < self.exploration_rate
-                if explore.any():
-                    choice_scores = choice_scores.clone()
-                    choice_scores[explore] = torch.rand_like(choice_scores[explore])
-            choice = choice_scores.argmax(dim=-1)
+            if self.use_seq_level and hidden_states.ndim == 3:
+                B, T, D = hidden_states.shape
+                seq_repr = hidden_states.float().mean(dim=1)  # (B, D)
+                logits = self.gate(seq_repr)  # (B, 2)
+            else:
+                B, T = None, None
+                logits = self.gate(hidden_states.float())
+
+            if self.use_deepseek_style:
+                # Sigmoid + bias selection, unbiased weight
+                scores = torch.sigmoid(logits)  # (*, 2)
+                biased = scores + self.branch_bias
+                if self.training and self.use_sampling:
+                    flat = scores.view(-1, 2)
+                    choice = torch.multinomial(flat, 1).view(scores.shape[:-1])
+                else:
+                    choice = biased.argmax(dim=-1)
+                # Gather unbiased score for selected branch
+                probs = scores
+            else:
+                # Softmax style
+                probs = F.softmax(logits, dim=-1)
+                if self.training and self.use_sampling:
+                    flat = probs.view(-1, 2)
+                    choice = torch.multinomial(flat, 1).view(probs.shape[:-1])
+                else:
+                    choice_scores = probs.float()
+                    if self.training and self.exploration_rate > 0.0:
+                        explore = torch.rand(choice_scores.shape[:-1], device=choice_scores.device) < self.exploration_rate
+                        if explore.any():
+                            choice_scores = choice_scores.clone()
+                            choice_scores[explore] = torch.rand_like(choice_scores[explore])
+                    choice = choice_scores.argmax(dim=-1)
+
+            # Broadcast seq-level decision to all tokens
+            if self.use_seq_level and B is not None:
+                choice = choice.unsqueeze(1).expand(B, T)
+                probs = probs.unsqueeze(1).expand(B, T, 2)
+
+        # Track counts for bias update (DeepSeek style)
+        if self.use_deepseek_style and self.training:
+            with torch.no_grad():
+                flat_choice = choice.reshape(-1)
+                counts = torch.bincount(flat_choice, minlength=2).float()
+                self.local_counts += counts
+
         attn_mask = (choice == 0).unsqueeze(-1)
         mlp_mask = ~attn_mask
         probs_out = probs.to(hidden_states.dtype)
@@ -211,7 +384,12 @@ def _make_router(input_dim: int, num_experts: int, exploration_rate: float = 0.0
         num_groups=None,
         group_topk=None,
     )
-    return DeepSeekRouter(cfg)
+    router = DeepSeekRouter(cfg)
+    # Initialize router weights with small random values so tokens
+    # get diverse expert preferences from the start (instead of all-zero
+    # which collapses to a single expert via tiebreaking).
+    nn.init.kaiming_uniform_(router.weight, a=math.sqrt(5))
+    return router
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +433,50 @@ def _route_and_project_heads(routers: nn.ModuleList, x: Tensor, weight_bank: Ten
         proj = norm(proj)
         results.append(proj)
     return torch.stack(results, dim=1)
+
+
+def _seq_route_and_project_heads(routers: nn.ModuleList, x: Tensor, weight_bank: Tensor,
+                                  B: int, T: int,
+                                  stats: RoutingStats | None = None,
+                                  name_prefix: str = "",
+                                  token_mask: Tensor | None = None) -> Tensor:
+    """Seq-level routing: mean pool → one expert per head per sequence, apply to all tokens."""
+    H = len(routers)
+    # x: (B*T, D) — reshape to (B, T, D) for mean pooling
+    x_3d = x.view(B, T, -1)
+    seq_repr = x_3d.mean(dim=1)  # (B, D)
+    results = []
+    for h in range(H):
+        # Route on seq representation
+        eid, ew = _route_top1(routers[h], seq_repr, stats, f"{name_prefix}_h{h}", token_mask=token_mask)
+        # Expand to all tokens: (B,) -> (B*T,)
+        eid_expanded = eid.unsqueeze(1).expand(B, T).reshape(B * T)
+        ew_expanded = ew.unsqueeze(1).expand(B, T).reshape(B * T)
+        proj = _grouped_project(x, weight_bank, eid_expanded, ew_expanded)
+        proj = norm(proj)
+        results.append(proj)
+    return torch.stack(results, dim=1)
+
+
+def _seq_route_and_project_reduce(routers: nn.ModuleList, x: Tensor, weight_bank: Tensor,
+                                   B: int, T: int,
+                                   stats: RoutingStats | None = None,
+                                   name_prefix: str = "",
+                                   token_mask: Tensor | None = None) -> Tensor:
+    """Seq-level routing for output projection, sum across heads."""
+    N, H, _ = x.shape
+    dim = weight_bank.shape[2]
+    # Use the attention output mean for routing
+    x_mean = x.view(B, T, H, -1).mean(dim=1)  # (B, H, HD)
+    token_out = torch.zeros(N, dim, device=x.device, dtype=torch.float32)
+    for h in range(H):
+        x_h = x[:, h].contiguous()
+        seq_repr_h = x_mean[:, h].contiguous()  # (B, HD)
+        eid, ew = _route_top1(routers[h], seq_repr_h, stats, f"{name_prefix}_h{h}", token_mask=token_mask)
+        eid_expanded = eid.unsqueeze(1).expand(B, T).reshape(B * T)
+        ew_expanded = ew.unsqueeze(1).expand(B, T).reshape(B * T)
+        token_out += _grouped_project(x_h, weight_bank, eid_expanded, ew_expanded).float()
+    return token_out
 
 
 def _route_and_project_reduce(routers: nn.ModuleList, x: Tensor, weight_bank: Tensor,
@@ -309,25 +531,20 @@ class AttentionExpertBank(nn.Module):
         super().__init__()
         self.mode = mode
         self.num_experts = num_experts
+        self.num_heads = num_heads
+        self.dim = dim
+        self.head_dim = head_dim
+        self.exploration_rate = exploration_rate
         E, D, HD, H = num_experts, dim, head_dim, num_heads
 
-        if mode == "per_head_fully_independent":
-            self.q_routers = nn.ModuleList([_make_router(D, E, exploration_rate) for _ in range(H)])
-            self.k_routers = nn.ModuleList([_make_router(D, E, exploration_rate) for _ in range(H)])
-            self.v_routers = nn.ModuleList([_make_router(D, E, exploration_rate) for _ in range(H)])
-            self.o_routers = nn.ModuleList([_make_router(HD, E, exploration_rate) for _ in range(H)])
-            self.q_proj = nn.Parameter(torch.empty(E, D, HD))
-            self.k_proj = nn.Parameter(torch.empty(E, D, HD))
-            self.v_proj = nn.Parameter(torch.empty(E, D, HD))
-            self.o_proj = nn.Parameter(torch.empty(E, HD, D))
-        elif mode == "per_head_precompute_kv":
-            self.routers = nn.ModuleList([_make_router(D, E, exploration_rate) for _ in range(H)])
-            self.q_proj = nn.Parameter(torch.empty(E, D, HD))
-            self.k_proj = nn.Parameter(torch.empty(E, D, HD))
-            self.v_proj = nn.Parameter(torch.empty(E, D, HD))
-            self.o_proj = nn.Parameter(torch.empty(E, HD, D))
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
+        # Plain dict for per-depth routers (set by BranchRoutedDepthStep._install_routers)
+        self._active_routers = {}
+
+        # Shared expert projection weights (used by all depths)
+        self.q_proj = nn.Parameter(torch.empty(E, D, HD))
+        self.k_proj = nn.Parameter(torch.empty(E, D, HD))
+        self.v_proj = nn.Parameter(torch.empty(E, D, HD))
+        self.o_proj = nn.Parameter(torch.empty(E, HD, D))
         self._init_weights(dim)
 
     def _init_weights(self, dim):
@@ -337,14 +554,23 @@ class AttentionExpertBank(nn.Module):
             nn.init.uniform_(proj, -bound, bound)
         nn.init.zeros_(self.o_proj)
 
-    def get_all_routers(self) -> list[DeepSeekRouter]:
-        """Return all DeepSeek routers for bias updates."""
-        routers = []
-        for attr in ["q_routers", "k_routers", "v_routers", "o_routers", "routers"]:
-            module_list = getattr(self, attr, None)
-            if module_list is not None:
-                routers.extend(module_list)
-        return routers
+    def make_routers(self) -> nn.ModuleDict:
+        """Create a fresh set of routers for one depth step."""
+        E, D, HD, H = self.num_experts, self.dim, self.head_dim, self.num_heads
+        er = self.exploration_rate
+        if self.mode == "per_head_fully_independent":
+            return nn.ModuleDict({
+                "q_routers": nn.ModuleList([_make_router(D, E, er) for _ in range(H)]),
+                "k_routers": nn.ModuleList([_make_router(D, E, er) for _ in range(H)]),
+                "v_routers": nn.ModuleList([_make_router(D, E, er) for _ in range(H)]),
+                "o_routers": nn.ModuleList([_make_router(HD, E, er) for _ in range(H)]),
+            })
+        elif self.mode == "per_head_precompute_kv":
+            return nn.ModuleDict({
+                "routers": nn.ModuleList([_make_router(D, E, er) for _ in range(H)]),
+            })
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +581,8 @@ class MLPExpertBank(nn.Module):
         super().__init__()
         hdim = 4 * dim
         self.num_experts = num_experts
-        self.router = _make_router(dim, num_experts, exploration_rate)
+        self.dim = dim
+        self.exploration_rate = exploration_rate
         self.c_fc = nn.Parameter(torch.empty(num_experts, dim, hdim))
         self.c_proj = nn.Parameter(torch.empty(num_experts, hdim, dim))
         self._init_weights(dim)
@@ -366,8 +593,13 @@ class MLPExpertBank(nn.Module):
         nn.init.uniform_(self.c_fc, -bound, bound)
         nn.init.zeros_(self.c_proj)
 
+    def make_router(self) -> DeepSeekRouter:
+        """Create a fresh router for one depth step."""
+        return _make_router(self.dim, self.num_experts, self.exploration_rate)
+
     def forward(
         self,
+        router: DeepSeekRouter,
         x: Tensor,
         stats: RoutingStats | None = None,
         depth_idx: int = 0,
@@ -388,7 +620,7 @@ class MLPExpertBank(nn.Module):
                 x_selected = fp32_index_select(x, 0, selected_idx)
 
         seq_token_mask = None if selected_idx is None else token_mask
-        eid, ew = _route_top1(self.router, x_selected, stats, f"mlp_d{depth_idx}", token_mask=seq_token_mask)
+        eid, ew = _route_top1(router, x_selected, stats, f"mlp_d{depth_idx}", token_mask=seq_token_mask)
         h = _grouped_project(x_selected, self.c_fc, eid, torch.ones_like(ew))
         h = F.relu(h).square()
         out = _grouped_project(h, self.c_proj, eid, ew)
@@ -397,19 +629,18 @@ class MLPExpertBank(nn.Module):
         dense_out = x.new_zeros(x.shape[0], x.shape[1])
         return fp32_index_put(dense_out, selected_idx, out)
 
-    def get_all_routers(self) -> list[DeepSeekRouter]:
-        return [self.router]
-
 
 # ---------------------------------------------------------------------------
 # Routed attention modules
 
 class RoutedAttentionFullyIndependent(nn.Module):
-    def __init__(self, bank: AttentionExpertBank, num_heads: int, head_dim: int, max_seq_len: int):
+    def __init__(self, bank: AttentionExpertBank, num_heads: int, head_dim: int, max_seq_len: int,
+                 attn_routing_level: str = "token"):
         super().__init__()
         self.bank = bank
         self.num_heads = num_heads
         self.head_dim = head_dim
+        self.attn_routing_level = attn_routing_level  # "token", "seq", or "seq_qk"
         self.rotary = Rotary(head_dim, max_seq_len)
         self.attn_scale = 0.12
         self.attn_gate_dim = 12
@@ -435,15 +666,15 @@ class RoutedAttentionFullyIndependent(nn.Module):
         flat_selected = fp32_index_select(flat, 0, selected_idx)
 
         q_selected = _route_and_project_heads(
-            bank.q_routers,
+            bank._active_routers["q_routers"],
             flat_selected,
             bank.q_proj,
             stats,
             f"q_{dp}",
             token_mask=flat_mask,
         )
-        k = _route_and_project_heads(bank.k_routers, flat, bank.k_proj, stats, f"k_{dp}")
-        v = _route_and_project_heads(bank.v_routers, flat, bank.v_proj, stats, f"v_{dp}")
+        k = _route_and_project_heads(bank._active_routers["k_routers"], flat, bank.k_proj, stats, f"k_{dp}")
+        v = _route_and_project_heads(bank._active_routers["v_routers"], flat, bank.v_proj, stats, f"v_{dp}")
 
         if ve is not None:
             v = lambdas[0] * v + lambdas[1] * ve.reshape(B * T, H, HD).to(v.dtype)
@@ -483,7 +714,7 @@ class RoutedAttentionFullyIndependent(nn.Module):
         gate_selected = fp32_index_select(gate.reshape(B * T, H), 0, selected_idx).unsqueeze(-1)
         y_selected = attn_selected * gate_selected.to(attn_selected.dtype)
         out_selected = _route_and_project_reduce(
-            bank.o_routers,
+            bank._active_routers["o_routers"],
             y_selected,
             bank.o_proj,
             stats,
@@ -512,15 +743,15 @@ class RoutedAttentionFullyIndependent(nn.Module):
         flat_selected = fp32_index_select(flat, 0, selected_idx)
 
         q_selected = _route_and_project_heads(
-            bank.q_routers,
+            bank._active_routers["q_routers"],
             flat_selected,
             bank.q_proj,
             stats,
             f"q_{dp}",
             token_mask=flat_mask,
         )
-        k = _route_and_project_heads(bank.k_routers, flat, bank.k_proj, stats, f"k_{dp}")
-        v = _route_and_project_heads(bank.v_routers, flat, bank.v_proj, stats, f"v_{dp}")
+        k = _route_and_project_heads(bank._active_routers["k_routers"], flat, bank.k_proj, stats, f"k_{dp}")
+        v = _route_and_project_heads(bank._active_routers["v_routers"], flat, bank.v_proj, stats, f"v_{dp}")
 
         if ve is not None:
             v = lambdas[0] * v + lambdas[1] * ve.reshape(B * T, H, HD).to(v.dtype)
@@ -541,7 +772,7 @@ class RoutedAttentionFullyIndependent(nn.Module):
         y = y.transpose(1, 2)
         y_selected = fp32_index_select((y * gate.unsqueeze(-1)).reshape(B * T, H, HD), 0, selected_idx)
         out_selected = _route_and_project_reduce(
-            bank.o_routers,
+            bank._active_routers["o_routers"],
             y_selected,
             bank.o_proj,
             stats,
@@ -567,7 +798,9 @@ class RoutedAttentionFullyIndependent(nn.Module):
         flat = x.reshape(B * T, D)
         dp = f"d{depth_idx}"
 
-        if token_mask is not None:
+        if token_mask is not None and self.attn_routing_level == "token":
+            # Sparse/dense query optimization only for token-level routing
+            # Seq-level routing needs full B*T tensors for correct mean pooling
             flat_mask = token_mask.reshape(-1).bool()
             if not flat_mask.any():
                 return x.new_zeros(B, T, D)
@@ -576,9 +809,23 @@ class RoutedAttentionFullyIndependent(nn.Module):
                     return self._forward_sparse_queries(x, flat, token_mask, ve, lambdas, stats, dp)
                 return self._forward_dense_queries(x, flat, token_mask, ve, lambdas, stats, dp)
 
-        q = _route_and_project_heads(bank.q_routers, flat, bank.q_proj, stats, f"q_{dp}")
-        k = _route_and_project_heads(bank.k_routers, flat, bank.k_proj, stats, f"k_{dp}")
-        v = _route_and_project_heads(bank.v_routers, flat, bank.v_proj, stats, f"v_{dp}")
+        # Select routing function based on attn_routing_level
+        level = self.attn_routing_level
+        if level == "seq":
+            # All Q/K/V/O use seq-level routing
+            q = _seq_route_and_project_heads(bank._active_routers["q_routers"], flat, bank.q_proj, B, T, stats, f"q_{dp}")
+            k = _seq_route_and_project_heads(bank._active_routers["k_routers"], flat, bank.k_proj, B, T, stats, f"k_{dp}")
+            v = _seq_route_and_project_heads(bank._active_routers["v_routers"], flat, bank.v_proj, B, T, stats, f"v_{dp}")
+        elif level == "seq_qk":
+            # Q/K use seq-level, V uses token-level
+            q = _seq_route_and_project_heads(bank._active_routers["q_routers"], flat, bank.q_proj, B, T, stats, f"q_{dp}")
+            k = _seq_route_and_project_heads(bank._active_routers["k_routers"], flat, bank.k_proj, B, T, stats, f"k_{dp}")
+            v = _route_and_project_heads(bank._active_routers["v_routers"], flat, bank.v_proj, stats, f"v_{dp}")
+        else:
+            # Token-level (default)
+            q = _route_and_project_heads(bank._active_routers["q_routers"], flat, bank.q_proj, stats, f"q_{dp}")
+            k = _route_and_project_heads(bank._active_routers["k_routers"], flat, bank.k_proj, stats, f"k_{dp}")
+            v = _route_and_project_heads(bank._active_routers["v_routers"], flat, bank.v_proj, stats, f"v_{dp}")
 
         if ve is not None:
             v = lambdas[0] * v + lambdas[1] * ve.reshape(B * T, H, HD).to(v.dtype)
@@ -598,7 +845,11 @@ class RoutedAttentionFullyIndependent(nn.Module):
         y = y * gate.unsqueeze(-1)
 
         y_flat = y.reshape(B * T, H, HD)
-        out = _route_and_project_reduce(bank.o_routers, y_flat, bank.o_proj, stats, f"o_{dp}")
+        if level == "seq":
+            out = _seq_route_and_project_reduce(bank._active_routers["o_routers"], y_flat, bank.o_proj, B, T, stats, f"o_{dp}")
+        else:
+            # Token-level O for both "token" and "seq_qk"
+            out = _route_and_project_reduce(bank._active_routers["o_routers"], y_flat, bank.o_proj, stats, f"o_{dp}")
         return out.view(B, T, D)
 
 
@@ -632,7 +883,7 @@ class RoutedAttentionPrecomputeKV(nn.Module):
         head_eids, head_ews = [], []
         for h in range(H):
             eid, ew = _route_top1(
-                bank.routers[h],
+                bank._active_routers["routers"][h],
                 flat_selected,
                 stats,
                 f"qkvo_{dp}_h{h}",
@@ -825,7 +1076,7 @@ class RoutedAttentionPrecomputeKV(nn.Module):
 
         head_eids, head_ews = [], []
         for h in range(H):
-            eid, ew = _route_top1(bank.routers[h], flat, stats, f"qkvo_{dp}_h{h}")
+            eid, ew = _route_top1(bank._active_routers["routers"][h], flat, stats, f"qkvo_{dp}_h{h}")
             head_eids.append(eid)
             head_ews.append(ew)
 
@@ -884,40 +1135,80 @@ class RoutedAttentionPrecomputeKV(nn.Module):
 
 class BranchRoutedDepthStep(nn.Module):
     def __init__(self, attn_bank: AttentionExpertBank, mlp_bank: MLPExpertBank,
-                 num_heads: int, head_dim: int, max_seq_len: int, depth_idx: int, mode: str):
+                 num_heads: int, head_dim: int, max_seq_len: int, depth_idx: int, mode: str,
+                 attn_routing_level: str = "token", branch_mode: str = "router"):
         super().__init__()
         self.depth_idx = depth_idx
+        self.mode = mode
+        self.branch_mode = branch_mode
         if mode == "per_head_fully_independent":
-            self.attn = RoutedAttentionFullyIndependent(attn_bank, num_heads, head_dim, max_seq_len)
+            self.attn = RoutedAttentionFullyIndependent(attn_bank, num_heads, head_dim, max_seq_len,
+                                                         attn_routing_level=attn_routing_level)
         elif mode == "per_head_precompute_kv":
             self.attn = RoutedAttentionPrecomputeKV(attn_bank, num_heads, head_dim, max_seq_len)
         else:
             raise ValueError(f"Unknown mode: {mode}")
         self.mlp_bank = mlp_bank
 
+        # Per-depth routers (not shared across depths)
+        self.attn_routers = attn_bank.make_routers()
+        self.mlp_router = mlp_bank.make_router()
+
+    def _install_routers(self):
+        """Temporarily install this depth's routers onto the shared banks.
+
+        Stores routers in a plain dict (_active_routers) on the bank, not as
+        nn.Module attributes, to avoid polluting state_dict/torch.compile.
+        The attention forward methods read from bank._active_routers.
+        """
+        bank = self.attn.bank
+        bank._active_routers = dict(self.attn_routers)
+
+    def get_all_routers(self) -> list:
+        """Return all DeepSeek routers owned by this depth step."""
+        routers = [self.mlp_router]
+        for val in self.attn_routers.values():
+            if isinstance(val, nn.ModuleList):
+                routers.extend(val)
+        return routers
+
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor,
-                sa_lambdas: Tensor, branch_router: BranchRouter, stats: RoutingStats | None = None):
+                sa_lambdas: Tensor, branch_router: BranchRouter | None, stats: RoutingStats | None = None):
         B, T, D = x.shape
+        already_recorded = (stats is not None and
+                           len(stats.branch_records) > self.depth_idx)
+        effective_stats = None if already_recorded else stats
         x = lambdas[0] * x + lambdas[1] * x0
         x_norm = norm(x)
-        w_attn, w_mlp, _, _ = branch_router(x)
-        if stats is not None and branch_router.last_probs is not None:
-            stats.add_branch(branch_router.last_probs)
-        attn_out = self.attn(
-            x_norm,
-            ve,
-            sa_lambdas,
-            stats,
-            self.depth_idx,
-            token_mask=w_attn.bool(),
-        )
-        mlp_out = self.mlp_bank(
-            x_norm.reshape(-1, D),
-            stats,
-            self.depth_idx,
-            token_mask=w_mlp.bool(),
-        ).view(B, T, D)
-        x = x + w_attn * attn_out + w_mlp * mlp_out
+
+        if self.branch_mode == "alternating":
+            # Hardcoded: even depths = attention, odd depths = MLP
+            self._install_routers()
+            if self.depth_idx % 2 == 0:
+                # Attention depth
+                attn_out = self.attn(x_norm, ve, sa_lambdas, effective_stats, self.depth_idx)
+                x = x + attn_out
+            else:
+                # MLP depth
+                mlp_out = self.mlp_bank(
+                    self.mlp_router, x_norm.reshape(-1, D), effective_stats, self.depth_idx,
+                ).view(B, T, D)
+                x = x + mlp_out
+        else:
+            # Router-based branch selection
+            w_attn, w_mlp, _, _ = branch_router(x)
+            if effective_stats is not None and branch_router.last_probs is not None:
+                effective_stats.add_branch(branch_router.last_probs, branch_router.last_selected)
+            self._install_routers()
+            attn_out = self.attn(
+                x_norm, ve, sa_lambdas, effective_stats, self.depth_idx,
+                token_mask=w_attn.bool(),
+            )
+            mlp_out = self.mlp_bank(
+                self.mlp_router, x_norm.reshape(-1, D), effective_stats, self.depth_idx,
+                token_mask=w_mlp.bool(),
+            ).view(B, T, D)
+            x = x + w_attn * attn_out + w_mlp * mlp_out
         return x
 
 
@@ -932,24 +1223,50 @@ class SpeedrunMoEGPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int,
                  head_dim: int, max_seq_len: int, mode: str,
                  num_attn_experts: int = 66, num_mlp_experts: int = 12,
-                 exploration_rate: float = 0.02):
+                 exploration_rate: float = 0.02,
+                 branch_sampling: bool = False,
+                 branch_level: str = "token",       # "token" or "seq"
+                 branch_mode: str = "router",       # "router" or "alternating"
+                 branch_deepseek: bool = False,     # use DeepSeek-style sigmoid+bias for branch router
+                 attn_routing_level: str = "token",  # "token", "seq", or "seq_qk" (Q/K seq, V/O token)
+                 global_load_balancing: bool = False):
         super().__init__()
         self.num_blocks = num_layers
         self.num_depths = num_layers * 2
         self.model_dim = model_dim
         self.mode = mode
+        self.branch_level = branch_level
+        self.branch_mode = branch_mode
+        self.attn_routing_level = attn_routing_level
+        self.global_load_balancing = global_load_balancing
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.branch_router = BranchRouter(model_dim, exploration_rate=exploration_rate)
 
         self.attn_bank = AttentionExpertBank(num_attn_experts, model_dim, num_heads, head_dim, mode, exploration_rate)
         self.mlp_bank = MLPExpertBank(num_mlp_experts, model_dim, exploration_rate)
 
         self.blocks = nn.ModuleList([
-            BranchRoutedDepthStep(self.attn_bank, self.mlp_bank, num_heads, head_dim, max_seq_len, i, mode)
+            BranchRoutedDepthStep(self.attn_bank, self.mlp_bank, num_heads, head_dim, max_seq_len, i, mode,
+                                  attn_routing_level=attn_routing_level, branch_mode=branch_mode)
             for i in range(self.num_depths)
         ])
+        # Per-depth branch routers
+        self.branch_routers = nn.ModuleList([
+            BranchRouter(model_dim, exploration_rate=exploration_rate,
+                         use_sampling=branch_sampling, use_seq_level=(branch_level == "seq"),
+                         use_deepseek_style=branch_deepseek)
+            for _ in range(self.num_depths)
+        ])
+
+        # Global load balancing: per-projection-type bias buffers
+        if global_load_balancing:
+            self.register_buffer("_global_q_bias", torch.zeros(num_attn_experts))
+            self.register_buffer("_global_k_bias", torch.zeros(num_attn_experts))
+            self.register_buffer("_global_v_bias", torch.zeros(num_attn_experts))
+            self.register_buffer("_global_o_bias", torch.zeros(num_attn_experts))
+            self.register_buffer("_global_mlp_bias", torch.zeros(num_mlp_experts))
+            self._install_global_bias()
 
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
         self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8,
@@ -977,9 +1294,119 @@ class SpeedrunMoEGPT(nn.Module):
         self._routing_stats = {}
         self._routing_stats_obj = None
 
+    def _install_global_bias(self):
+        """Sync per-projection-type global bias to all routers."""
+        from src.models.router import DeepSeekRouter
+        bias_map = {
+            "q_routers": self._global_q_bias,
+            "k_routers": self._global_k_bias,
+            "v_routers": self._global_v_bias,
+            "o_routers": self._global_o_bias,
+            "routers": self._global_q_bias,  # precompute_kv bundled QKVO uses Q bias
+        }
+        for block in self.blocks:
+            for key, val in block.attn_routers.items():
+                bias = bias_map.get(key)
+                if bias is not None and isinstance(val, nn.ModuleList):
+                    for router in val:
+                        if isinstance(router, DeepSeekRouter):
+                            router.expert_bias.copy_(bias)
+            if isinstance(block.mlp_router, DeepSeekRouter):
+                block.mlp_router.expert_bias.copy_(self._global_mlp_bias)
+
+    def get_bias_rate(self, step: int, base_rate: float,
+                      warmup_start: float = 0.01, warmup_steps: int = 100) -> float:
+        """Linear decay from warmup_start to base_rate over warmup_steps, then constant."""
+        if step < warmup_steps:
+            frac = step / warmup_steps
+            return warmup_start + (base_rate - warmup_start) * frac
+        return base_rate
+
+    def update_global_bias(self, bias_rate: float, bias_rates: dict | None = None):
+        """Global load balancing: pool counts per projection type, update bias, broadcast."""
+        from src.models.router import DeepSeekRouter
+        # Accumulate counts per projection type
+        counts_map = {
+            "q_routers": torch.zeros_like(self._global_q_bias),
+            "k_routers": torch.zeros_like(self._global_k_bias),
+            "v_routers": torch.zeros_like(self._global_v_bias),
+            "o_routers": torch.zeros_like(self._global_o_bias),
+            "routers": torch.zeros_like(self._global_q_bias),  # precompute_kv bundled
+        }
+        mlp_counts = torch.zeros_like(self._global_mlp_bias)
+        for block in self.blocks:
+            for key, val in block.attn_routers.items():
+                if key in counts_map and isinstance(val, nn.ModuleList):
+                    for router in val:
+                        if isinstance(router, DeepSeekRouter):
+                            counts_map[key] += router.local_tokens_per_expert
+                            router.local_tokens_per_expert.zero_()
+            if isinstance(block.mlp_router, DeepSeekRouter):
+                mlp_counts += block.mlp_router.local_tokens_per_expert
+                block.mlp_router.local_tokens_per_expert.zero_()
+        # All-reduce counts across ranks so all ranks see global token distribution
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            for counts in counts_map.values():
+                dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+            dist.all_reduce(mlp_counts, op=dist.ReduceOp.SUM)
+
+        bias_map = {
+            "q_routers": self._global_q_bias,
+            "k_routers": self._global_k_bias,
+            "v_routers": self._global_v_bias,
+            "o_routers": self._global_o_bias,
+            "routers": self._global_q_bias,
+        }
+        # Per-projection bias rates (fall back to default)
+        rate_map = {
+            "q_routers": bias_rates.get("q", bias_rate) if bias_rates else bias_rate,
+            "k_routers": bias_rates.get("k", bias_rate) if bias_rates else bias_rate,
+            "v_routers": bias_rates.get("v", bias_rate) if bias_rates else bias_rate,
+            "o_routers": bias_rates.get("o", bias_rate) if bias_rates else bias_rate,
+            "routers": bias_rates.get("q", bias_rate) if bias_rates else bias_rate,
+        }
+        mlp_rate = bias_rates.get("mlp", bias_rate) if bias_rates else bias_rate
+        branch_rate = bias_rates.get("branch", bias_rate) if bias_rates else bias_rate
+        with torch.no_grad():
+            for key, counts in counts_map.items():
+                bias = bias_map.get(key)
+                r = rate_map.get(key, bias_rate)
+                if bias is not None and counts.sum() > 0:
+                    total = counts.sum()
+                    loads = counts / total
+                    expected = 1.0 / counts.shape[0]
+                    s = torch.sign(loads - expected)
+                    bias -= (s - s.mean()) * r
+                    bias.clamp_(-16.0, 16.0)
+            if mlp_counts.sum() > 0:
+                total = mlp_counts.sum()
+                loads = mlp_counts / total
+                expected = 1.0 / mlp_counts.shape[0]
+                s = torch.sign(loads - expected)
+                self._global_mlp_bias -= (s - s.mean()) * mlp_rate
+                self._global_mlp_bias.clamp_(-16.0, 16.0)
+            # Update branch router biases (per-depth, all-reduce then update)
+            for br in self.branch_routers:
+                if hasattr(br, 'branch_bias') and hasattr(br, 'local_counts'):
+                    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                        dist.all_reduce(br.local_counts, op=dist.ReduceOp.SUM)
+                    if br.local_counts.sum() > 0:
+                        total = br.local_counts.sum()
+                        loads = br.local_counts / total
+                        expected = 1.0 / br.local_counts.shape[0]
+                        s = torch.sign(loads - expected)
+                        br.branch_bias -= (s - s.mean()) * branch_rate
+                        br.branch_bias.clamp_(-16.0, 16.0)
+                    br.local_counts.zero_()
+            # Broadcast updated global bias to all routers
+            self._install_global_bias()
+
     def get_all_routers(self) -> list[DeepSeekRouter]:
-        """Return all DeepSeek routers for bias updates."""
-        return self.attn_bank.get_all_routers() + self.mlp_bank.get_all_routers()
+        """Return all DeepSeek routers for bias updates (per-depth)."""
+        routers = []
+        for block in self.blocks:
+            routers.extend(block.get_all_routers())
+        return routers
 
     def forward(self, input_ids: Tensor, labels: Tensor):
         B, T = input_ids.shape
@@ -1000,7 +1427,8 @@ class SpeedrunMoEGPT(nn.Module):
         for i in range(self.num_depths):
             if i >= n:
                 x = x + skip_weights[i - n] * skip_connections.pop()
-            x = self.blocks[i](x, ve[i], x0, lambdas[i], sa_lambdas[i], self.branch_router, stats)
+            br = self.branch_routers[i] if self.branch_mode == "router" else None
+            x = self.blocks[i](x, ve[i], x0, lambdas[i], sa_lambdas[i], br, stats)
             if i < n:
                 skip_connections.append(x)
 
