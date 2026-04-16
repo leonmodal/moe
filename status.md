@@ -28,7 +28,8 @@ DeepSeek routing is a pluggable config option: `router_type: deepseek`.
 
 - **Format**: Sharded parquet only (token-bin removed)
 - **Dataset**: `src/data/parquet_dataset.py` (StatefulParquetDataset)
-- **Tokenizer**: Configurable (default: Qwen/Qwen3-0.6B)
+- **Tokenizer**: Configurable via `data.tokenizer_name` — the `DataConfig` dataclass default is `gpt2`; most shipped training configs (`configs/standard_moe.yaml`, `configs/global_moe.yaml`, …) set it to `Qwen/Qwen3-0.6B`.
+- **Prefetch**: Dataset-level file read-ahead controlled by `data.prefetch_files` (default `1`). DataLoader `num_workers` is forced to `0` for stateful parquet datasets so checkpoint state stays authoritative — see `docs/data.md`.
 
 ### Checkpoints
 

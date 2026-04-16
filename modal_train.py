@@ -148,6 +148,50 @@ def resolve_output_dir(cfg: dict, checkpoint_root: str = CHECKPOINT_ROOT) -> str
     return f"{checkpoint_root}/{experiment_name}"
 
 
+def build_torchrun_invocation(
+    config_path: str,
+    *,
+    node_rank: int,
+    master_addr: str,
+    nnodes: int,
+    nproc_per_node: int,
+    max_checkpoints: int,
+    master_port: int = 1234,
+    data_dir: str = REMOTE_DATA_DIR,
+    checkpoint_root: str = CHECKPOINT_ROOT,
+    training_script: str = TRAINING_SCRIPT,
+    auto_resume: bool = True,
+) -> dict:
+    """Assemble the full kwargs passed to `torchrun_util.torchrun.run(...)`.
+
+    Reads the YAML config at `config_path` to derive `output_dir`, then
+    wires together the training script, script args, and cluster coordinates.
+    Pure function: same inputs → same kwargs. `modal_train.train()` calls
+    this internally so tests can exercise the Modal launcher's full command
+    assembly without needing to import Modal decorators.
+    """
+    import yaml
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    output_dir = resolve_output_dir(cfg, checkpoint_root)
+    script_args = build_train_script_args(
+        config_path,
+        data_dir=data_dir,
+        output_dir=output_dir,
+        max_checkpoints=max_checkpoints,
+        auto_resume=auto_resume,
+    )
+    return {
+        "node_rank": node_rank,
+        "master_addr": master_addr,
+        "master_port": master_port,
+        "nnodes": str(nnodes),
+        "nproc_per_node": str(nproc_per_node),
+        "training_script": training_script,
+        "training_script_args": script_args,
+    }
+
+
 # --------------------------------------------------------------------------- #
 #  Training function                                                           #
 # --------------------------------------------------------------------------- #
@@ -183,21 +227,15 @@ def train(config: str = CONFIG_FILE):
     print(f"  Master     : {cluster_info.container_ips[0]}")
     print(f"  GPUs       : {N_NODES} x {GPUS_PER_NODE} = {N_NODES * GPUS_PER_NODE}")
 
-    script_args = build_train_script_args(
+    invocation = build_torchrun_invocation(
         remote_config_path,
-        output_dir=output_dir,
-        max_checkpoints=MAX_CHECKPOINTS,
-    )
-
-    torchrun.run(
         node_rank=cluster_info.rank,
         master_addr=cluster_info.container_ips[0],
-        master_port=1234,
-        nnodes=str(N_NODES),
-        nproc_per_node=str(GPUS_PER_NODE),
-        training_script=TRAINING_SCRIPT,
-        training_script_args=script_args,
+        nnodes=N_NODES,
+        nproc_per_node=GPUS_PER_NODE,
+        max_checkpoints=MAX_CHECKPOINTS,
     )
+    torchrun.run(**invocation)
 
 
 # --------------------------------------------------------------------------- #

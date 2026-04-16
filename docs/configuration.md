@@ -81,6 +81,11 @@ Used when `router_type: deepseek`:
 | `output_dir` | string | required | Output directory for checkpoints |
 | `wandb_project` | string | null | WandB project name |
 | `bias_update_rate` | float | 0.0 | Expert bias update rate (0 = disabled) |
+| `bias_warmup_start` | float | 0.0 | Initial bias rate at step 0 (linear ramp to `bias_update_rate`) |
+| `bias_warmup_steps` | int | 0 | Steps to ramp `bias_warmup_start` → `bias_update_rate`; 0 = no warmup |
+| `router_exploration_warmup_start` | float | 0.0 | Initial router-exploration rate at step 0; see `docs/training.md` §Router-Exploration Warmup |
+| `router_exploration_warmup_steps` | int | 0 | Steps to ramp to the model's `router_exploration_rate`; 0 = feature disabled |
+| `momentum_warmup_steps` | int | 300 | Muon optimizer momentum warmup horizon |
 | `torch_compile` | bool | false | Enable torch.compile |
 | `disable_liger` | bool | false | Disable liger kernels |
 

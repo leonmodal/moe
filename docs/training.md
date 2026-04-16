@@ -58,10 +58,18 @@ For DeepSeek-style routing (`router_type: deepseek`), expert biases are updated 
 3. Zero-sum update: `bias -= (s - s.mean()) * rate`
 4. Clamp to ±16
 
+Configuration (see `TrainingConfig` in `src/training/config.py`):
+- `bias_update_rate`: Base rate, default `0.0` (disabled). The bias update pass is skipped entirely when this is `0`; set it to `1e-3` (DeepSeek V3 reference) on MoE configs to enable.
+- `bias_warmup_start`: Initial rate for linear warmup, default `0.0`.
+- `bias_warmup_steps`: Steps to ramp from `warmup_start` to `bias_update_rate`, default `0` (no warmup).
+
+## Router-Exploration Warmup
+
+Linearly schedule the effective `router_exploration_rate` from a lower start value to the model-configured target over the first N steps, then hold at the target. Useful for stabilizing DeepSeek routers during the first few hundred steps before the router has learned; see `docs/research/external_moe_techniques.md` §"Implemented here with benchmark evidence".
+
 Configuration:
-- `bias_update_rate`: Base rate (default 0.001)
-- `bias_warmup_start`: Initial rate for linear warmup
-- `bias_warmup_steps`: Steps to ramp from warmup_start to base rate
+- `router_exploration_warmup_start`: Rate at step 0, default `0.0`.
+- `router_exploration_warmup_steps`: Steps to ramp from `warmup_start` to the model's `router_exploration_rate`, default `0` (feature disabled; rate stays at the model target every step).
 
 ## Loss Computation
 

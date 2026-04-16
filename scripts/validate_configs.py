@@ -38,8 +38,12 @@ DEPRECATED_MODEL_TYPES = {
 }
 
 VALID_ROUTER_TYPES = {"softmax", "deepseek"}
+# Must match src/models/moe_everything/attention_bank.py runtime enum. The old
+# "bundled" mode (1 router per projection, top-K) has been replaced by the
+# H-routers-per-projection-top-1 designs (see docs/routing.md) and is rejected
+# at runtime with ValueError; the validator must agree.
 VALID_ATTN_EXPERT_MODES = {
-    "bundled", "per_head_fully_independent", "per_head_precompute_kv",
+    "per_head_fully_independent", "per_head_precompute_kv",
 }
 VALID_LR_SCHEDULERS = {"cosine", "linear", "constant", "stable_decay"}
 VALID_OPTIMIZERS = {"adamw", "muon"}

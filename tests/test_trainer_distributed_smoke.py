@@ -8,6 +8,9 @@ parquet fixture, completes at least one optimizer step, and asserts that the
 resulting checkpoint directory contains the separate state files required by
 AC-12 (`model.pt`, `optimizer_adam.pt`, `training_state.pt`, `data_state.pt`,
 `meta.json`).
+
+Parametrized across model families so AC-9's "all supported models" wording is
+exercised end-to-end, not just inferred from an in-process smoke.
 """
 from __future__ import annotations
 
@@ -37,9 +40,43 @@ def _write_parquet_shards(data_dir: Path, num_files: int = 2, rows_per_file: int
         pd.DataFrame({"text": rows}).to_parquet(data_dir / f"shard_{f:04d}.parquet")
 
 
-def _write_tiny_dense_config(path: Path, *, output_dir: Path, data_dir: Path) -> None:
-    path.write_text(textwrap.dedent(f"""\
-        experiment_name: dist_smoke
+_COMMON_TRAINING_YAML = textwrap.dedent("""\
+    training:
+      learning_rate: 1.0e-3
+      weight_decay: 0.0
+      max_grad_norm: 1.0
+      lr_scheduler: constant
+      warmup_steps: 0
+      max_steps: 2
+      min_lr_ratio: 1.0
+      batch_size: 1
+      gradient_accumulation: 1
+      mixed_precision: bf16
+      log_every: 1
+      save_every: 1
+      output_dir: {output_dir}
+      wandb_project: null
+      optimizer: adamw
+      max_checkpoints: 0
+      disable_liger: true
+    data:
+      data_dir: {data_dir}
+      text_column: text
+      seq_len: 32
+      tokenizer_name: gpt2
+      num_workers: 0
+      prefetch_files: 0
+    eval:
+      enabled: false
+    checkpoint:
+      resume_from: null
+""")
+
+
+_MODEL_YAMLS: dict[str, str] = {
+    # Dense baseline — no routing; proves the trainer path itself.
+    "dense": textwrap.dedent("""\
+        experiment_name: dist_smoke_dense
         model:
           type: dense
           vocab_size: 50304
@@ -55,36 +92,45 @@ def _write_tiny_dense_config(path: Path, *, output_dir: Path, data_dir: Path) ->
           tie_word_embeddings: true
           attention_bias: false
           attention_dropout: 0.0
-        training:
-          learning_rate: 1.0e-3
-          weight_decay: 0.0
-          max_grad_norm: 1.0
-          lr_scheduler: constant
-          warmup_steps: 0
-          max_steps: 2
-          min_lr_ratio: 1.0
-          batch_size: 1
-          gradient_accumulation: 1
-          mixed_precision: bf16
-          log_every: 1
-          save_every: 1
-          output_dir: {output_dir}
-          wandb_project: null
-          optimizer: adamw
-          max_checkpoints: 0
-          disable_liger: true
-        data:
-          data_dir: {data_dir}
-          text_column: text
-          seq_len: 32
-          tokenizer_name: gpt2
-          num_workers: 0
-          prefetch_files: 0
-        eval:
-          enabled: false
-        checkpoint:
-          resume_from: null
-    """))
+    """),
+    # Routed model — standard_moe with DeepSeek routing. Covers the routing
+    # path (expert dispatch, aux loss, bias buffers) under the real distributed
+    # trainer, which the dense smoke alone cannot prove.
+    "standard_moe_deepseek": textwrap.dedent("""\
+        experiment_name: dist_smoke_standard_moe
+        model:
+          type: standard_moe
+          router_type: deepseek
+          vocab_size: 50304
+          hidden_size: 64
+          num_hidden_layers: 2
+          head_dim: 16
+          num_attention_heads: 4
+          num_key_value_heads: 2
+          num_experts: 4
+          num_experts_per_tok: 2
+          moe_intermediate_size: 32
+          intermediate_size: 128
+          max_position_embeddings: 128
+          norm_topk_prob: true
+          router_aux_loss_coef: 0.001
+          topk_scaling_factor: 2.5
+          num_groups: 2
+          group_topk: 1
+          rms_norm_eps: 1.0e-6
+          rope_theta: 1000000.0
+          tie_word_embeddings: true
+          attention_bias: false
+          attention_dropout: 0.0
+          output_router_logits: true
+    """),
+}
+
+
+def _write_config(path: Path, *, model_variant: str, output_dir: Path, data_dir: Path) -> None:
+    model_block = _MODEL_YAMLS[model_variant]
+    training_block = _COMMON_TRAINING_YAML.format(output_dir=output_dir, data_dir=data_dir)
+    path.write_text(model_block + training_block)
 
 
 def _required_checkpoint_files(ckpt_dir: Path) -> list[Path]:
@@ -102,19 +148,25 @@ def _find_checkpoint(output_dir: Path) -> Path | None:
     return candidates[-1] if candidates else None
 
 
-def _run_trainer_subprocess(tmp_path: Path, dist_strategy: str, timeout: int = 600) -> tuple[subprocess.CompletedProcess, Path]:
+def _run_trainer_subprocess(
+    tmp_path: Path,
+    *,
+    model_variant: str,
+    dist_strategy: str,
+    timeout: int = 600,
+) -> tuple[subprocess.CompletedProcess, Path]:
     data_dir = tmp_path / "data"
     _write_parquet_shards(data_dir, num_files=2, rows_per_file=64)
     output_dir = tmp_path / "out"
     output_dir.mkdir()
     config_path = tmp_path / "config.yaml"
-    _write_tiny_dense_config(config_path, output_dir=output_dir, data_dir=data_dir)
+    _write_config(config_path, model_variant=model_variant,
+                  output_dir=output_dir, data_dir=data_dir)
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONPATH"] = f"{_REPO_ROOT}" + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     env["WANDB_DISABLED"] = "true"
-    # Quiet NCCL chatter so failures are visible.
     env.setdefault("NCCL_DEBUG", "WARN")
     env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
 
@@ -133,44 +185,45 @@ def _run_trainer_subprocess(tmp_path: Path, dist_strategy: str, timeout: int = 6
     elapsed = time.perf_counter() - t0
     if result.returncode != 0:
         pytest.fail(
-            f"torchrun {dist_strategy} exited with code {result.returncode} after {elapsed:.1f}s\n"
+            f"torchrun {dist_strategy} ({model_variant}) exited with code "
+            f"{result.returncode} after {elapsed:.1f}s\n"
             f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
         )
     return result, output_dir
 
 
+_SMOKE_MATRIX = [
+    ("dense", "ddp"),
+    ("dense", "fsdp"),
+    ("standard_moe_deepseek", "ddp"),
+    ("standard_moe_deepseek", "fsdp"),
+]
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 2,
     reason="requires at least 2 CUDA devices",
 )
-def test_unified_trainer_ddp_subprocess_smoke(tmp_path):
-    """`torchrun --nproc_per_node=2 scripts/train.py --dist-strategy ddp` runs to
-    completion, executes ≥1 optimizer step, and writes a checkpoint directory
-    with the full set of separate state files.
+@pytest.mark.parametrize("model_variant,dist_strategy", _SMOKE_MATRIX)
+def test_unified_trainer_subprocess_smoke(tmp_path, model_variant, dist_strategy):
+    """Launch `scripts/train.py` under `torchrun --nproc_per_node=2` for the
+    parametrized (model, strategy) pair. Each combination executes at least
+    one optimizer step and writes a full AC-12 checkpoint directory.
     """
-    result, output_dir = _run_trainer_subprocess(tmp_path, dist_strategy="ddp")
+    result, output_dir = _run_trainer_subprocess(
+        tmp_path, model_variant=model_variant, dist_strategy=dist_strategy,
+    )
     assert "step=" in result.stdout or "step=" in result.stderr, (
-        f"Expected at least one logged optimizer step in stdout/stderr; got:\n"
+        f"Expected at least one logged optimizer step for {model_variant} "
+        f"under {dist_strategy}; got:\n"
         f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
     )
     ckpt = _find_checkpoint(output_dir)
-    assert ckpt is not None, f"No checkpoint-* directory under {output_dir}"
-    for req in _required_checkpoint_files(ckpt):
-        assert req.exists(), f"Expected {req} after DDP smoke; not found"
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
-    reason="requires at least 2 CUDA devices",
-)
-def test_unified_trainer_fsdp_subprocess_smoke(tmp_path):
-    """Same shape as the DDP smoke but with `--dist-strategy fsdp`."""
-    result, output_dir = _run_trainer_subprocess(tmp_path, dist_strategy="fsdp")
-    assert "step=" in result.stdout or "step=" in result.stderr, (
-        f"Expected at least one logged optimizer step in stdout/stderr; got:\n"
-        f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+    assert ckpt is not None, (
+        f"No checkpoint-* directory under {output_dir} for "
+        f"{model_variant}/{dist_strategy}"
     )
-    ckpt = _find_checkpoint(output_dir)
-    assert ckpt is not None, f"No checkpoint-* directory under {output_dir}"
     for req in _required_checkpoint_files(ckpt):
-        assert req.exists(), f"Expected {req} after FSDP smoke; not found"
+        assert req.exists(), (
+            f"Expected {req} after {model_variant}/{dist_strategy} smoke; not found"
+        )
