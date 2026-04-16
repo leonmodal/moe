@@ -31,6 +31,12 @@ class MoEverythingConfig(Qwen3MoeConfig):
         scale_branch_by_routing_weight: bool = True,
         router_exploration_rate: float = 0.0,
         branch_router_exploration_rate: float | None = None,
+        # BranchRouter mode options (from speedrun extraction)
+        branch_sampling: bool = False,
+        branch_level: str = "token",  # "token" or "seq"
+        branch_deepseek: bool = False,
+        # Attention routing level (token vs seq)
+        attn_routing_level: str = "token",  # "token" or "seq"
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -61,3 +67,7 @@ class MoEverythingConfig(Qwen3MoeConfig):
             if branch_router_exploration_rate is None
             else branch_router_exploration_rate
         )
+        self.branch_sampling = branch_sampling
+        self.branch_level = branch_level
+        self.branch_deepseek = branch_deepseek
+        self.attn_routing_level = attn_routing_level

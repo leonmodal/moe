@@ -25,7 +25,35 @@ from src.models.router import (
     is_checkpoint_recompute,
 )
 from src.models.routing.routers import _straight_through_ones
+from src.models.routing.helpers import should_use_sparse_query_path
 from .config import MoEverythingConfig
+
+
+def _make_top1_router(input_dim: int, num_experts: int, config) -> "DeepSeekRouter | ExplorationTopKRouter":
+    """Create a top-1 router for per-head-slot expert selection.
+
+    This is the correct per-head design: each head slot has its own
+    dedicated router doing top-1 from the expert pool.
+    """
+    from types import SimpleNamespace
+    base_cfg = SimpleNamespace(
+        hidden_size=input_dim,
+        num_local_experts=num_experts,
+        num_experts=num_experts,
+        num_experts_per_tok=1,  # top-1: each head picks exactly one expert
+        norm_topk_prob=getattr(config, "norm_topk_prob", True),
+        router_exploration_rate=getattr(config, "router_exploration_rate", 0.0),
+    )
+    if getattr(config, "use_deepseek_routing", False):
+        base_cfg.topk_scaling_factor = getattr(config, "topk_scaling_factor", None)
+        base_cfg.num_groups = None  # no group-limited for per-head top-1
+        base_cfg.group_topk = None
+        router = DeepSeekRouter(base_cfg)
+    else:
+        router = ExplorationTopKRouter(base_cfg)
+    import math
+    nn.init.kaiming_uniform_(router.weight, a=math.sqrt(5))
+    return router
 
 DEFAULT_PER_HEAD_DENSE_FRACTION_THRESHOLD = 0.75
 AUTO_PER_HEAD_SPARSE_THRESHOLDS = {
@@ -227,7 +255,11 @@ class AttentionExpertBank(nn.Module):
         return ExplorationTopKRouter(base_cfg)
 
     def _route_flat(self, router, x, top_k):
-        """Route with explicit top_k for flat bank."""
+        """Route with explicit top_k for flat bank.
+
+        DEPRECATED: Only kept for sanity_check_mode paths.
+        The main per-head paths now use _route_per_head().
+        """
         if isinstance(router, (DeepSeekRouter, ExplorationTopKRouter)):
             router_probs, weights, idx = router(x)
             return idx, weights, router_probs
@@ -238,6 +270,31 @@ class AttentionExpertBank(nn.Module):
             top_vals, top_idx = torch.topk(probs, top_k, dim=-1)
             top_vals = top_vals / (top_vals.sum(dim=-1, keepdim=True) + 1e-20)
         return top_idx, top_vals.to(x.dtype), probs
+
+    def _route_per_head(self, routers, x, depth_idx=None):
+        """Per-head top-1 routing: H routers each pick 1 expert.
+
+        Returns (idx, weights, probs_list) where:
+        - idx: (N, H) expert indices (one per head)
+        - weights: (N, H) routing weights
+        - probs_list: list of H (N, E) prob tensors for aux loss
+        """
+        if isinstance(routers, nn.ModuleList) and len(routers) > 0 and isinstance(routers[0], nn.ModuleList):
+            # Per-depth routers: select the depth-specific set
+            routers = routers[depth_idx] if depth_idx is not None else routers[0]
+
+        H = len(routers)
+        all_idx = []
+        all_weights = []
+        all_probs = []
+        for h in range(H):
+            probs_h, weights_h, idx_h = routers[h](x)  # top-1: weights (N,1), idx (N,1)
+            all_idx.append(idx_h.squeeze(-1))      # (N,)
+            all_weights.append(weights_h.squeeze(-1))  # (N,)
+            all_probs.append(probs_h)              # (N, E)
+        idx = torch.stack(all_idx, dim=1)          # (N, H)
+        weights = torch.stack(all_weights, dim=1)  # (N, H)
+        return idx, weights, all_probs
 
     def _project_flat_head(self, flat, weight_bank, expert_idx, expert_weights, norm_weights=None):
         """Project one head position from flat bank (1D expert routing)."""
@@ -463,11 +520,17 @@ class AttentionExpertBank(nn.Module):
         return pair_out.view(N, num_slots, H_out)
 
     def _init_per_head_fully_independent(self):
-        """Flat-bank Q/K/V/O with GQA: Q bundled per KV group, K/V/O per head.
+        """Per-head top-1 routing: H separate routers per projection, each doing top-1.
 
-        Q router picks top-num_kv_heads from E (each expert produces q_group_dim),
-        K/V pick top-num_kv_heads from E,
-        O router picks top-num_heads from E (each expert takes head_dim).
+        Design (from speedrun extraction):
+        - num_kv_heads Q-routers (each picks 1 expert producing q_group_dim)
+        - num_kv_heads K-routers (each picks 1 expert producing head_dim)
+        - num_kv_heads V-routers (each picks 1 expert producing head_dim)
+        - num_heads O-routers (each picks 1 expert producing hidden_size from head_dim)
+        Total: 3*num_kv_heads + num_heads routers, each doing top-1.
+
+        This is NOT one router picking top-K — it is K separate routers each picking top-1.
+        Each head slot independently learns to specialize on different experts.
         """
         if self.routed_norm:
             self.attn_pre_norm = NormExpertBank(self.num_depths, self.hidden_size, eps=self.eps)
@@ -478,23 +541,39 @@ class AttentionExpertBank(nn.Module):
             self.k_pre_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
             self.v_pre_norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         E = self.num_experts
-        # Q routes per KV-group, K/V route per KV-head — same pool size.
-        # O routes per head from a larger pool (E_o = E * heads_per_group)
-        # so that O total params match the standard per-layer O projection.
         E_kv = E
         E_o = E * self.q_heads_per_kv
         self.num_kv_experts = E_kv
         self.num_o_experts = E_o
+
+        # H separate top-1 routers per projection (the speedrun design)
+        H_kv = self.num_kv_heads
+        H = self.num_heads
         if self.per_layer_attn_router:
-            self.q_routers = nn.ModuleList([self._make_flat_bank_router(self.hidden_size, self.num_kv_heads) for _ in range(self.num_depths)])
-            self.k_routers = nn.ModuleList([self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv) for _ in range(self.num_depths)])
-            self.v_routers = nn.ModuleList([self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv) for _ in range(self.num_depths)])
-            self.o_routers = nn.ModuleList([self._make_flat_bank_router(self.q_dim, self.num_heads, num_experts=E_o) for _ in range(self.num_depths)])
+            # Per-depth routers: num_depths sets, each with H routers per projection
+            self.q_routers = nn.ModuleList([
+                nn.ModuleList([_make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
+                for _ in range(self.num_depths)
+            ])
+            self.k_routers = nn.ModuleList([
+                nn.ModuleList([_make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
+                for _ in range(self.num_depths)
+            ])
+            self.v_routers = nn.ModuleList([
+                nn.ModuleList([_make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
+                for _ in range(self.num_depths)
+            ])
+            self.o_routers = nn.ModuleList([
+                nn.ModuleList([_make_top1_router(self.q_dim, E_o, self.config) for _ in range(H)])
+                for _ in range(self.num_depths)
+            ])
         else:
-            self.q_router = self._make_flat_bank_router(self.hidden_size, self.num_kv_heads)
-            self.k_router = self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv)
-            self.v_router = self._make_flat_bank_router(self.hidden_size, self.num_kv_heads, num_experts=E_kv)
-            self.o_router = self._make_flat_bank_router(self.q_dim, self.num_heads, num_experts=E_o)
+            # Shared routers across depths: H routers per projection
+            self.q_routers = nn.ModuleList([_make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
+            self.k_routers = nn.ModuleList([_make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
+            self.v_routers = nn.ModuleList([_make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
+            self.o_routers = nn.ModuleList([_make_top1_router(self.q_dim, E_o, self.config) for _ in range(H)])
+
         self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_group_dim))
         self.k_proj = nn.Parameter(torch.empty(E_kv, self.hidden_size, self.head_dim))
         self.v_proj = nn.Parameter(torch.empty(E_kv, self.hidden_size, self.head_dim))
@@ -508,11 +587,10 @@ class AttentionExpertBank(nn.Module):
         self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
 
     def _init_per_head_precompute_kv(self):
-        """Flat-bank precompute KV with GQA-group routing.
+        """Per-head top-1 routing for precompute-KV mode.
 
-        A single router picks top-num_kv_heads experts from E. Each selected
-        expert provides one KV head plus the grouped-query slice that attends
-        against it.
+        H separate routers (one per KV head), each doing top-1 from the expert
+        pool. One routing decision picks Q+K+V+O together (bundled per expert).
         """
         if self.routed_norm:
             self.norm = NormExpertBank(self.num_depths, self.hidden_size, eps=self.eps)
@@ -521,12 +599,14 @@ class AttentionExpertBank(nn.Module):
         else:
             self.norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         E = self.num_experts
+        H_kv = self.num_kv_heads
         if self.per_layer_attn_router:
-            self.routers = nn.ModuleList(
-                [self._make_flat_bank_router(self.hidden_size, self.num_kv_heads) for _ in range(self.num_depths)]
-            )
+            self.routers = nn.ModuleList([
+                nn.ModuleList([_make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
+                for _ in range(self.num_depths)
+            ])
         else:
-            self.router = self._make_flat_bank_router(self.hidden_size, self.num_kv_heads)
+            self.routers = nn.ModuleList([_make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
         if self.sanity_check_mode == "alternating_global_moe":
             num_logical_layers = max(1, self.num_depths // 2)
             self.logical_q_proj = nn.ParameterList(
@@ -661,10 +741,17 @@ class AttentionExpertBank(nn.Module):
     def _store_router_info(
         self,
         name: str,
-        router_probs: torch.Tensor,
+        router_probs,
         expert_idx: torch.Tensor,
         token_mask: torch.Tensor | None = None,
     ) -> None:
+        # Handle per-head probs list: concatenate into (N*H, E) for aux loss compatibility
+        if isinstance(router_probs, list):
+            router_probs = torch.cat(router_probs, dim=0)  # (N*H, E)
+            # Also reshape idx to match: (N, H) -> (N*H, 1)
+            if expert_idx.ndim == 2:
+                expert_idx = expert_idx.reshape(-1, 1)
+
         if token_mask is not None:
             flat_mask = token_mask.reshape(-1).bool().to(router_probs.device)
             dense_probs = router_probs.new_zeros(flat_mask.numel(), router_probs.shape[-1])
@@ -731,9 +818,9 @@ class AttentionExpertBank(nn.Module):
             k_router = self._select_router("k_router", depth_idx)
             v_router = self._select_router("v_router", depth_idx)
 
-            q_idx, q_w, q_probs = self._route_flat(q_router, q_flat, self.num_kv_heads)
-            k_idx, k_w, k_probs = self._route_flat(k_router, k_flat, self.num_kv_heads)
-            v_idx, v_w, v_probs = self._route_flat(v_router, v_flat, self.num_kv_heads)
+            q_idx, q_w, q_probs = self._route_per_head(self.q_routers, q_flat, depth_idx)
+            k_idx, k_w, k_probs = self._route_per_head(self.k_routers, k_flat, depth_idx)
+            v_idx, v_w, v_probs = self._route_per_head(self.v_routers, v_flat, depth_idx)
             self._store_router_info("q", q_probs, q_idx)
             self._store_router_info("k", k_probs, k_idx)
             self._store_router_info("v", v_probs, v_idx)
@@ -783,7 +870,7 @@ class AttentionExpertBank(nn.Module):
         attn_heads = attn_output.transpose(1, 2).reshape(N, self.num_heads, self.head_dim)
         attn_flat = attn_heads.reshape(N, self.q_dim)
         o_router = self._select_router("o_router", depth_idx)
-        o_idx, o_w, o_probs = self._route_flat(o_router, attn_flat, self.num_heads)
+        o_idx, o_w, o_probs = self._route_per_head(self.o_routers, attn_flat, depth_idx)
         self._store_router_info("o", o_probs, o_idx)
         po_w = o_w if self.scale_attn_by_routing_weight else _straight_through_ones(o_w)
         o_out = self._project_pair_inputs_grouped(
@@ -869,9 +956,9 @@ class AttentionExpertBank(nn.Module):
             v_flat = self.v_pre_norm(hidden_selected)
 
         q_router, k_router, v_router, o_router = self._select_attn_routers(depth_idx)
-        q_idx, q_w, q_probs = self._route_flat(q_router, q_flat, self.num_kv_heads)
-        k_idx, k_w, k_probs = self._route_flat(k_router, k_flat, self.num_kv_heads)
-        v_idx, v_w, v_probs = self._route_flat(v_router, v_flat, self.num_kv_heads)
+        q_idx, q_w, q_probs = self._route_per_head(self.q_routers, q_flat, depth_idx)
+        k_idx, k_w, k_probs = self._route_per_head(self.k_routers, k_flat, depth_idx)
+        v_idx, v_w, v_probs = self._route_per_head(self.v_routers, v_flat, depth_idx)
         self._store_router_info("q", q_probs, q_idx, token_mask=flat_mask)
         self._store_router_info("k", k_probs, k_idx, token_mask=flat_mask)
         self._store_router_info("v", v_probs, v_idx, token_mask=flat_mask)
@@ -925,7 +1012,7 @@ class AttentionExpertBank(nn.Module):
 
         attn_selected = attn_heads.transpose(1, 2).reshape(B * T, self.num_heads, self.head_dim)[flat_mask]
         attn_flat = attn_selected.reshape(attn_selected.shape[0], self.q_dim)
-        o_idx, o_w, o_probs = self._route_flat(o_router, attn_flat, self.num_heads)
+        o_idx, o_w, o_probs = self._route_per_head(self.o_routers, attn_flat, depth_idx)
         self._store_router_info("o", o_probs, o_idx, token_mask=flat_mask)
         po_w = o_w if self.scale_attn_by_routing_weight else _straight_through_ones(o_w)
 
@@ -959,8 +1046,7 @@ class AttentionExpertBank(nn.Module):
             N, self.num_kv_heads, depth_idx, hidden_states.device, dtype=flat.dtype
         )
         if routed is None:
-            router = self._select_router("router", depth_idx)
-            idx, w, probs = self._route_flat(router, flat, self.num_kv_heads)
+            idx, w, probs = self._route_per_head(self.routers, flat, depth_idx)
             self._store_router_info("attn", probs, idx)
         else:
             idx, w, probs = routed

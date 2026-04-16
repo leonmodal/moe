@@ -215,6 +215,10 @@ def build_model(cfg: dict):
             scale_branch_by_routing_weight=mcfg.get("scale_branch_by_routing_weight", True),
             router_exploration_rate=mcfg.get("router_exploration_rate", 0.0),
             branch_router_exploration_rate=mcfg.get("branch_router_exploration_rate"),
+            branch_sampling=mcfg.get("branch_sampling", False),
+            branch_level=mcfg.get("branch_level", "token"),
+            branch_deepseek=mcfg.get("branch_deepseek", False),
+            attn_routing_level=mcfg.get("attn_routing_level", "token"),
             **common,
         )
         model = MoEverythingForCausalLM(config)

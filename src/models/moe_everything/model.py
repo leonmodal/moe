@@ -66,6 +66,9 @@ class MoEverythingModel(nn.Module):
             getattr(config, "router_exploration_rate", 0.0),
         )
         scale_branch = getattr(config, "scale_branch_by_routing_weight", True)
+        use_sampling = getattr(config, "branch_sampling", False)
+        use_seq_level = getattr(config, "branch_level", "token") == "seq"
+        use_deepseek_style = getattr(config, "branch_deepseek", False)
         if self.sanity_check_mode == "alternating_global_moe":
             if self.per_layer_router:
                 self.branch_routers = nn.ModuleList([BranchRouterRecorder() for _ in range(self.num_depths)])
@@ -74,12 +77,16 @@ class MoEverythingModel(nn.Module):
         elif self.per_layer_router:
             self.branch_routers = nn.ModuleList([
                 BranchRouter(config.hidden_size, exploration_rate=branch_exploration_rate,
-                             scale_by_routing_weight=scale_branch)
+                             scale_by_routing_weight=scale_branch,
+                             use_sampling=use_sampling, use_seq_level=use_seq_level,
+                             use_deepseek_style=use_deepseek_style)
                 for _ in range(self.num_depths)
             ])
         else:
             self.branch_router = BranchRouter(config.hidden_size, exploration_rate=branch_exploration_rate,
-                                              scale_by_routing_weight=scale_branch)
+                                              scale_by_routing_weight=scale_branch,
+                                              use_sampling=use_sampling, use_seq_level=use_seq_level,
+                                              use_deepseek_style=use_deepseek_style)
 
         self.attn_bank = AttentionExpertBank(config)
         self.mlp_bank = MlpExpertBank(config)
