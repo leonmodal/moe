@@ -246,22 +246,45 @@ _SMOKE_MATRIX = [
 def test_unified_trainer_subprocess_smoke(tmp_path, model_variant, dist_strategy):
     """Launch `scripts/train.py` under `torchrun --nproc_per_node=2` for the
     parametrized (model, strategy) pair. Each combination executes at least
-    one optimizer step and writes a full AC-12 checkpoint directory.
-
-    Supported model set (from `tests/test_unified_trainer.py`) × {DDP, FSDP}.
-    MoE-Everything's FSDP CLI path is served by a transparent DDP fallback in
-    `src/training/distributed.py::wrap_model` (see `_USE_DDP_INSTEAD_OF_FSDP`);
-    the CLI contract (`--dist-strategy fsdp`) still accepts every supported
-    model, and the fallback reason is documented alongside the selector.
+    one optimizer step, writes a full AC-12 checkpoint directory, and
+    reports the effective wrapper class in the banner so the assertions
+    below can pin the real distributed runtime (no silent substitutions).
     """
     result, output_dir = _run_trainer_subprocess(
         tmp_path, model_variant=model_variant, dist_strategy=dist_strategy,
     )
-    assert "step=" in result.stdout or "step=" in result.stderr, (
+    combined = result.stdout + result.stderr
+    assert "step=" in combined, (
         f"Expected at least one logged optimizer step for {model_variant} "
         f"under {dist_strategy}; got:\n"
         f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
     )
+
+    # The trainer banner must report the actual wrapper (FSDP or DDP), so a
+    # future regression that silently substitutes one for the other surfaces
+    # here. moe_everything must use real FSDP under --dist-strategy fsdp;
+    # every other (variant, fsdp) pair must use FSDP too; every ddp pair
+    # must use DDP.
+    if dist_strategy == "fsdp":
+        assert "Wrapper   : FSDP(" in combined, (
+            f"{model_variant}/fsdp must use a real FSDP wrapper — the banner "
+            f"should read 'Wrapper   : FSDP(...)'. Got:\n{combined}"
+        )
+        if model_variant.startswith("moe_everything"):
+            assert "NO_SHARD" in combined and "auto_wrap=yes" in combined, (
+                "moe_everything × fsdp must use NO_SHARD + an auto_wrap_policy "
+                "so sparse-gradient sub-modules stay in their own FSDP units. "
+                f"Got banner line from:\n{combined}"
+            )
+        else:
+            assert "FULL_SHARD" in combined, (
+                f"{model_variant}/fsdp must use FULL_SHARD sharding. Got:\n{combined}"
+            )
+    else:  # ddp
+        assert "Wrapper   : DDP" in combined, (
+            f"{model_variant}/ddp must use a DDP wrapper. Got:\n{combined}"
+        )
+
     ckpt = _find_checkpoint(output_dir)
     assert ckpt is not None, (
         f"No checkpoint-* directory under {output_dir} for "

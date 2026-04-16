@@ -20,6 +20,11 @@ except Exception:
     MixedPrecision = None
     ShardingStrategy = None
 
+try:
+    from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+except Exception:
+    ModuleWrapPolicy = None
+
 
 def is_distributed() -> bool:
     return dist.is_available() and dist.is_initialized()
@@ -136,34 +141,83 @@ _FSDP_SHARDING_BY_MODEL_TYPE: dict[str, str] = {
     "dense": "FULL_SHARD",
     "standard_moe": "FULL_SHARD",
     "global_moe": "FULL_SHARD",
-    # Placeholder: moe_everything does not use FSDP at all in this version
-    # (see `_USE_DDP_INSTEAD_OF_FSDP`). This entry is unused but kept for
-    # shape-consistency of the selector map; if the DDP fallback is lifted
-    # in the future, this is the obvious place to pick a real strategy.
-    "moe_everything": "FULL_SHARD",
+    # MoE-Everything's branch-routed forward leaves whole flat-params units
+    # gradient-inactive on most steps; FULL_SHARD / SHARD_GRAD_OP fire the
+    # `TrainingState.IDLE` post-backward-hook assertion on the inactive
+    # shards. NO_SHARD keeps params replicated while still routing through
+    # FSDP for consistent state-dict handling; combined with the
+    # `auto_wrap_policy` below (which splits AttentionExpertBank,
+    # MlpExpertBank, and BranchRouter into their own FSDP units) it
+    # isolates sparse sub-module activity from the root unit's hooks.
+    "moe_everything": "NO_SHARD",
 }
 
 
 # Model families whose FSDP path must NOT use `MixedPrecision` downcasting
-# of parameters. Currently empty — the only problematic family (moe_everything)
-# is short-circuited to DDP below, so it never reaches the MixedPrecision
-# construction. Kept as an explicit hook point for future per-family policies.
-_FSDP_SKIP_MIXED_PRECISION: set[str] = set()
+# of parameters. MoE-Everything under NO_SHARD + bf16 MixedPrecision hits a
+# `setStorage ... storage of size 0` error on the embedding flat-param in
+# backward (torch 2.10) because NO_SHARD retains the fp32 "master" copy
+# while FSDP materializes a bf16 shard; when the flat-param is resharded
+# mid-backward, the fp32 storage is already freed. Skipping the FSDP-level
+# MixedPrecision policy for this family leaves params in fp32; the
+# trainer's outer `torch.autocast` still casts activations to bf16.
+_FSDP_SKIP_MIXED_PRECISION: set[str] = {"moe_everything"}
 
 
-# Model families for which `--dist-strategy fsdp` is transparently fulfilled
-# by DDP instead of FSDP. The rationale is documented inline in `wrap_model`:
-# branch-routed MoE-Everything leaves whole flat-params groups gradient-
-# inactive on most steps, and every FSDP sharding policy available in torch
-# 2.10 fires either the `TrainingState.IDLE` post-backward assertion
-# (FULL_SHARD / SHARD_GRAD_OP) or a `setStorage ... storage of size 0` error
-# (NO_SHARD + use_orig_params=True), even after `use_orig_params` is lifted
-# to False. The DDP fallback preserves the original-plan promise that every
-# supported model runs under `--dist-strategy fsdp` through the unified
-# trainer and the same CLI. Once the upstream sparse-gradient + flat-params
-# FSDP interaction is resolved, this family should move back into
-# `_FSDP_SHARDING_BY_MODEL_TYPE`.
-_USE_DDP_INSTEAD_OF_FSDP = {"moe_everything"}
+def _moe_everything_auto_wrap_policy():
+    """Build an `auto_wrap_policy` for MoE-Everything.
+
+    Wraps each top-level sub-module class (`nn.Embedding`, `nn.Linear`,
+    `AttentionExpertBank`, `MlpExpertBank`, `BranchRouter`, etc.) as its
+    own FSDP unit. Under NO_SHARD this yields one FSDP unit per major
+    sub-module so sparse gradient activity at the expert-bank level is
+    isolated per-unit — the alternative of leaving the whole branch-routed
+    stack in a single root FSDP unit trips the `TrainingState.IDLE`
+    post-backward assertion because per-step inactive expert params live
+    in the same flat-params group as always-active params.
+
+    Returns `None` if the wrap-policy API or the target classes are
+    unavailable, in which case the caller falls back to the default
+    single-unit behavior.
+    """
+    if ModuleWrapPolicy is None:
+        return None
+    try:
+        import torch.nn as nn
+        from src.models.moe_everything.attention_bank import AttentionExpertBank
+        from src.models.moe_everything.mlp_bank import MlpExpertBank
+        from src.models.routing.routers import BranchRouter
+        from src.models.modeling_qwen3_moe import Qwen3MoeRMSNorm
+    except Exception:
+        return None
+    return ModuleWrapPolicy({
+        AttentionExpertBank, MlpExpertBank, BranchRouter,
+        nn.Embedding, nn.Linear, Qwen3MoeRMSNorm,
+    })
+
+
+def describe_wrapper(model) -> str:
+    """Human-readable summary of the distributed wrapper on `model`.
+
+    Used by the trainer banner so operators can audit the effective wrapper
+    from the training log without cross-referencing CLI flags against the
+    per-family policy table. For FSDP this reports the sharding strategy and
+    whether an `auto_wrap_policy` was supplied; for DDP it just names the
+    class; for unwrapped models it returns `"none"`.
+    """
+    if isinstance(model, DDP):
+        return "DDP"
+    if FSDP is not None and isinstance(model, FSDP):
+        try:
+            strat = model.sharding_strategy.name
+        except Exception:
+            strat = "unknown"
+        has_auto_wrap = any(
+            FSDP is not None and isinstance(m, FSDP)
+            for m in model.modules() if m is not model
+        )
+        return f"FSDP({strat}, auto_wrap={'yes' if has_auto_wrap else 'no'})"
+    return "none"
 
 
 def _fsdp_sharding_for(model_type: str | None):
@@ -188,6 +242,19 @@ def _ddp_wrap(model, local_rank: int):
     )
 
 
+def _auto_wrap_policy_for(model_type: str | None):
+    """Return the FSDP `auto_wrap_policy` callable for the given family.
+
+    `moe_everything` needs its branch-routed sub-modules wrapped as separate
+    FSDP units so sparse gradient activity does not trip the root unit's
+    post-backward-hook assertion. Other families keep the default
+    single-unit wrapping.
+    """
+    if model_type == "moe_everything":
+        return _moe_everything_auto_wrap_policy()
+    return None
+
+
 def wrap_model(
     model,
     *,
@@ -199,12 +266,12 @@ def wrap_model(
     """Wrap model with DDP or FSDP based on strategy.
 
     `model_type` (e.g. "dense", "standard_moe", "global_moe", "moe_everything")
-    selects a per-family FSDP policy — see `_FSDP_SHARDING_BY_MODEL_TYPE` and
-    `_USE_DDP_INSTEAD_OF_FSDP`. When `strategy == "fsdp"` and the model family
-    is in `_USE_DDP_INSTEAD_OF_FSDP`, the trainer transparently falls back to
-    DDP so the CLI still accepts `--dist-strategy fsdp` for every supported
-    model (the fallback is logged from the trainer side via the standard
-    banner — this function itself stays quiet to keep test fixtures simple).
+    selects a per-family FSDP policy. All families use a real FSDP wrapper
+    under `--dist-strategy fsdp`:
+    - `dense` / `standard_moe` / `global_moe` → FULL_SHARD, single-unit wrap.
+    - `moe_everything` → NO_SHARD with an `auto_wrap_policy` that makes
+      `AttentionExpertBank`, `MlpExpertBank`, and `BranchRouter` separate
+      FSDP units (see `_moe_everything_auto_wrap_policy`).
     """
     world_size = dist_world_size()
     if strategy == "none" or world_size == 1:
@@ -214,8 +281,6 @@ def wrap_model(
     if strategy == "fsdp":
         if FSDP is None:
             raise RuntimeError("FSDP is unavailable in this torch install")
-        if (model_type or "") in _USE_DDP_INSTEAD_OF_FSDP:
-            return _ddp_wrap(model, local_rank)
         sharding_name = _FSDP_SHARDING_BY_MODEL_TYPE.get(model_type or "", "FULL_SHARD")
         if (model_type or "") in _FSDP_SKIP_MIXED_PRECISION:
             mixed_precision = None
@@ -228,6 +293,7 @@ def wrap_model(
             sharding_strategy=getattr(ShardingStrategy, sharding_name),
             sync_module_states=True,
             use_orig_params=_fsdp_use_orig_params_for(sharding_name),
+            auto_wrap_policy=_auto_wrap_policy_for(model_type),
         )
     raise ValueError(f"Unknown strategy: {strategy}")
 

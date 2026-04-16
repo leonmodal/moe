@@ -35,6 +35,7 @@ from .data import build_train_dataset, build_eval_dataset
 from .distributed import (
     barrier,
     cleanup_distributed,
+    describe_wrapper,
     infer_dtype,
     is_distributed,
     is_main_process,
@@ -176,6 +177,7 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
         print(f"  Model     : {cfg['model']['type']}", flush=True)
         print(f"  Params    : {params['total']/1e9:.3f}B total", flush=True)
         print(f"  Strategy  : {strategy}", flush=True)
+        print(f"  Wrapper   : {describe_wrapper(model)}", flush=True)
         print(f"  Precision : {train_cfg.mixed_precision}", flush=True)
         print("=" * 60, flush=True)
 
