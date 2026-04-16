@@ -120,13 +120,26 @@ def _trainer_style_loader(dataset, batch_size: int, requested_workers: int) -> D
 
 
 @pytest.mark.parametrize("requested_workers", [0, 4])
-def test_trainer_dataloader_exact_resume(tmp_path, requested_workers):
+@pytest.mark.parametrize("prefetch_files", [0, 1])
+def test_trainer_dataloader_exact_resume(tmp_path, requested_workers, prefetch_files):
     """Batches after save/load must exactly match uninterrupted continuation,
-    regardless of the config-requested num_workers.
+    independent of both the config-requested `num_workers` and whether the
+    dataset-level `prefetch_files` read-ahead is enabled.
+
+    The inner loop covers four combinations: prefetch off / on × workers 0 / 4.
+    With `num_workers=4` the trainer-side helper forces it back to 0 (AC-12);
+    with `prefetch_files=1` the dataset opens a background thread that reads
+    the next parquet shard while tokenization proceeds on the current one.
+    The resume contract must not depend on either knob.
     """
     data_dir = _write_parquet_fixture(tmp_path, num_files=4, rows_per_file=32)
     tokenizer = _IdentityTokenizer()
-    config = DataConfig(data_dir=str(data_dir), seq_len=32, tokenizer_name="stub")
+    config = DataConfig(
+        data_dir=str(data_dir),
+        seq_len=32,
+        tokenizer_name="stub",
+        prefetch_files=prefetch_files,
+    )
 
     B = 2
     N_BEFORE = 6
@@ -145,7 +158,6 @@ def test_trainer_dataloader_exact_resume(tmp_path, requested_workers):
     batches_b_before = [next(it_b)["input_ids"].clone() for _ in range(N_BEFORE)]
 
     saved_state = ds_b.get_state()
-    # Authoritative resume markers per StatefulParquetDataset contract.
     assert "file_idx" in saved_state and "text_idx" in saved_state and "buffer" in saved_state
 
     ds_b2 = StatefulParquetDataset(config, tokenizer, rank=0, world_size=1, seed=0)
@@ -154,15 +166,14 @@ def test_trainer_dataloader_exact_resume(tmp_path, requested_workers):
     it_b2 = iter(dl_b2)
     batches_b_after = [next(it_b2)["input_ids"].clone() for _ in range(N_AFTER)]
 
-    # Pre-checkpoint batches must match run A.
+    ctx = f"workers={requested_workers}, prefetch_files={prefetch_files}"
     for i, (a, b) in enumerate(zip(batches_a[:N_BEFORE], batches_b_before)):
-        assert torch.equal(a, b), f"Pre-checkpoint batch {i} diverged (requested_workers={requested_workers})"
+        assert torch.equal(a, b), f"Pre-checkpoint batch {i} diverged ({ctx})"
 
-    # Post-resume batches must exactly continue run A.
     for i, (a, b) in enumerate(zip(batches_a[N_BEFORE:], batches_b_after)):
         assert torch.equal(a, b), (
-            f"Post-resume batch {i} diverged (requested_workers={requested_workers}). "
-            f"This is the AC-12 resume bug the _stateful_dataloader_workers helper is meant to defend."
+            f"Post-resume batch {i} diverged ({ctx}). AC-8 prefetch or AC-12 "
+            "resume contract regressed."
         )
 
 

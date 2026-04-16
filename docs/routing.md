@@ -186,23 +186,49 @@ Late training (alpha~0.0): Global signal dominates, ensuring overall balance.
 
 ## 4. Routing Statistics & Monitoring
 
-### Collected Metrics
+Three distinct components collaborate here; conflating them has caused repeated doc drift.
 
-**File**: `src/utils/routing_stats.py`
+### 4a. Per-forward-pass records
+
+**File**: `src/models/routing/stats.py` — the `RoutingStats` dataclass.
+
+Accumulated inside a single forward pass and cleared after each step. Carries:
+
+| Field | Description |
+|-------|-------------|
+| `aux_loss`, `seq_aux_loss`, `branch_aux_loss`, `attention_aux_loss` | Running auxiliary-loss scalars for the forward pass |
+| `router_records` | Per-layer MLP/MoE router decisions (selected experts, routing weights, exploration masks) |
+| `branch_records` | Per-depth branch router decisions (attn vs MLP) for MoE-Everything |
+| `attn_records` | Per-depth attention routing records for MoE-Everything `per_head_*` modes |
+
+These records are the source of truth for branch probabilities, per-head attention routing, and expert-bias health — they are populated by the model's forward pass, not by any training-loop aggregator.
+
+### 4b. Aggregated count / load / margin summaries
+
+**File**: `src/utils/routing_stats.py` — decoupled utility.
+
+Computes time-aggregated summaries from router probabilities / counts that accumulate across many forward passes:
 
 | Metric | Description |
 |--------|-------------|
-| Per-expert token counts | How many tokens each expert received per layer |
+| Per-expert token counts | How many tokens each expert received (per layer, over the reporting window) |
 | Load imbalance | Max/min expert utilization ratio |
 | Active expert count | Number of experts that received > 0 tokens |
-| Router margins | Gap between K-th and (K+1)-th router scores (higher = more decisive routing) |
-| Branch probabilities | Attention vs MLP selection rates per depth |
-| Expert bias stats | Mean, std, min, max of bias values |
+| Router margins | Gap between K-th and (K+1)-th router scores |
+| Entropy | Routing distribution entropy (lower = more decisive) |
 
-### Visualization
+This module does NOT carry branch records or expert-bias values itself. Those live in §4a (records) and in the router modules (`src/models/routing/bias.py` for the global bias buffers).
+
+### 4c. Plotting / WandB bridge
+
+**File**: `src/training/logging.py`
+
+Pulls the `RoutingStats` object off the model (`model._routing_stats_obj`), converts the records into heatmaps / curves via `src/utils/routing_plots.py`, and logs to WandB. This is the glue that binds §4a records to §4b aggregates in a single WandB panel.
+
+### Visualization helpers
 
 **File**: `src/utils/routing_plots.py`
 
-- **Routing heatmaps**: Expert utilization across layers (logged to WandB)
-- **Expert bias charts**: Bias value distribution over training
-- **Per-head utilization histograms**: For MoE-Everything attention experts
+- Routing heatmaps (expert utilization across layers)
+- Expert bias charts (bias value distribution over training; reads from `src/models/routing/bias.py` buffers)
+- Per-head attention routing curves (MoE-Everything)

@@ -16,12 +16,19 @@ start of a resumed run. With num_workers=0 (forced by the trainer for
 stateful datasets) the live attributes on the main-process dataset object
 are the authoritative source for get_state(), and resumed batches match
 the uninterrupted continuation tensor-for-tensor.
+
+Throughput optimization: `DataConfig.prefetch_files` enables a single-file
+read-ahead inside the dataset itself (a dedicated background thread reads
+the next parquet shard while the main process tokenizes the current one).
+Prefetch is resume-safe: the persisted state is unchanged, and on resume
+we simply re-schedule the same file order from `_start_file_idx`.
 """
+import concurrent.futures
 import glob
 import json
 import os
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterator
 
 import pandas as pd
@@ -38,6 +45,12 @@ class DataConfig:
     num_workers: int = 4
     split: str = "all"             # all | train | val
     holdout_fraction: float = 0.0  # file-level holdout used when split != all
+    # Dataset-level read-ahead of parquet files. 1 = read one file ahead in a
+    # background thread while the main process tokenizes; 0 disables prefetch.
+    # Prefetch is keyed strictly by file order so resume stays exact. The trainer
+    # forces DataLoader num_workers=0 for AC-12 correctness, so this is the
+    # correct layer to add parallelism for AC-8 throughput.
+    prefetch_files: int = 1
 
 
 class StatefulParquetDataset(IterableDataset):
@@ -168,48 +181,83 @@ class StatefulParquetDataset(IterableDataset):
         token_buffer: list[int] = list(self._start_buffer)
         self._live_buffer = token_buffer
 
-        start_text_idx = self._start_text_idx
-        for file_idx, file_path in enumerate(self.files):
-            if file_idx < self._start_file_idx:
-                continue
+        files = self.files
+        n_files = len(files)
+        start = self._start_file_idx
+        if start >= n_files:
+            return
 
-            self._cur_file_idx = file_idx
-            df = self._load_file(file_path)
-            self._cur_seq_idx = 0
+        executor = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="parquet-prefetch"
+            )
+            if self.config.prefetch_files > 0 else None
+        )
 
-            # Only the start file honours the resumption text offset; subsequent
-            # files always begin at text 0.
-            first_text = start_text_idx if file_idx == self._start_file_idx else 0
-            self._cur_text_idx = first_text
+        try:
+            df = self._load_file(files[start])
+            next_future = (
+                executor.submit(self._load_file, files[start + 1])
+                if executor is not None and start + 1 < n_files else None
+            )
 
-            texts = df[self.config.text_column]
-            for text_idx in range(first_text, len(texts)):
-                text = texts.iat[text_idx]
-                if isinstance(text, str) and text.strip():
-                    ids = self.tokenizer.encode(text, add_special_tokens=False)
-                    token_buffer.extend(ids)
-                    token_buffer.append(eos)
+            start_text_idx = self._start_text_idx
+            cur_file_idx = start
+            while True:
+                self._cur_file_idx = cur_file_idx
+                self._cur_seq_idx = 0
 
-                # Text `text_idx` is now fully absorbed into the buffer (or
-                # skipped as empty). Advance the "next text to consume" marker
-                # BEFORE yielding so a save between yields still points at the
-                # correct next text and doesn't re-tokenize text `text_idx`.
-                self._cur_text_idx = text_idx + 1
+                # Only the start file honours the resumption text offset;
+                # subsequent files always begin at text 0.
+                first_text = start_text_idx if cur_file_idx == start else 0
+                self._cur_text_idx = first_text
 
-                while len(token_buffer) >= seq_len + 1:
-                    chunk = token_buffer[: seq_len + 1]
-                    # Advance in place to preserve `_live_buffer` aliasing
-                    # and keep get_state() authoritative during iteration.
-                    del token_buffer[:seq_len]
-                    self._cur_seq_idx += 1
+                texts = df[self.config.text_column]
+                for text_idx in range(first_text, len(texts)):
+                    text = texts.iat[text_idx]
+                    if isinstance(text, str) and text.strip():
+                        ids = self.tokenizer.encode(text, add_special_tokens=False)
+                        token_buffer.extend(ids)
+                        token_buffer.append(eos)
 
-                    yield {
-                        "input_ids": torch.tensor(chunk[:-1], dtype=torch.long),
-                        "labels": torch.tensor(chunk[1:], dtype=torch.long),
-                    }
+                    # Text `text_idx` is now fully absorbed into the buffer (or
+                    # skipped as empty). Advance the "next text to consume"
+                    # marker BEFORE yielding so a save between yields still
+                    # points at the next un-consumed text.
+                    self._cur_text_idx = text_idx + 1
 
-            # Finishing a file resets the per-file start offset.
-            start_text_idx = 0
+                    while len(token_buffer) >= seq_len + 1:
+                        chunk = token_buffer[: seq_len + 1]
+                        # Advance in place to preserve `_live_buffer` aliasing
+                        # and keep get_state() authoritative during iteration.
+                        del token_buffer[:seq_len]
+                        self._cur_seq_idx += 1
+
+                        yield {
+                            "input_ids": torch.tensor(chunk[:-1], dtype=torch.long),
+                            "labels": torch.tensor(chunk[1:], dtype=torch.long),
+                        }
+
+                # Finishing a file resets the per-file start offset.
+                start_text_idx = 0
+                cur_file_idx += 1
+                if cur_file_idx >= n_files:
+                    break
+
+                # Block on the pre-submitted next-file future (or load sync
+                # if prefetch is disabled), then kick off the file after that.
+                if next_future is not None:
+                    df = next_future.result()
+                    next_future = None
+                else:
+                    df = self._load_file(files[cur_file_idx])
+                if executor is not None and cur_file_idx + 1 < n_files:
+                    next_future = executor.submit(
+                        self._load_file, files[cur_file_idx + 1]
+                    )
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
 
     def _load_file(self, path: str) -> pd.DataFrame:
         return pd.read_parquet(path, columns=[self.config.text_column])
