@@ -1,10 +1,14 @@
 """
-Distributed Muon and Adam optimizers for the speedrun model.
+Distributed Muon and Adam optimizers.
 
-Reference: /tmp/modded-nanogpt-prefa3/train_gpt.py (lines 388-527)
+Extracted from the archived speedrun model during the reorganization
+(reference: upstream modded-nanogpt `train_gpt.py` lines 388-527) and
+kept in active `src/utils/` because they are decoupled from the speedrun
+model architecture and usable by any trainer.
 
 These optimizers handle their own gradient all-reduce internally via
-reduce_scatter / all_gather, so the model should NOT be wrapped in DDP.
+reduce_scatter / all_gather, so the model should NOT be wrapped in DDP
+when using them.
 """
 
 from __future__ import annotations

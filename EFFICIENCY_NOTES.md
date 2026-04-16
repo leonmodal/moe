@@ -1,6 +1,6 @@
 # Efficiency And Correctness Notes
 
-This note summarizes the current state after restoring GQA across the baseline and per-head models, and after updating the per-head attention code to match that geometry.
+This note summarizes correctness fixes and throughput work done during the codebase reorganization. Sections labelled "historical" describe the state at the time of the original benchmark run and may have been superseded by later rounds — see `docs/architecture.md` and `docs/training.md` for the current state.
 
 ## 1. Correctness fixes
 
@@ -153,29 +153,32 @@ Observed results:
 
 The measured max difference against the legacy reference was `0.0`.
 
-## 4. What was not implemented
+## 4. What was not implemented in the benchmark pass
 
 ### Expert parallelization
 
-Expert parallel all-to-all / sharded expert execution was not implemented in this pass.
+Expert parallel all-to-all / sharded expert execution was not implemented during this benchmarking work. TorchTitan and Megatron-LM references were inspected for the design patterns, but the active repo runs experts locally rather than with true expert-parallel dispatch. This remains open follow-up work.
 
-TorchTitan and Megatron-LM references were inspected for the design patterns, but the current repo still runs experts locally rather than with true expert parallel dispatch.
+## 5. Distributed training (current state)
 
-### Native DDP/FSDP rewrite
+The original benchmark pass ran under HuggingFace Accelerate. Post-reorganization, the active trainer is torch-native and the Accelerate dependency is gone:
 
-Training is still wrapped in Accelerate. A full rewrite to native DDP/FSDP was not attempted in this pass.
+- Entrypoint: `scripts/train.py`
+- Distributed wiring: `src/training/distributed.py` (DDP, FSDP, single-GPU) selected via `--dist-strategy ddp|fsdp|none`
+- Modal multi-node: `modal_train.py` launches `scripts/train.py` via `torchrun` under `@modal.experimental.clustered(size=N_NODES, rdma=True)`
 
-## 5. Regression checks
+See `docs/distributed.md` for the active API surface and `MULTINODE_README.md` for the Modal launcher specifics.
 
-The model test suite now covers:
+## 6. Regression checks
 
-- representative experiment configs using the expected GQA ratios
-- `per_head_precompute_kv` routing one slot per KV head while still producing all Q heads
-- mode-specific sparse/dense auto-threshold behavior
-- sanity config attention geometry matching the global baseline
+The active test suite covers the per-head attention and router geometry items in this note:
+
+- the 7-variant trainer smoke matrix (`tests/test_unified_trainer.py`): forward / backward / optimizer / checkpoint round-trip / loss decrease for dense, standard_moe (softmax/deepseek), global_moe (softmax/deepseek), moe_everything (`per_head_fully_independent`, `per_head_precompute_kv`)
+- aux-loss semantics (`tests/test_aux_loss_fix.py`, `tests/test_seq_loss_vs_paper.py`, `tests/test_integration.py`)
+- routing stats and plots (`tests/test_routing_stats.py`, `tests/test_routing_plots.py`)
 
 Command:
 
 ```bash
-uv run pytest -q tests/test_models.py
+uv run pytest -q
 ```

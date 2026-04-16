@@ -92,7 +92,7 @@ Used when `router_type: deepseek`:
 | `text_column` | string | "text" | Column name in parquet files |
 | `seq_len` | int | 2048 | Sequence length |
 | `tokenizer_name` | string | "gpt2" | HuggingFace tokenizer name |
-| `num_workers` | int | 4 | Data loading workers |
+| `num_workers` | int | 4 | DataLoader workers. **Overridden to 0 for stateful parquet datasets** — the trainer forces `num_workers=0` whenever the dataset exposes `get_state`/`set_state` so that checkpointed `data_state.pt` stays authoritative for deterministic resume (see `docs/data.md`). Throughput work is tracked separately under AC-8 as dataset-level read-ahead. |
 
 ## Eval Section
 

@@ -1,13 +1,21 @@
 """
 Stateful Parquet dataset for language model pretraining.
 
-State tracked:
-  - current file index
-  - sequences already yielded from that file (for skip-on-resume)
-  - leftover token buffer (serialized as a list)
+Resume contract (authoritative markers used by set_state):
+  - file_idx: index of the file currently being consumed
+  - text_idx: index of the next text row to tokenize in that file
+  - buffer:   the live token buffer (tokens from already-consumed texts
+              that have not yet been emitted as a full seq_len+1 chunk)
 
-State is saved as JSON alongside model checkpoints and restored
-at the start of a resumed training run.
+Also captured for diagnostics but NOT used on resume:
+  - seq_idx:  number of sequences yielded from the current file since
+              iteration started
+
+State is saved as JSON alongside model checkpoints and restored at the
+start of a resumed run. With num_workers=0 (forced by the trainer for
+stateful datasets) the live attributes on the main-process dataset object
+are the authoritative source for get_state(), and resumed batches match
+the uninterrupted continuation tensor-for-tensor.
 """
 import glob
 import json
