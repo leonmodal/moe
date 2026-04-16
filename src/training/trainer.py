@@ -148,7 +148,13 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
             print(f"Compiling model with torch.compile(mode={compile_mode!r})", flush=True)
         model = torch.compile(model, mode=compile_mode, dynamic=False)
 
-    model = wrap_model(model, strategy=strategy, local_rank=local_rank, mixed_precision_name=train_cfg.mixed_precision)
+    model = wrap_model(
+        model,
+        strategy=strategy,
+        local_rank=local_rank,
+        mixed_precision_name=train_cfg.mixed_precision,
+        model_type=cfg.get("model", {}).get("type"),
+    )
     raw_model = base_model
 
     # Build optimizer

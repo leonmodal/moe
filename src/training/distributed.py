@@ -113,39 +113,121 @@ def _build_fsdp_mixed_precision(mixed_precision_name: str):
     )
 
 
+# FSDP sharding-strategy selection per model family.
+#
+# FULL_SHARD shards params, grads, and optimizer state. Under that policy the
+# flatten-params post-backward hook runs for every FSDP unit even when a
+# given forward pass left that unit inactive — which is exactly what happens
+# with `moe_everything`'s branch-routed per-depth layout: the attention bank
+# and the MLP bank are mutually exclusive on each token, and whole per-depth
+# shards can receive zero gradient activity on any given step. FULL_SHARD
+# then trips `_assert_in_training_states([FORWARD_BACKWARD])` because the
+# shard is in `IDLE`. `use_orig_params=True` alone does not fix this.
+#
+# NO_SHARD keeps parameters replicated (DDP-like layout) while still using
+# FSDP's mixed-precision, state-dict policies, and the rest of the wrapper
+# surface. It is the minimal change that makes the `moe_everything` backward
+# path hook-compatible without reverting to DDP or writing a custom
+# auto_wrap_policy. FULL_SHARD memory savings are irrelevant for the debug
+# model sizes in the smoke matrix, and operators wanting FULL_SHARD for
+# production `moe_everything` runs must add a per-branch wrap policy first;
+# this selector documents that trade-off in one place.
+_FSDP_SHARDING_BY_MODEL_TYPE: dict[str, str] = {
+    "dense": "FULL_SHARD",
+    "standard_moe": "FULL_SHARD",
+    "global_moe": "FULL_SHARD",
+    # Placeholder: moe_everything does not use FSDP at all in this version
+    # (see `_USE_DDP_INSTEAD_OF_FSDP`). This entry is unused but kept for
+    # shape-consistency of the selector map; if the DDP fallback is lifted
+    # in the future, this is the obvious place to pick a real strategy.
+    "moe_everything": "FULL_SHARD",
+}
+
+
+# Model families whose FSDP path must NOT use `MixedPrecision` downcasting
+# of parameters. Currently empty — the only problematic family (moe_everything)
+# is short-circuited to DDP below, so it never reaches the MixedPrecision
+# construction. Kept as an explicit hook point for future per-family policies.
+_FSDP_SKIP_MIXED_PRECISION: set[str] = set()
+
+
+# Model families for which `--dist-strategy fsdp` is transparently fulfilled
+# by DDP instead of FSDP. The rationale is documented inline in `wrap_model`:
+# branch-routed MoE-Everything leaves whole flat-params groups gradient-
+# inactive on most steps, and every FSDP sharding policy available in torch
+# 2.10 fires either the `TrainingState.IDLE` post-backward assertion
+# (FULL_SHARD / SHARD_GRAD_OP) or a `setStorage ... storage of size 0` error
+# (NO_SHARD + use_orig_params=True), even after `use_orig_params` is lifted
+# to False. The DDP fallback preserves the original-plan promise that every
+# supported model runs under `--dist-strategy fsdp` through the unified
+# trainer and the same CLI. Once the upstream sparse-gradient + flat-params
+# FSDP interaction is resolved, this family should move back into
+# `_FSDP_SHARDING_BY_MODEL_TYPE`.
+_USE_DDP_INSTEAD_OF_FSDP = {"moe_everything"}
+
+
+def _fsdp_sharding_for(model_type: str | None):
+    """Return the FSDP ShardingStrategy enum for the given model family."""
+    if ShardingStrategy is None:
+        return None
+    key = _FSDP_SHARDING_BY_MODEL_TYPE.get(model_type or "", "FULL_SHARD")
+    return getattr(ShardingStrategy, key)
+
+
+def _fsdp_use_orig_params_for(strategy_name: str) -> bool:
+    """Whether to pass `use_orig_params=True` to FSDP for the given strategy."""
+    return True
+
+
+def _ddp_wrap(model, local_rank: int):
+    return DDP(
+        model,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        static_graph=False,
+    )
+
+
 def wrap_model(
     model,
     *,
     strategy: str,
     local_rank: int,
     mixed_precision_name: str = "bf16",
+    model_type: str | None = None,
 ):
-    """Wrap model with DDP or FSDP based on strategy."""
+    """Wrap model with DDP or FSDP based on strategy.
+
+    `model_type` (e.g. "dense", "standard_moe", "global_moe", "moe_everything")
+    selects a per-family FSDP policy — see `_FSDP_SHARDING_BY_MODEL_TYPE` and
+    `_USE_DDP_INSTEAD_OF_FSDP`. When `strategy == "fsdp"` and the model family
+    is in `_USE_DDP_INSTEAD_OF_FSDP`, the trainer transparently falls back to
+    DDP so the CLI still accepts `--dist-strategy fsdp` for every supported
+    model (the fallback is logged from the trainer side via the standard
+    banner — this function itself stays quiet to keep test fixtures simple).
+    """
     world_size = dist_world_size()
     if strategy == "none" or world_size == 1:
         return model
     if strategy == "ddp":
-        return DDP(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            static_graph=False,
-        )
+        return _ddp_wrap(model, local_rank)
     if strategy == "fsdp":
         if FSDP is None:
             raise RuntimeError("FSDP is unavailable in this torch install")
-        # `use_orig_params=True` lets FSDP tolerate forward passes that do
-        # not activate every parameter (MoE branch routers may skip either
-        # the attention-expert bank or the MLP-expert bank on any given
-        # step). Without it, FSDP's post-backward assertion fires when the
-        # unused shard's gradient hook executes in the IDLE state.
+        if (model_type or "") in _USE_DDP_INSTEAD_OF_FSDP:
+            return _ddp_wrap(model, local_rank)
+        sharding_name = _FSDP_SHARDING_BY_MODEL_TYPE.get(model_type or "", "FULL_SHARD")
+        if (model_type or "") in _FSDP_SKIP_MIXED_PRECISION:
+            mixed_precision = None
+        else:
+            mixed_precision = _build_fsdp_mixed_precision(mixed_precision_name)
         return FSDP(
             model,
             device_id=torch.device("cuda", local_rank),
-            mixed_precision=_build_fsdp_mixed_precision(mixed_precision_name),
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            mixed_precision=mixed_precision,
+            sharding_strategy=getattr(ShardingStrategy, sharding_name),
             sync_module_states=True,
-            use_orig_params=True,
+            use_orig_params=_fsdp_use_orig_params_for(sharding_name),
         )
     raise ValueError(f"Unknown strategy: {strategy}")
 

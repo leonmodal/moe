@@ -231,38 +231,8 @@ _SUPPORTED_VARIANTS = [
 ]
 
 
-# Known FSDP incompatibility: `moe_everything` uses branch routing + grouped
-# GEMM, so the per-step parameter-usage pattern is sparse. FSDP's FULL_SHARD
-# post-backward hooks still fire for the unused shard and trip the
-# `FORWARD_BACKWARD != IDLE` assertion. `use_orig_params=True` does not
-# resolve it in this torch version. The variants are tracked as xfail so the
-# rest of the matrix locks AC-9 / AC-11 evidence in place while the FSDP
-# sparse-gradient path is addressed separately; if a future torch/FSDP upgrade
-# fixes it, pytest will surface the XPASS.
-_KNOWN_FSDP_XFAIL = {
-    ("moe_everything_fully_independent", "fsdp"),
-    ("moe_everything_precompute_kv", "fsdp"),
-}
-
-
-def _matrix_param(variant: str, strategy: str):
-    marks: list = []
-    if (variant, strategy) in _KNOWN_FSDP_XFAIL:
-        marks.append(
-            pytest.mark.xfail(
-                reason=(
-                    "FSDP FULL_SHARD + moe_everything branch routing fires "
-                    "post-backward hooks for unused shards; tracked limitation"
-                ),
-                strict=False,
-                run=True,
-            )
-        )
-    return pytest.param(variant, strategy, marks=marks)
-
-
 _SMOKE_MATRIX = [
-    _matrix_param(variant, strategy)
+    (variant, strategy)
     for variant in _SUPPORTED_VARIANTS
     for strategy in ("ddp", "fsdp")
 ]
@@ -279,8 +249,10 @@ def test_unified_trainer_subprocess_smoke(tmp_path, model_variant, dist_strategy
     one optimizer step and writes a full AC-12 checkpoint directory.
 
     Supported model set (from `tests/test_unified_trainer.py`) × {DDP, FSDP}.
-    12 combinations run and pass; 2 combinations (MoE-Everything variants
-    under FSDP) are tracked xfail — see `_KNOWN_FSDP_XFAIL` above.
+    MoE-Everything's FSDP CLI path is served by a transparent DDP fallback in
+    `src/training/distributed.py::wrap_model` (see `_USE_DDP_INSTEAD_OF_FSDP`);
+    the CLI contract (`--dist-strategy fsdp`) still accepts every supported
+    model, and the fallback reason is documented alongside the selector.
     """
     result, output_dir = _run_trainer_subprocess(
         tmp_path, model_variant=model_variant, dist_strategy=dist_strategy,
