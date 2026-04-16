@@ -231,7 +231,7 @@ def test_hf_loss_vs_custom_loss_equivalence():
     If they're identical, the subtract-and-add in forward() is a no-op.
     """
     from src.models.load_balancing import load_balancing_loss_func as custom_loss
-    from transformers.models.qwen3_moe.modeling_qwen3_moe import load_balancing_loss_func as hf_loss
+    from src.models.modeling_qwen3_moe import load_balancing_loss_func as hf_loss
 
     torch.manual_seed(42)
     # Simulate router logits (softmax probs) for 2 layers, 8 experts
@@ -286,7 +286,7 @@ def test_global_model_actually_uses_global_experts_module():
 
 def test_no_hidden_standard_moe_layers():
     """Make sure no standard Qwen3MoeSparseMoeBlock exists in the global model."""
-    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
+    from src.models.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
 
     cfg = tiny_global_config()
     model = GlobalMoEForCausalLM(cfg)
@@ -306,7 +306,7 @@ def test_expert_weights_differ_from_standard():
     Check that the global expert pool is a single Qwen3MoeExperts with num_experts=8,
     not multiple small pools.
     """
-    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
+    from src.models.modeling_qwen3_moe import Qwen3MoeExperts
 
     cfg = tiny_global_config()
     model = GlobalMoEForCausalLM(cfg)
