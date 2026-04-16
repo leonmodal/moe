@@ -570,13 +570,13 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                         continue
                     if rname in ("k", "v"):
                         n_experts = num_kv_experts
-                        n_per_tok = self.config.num_key_value_heads
+                        n_per_tok = 1  # per-head top-1 routing: each head picks 1 expert
                     elif rname == "o":
                         n_experts = num_o_experts
-                        n_per_tok = self.config.num_attention_heads
+                        n_per_tok = 1  # per-head top-1 routing
                     else:
                         n_experts = num_attn_experts
-                        n_per_tok = self.config.num_key_value_heads
+                        n_per_tok = 1  # per-head top-1 routing
                     attn_aux = load_balancing_loss_func(
                         r_logits,
                         n_experts,

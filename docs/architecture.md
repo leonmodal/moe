@@ -207,7 +207,7 @@ Each head slot has its **own dedicated router** doing **top-1** from the expert 
 
 Each router is `nn.Linear(dim, num_experts)` → top-1. Different head-slot routers learn to specialize independently.
 
-> **Note**: The reference implementation for this is in `legacy/speedrun/speedrun_moe_gpt.py`, not `mixture_of_everything.py`. The latter incorrectly uses 1 router per projection doing top-K, which collapses the per-head independence.
+> **Implementation**: `src/models/moe_everything/attention_bank.py` uses per-head top-1 routers created via `src/models/routing/helpers.py:make_top1_router()`.
 
 #### Weight Banks
 
@@ -319,7 +319,7 @@ Each head slot has its **own dedicated router** doing **top-1** — one routing 
 
 Each router is `nn.Linear(dim, num_experts)` → top-1. The bundled decision means Q and K always come from the same learned subspace.
 
-> **Note**: The reference implementation for this is in `legacy/speedrun/speedrun_moe_gpt.py`, not `mixture_of_everything.py`. The latter incorrectly uses 1 router doing top-K, which is a fundamentally different routing architecture.
+> **Implementation**: `src/models/moe_everything/attention_bank.py` uses per-head top-1 routers for precompute-KV mode.
 
 #### Weight Banks
 

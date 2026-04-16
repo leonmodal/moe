@@ -77,7 +77,7 @@ Configuration:
 
 Saved as separate files per checkpoint directory:
 - `model.pt` — model weights only
-- `optimizer.pt` — optimizer state
+- `optimizer_adam.pt` or `optimizer_muon.pt` — optimizer state (type-specific)
 - `training_state.pt` — scheduler, step, tokens_seen, wandb_run_id
 - `data_state.pt` — dataset position for deterministic resume
 - `meta.json` — human-readable metadata

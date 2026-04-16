@@ -25,35 +25,12 @@ from src.models.router import (
     is_checkpoint_recompute,
 )
 from src.models.routing.routers import _straight_through_ones
-from src.models.routing.helpers import should_use_sparse_query_path
+from src.models.routing.helpers import (
+    make_top1_router,
+    should_use_sparse_query_path,
+    sparse_gather_project,
+)
 from .config import MoEverythingConfig
-
-
-def _make_top1_router(input_dim: int, num_experts: int, config) -> "DeepSeekRouter | ExplorationTopKRouter":
-    """Create a top-1 router for per-head-slot expert selection.
-
-    This is the correct per-head design: each head slot has its own
-    dedicated router doing top-1 from the expert pool.
-    """
-    from types import SimpleNamespace
-    base_cfg = SimpleNamespace(
-        hidden_size=input_dim,
-        num_local_experts=num_experts,
-        num_experts=num_experts,
-        num_experts_per_tok=1,  # top-1: each head picks exactly one expert
-        norm_topk_prob=getattr(config, "norm_topk_prob", True),
-        router_exploration_rate=getattr(config, "router_exploration_rate", 0.0),
-    )
-    if getattr(config, "use_deepseek_routing", False):
-        base_cfg.topk_scaling_factor = getattr(config, "topk_scaling_factor", None)
-        base_cfg.num_groups = None  # no group-limited for per-head top-1
-        base_cfg.group_topk = None
-        router = DeepSeekRouter(base_cfg)
-    else:
-        router = ExplorationTopKRouter(base_cfg)
-    import math
-    nn.init.kaiming_uniform_(router.weight, a=math.sqrt(5))
-    return router
 
 DEFAULT_PER_HEAD_DENSE_FRACTION_THRESHOLD = 0.75
 AUTO_PER_HEAD_SPARSE_THRESHOLDS = {
@@ -552,27 +529,27 @@ class AttentionExpertBank(nn.Module):
         if self.per_layer_attn_router:
             # Per-depth routers: num_depths sets, each with H routers per projection
             self.q_routers = nn.ModuleList([
-                nn.ModuleList([_make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
+                nn.ModuleList([make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
                 for _ in range(self.num_depths)
             ])
             self.k_routers = nn.ModuleList([
-                nn.ModuleList([_make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
+                nn.ModuleList([make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
                 for _ in range(self.num_depths)
             ])
             self.v_routers = nn.ModuleList([
-                nn.ModuleList([_make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
+                nn.ModuleList([make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
                 for _ in range(self.num_depths)
             ])
             self.o_routers = nn.ModuleList([
-                nn.ModuleList([_make_top1_router(self.q_dim, E_o, self.config) for _ in range(H)])
+                nn.ModuleList([make_top1_router(self.q_dim, E_o, self.config) for _ in range(H)])
                 for _ in range(self.num_depths)
             ])
         else:
             # Shared routers across depths: H routers per projection
-            self.q_routers = nn.ModuleList([_make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
-            self.k_routers = nn.ModuleList([_make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
-            self.v_routers = nn.ModuleList([_make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
-            self.o_routers = nn.ModuleList([_make_top1_router(self.q_dim, E_o, self.config) for _ in range(H)])
+            self.q_routers = nn.ModuleList([make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
+            self.k_routers = nn.ModuleList([make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
+            self.v_routers = nn.ModuleList([make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
+            self.o_routers = nn.ModuleList([make_top1_router(self.q_dim, E_o, self.config) for _ in range(H)])
 
         self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_group_dim))
         self.k_proj = nn.Parameter(torch.empty(E_kv, self.hidden_size, self.head_dim))
@@ -602,11 +579,11 @@ class AttentionExpertBank(nn.Module):
         H_kv = self.num_kv_heads
         if self.per_layer_attn_router:
             self.routers = nn.ModuleList([
-                nn.ModuleList([_make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
+                nn.ModuleList([make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
                 for _ in range(self.num_depths)
             ])
         else:
-            self.routers = nn.ModuleList([_make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
+            self.routers = nn.ModuleList([make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
         if self.sanity_check_mode == "alternating_global_moe":
             num_logical_layers = max(1, self.num_depths // 2)
             self.logical_q_proj = nn.ParameterList(
