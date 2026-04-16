@@ -1,0 +1,35 @@
+Audited all 11 requested docs against the current repo. `docs/plan.md` is not in scope, but it’s useful as evidence that some “current state” docs are really future-state cleanup notes.
+
+**Critical**
+- `README.md:106-115,121-135,280-285` and `docs/README.md:28-30` describe MoE-Everything attention routing as separate per-head top-1 routers. Actual code builds one router per projection family and selects `top_k=num_key_value_heads` or `num_attention_heads`, not H independent top-1 routers (`src/models/mixture_of_everything.py:382-410,648-680,693-713,917-919,1145-1147`).
+- `MULTINODE_README.md:174-175` says `./scripts/train.sh ...` is the Accelerate workflow. It is not: `scripts/train.sh` defaults to `torchrun` with `TRAIN_ENTRYPOINT=train.py`; Accelerate only happens when `LAUNCHER=accelerate` is set (`scripts/train.sh:46-60,71-82`).
+- `EFFICIENCY_NOTES.md:164-166` says training is still wrapped in Accelerate and no native DDP/FSDP rewrite was attempted. The repo already has a raw `torch.distributed` trainer with DDP/FSDP (`train_torch.py:1-6,567-583,1375-1764`).
+- `docs/data.md:22-27,30-45` says parquet files are deterministically sorted and resume restores leftover tokens for exact reproducibility. The dataset shuffles files with a fixed seed, and `get_state()` explicitly drops the buffer (`buffer: []`), so that exact-resume claim is false (`src/data/parquet_dataset.py:65-68,112-117,142-170`).
+- `docs/distributed.md:38-40` says FSDP uses bf16 compute with fp32 reduction. `build_fsdp_mixed_precision()` sets `param_dtype`, `reduce_dtype`, and `buffer_dtype` all to the same inferred dtype (`train_torch.py:554-564`).
+- `docs/distributed.md:77` uses `modal run modal_train.py::upload_data`; that function does not exist. The only data helper is `download_data` (`modal_train.py:187-191`).
+- `docs/distributed.md:89-111` and `docs/functionality-inventory.md:82` describe `gcp_setup.sh` as GCP multi-node setup. The file is actually an Oracle Linux dev-environment bootstrap and contains no GCP cluster logic (`gcp_setup.sh:1-186`).
+- `docs/distributed.md:119-132` says checkpoints are `model_state.pt`, `optimizer_state.pt`, `scheduler_state.pt`, plus `meta.json`. Current code writes `trainer.pt` + `meta.json` in the standard torch trainer (`train_torch.py:586-625`), only `trainer.pt` in the speedrun path (`train_torch.py:1335-1363`), and an Accelerate-managed layout in `train.py` (`train.py:888-899`).
+- `docs/configuration.md:117` says `optimizer: speedrun` selects the Muon+Adam hybrid. In the standard trainer, Muon is only selected when `optimizer == "muon"`; other values fall back to AdamW (`train_torch.py:1495-1505`).
+- `docs/configuration.md:292` puts `bias_update_rate` in the model section of the MoE-Everything example. Bias-update settings are read from `training`, not `model` (`train.py:1526-1544`, `train_torch.py:1214-1232`).
+- `docs/routing.md:16` says all routers live in `src/models/router.py`. Branch routers live in `src/models/mixture_of_everything.py` and `src/models/speedrun_moe_gpt.py` (`src/models/mixture_of_everything.py:159-199`, `src/models/speedrun_moe_gpt.py:286-...`).
+- `docs/training.md:197-205` says total loss includes `branch_router_aux_loss_coef * branch_aux_loss`. The model never computes or applies branch aux loss and explicitly says branch balancing is not used (`src/models/mixture_of_everything.py:2146,2234-2236,2269-2271`).
+- `docs/training.md:79-87` says `train_torch.py` already has “basic expert bias updates”. That is only true in the speedrun loop; the standard DDP/FSDP path never updates expert bias (`train_torch.py:1211-1263` vs. `train_torch.py:1601-1764`).
+- `docs/training.md:221-226` says eval skips `model.eval()` when `torch.compile` is active. Both standard and speedrun eval call `model.eval()` unconditionally (`train_torch.py:703-705,1104-1109`).
+
+**Moderate**
+- `docs/README.md:19-30` presents a “Final” model-family table that omits still-active `speedrun_gpt`, `speedrun_moe_fully_independent`, `speedrun_moe_precompute_kv`, and `speedrun_moe_everything` support (`train_torch.py:208-243,341-374,1392-1394`; `configs/speedrun/*.yaml`).
+- `docs/architecture.md:3-15` says it covers “all model families”, but it omits the active speedrun families. It is an incomplete current-state architecture doc, not an all-model inventory.
+- `docs/architecture.md:116-120` says MoE-Everything has “exactly three shared components, instantiated once and reused across all depth steps.” That is only true for default settings; the code supports per-layer branch routers, MLP routers, attention routers, and norms (`src/models/mixture_of_everything.py:84-89,1671-1723`).
+- `MULTINODE_README.md:121-129` describes Modal execution as if every worker runs `train.py` via Accelerate. `modal_train.py` actually routes speedrun model types to `train_torch.py --dist-strategy none` and non-speedrun configs to `train.py` (`modal_train.py:152-170`).
+- `MULTINODE_README.md:89-95` says the container copies `train.py`, `src/`, `configs/`, and `torchrun_util/`; it also copies `train_torch.py` (`modal_train.py:83-88`).
+- `docs/routing.md:191-208` attributes branch-probability and expert-bias metrics to `src/utils/routing_stats.py`. That utility computes expert-count/margin stats; branch fractions and bias summaries are assembled elsewhere (`src/utils/routing_stats.py:44-128,157-214`, `train.py:1637-1747`, `src/models/speedrun_moe_gpt.py:113-133`).
+- `docs/functionality-inventory.md:14-16,63-64,72,80,83,91,128-149,154` is written like a current inventory, but it is mostly future-state cleanup planning. `train.py`, `accelerate_configs/`, token-bin, speedrun model files/configs, and speedrun exports all still exist and are still used (`train_torch.py:33-54`, `src/models/__init__.py:21-47`, `modal_train.py:152-170`).
+
+**Minor**
+- `README.md:45-47` and `MULTINODE_README.md:93,121-129,171-198` still document `train.py`/Accelerate as normal operational paths. Those paths still exist, but they should be labeled explicitly as legacy/planned-removal.
+- `README.md:77-95` and `docs/architecture.md:437-589` present speedrun families/features as normal current documentation. The code is still there, but repo cleanup docs treat speedrun as archival-bound, so these sections need a legacy/planned-removal note.
+- `docs/configuration.md:177-191`, `docs/data.md:63-115`, and `docs/training.md:83` describe token-bin as a standard active backend. Current code still supports it, but cleanup docs mark it for removal, so these sections should be labeled legacy/planned-removal.
+- `docs/distributed.md:42-45` documents the speedrun distributed-optimizer path without noting that it belongs to the speedrun stack slated for archival.
+- `docs/routing.md:138` anchors expert-bias updates to `train.py` without noting planned removal; that implementation is still real, but the doc should say it is the legacy/soon-to-be-retired path.
+
+If you want, I can turn this into a patch plan per doc file or directly rewrite the docs to match current code plus planned-removal notes.
