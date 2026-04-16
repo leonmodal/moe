@@ -218,7 +218,6 @@ def build_model(cfg: dict):
             branch_sampling=mcfg.get("branch_sampling", False),
             branch_level=mcfg.get("branch_level", "token"),
             branch_deepseek=mcfg.get("branch_deepseek", False),
-            attn_routing_level=mcfg.get("attn_routing_level", "token"),
             **common,
         )
         model = MoEverythingForCausalLM(config)

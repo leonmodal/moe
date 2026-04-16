@@ -13,7 +13,7 @@ This document covers all router implementations, expert selection mechanisms, lo
 
 ## 1. Router Implementations
 
-Routers are defined in `src/models/router.py` and re-exported via `src/models/routing/routers.py`.
+Router implementations are in `src/models/routing/routers.py` (BranchRouter, BranchRouterRecorder) and `src/models/router.py` (DeepSeekRouter, ExplorationTopKRouter). Load balancing loss is in `src/models/routing/load_balancing.py`.
 
 ### DeepSeek Router (Sigmoid + Expert Bias)
 
@@ -86,12 +86,12 @@ The hard decision makes this non-differentiable at the selection point, but the 
 
 ## 2. Load Balancing Losses
 
-All losses in `src/models/load_balancing.py`.
+All losses in `src/models/routing/load_balancing.py`.
 
 ### Batch-Level Load Balancing Loss (Switch Transformer)
 
 **Function**: `load_balancing_loss_func()`
-**File**: `src/models/load_balancing.py:39-139`
+**File**: `src/models/routing/load_balancing.py:39-139`
 
 ```
 L = num_experts * sum_i(f_i * P_i)
@@ -110,7 +110,7 @@ Where:
 ### Sequence-Level Load Balancing Loss (DeepSeek V2/V3)
 
 **Function**: `seq_load_balancing_loss_func()`
-**File**: `src/models/load_balancing.py:166-274`
+**File**: `src/models/routing/load_balancing.py:166-274`
 
 Per-sequence balance metric from DeepSeek V2/V3 (arxiv 2412.19437, Equations 17-20):
 

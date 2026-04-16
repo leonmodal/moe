@@ -35,8 +35,6 @@ class MoEverythingConfig(Qwen3MoeConfig):
         branch_sampling: bool = False,
         branch_level: str = "token",  # "token" or "seq"
         branch_deepseek: bool = False,
-        # Attention routing level (token vs seq)
-        attn_routing_level: str = "token",  # "token" or "seq"
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -70,4 +68,3 @@ class MoEverythingConfig(Qwen3MoeConfig):
         self.branch_sampling = branch_sampling
         self.branch_level = branch_level
         self.branch_deepseek = branch_deepseek
-        self.attn_routing_level = attn_routing_level

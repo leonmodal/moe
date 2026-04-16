@@ -243,39 +243,36 @@ Each head slot has its own router that independently picks one expert. With H=6 
 ```
 Token x (hidden_size=1024)
 │
-├─ Q path:
-│   x -> q_pre_norm -> q_router -> selects num_kv_heads experts from q_proj[E]
-│   For each selected expert e_i with weight w_i:
-│     q_i = x @ q_proj[e_i]  # (hidden_size) -> (q_group_dim)
-│     q_i = RMSNorm(q_i, q_norm_weight[e_i])
-│     q_i *= w_i
-│   Stack: Q = [q_0, q_1, ..., q_{num_kv_heads-1}]
+├─ Q path (H = num_kv_heads separate top-1 routers):
+│   x -> q_pre_norm
+│   For each head slot h in [0, H):
+│     q_routers[h](x) -> picks 1 expert e_h with weight w_h
+│     q_h = x @ q_proj[e_h]  # (hidden_size) -> (q_group_dim)
+│     q_h = RMSNorm(q_h, q_norm_weight[e_h])
+│     q_h *= w_h
+│   Stack: Q = [q_0, q_1, ..., q_{H-1}]
 │   Reshape: Q -> (num_heads, head_dim) via GQA unfolding
 │
-├─ K path:
-│   x -> k_pre_norm -> k_router -> selects num_kv_heads experts from k_proj[E_kv]
-│   For each selected expert e_i with weight w_i:
-│     k_i = x @ k_proj[e_i]  # (hidden_size) -> (head_dim)
-│     k_i = RMSNorm(k_i, k_norm_weight[e_i])
-│     k_i *= w_i
-│   Stack: K = [k_0, k_1, ..., k_{num_kv_heads-1}]
+├─ K path (H separate top-1 routers):
+│   x -> k_pre_norm
+│   For each head slot h: k_routers[h](x) -> picks 1 expert
+│   Stack: K = [k_0, ..., k_{H-1}] with per-expert RMSNorm
 │
-├─ V path:
-│   x -> v_pre_norm -> v_router -> selects num_kv_heads experts from v_proj[E_kv]
-│   Same structure as K, no norm applied to V
+├─ V path (H separate top-1 routers):
+│   x -> v_pre_norm
+│   For each head slot h: v_routers[h](x) -> picks 1 expert
+│   Stack: V = [v_0, ..., v_{H-1}]
 │
 ├─ Apply RoPE to Q, K
 ├─ Run standard attention: attn_out = Attention(Q, K, V)
 │
-└─ O path:
-    attn_out (num_heads, head_dim) -> o_router -> selects num_heads experts from o_proj[E_o]
-    For each selected expert e_i with weight w_i:
-      o_i = attn_out[head_i] @ o_proj[e_i]  # (head_dim) -> (hidden_size)
-      o_i *= w_i
-    Sum across heads: output = sum(o_0, o_1, ..., o_{num_heads-1})
+└─ O path (num_heads separate top-1 routers):
+    For each head h: o_routers[h](attn_out) -> picks 1 expert
+    o_h = attn_out[h] @ o_proj[e_h] * w_h
+    Sum across heads: output = sum(o_0, ..., o_{num_heads-1})
 ```
 
-**Key insight**: Each token independently selects which expert weight matrices to use for each projection. Token A might use experts [2, 0, 3, 1] for its 4 KV-group Q projections, while Token B uses [1, 3, 0, 2]. The expert weights are shared -- the diversity comes from routing decisions.
+**Key insight**: Each head slot has its own dedicated router that picks exactly one expert via top-1 selection. This is NOT one router picking top-K — it is H separate routers each independently picking top-1. Different tokens route different experts to the same head slot.
 
 #### Grouped Expert MatMul (Efficient Execution)
 

@@ -746,7 +746,9 @@ class AttentionExpertBank(nn.Module):
         token_mask: torch.Tensor | None = None,
     ) -> None:
         # Handle per-head probs list: concatenate into (N*H, E) for aux loss compatibility
+        num_head_repeats = 1
         if isinstance(router_probs, list):
+            num_head_repeats = len(router_probs)
             router_probs = torch.cat(router_probs, dim=0)  # (N*H, E)
             # Also reshape idx to match: (N, H) -> (N*H, 1)
             if expert_idx.ndim == 2:
@@ -754,6 +756,9 @@ class AttentionExpertBank(nn.Module):
 
         if token_mask is not None:
             flat_mask = token_mask.reshape(-1).bool().to(router_probs.device)
+            # Expand mask to match per-head flattened probs: (N,) -> (N*H,)
+            if num_head_repeats > 1:
+                flat_mask = flat_mask.repeat(num_head_repeats)
             dense_probs = router_probs.new_zeros(flat_mask.numel(), router_probs.shape[-1])
             dense_probs[flat_mask] = router_probs
 
@@ -778,13 +783,20 @@ class AttentionExpertBank(nn.Module):
     def _attach_token_mask_to_last_router_info(self, token_mask: torch.Tensor) -> None:
         flat_mask = token_mask.reshape(-1).bool().detach()
         for info in self.last_router_info.values():
-            info["token_mask"] = flat_mask
-            if info["router_logits"].shape[0] != flat_mask.numel():
+            # Expand mask if router_logits has more rows (per-head flattened)
+            probs_rows = info["router_logits"].shape[0]
+            mask_rows = flat_mask.numel()
+            if probs_rows > mask_rows and probs_rows % mask_rows == 0:
+                expanded_mask = flat_mask.repeat(probs_rows // mask_rows)
+            else:
+                expanded_mask = flat_mask
+            info["token_mask"] = expanded_mask
+            if info["router_logits"].shape[0] != expanded_mask.numel():
                 continue
             info["router_logits"] = info["router_logits"].clone()
-            info["router_logits"][~flat_mask] = 0
+            info["router_logits"][~expanded_mask] = 0
             info["selected_experts"] = info["selected_experts"].clone()
-            info["selected_experts"][~flat_mask] = 0
+            info["selected_experts"][~expanded_mask] = 0
 
     def _zero_dummy(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         dummy = torch.zeros((), device=device, dtype=dtype)
@@ -813,10 +825,6 @@ class AttentionExpertBank(nn.Module):
                 q_flat = self.q_pre_norm(hidden_states).reshape(B * T, H)
                 k_flat = self.k_pre_norm(hidden_states).reshape(B * T, H)
                 v_flat = self.v_pre_norm(hidden_states).reshape(B * T, H)
-
-            q_router = self._select_router("q_router", depth_idx)
-            k_router = self._select_router("k_router", depth_idx)
-            v_router = self._select_router("v_router", depth_idx)
 
             q_idx, q_w, q_probs = self._route_per_head(self.q_routers, q_flat, depth_idx)
             k_idx, k_w, k_probs = self._route_per_head(self.k_routers, k_flat, depth_idx)
@@ -869,7 +877,6 @@ class AttentionExpertBank(nn.Module):
         N = B * T
         attn_heads = attn_output.transpose(1, 2).reshape(N, self.num_heads, self.head_dim)
         attn_flat = attn_heads.reshape(N, self.q_dim)
-        o_router = self._select_router("o_router", depth_idx)
         o_idx, o_w, o_probs = self._route_per_head(self.o_routers, attn_flat, depth_idx)
         self._store_router_info("o", o_probs, o_idx)
         po_w = o_w if self.scale_attn_by_routing_weight else _straight_through_ones(o_w)
@@ -955,7 +962,6 @@ class AttentionExpertBank(nn.Module):
             k_flat = self.k_pre_norm(hidden_selected)
             v_flat = self.v_pre_norm(hidden_selected)
 
-        q_router, k_router, v_router, o_router = self._select_attn_routers(depth_idx)
         q_idx, q_w, q_probs = self._route_per_head(self.q_routers, q_flat, depth_idx)
         k_idx, k_w, k_probs = self._route_per_head(self.k_routers, k_flat, depth_idx)
         v_idx, v_w, v_probs = self._route_per_head(self.v_routers, v_flat, depth_idx)

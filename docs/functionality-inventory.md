@@ -39,6 +39,18 @@ Post-reorganization inventory of active features and archived components.
 | Newton-Schulz | `src/utils/triton_newton_schulz.py` | For Muon optimizer |
 | Routing loss | `src/utils/routing_loss.py` | Switch-style aux loss |
 
+## Active Routing Package
+
+| Component | File | Notes |
+|-----------|------|-------|
+| BranchRouter | `src/models/routing/routers.py` | Binary attn/MLP branch selection with speedrun features |
+| DeepSeekRouter | `src/models/router.py` | Sigmoid + expert bias (re-exported via routing/) |
+| ExplorationTopKRouter | `src/models/router.py` | Softmax top-k with exploration |
+| Load balancing | `src/models/routing/load_balancing.py` | Batch + sequence-level aux losses |
+| Bias management | `src/models/routing/bias.py` | Per-projection global bias update |
+| Routing stats | `src/models/routing/stats.py` | Per-forward-pass accumulation |
+| Routing helpers | `src/models/routing/helpers.py` | Top-1 dispatch, sparse gather-project |
+
 ## Archived to legacy/speedrun/
 
 | Component | Original Location | Notes |
