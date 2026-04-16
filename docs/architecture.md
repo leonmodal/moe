@@ -11,14 +11,14 @@ This document covers all model families, their layer designs, and advanced archi
   - [4a. Fully Independent Mode](#4a-fully-independent-mode)
   - [4b. Precompute KV Mode](#4b-precompute-kv-mode)
 - [5. Architecture Comparison](#5-architecture-comparison)
-- [6. Advanced Features (from Speedrun)](#6-advanced-features-from-speedrun)
+- [6. Advanced Features (extracted from archived speedrun models)](#6-advanced-features-extracted-from-archived-speedrun-models)
 
 ---
 
 ## 1. Standard LLM (Dense)
 
-**Config type**: `dense` or `gpt2_dense`
-**Implementation**: `Qwen3ForCausalLM` (HuggingFace transformers)
+**Config type**: `dense`
+**Implementation**: `Qwen3ForCausalLM`
 
 A standard dense transformer with no expert routing. Every token passes through every parameter. Used as a baseline for comparing MoE efficiency.
 
@@ -34,7 +34,7 @@ A standard dense transformer with no expert routing. Every token passes through 
 
 ## 2. Standard MoE
 
-**Config type**: `standard_moe` or `deepseek_standard_moe`
+**Config type**: `standard_moe` (with optional `router_type: deepseek`)
 **File**: `src/models/standard_moe.py`
 **Base**: `Qwen3MoeForCausalLM` with fixes
 
@@ -51,7 +51,7 @@ Layer N:
 
 **Variants**:
 - `standard_moe`: Softmax router with optional exploration
-- `deepseek_standard_moe`: Sigmoid router + non-gradient expert bias updates (DeepSeek V3 style)
+- With `router_type: deepseek`: Sigmoid router + non-gradient expert bias updates (DeepSeek V3 style)
 
 **Typical config**: 16 experts per layer, top-4 routing
 
@@ -59,7 +59,7 @@ Layer N:
 
 ## 3. Global MoE
 
-**Config type**: `global_moe` or `deepseek_global_moe`
+**Config type**: `global_moe` (with optional `router_type: deepseek`)
 **File**: `src/models/global_moe.py`
 
 Instead of each layer having its own experts, all layers share a single global pool of experts. Each layer has only a router (no expert weights). The router selects from the shared pool.
@@ -207,7 +207,7 @@ Each head slot has its **own dedicated router** doing **top-1** from the expert 
 
 Each router is `nn.Linear(dim, num_experts)` → top-1. Different head-slot routers learn to specialize independently.
 
-> **Note**: The reference implementation for this is in `speedrun_moe_gpt.py`, not `mixture_of_everything.py`. The latter incorrectly uses 1 router per projection doing top-K, which collapses the per-head independence.
+> **Note**: The reference implementation for this is in `legacy/speedrun/speedrun_moe_gpt.py`, not `mixture_of_everything.py`. The latter incorrectly uses 1 router per projection doing top-K, which collapses the per-head independence.
 
 #### Weight Banks
 
@@ -322,7 +322,7 @@ Each head slot has its **own dedicated router** doing **top-1** — one routing 
 
 Each router is `nn.Linear(dim, num_experts)` → top-1. The bundled decision means Q and K always come from the same learned subspace.
 
-> **Note**: The reference implementation for this is in `speedrun_moe_gpt.py`, not `mixture_of_everything.py`. The latter incorrectly uses 1 router doing top-K, which is a fundamentally different routing architecture.
+> **Note**: The reference implementation for this is in `legacy/speedrun/speedrun_moe_gpt.py`, not `mixture_of_everything.py`. The latter incorrectly uses 1 router doing top-K, which is a fundamentally different routing architecture.
 
 #### Weight Banks
 
@@ -478,7 +478,7 @@ These features originated in the modded-nanogpt speedrun models and may be porte
 
 ### FlexAttention with Document Masking + Sliding Window
 
-**Origin**: `src/models/speedrun_gpt.py:277-315`
+**Origin**: `legacy/speedrun/speedrun_gpt.py:277-315`
 
 PyTorch's FlexAttention API allows defining custom block-level attention masks efficiently. Our implementation combines three masking strategies:
 
@@ -522,7 +522,7 @@ window_size = next_multiple_of_128(1728 * (step / num_iterations))
 
 ### Sigmoid Logit Softcapping
 
-**Origin**: `src/models/speedrun_gpt.py:348-349`
+**Origin**: `legacy/speedrun/speedrun_gpt.py:348-349`
 
 ```python
 logits = 30 * torch.sigmoid(logits / 7.5)
@@ -546,7 +546,7 @@ This bounds the logits to the range [0, 30] before cross-entropy loss, following
 
 ### Learnable Skip Connections (U-net Design)
 
-**Origin**: `src/models/speedrun_gpt.py:260-344`
+**Origin**: `legacy/speedrun/speedrun_gpt.py:260-344`
 
 The model learns scalar weights that control residual connections in a U-net pattern:
 
@@ -574,7 +574,7 @@ Three sets of learnable scalars per layer:
 
 ### Gated Attention
 
-**Origin**: `src/models/speedrun_gpt.py:183-201`
+**Origin**: `legacy/speedrun/speedrun_gpt.py:183-201`
 
 Each attention head has a learned gate that can suppress or amplify its output:
 

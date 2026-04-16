@@ -25,6 +25,28 @@ except Exception:
     StateDictType = None
 
 
+def _save_optimizer_state(optimizer, optim_state: dict, ckpt_dir: str) -> None:
+    """Save optimizer state, splitting Muon hybrid optimizer into separate files."""
+    try:
+        from src.utils.muon import Muon
+        if isinstance(optimizer, Muon):
+            # Muon optimizer has both muon and adam param groups
+            # Save the full state dict but mark it as muon-type
+            torch.save(
+                {"type": "muon", "state_dict": optim_state},
+                os.path.join(ckpt_dir, "optimizer_muon.pt"),
+            )
+            return
+    except ImportError:
+        pass
+
+    # Standard optimizer (AdamW or similar)
+    torch.save(
+        {"type": "adam", "state_dict": optim_state},
+        os.path.join(ckpt_dir, "optimizer_adam.pt"),
+    )
+
+
 def save_checkpoint(
     *,
     model,
@@ -54,8 +76,8 @@ def save_checkpoint(
         # Save model weights separately
         torch.save(model_state, os.path.join(ckpt_dir, "model.pt"))
 
-        # Save optimizer state separately
-        torch.save(optim_state, os.path.join(ckpt_dir, "optimizer.pt"))
+        # Save optimizer state — detect Muon hybrid and save separately
+        _save_optimizer_state(optimizer, optim_state, ckpt_dir)
 
         # Save training state (scheduler, step, etc.)
         training_state = {
@@ -101,6 +123,25 @@ def load_checkpoint(
     raise FileNotFoundError(f"No checkpoint found in {resume_from}")
 
 
+def _load_optimizer_state(resume_from: str) -> dict:
+    """Load optimizer state from checkpoint directory, supporting all formats."""
+    # Try typed format: optimizer_muon.pt or optimizer_adam.pt
+    for name in ("optimizer_muon.pt", "optimizer_adam.pt"):
+        path = os.path.join(resume_from, name)
+        if os.path.exists(path):
+            payload = torch.load(path, map_location="cpu")
+            if isinstance(payload, dict) and "state_dict" in payload:
+                return payload["state_dict"]
+            return payload
+
+    # Fall back to legacy single optimizer.pt
+    path = os.path.join(resume_from, "optimizer.pt")
+    if os.path.exists(path):
+        return torch.load(path, map_location="cpu")
+
+    raise FileNotFoundError(f"No optimizer state found in {resume_from}")
+
+
 def _load_separate_checkpoint(
     model,
     optimizer,
@@ -109,7 +150,9 @@ def _load_separate_checkpoint(
 ) -> tuple[int, dict | None, float]:
     """Load checkpoint from separate files."""
     model_state = torch.load(os.path.join(resume_from, "model.pt"), map_location="cpu")
-    optim_state = torch.load(os.path.join(resume_from, "optimizer.pt"), map_location="cpu")
+
+    # Load optimizer state — try new typed format first, then legacy
+    optim_state = _load_optimizer_state(resume_from)
 
     if FSDP is not None and isinstance(model, FSDP):
         load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)

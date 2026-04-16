@@ -42,10 +42,10 @@ SUPPORTED_TYPES = {
     "moe_everything",
 }
 
-# Deprecated model type aliases that map to supported types
-_DEPRECATED_ALIASES = {
-    "deepseek_standard_moe": "standard_moe",
-    "deepseek_global_moe": "global_moe",
+# Deprecated model types that must be rejected with clear guidance
+_DEPRECATED_TYPES = {
+    "deepseek_standard_moe": "Use type: standard_moe with router_type: deepseek",
+    "deepseek_global_moe": "Use type: global_moe with router_type: deepseek",
 }
 
 
@@ -101,13 +101,13 @@ def build_model(cfg: dict):
     mcfg = cfg["model"]
     attn_impl = mcfg.get("attn_implementation", "sdpa")
 
-    # Handle deprecated aliases
-    if mtype in _DEPRECATED_ALIASES:
-        actual_type = _DEPRECATED_ALIASES[mtype]
-        # For deepseek variants, set router_type
-        if "deepseek" in mtype:
-            mcfg.setdefault("router_type", "deepseek")
-        mtype = actual_type
+    # Reject deprecated model types with migration guidance
+    if mtype in _DEPRECATED_TYPES:
+        raise ValueError(
+            f"Model type '{mtype}' is deprecated. "
+            f"{_DEPRECATED_TYPES[mtype]}. "
+            f"Supported types: {', '.join(sorted(SUPPORTED_TYPES))}"
+        )
 
     # Reject archived model types
     if mtype in _ARCHIVED_TYPES:

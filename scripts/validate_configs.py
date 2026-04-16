@@ -9,8 +9,10 @@ Validates:
 - Required fields are present
 - Model type uses normalized taxonomy
 - No deprecated model types
+- Router type and attention mode enums are valid
 - Data format is parquet (token-bin removed)
 - Training config fields are valid
+- Recursively scans all config subdirectories
 """
 
 from __future__ import annotations
@@ -34,6 +36,14 @@ DEPRECATED_MODEL_TYPES = {
     "speedrun_moe_precompute_kv": "archived to legacy/",
     "speedrun_moe_everything": "archived to legacy/",
 }
+
+VALID_ROUTER_TYPES = {"softmax", "deepseek"}
+VALID_ATTN_EXPERT_MODES = {
+    "bundled", "per_head_fully_independent", "per_head_precompute_kv",
+}
+VALID_LR_SCHEDULERS = {"cosine", "linear", "constant", "stable_decay"}
+VALID_OPTIMIZERS = {"adamw", "muon"}
+VALID_MIXED_PRECISION = {"bf16", "fp16", "fp32", ""}
 
 REQUIRED_MODEL_FIELDS = {"type", "vocab_size", "hidden_size", "num_hidden_layers"}
 REQUIRED_MoE_FIELDS = {"num_experts", "num_experts_per_tok", "moe_intermediate_size"}
@@ -76,11 +86,19 @@ def validate_config(path: Path) -> list[str]:
         if missing_model:
             issues.append(f"Missing required model fields: {missing_model}")
 
-        if mtype in ("standard_moe", "global_moe", "moe_everything",
-                      "deepseek_standard_moe", "deepseek_global_moe"):
+        if mtype in ("standard_moe", "global_moe", "moe_everything"):
             missing_moe = REQUIRED_MoE_FIELDS - set(model.keys())
             if missing_moe:
                 issues.append(f"Missing required MoE fields: {missing_moe}")
+
+        # Validate enum fields
+        router_type = model.get("router_type")
+        if router_type is not None and router_type not in VALID_ROUTER_TYPES:
+            issues.append(f"Invalid router_type '{router_type}' — must be one of {VALID_ROUTER_TYPES}")
+
+        attn_mode = model.get("attn_expert_mode")
+        if attn_mode is not None and attn_mode not in VALID_ATTN_EXPERT_MODES:
+            issues.append(f"Invalid attn_expert_mode '{attn_mode}' — must be one of {VALID_ATTN_EXPERT_MODES}")
 
     # Training section
     training = cfg.get("training", {})
@@ -91,6 +109,18 @@ def validate_config(path: Path) -> list[str]:
         if missing_training:
             issues.append(f"Missing required training fields: {missing_training}")
 
+        lr_sched = training.get("lr_scheduler")
+        if lr_sched is not None and lr_sched not in VALID_LR_SCHEDULERS:
+            issues.append(f"Invalid lr_scheduler '{lr_sched}' — must be one of {VALID_LR_SCHEDULERS}")
+
+        optimizer = training.get("optimizer")
+        if optimizer is not None and optimizer not in VALID_OPTIMIZERS:
+            issues.append(f"Invalid optimizer '{optimizer}' — must be one of {VALID_OPTIMIZERS}")
+
+        mp = training.get("mixed_precision", "")
+        if mp and mp not in VALID_MIXED_PRECISION:
+            issues.append(f"Invalid mixed_precision '{mp}' — must be one of {VALID_MIXED_PRECISION}")
+
     # Data section
     data = cfg.get("data", {})
     if data:
@@ -100,6 +130,18 @@ def validate_config(path: Path) -> list[str]:
             issues.append("'files_glob' field indicates token-bin format — use parquet with 'data_dir'")
 
     return issues
+
+
+def _find_all_configs(config_dir: Path) -> list[Path]:
+    """Recursively find all YAML configs, excluding legacy/ directories."""
+    configs = []
+    for path in sorted(config_dir.rglob("*.yaml")):
+        # Skip any path component named 'legacy' or 'speedrun' within config dir
+        parts = path.relative_to(config_dir).parts
+        if "speedrun" in parts:
+            continue
+        configs.append(path)
+    return configs
 
 
 def main():
@@ -113,11 +155,7 @@ def main():
         config_files = [Path(c) for c in args.configs]
     else:
         config_dir = Path("configs")
-        config_files = sorted(config_dir.glob("*.yaml"))
-        # Also check subdirectories (except speedrun which is archived)
-        for subdir in config_dir.iterdir():
-            if subdir.is_dir() and subdir.name not in ("speedrun",):
-                config_files.extend(sorted(subdir.glob("*.yaml")))
+        config_files = _find_all_configs(config_dir)
 
     total_issues = 0
     for config_file in config_files:

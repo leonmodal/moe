@@ -104,6 +104,7 @@ class StatefulParquetDataset(IterableDataset):
         # Live tracking (updated during __iter__)
         self._cur_file_idx: int = 0
         self._cur_seq_idx: int = 0
+        self._live_buffer: list[int] = []
 
     # ------------------------------------------------------------------ #
     #  State management                                                    #
@@ -113,7 +114,7 @@ class StatefulParquetDataset(IterableDataset):
         return {
             "file_idx": self._cur_file_idx,
             "seq_idx": self._cur_seq_idx,
-            "buffer": [],  # buffer is small; drop it for simplicity
+            "buffer": list(self._live_buffer) if self._live_buffer else [],
         }
 
     def set_state(self, state: dict) -> None:
@@ -140,6 +141,7 @@ class StatefulParquetDataset(IterableDataset):
         eos = self.tokenizer.eos_token_id or 0
 
         token_buffer: list[int] = list(self._start_buffer)
+        self._live_buffer = token_buffer
         skip_seqs = self._start_seq_skip
 
         for file_idx, file_path in enumerate(self.files):

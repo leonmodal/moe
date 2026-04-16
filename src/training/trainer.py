@@ -153,7 +153,15 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
     barrier()
 
     dataset = build_train_dataset(cfg, tokenizer=tokenizer, rank=rank, world_size=world_size)
-    dataloader = DataLoader(dataset, batch_size=train_cfg.batch_size, num_workers=0, pin_memory=True)
+    data_num_workers = dcfg_dict.get("num_workers", 4)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=train_cfg.batch_size,
+        num_workers=data_num_workers,
+        pin_memory=True,
+        prefetch_factor=2 if data_num_workers > 0 else None,
+        persistent_workers=data_num_workers > 0,
+    )
 
     eval_dataset = build_eval_dataset(cfg, tokenizer=tokenizer, rank=rank, world_size=world_size)
     eval_dataloader = None
@@ -162,8 +170,10 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
         eval_dataloader = DataLoader(
             eval_dataset,
             batch_size=int(eval_cfg.get("batch_size", train_cfg.batch_size)),
-            num_workers=0,
+            num_workers=data_num_workers,
             pin_memory=True,
+            prefetch_factor=2 if data_num_workers > 0 else None,
+            persistent_workers=data_num_workers > 0,
         )
 
     # Resume from checkpoint

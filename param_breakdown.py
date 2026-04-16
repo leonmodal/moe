@@ -49,20 +49,22 @@ def build_model(cfg: dict):
         config.num_groups = mcfg.get("num_groups", None)
         config.group_topk = mcfg.get("group_topk", None)
 
+    use_deepseek = mcfg.get("router_type") == "deepseek" or mcfg.get("use_deepseek_routing", False)
+
     if mtype == "standard_moe":
         config = Qwen3MoeConfig(num_experts=mcfg["num_experts"], **common)
-        model = StandardMoEModel(config)
-    elif mtype == "deepseek_standard_moe":
-        config = Qwen3MoeConfig(num_experts=mcfg["num_experts"], **common)
-        _set_deepseek_router_params(config, mcfg)
-        model = DeepSeekStandardMoEModel(config)
+        if use_deepseek:
+            _set_deepseek_router_params(config, mcfg)
+            model = DeepSeekStandardMoEModel(config)
+        else:
+            model = StandardMoEModel(config)
     elif mtype == "global_moe":
         config = GlobalMoEConfig(num_experts=mcfg["num_experts"], **common)
-        model = GlobalMoEForCausalLM(config)
-    elif mtype == "deepseek_global_moe":
-        config = GlobalMoEConfig(num_experts=mcfg["num_experts"], **common)
-        _set_deepseek_router_params(config, mcfg)
-        model = DeepSeekGlobalMoEForCausalLM(config)
+        if use_deepseek:
+            _set_deepseek_router_params(config, mcfg)
+            model = DeepSeekGlobalMoEForCausalLM(config)
+        else:
+            model = GlobalMoEForCausalLM(config)
     elif mtype == "moe_everything":
         config = MoEverythingConfig(
             num_experts=mcfg["num_experts"],

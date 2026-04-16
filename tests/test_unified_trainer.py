@@ -1,7 +1,16 @@
 """Smoke tests for the unified trainer with all supported model variants.
 
-Tests: forward pass, backward pass, optimizer step, and checkpoint save/load
-for each model type in the supported taxonomy.
+Tests: forward pass, backward pass, optimizer step, checkpoint save/load,
+loss sanity (decreasing over steps), and deprecated type rejection.
+
+Model matrix (7 variants):
+- dense
+- standard_moe (softmax)
+- standard_moe (deepseek)
+- global_moe (softmax)
+- global_moe (deepseek)
+- moe_everything (per_head_fully_independent)
+- moe_everything (per_head_precompute_kv)
 """
 
 import os
@@ -14,10 +23,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.training.model_factory import build_model, SUPPORTED_TYPES, _ARCHIVED_TYPES
+from src.training.model_factory import build_model, SUPPORTED_TYPES, _ARCHIVED_TYPES, _DEPRECATED_TYPES
 
 
-# Minimal config templates for each model type
 def _dense_config():
     return {
         "model": {
@@ -58,7 +66,7 @@ def _moe_config(model_type="standard_moe", router_type="softmax", **extra):
     return cfg
 
 
-def _moe_everything_config(attn_expert_mode="bundled"):
+def _moe_everything_config(attn_expert_mode):
     return _moe_config(
         model_type="moe_everything",
         num_attn_experts=4,
@@ -67,14 +75,15 @@ def _moe_everything_config(attn_expert_mode="bundled"):
     )
 
 
-# Parametrized test matrix
+# Full parametrized test matrix — all 7 required variants
 MODEL_CONFIGS = [
     ("dense", _dense_config()),
     ("standard_moe_softmax", _moe_config("standard_moe", "softmax")),
     ("standard_moe_deepseek", _moe_config("standard_moe", "deepseek")),
     ("global_moe_softmax", _moe_config("global_moe", "softmax")),
     ("global_moe_deepseek", _moe_config("global_moe", "deepseek")),
-    ("moe_everything_bundled", _moe_everything_config("bundled")),
+    ("moe_everything_fully_independent", _moe_everything_config("per_head_fully_independent")),
+    ("moe_everything_precompute_kv", _moe_everything_config("per_head_precompute_kv")),
 ]
 
 
@@ -90,12 +99,10 @@ def test_forward_backward_step(name, cfg):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
-    # Create dummy input
     batch_size, seq_len = 2, 32
     input_ids = torch.randint(0, cfg["model"]["vocab_size"], (batch_size, seq_len)).cuda()
     labels = input_ids
 
-    # Forward pass
     is_dense = cfg["model"]["type"] == "dense"
     output = model(
         input_ids=input_ids,
@@ -108,16 +115,51 @@ def test_forward_backward_step(name, cfg):
     loss_value = output.loss.item()
     assert loss_value > 0, f"Loss should be positive, got {loss_value}"
 
-    # Backward pass
     output.loss.backward()
 
-    # Check gradients exist
     grad_count = sum(1 for p in model.parameters() if p.grad is not None)
     assert grad_count > 0, "No gradients computed"
 
-    # Optimizer step
     optimizer.step()
     optimizer.zero_grad()
+
+
+@pytest.mark.parametrize("name,cfg", MODEL_CONFIGS, ids=[c[0] for c in MODEL_CONFIGS])
+def test_loss_decreases(name, cfg):
+    """Test that loss decreases over 3 training steps (loss sanity check)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    model, model_cfg = build_model(cfg)
+    model = model.cuda()
+    model.train()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    torch.manual_seed(42)
+    batch_size, seq_len = 4, 32
+    input_ids = torch.randint(0, cfg["model"]["vocab_size"], (batch_size, seq_len)).cuda()
+    labels = input_ids
+
+    is_dense = cfg["model"]["type"] == "dense"
+    losses = []
+
+    for step in range(3):
+        output = model(
+            input_ids=input_ids,
+            labels=labels,
+            **({} if is_dense else {"output_router_logits": True}),
+        )
+        losses.append(output.loss.item())
+        output.loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+    # Loss should decrease: final loss should be less than initial loss
+    assert losses[-1] < losses[0], (
+        f"Loss did not decrease over 3 steps: {losses}. "
+        f"This may indicate a bug in the training loop or loss computation."
+    )
 
 
 @pytest.mark.parametrize("name,cfg", MODEL_CONFIGS, ids=[c[0] for c in MODEL_CONFIGS])
@@ -130,16 +172,13 @@ def test_checkpoint_roundtrip(name, cfg):
     model = model.cuda()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Save
         torch.save(model.state_dict(), os.path.join(tmpdir, "model.pt"))
 
-        # Load into fresh model
         model2, _ = build_model(cfg)
         model2 = model2.cuda()
         state = torch.load(os.path.join(tmpdir, "model.pt"), map_location="cuda")
         model2.load_state_dict(state)
 
-        # Verify outputs match
         input_ids = torch.randint(0, cfg["model"]["vocab_size"], (1, 16)).cuda()
         model.eval()
         model2.eval()
@@ -147,6 +186,14 @@ def test_checkpoint_roundtrip(name, cfg):
             out1 = model(input_ids=input_ids)
             out2 = model2(input_ids=input_ids)
         torch.testing.assert_close(out1.logits, out2.logits)
+
+
+def test_deprecated_types_rejected():
+    """Test that deprecated model types (deepseek_standard_moe, etc.) are rejected."""
+    for deprecated_type, guidance in _DEPRECATED_TYPES.items():
+        cfg = _moe_config(deprecated_type)
+        with pytest.raises(ValueError, match="deprecated"):
+            build_model(cfg)
 
 
 def test_archived_types_rejected():
@@ -162,18 +209,6 @@ def test_unknown_type_rejected():
     cfg = {"model": {"type": "nonexistent_model"}, "training": {}}
     with pytest.raises(ValueError, match="Unknown model type"):
         build_model(cfg)
-
-
-def test_deprecated_alias_works():
-    """Test that deprecated aliases still work via the model factory."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
-    cfg = _moe_config("standard_moe", "deepseek")
-    # Simulate the old alias
-    cfg["model"]["type"] = "deepseek_standard_moe"
-    model, _ = build_model(cfg)
-    assert model is not None
 
 
 if __name__ == "__main__":

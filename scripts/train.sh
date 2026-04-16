@@ -35,7 +35,7 @@ if [[ ! -f "$CONFIG" ]]; then
   exit 1
 fi
 
-EXTRA_ARGS=("$@")   # pass remaining args (--smoke_test, --resume, etc.) through
+EXTRA_ARGS=("$@")   # pass remaining args (--resume, etc.) through
 
 # ── Launch ───────────────────────────────────────────────────────────────────
 echo "========================================"
@@ -43,22 +43,7 @@ echo "  Config : $CONFIG"
 echo "  Extra  : ${EXTRA_ARGS[*]:-none}"
 echo "========================================"
 
-LAUNCHER="${LAUNCHER:-torchrun}"
-TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-train.py}"
-
-if [[ ! -f "$TRAIN_ENTRYPOINT" ]]; then
-  echo "ERROR: train entrypoint not found: $TRAIN_ENTRYPOINT"
-  exit 1
-fi
-
-if [[ "$LAUNCHER" == "accelerate" ]]; then
-  uv run accelerate launch \
-    --config_file accelerate_configs/ddp_8gpu.yaml \
-    "$TRAIN_ENTRYPOINT" \
-    --config "$CONFIG" \
-    "${EXTRA_ARGS[@]}"
-  exit 0
-fi
+TRAIN_ENTRYPOINT="scripts/train.py"
 
 if [[ -z "${NPROC_PER_NODE:-}" ]]; then
   if command -v nvidia-smi >/dev/null 2>&1; then

@@ -13,7 +13,7 @@ This document covers all router implementations, expert selection mechanisms, lo
 
 ## 1. Router Implementations
 
-All routers live in `src/models/router.py`.
+Routers are defined in `src/models/router.py` and re-exported via `src/models/routing/routers.py`.
 
 ### DeepSeek Router (Sigmoid + Expert Bias)
 
@@ -25,7 +25,7 @@ The primary router for production MoE models. Uses sigmoid scoring instead of so
 **Forward pass**:
 ```
 logits = linear(hidden_state)          # [batch*seq, num_experts]
-scores = sigmoid(logits) * scale       # scale is a learned scalar (~2.5)
+scores = sigmoid(logits)               # scores in (0, 1)
 scores_biased = scores + expert_bias   # bias is a persistent buffer, not a parameter
 top_k_weights, top_k_indices = topk(scores_biased, k)
 # Optional: normalize top_k_weights to sum to 1
@@ -135,7 +135,7 @@ Diagnostic variant for sigmoid routers. Since sigmoid scores don't sum to 1 (unl
 
 ## 3. Expert Bias Updates (DeepSeek V3)
 
-**Location**: `train.py:120-281`
+**Location**: `src/training/routing.py` (called from `src/training/trainer.py`)
 
 A non-gradient mechanism for balancing expert utilization. Instead of relying solely on auxiliary losses (which can conflict with the main task loss), expert biases are updated post-step based on actual token counts.
 

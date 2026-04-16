@@ -8,26 +8,28 @@ This repository implements Mixture-of-Experts (MoE) language model pre-training 
 
 | Document | Contents |
 |----------|----------|
-| [Architecture](architecture.md) | Model families, layer design, attention modes, and advanced features |
+| [Architecture](architecture.md) | Model families, layer design, attention modes |
 | [Routing & Experts](routing.md) | Router implementations, expert selection, load balancing, bias updates |
-| [Training](training.md) | Training loop, optimizers, LR schedulers, loss functions, `train.py` vs `train_torch.py` comparison |
-| [Data](data.md) | Dataset formats, data loading, tokenization, stateful resumption |
-| [Distributed Training](distributed.md) | DDP, FSDP, multi-node setup on Modal and GCP |
-| [Configuration](configuration.md) | Config file schema, parameter reference, example configs |
-| [Functionality Inventory](functionality-inventory.md) | Complete feature inventory table with keep/drop decisions for cleanup |
+| [Training](training.md) | Unified training loop, optimizers, LR schedulers, loss functions |
+| [Data](data.md) | Parquet dataset, tokenization, stateful resumption |
+| [Distributed Training](distributed.md) | DDP, FSDP, multi-node setup on Modal |
+| [Configuration](configuration.md) | Config file schema, parameter reference |
+| [External Research](research/external_moe_techniques.md) | Findings from Megatron-LM, modal-nmoe, nmoe |
 
-## Model Families (Final)
+## Model Families
 
-| Model | Type | File | Description |
-|-------|------|------|-------------|
-| **Standard LLM** | Dense | `Qwen3ForCausalLM` | Standard dense transformer (Qwen3 backbone) |
-| **Standard MoE** | Sparse | `src/models/standard_moe.py` | Per-layer routed MLP experts with fixed load-balancing loss |
-| **Global MoE** | Sparse | `src/models/global_moe.py` | Single shared expert pool across all layers |
-| **MoE-Everything** | Sparse | `src/models/mixture_of_everything.py` | Branch routing (attn vs MLP) + per-head attention expert banks + MLP expert banks, all shared across depths |
+| Model | Config Type | Description |
+|-------|------------|-------------|
+| **Dense** | `dense` | Standard dense transformer (Qwen3 backbone) |
+| **Standard MoE** | `standard_moe` | Per-layer routed MLP experts |
+| **Global MoE** | `global_moe` | Single shared expert pool across all layers |
+| **MoE-Everything** | `moe_everything` | Branch routing + per-head attention/MLP expert banks |
+
+DeepSeek routing available via `router_type: deepseek` for any MoE model type.
 
 MoE-Everything supports two attention expert modes:
-- **Fully Independent**: 4 routers per head (Q, K, V, O route independently)
-- **Precompute KV**: 1 router per head (same expert for all QKVO, KV precomputed per expert)
+- **Fully Independent** (`per_head_fully_independent`): Q, K, V, O each routed independently per head
+- **Precompute KV** (`per_head_precompute_kv`): bundled QKVO routing per head
 
 ## Quick Start
 
@@ -36,7 +38,7 @@ MoE-Everything supports two attention expert modes:
 uv sync
 
 # Single-node training (8 GPUs)
-torchrun --nproc_per_node=8 train_torch.py --config configs/scaling/xs_standard.yaml
+torchrun --nproc_per_node=8 scripts/train.py --config configs/standard_moe.yaml
 
 # Multi-node on Modal
 modal run modal_train.py
