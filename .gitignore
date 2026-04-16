@@ -13,3 +13,5 @@ run_logs/
 nmoe
 modal-nmoe
 Bagel/
+.humanize/
+.codex/
