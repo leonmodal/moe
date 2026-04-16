@@ -33,6 +33,10 @@ def build_dataset_from_config(
         num_workers=cfg_dict.get("num_workers", 4),
         split=cfg_dict.get("split", "all"),
         holdout_fraction=cfg_dict.get("holdout_fraction", 0.0),
+        # Copy prefetch_files through so `data.prefetch_files: 0` in YAML
+        # actually disables the dataset-level read-ahead added in Round 3.
+        # Default matches `DataConfig` (one-file read-ahead).
+        prefetch_files=cfg_dict.get("prefetch_files", 1),
     )
     return StatefulParquetDataset(
         config=data_cfg,

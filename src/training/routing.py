@@ -122,16 +122,31 @@ def exploration_rate_schedule(
 
 
 def apply_router_exploration_rate(model, rate: float) -> int:
-    """Push `rate` onto every router-like submodule with an `exploration_rate`.
+    """Push `rate` onto every expert-router submodule with an `exploration_rate`.
 
     Returns the number of router modules updated (useful for asserting
     coverage in tests). Safe for DDP/FSDP-wrapped models — the iteration goes
     through the unwrapped model and mutates the shared tensor-free attribute
     directly.
+
+    `BranchRouter` instances are deliberately skipped: MoE-Everything configs
+    can set `branch_router_exploration_rate` independently of the model-wide
+    `router_exploration_rate`, so the training-time warmup must not clobber
+    that separate value. Branch-router rate control remains a model-config
+    knob, not a trainer-side schedule.
     """
+    # Lazy import — the router module pulls torch dependencies and we do not
+    # want to force those on code paths that only inspect this helper.
+    try:
+        from src.models.routing.routers import BranchRouter
+    except Exception:  # pragma: no cover - defensive
+        BranchRouter = None  # type: ignore[assignment]
+
     raw_model = unwrap_model(model)
     count = 0
     for module in raw_model.modules():
+        if BranchRouter is not None and isinstance(module, BranchRouter):
+            continue
         if hasattr(module, "exploration_rate"):
             module.exploration_rate = float(rate)
             count += 1

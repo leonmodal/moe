@@ -97,6 +97,30 @@ def test_apply_is_idempotent_and_accepts_zero():
     assert m.r1.exploration_rate == 0.0
 
 
+def test_apply_skips_branch_router():
+    """`BranchRouter.exploration_rate` is controlled by the model-level
+    `branch_router_exploration_rate` config and must not be overwritten by
+    the trainer-side warmup schedule.
+    """
+    from src.models.routing.routers import BranchRouter
+
+    class _Mixed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.expert_router = _FakeRouter(0.0)  # acts like DeepSeek/Exploration router
+            self.branch_router = BranchRouter(hidden_size=16, exploration_rate=0.05)
+
+    m = _Mixed()
+    n = apply_router_exploration_rate(m, 0.42)
+    # The non-branch router is updated; the branch router is untouched.
+    assert n == 1, "applier must update exactly one non-BranchRouter module"
+    assert m.expert_router.exploration_rate == 0.42
+    assert m.branch_router.exploration_rate == 0.05, (
+        "BranchRouter.exploration_rate must be preserved so the "
+        "model-config `branch_router_exploration_rate` still takes effect."
+    )
+
+
 def test_apply_works_through_ddp_style_wrapper():
     """Mimic the DDP wrapper shape (`.module` attribute on wrapped model)."""
     inner = _ModelWithRouters()
