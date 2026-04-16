@@ -12,6 +12,8 @@ from src.models.router import (
     ExplorationTopKRouter,
 )
 from src.models.load_balancing import load_balancing_loss_func, seq_load_balancing_loss_func
+from .config import MoEverythingConfig
+from .attention_bank import NormExpertBank
 
 class MlpExpertBank(nn.Module):
     """MLP expert bank with pre-norm. Shared across all depths."""

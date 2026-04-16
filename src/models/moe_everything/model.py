@@ -16,6 +16,8 @@ from src.models.modeling_qwen3_moe import (
 )
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from src.models.routing.routers import BranchRouter, BranchRouterRecorder
+from src.models.router import checkpoint_recompute_context
+from src.models.load_balancing import load_balancing_loss_func, seq_load_balancing_loss_func
 from .config import MoEverythingConfig
 from .attention_bank import AttentionExpertBank, NormExpertBank
 from .mlp_bank import MlpExpertBank

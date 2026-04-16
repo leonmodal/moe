@@ -25,6 +25,7 @@ from src.models.router import (
     is_checkpoint_recompute,
 )
 from src.models.routing.routers import _straight_through_ones
+from .config import MoEverythingConfig
 
 DEFAULT_PER_HEAD_DENSE_FRACTION_THRESHOLD = 0.75
 AUTO_PER_HEAD_SPARSE_THRESHOLDS = {
