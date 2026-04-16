@@ -58,6 +58,7 @@ from .router import (
     checkpoint_recompute_context,
     is_checkpoint_recompute,
 )
+from .routing.routers import BranchRouter, BranchRouterRecorder, _straight_through_ones
 
 DEFAULT_PER_HEAD_DENSE_FRACTION_THRESHOLD = 0.75
 AUTO_PER_HEAD_SPARSE_THRESHOLDS = {
@@ -154,58 +155,8 @@ class MoEverythingConfig(Qwen3MoeConfig):
         )
 
 
-# ─── Branch router ─────────────────────────────────────────────────────────── #
-
-class BranchRouter(nn.Module):
-    """Binary router: ATTN (0) or MLP (1) per token.
-
-    Hard routing: each token picks one branch via argmax.
-    The selected branch output is scaled by its softmax probability
-    for gradient flow (same pattern as MoE expert routing).
-    """
-
-    def __init__(self, hidden_size: int, exploration_rate: float = 0.0,
-                 scale_by_routing_weight: bool = True):
-        super().__init__()
-        self.gate = nn.Linear(hidden_size, 2, bias=False)
-        self.exploration_rate = exploration_rate
-        self.scale_by_routing_weight = scale_by_routing_weight
-        self.last_probs = None
-        self.last_selected_experts = None
-
-    def forward(self, hidden_states: torch.Tensor):
-        logits = self.gate(hidden_states.float())
-        probs = F.softmax(logits, dim=-1).to(hidden_states.dtype)
-        self.last_probs = probs
-        choice_scores = probs.float()
-        if self.training and self.exploration_rate > 0.0:
-            explore_mask = torch.rand(choice_scores.shape[:-1], device=choice_scores.device) < self.exploration_rate
-            if explore_mask.any():
-                choice_scores = choice_scores.clone()
-                choice_scores[explore_mask] = torch.rand_like(choice_scores[explore_mask])
-        # Hard selection: 0 = attn, 1 = mlp
-        choice = choice_scores.argmax(dim=-1)      # (...,)
-        self.last_selected_experts = choice.unsqueeze(-1).detach()
-        attn_mask = (choice == 0).unsqueeze(-1)     # (..., 1)
-        mlp_mask = (choice == 1).unsqueeze(-1)      # (..., 1)
-        # Weight = probability of selected branch (differentiable)
-        if self.scale_by_routing_weight:
-            w_attn = probs[..., 0:1] * attn_mask       # (..., 1)
-            w_mlp = probs[..., 1:2] * mlp_mask         # (..., 1)
-        else:
-            # Straight-through: forward sees 1.0, backward gets grad through prob
-            w_attn = _straight_through_ones(probs[..., 0:1]) * attn_mask
-            w_mlp = _straight_through_ones(probs[..., 1:2]) * mlp_mask
-        return w_attn, w_mlp, attn_mask, mlp_mask
-
-
-class BranchRouterRecorder(nn.Module):
-    """Parameterless recorder used when branch routing is deterministic."""
-
-    def __init__(self):
-        super().__init__()
-        self.last_probs = None
-        self.last_selected_experts = None
+# BranchRouter and BranchRouterRecorder are now defined in src/models/routing/routers.py
+# and imported at the top of this file via: from .routing.routers import BranchRouter, BranchRouterRecorder
 
 
 # ─── Routed norm bank ─────────────────────────────────────────────────────── #
@@ -260,13 +211,7 @@ class NormExpertBank(nn.Module):
         return out.reshape(orig_shape)
 
 
-def _straight_through_ones(w: torch.Tensor) -> torch.Tensor:
-    """Return ones in forward, but pass gradients through to w.
-
-    Used when routing is pure selection (no scaling) but we still need
-    the router weights to receive gradients for load-balancing losses.
-    """
-    return w + (1.0 - w).detach()
+# _straight_through_ones is now in src/models/routing/routers.py and imported at the top
 
 
 # ─── Attention expert bank ─────────────────────────────────────────────────── #

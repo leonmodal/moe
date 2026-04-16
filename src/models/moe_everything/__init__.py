@@ -1,14 +1,15 @@
-"""MoE-Everything model: split by API seam from mixture_of_everything.py.
+"""MoE-Everything model package.
 
-This package provides the reorganized MoE-Everything model with coherent
-module boundaries. It re-exports from the original mixture_of_everything.py
-for compatibility during the transition.
+Imports from the monolithic mixture_of_everything.py which still holds
+the model classes. BranchRouter and BranchRouterRecorder have been
+extracted to src/models/routing/routers.py (the source of truth).
 
-Module structure:
-- config.py: MoEverythingConfig
-- attention_bank.py: AttentionExpertBank (per-head routed attention)
-- mlp_bank.py: MlpExpertBank (routed MLP experts)
-- model.py: MoEverythingModel, MoEverythingForCausalLM (assembly)
+Module organization by API seam:
+- Config: MoEverythingConfig
+- Routing: BranchRouter (from src/models/routing/routers.py)
+- Attention bank: AttentionExpertBank, NormExpertBank
+- MLP bank: MlpExpertBank
+- Model assembly: MoEverythingModel, MoEverythingForCausalLM
 """
 
 from src.models.mixture_of_everything import (
@@ -18,9 +19,8 @@ from src.models.mixture_of_everything import (
     AttentionExpertBank,
     MlpExpertBank,
     NormExpertBank,
-    BranchRouter,
-    BranchRouterRecorder,
 )
+from src.models.routing.routers import BranchRouter, BranchRouterRecorder
 
 __all__ = [
     "MoEverythingConfig",

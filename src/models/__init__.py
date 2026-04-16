@@ -45,9 +45,9 @@ _LAZY_IMPORTS = {
         "src.models.global_moe",
         "DeepSeekGlobalMoEForCausalLM",
     ),
-    "MoEverythingConfig": ("src.models.mixture_of_everything", "MoEverythingConfig"),
-    "MoEverythingForCausalLM": ("src.models.mixture_of_everything", "MoEverythingForCausalLM"),
-    "MoEverythingModel": ("src.models.mixture_of_everything", "MoEverythingModel"),
+    "MoEverythingConfig": ("src.models.moe_everything", "MoEverythingConfig"),
+    "MoEverythingForCausalLM": ("src.models.moe_everything", "MoEverythingForCausalLM"),
+    "MoEverythingModel": ("src.models.moe_everything", "MoEverythingModel"),
 }
 
 

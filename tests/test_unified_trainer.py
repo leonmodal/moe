@@ -188,6 +188,73 @@ def test_checkpoint_roundtrip(name, cfg):
         torch.testing.assert_close(out1.logits, out2.logits)
 
 
+def test_checkpoint_module_roundtrip():
+    """Test save_checkpoint/load_checkpoint using the checkpoint module semantics."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    cfg = _dense_config()
+    model, model_cfg = build_model(cfg)
+    model = model.cuda()
+    model.train()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    from src.training.config import TrainingConfig
+    from src.utils.training import build_lr_scheduler
+    train_cfg = TrainingConfig()
+    scheduler = build_lr_scheduler(optimizer, train_cfg)
+
+    # Do a training step
+    input_ids = torch.randint(0, cfg["model"]["vocab_size"], (2, 16)).cuda()
+    output = model(input_ids=input_ids, labels=input_ids)
+    output.loss.backward()
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        from src.training.checkpoint import save_checkpoint, load_checkpoint
+
+        # Save using the checkpoint module
+        save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            step=1,
+            output_dir=tmpdir,
+            tokens_seen=1000.0,
+        )
+
+        ckpt_dir = os.path.join(tmpdir, "checkpoint-1")
+        assert os.path.isdir(ckpt_dir), f"Checkpoint dir not created: {ckpt_dir}"
+        assert os.path.exists(os.path.join(ckpt_dir, "model.pt")), "model.pt not saved"
+        assert os.path.exists(os.path.join(ckpt_dir, "training_state.pt")), "training_state.pt not saved"
+        # Check optimizer file exists (adam or muon)
+        has_optimizer = (
+            os.path.exists(os.path.join(ckpt_dir, "optimizer_adam.pt"))
+            or os.path.exists(os.path.join(ckpt_dir, "optimizer_muon.pt"))
+        )
+        assert has_optimizer, "No optimizer state file saved"
+
+        # Load into fresh model
+        model2, _ = build_model(cfg)
+        model2 = model2.cuda()
+        optimizer2 = torch.optim.AdamW(model2.parameters(), lr=1e-4)
+        scheduler2 = build_lr_scheduler(optimizer2, train_cfg)
+
+        step, data_state, tokens = load_checkpoint(model2, optimizer2, scheduler2, ckpt_dir)
+        assert step == 1, f"Expected step 1, got {step}"
+        assert tokens == 1000.0, f"Expected tokens_seen 1000.0, got {tokens}"
+
+        # Verify model outputs match
+        model.eval()
+        model2.eval()
+        with torch.no_grad():
+            out1 = model(input_ids=input_ids)
+            out2 = model2(input_ids=input_ids)
+        torch.testing.assert_close(out1.logits, out2.logits)
+
+
 def test_deprecated_types_rejected():
     """Test that deprecated model types (deepseek_standard_moe, etc.) are rejected."""
     for deprecated_type, guidance in _DEPRECATED_TYPES.items():
