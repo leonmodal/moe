@@ -168,13 +168,23 @@ class StatefulParquetDataset(IterableDataset):
         the start of the current file.
         """
         self._start_file_idx = int(state.get("file_idx", 0))
-        self._start_buffer = list(state.get("buffer", []))
         if "text_idx" in state:
+            # Post-Round-1 payload: buffer is authoritative (the new iter
+            # keeps `_live_buffer` aliased with the live `token_buffer`).
             self._start_text_idx = int(state["text_idx"])
+            self._start_buffer = list(state.get("buffer", []))
             self._start_seq_skip = 0
         else:
-            # Legacy payload — no `text_idx` was ever written.
+            # Legacy payload — no `text_idx` was ever written AND the saved
+            # `buffer` is unreliable: pre-Round-1 `__iter__` rebound
+            # `token_buffer` on every yielded chunk without updating the
+            # `_live_buffer` alias, so `get_state()` serialised a stale
+            # (often frozen-at-first-text or empty) buffer. Reproduce the
+            # old skip-seqs semantics from a clean slate instead: re-walk
+            # the file from text 0, drop the first `seq_idx` full chunks,
+            # then yield normally.
             self._start_text_idx = 0
+            self._start_buffer = []
             self._start_seq_skip = int(state.get("seq_idx", 0))
 
     def save_state(self, path: str) -> None:
@@ -225,6 +235,36 @@ class StatefulParquetDataset(IterableDataset):
             # while walking the start file.
             skip_seqs = self._start_seq_skip
             cur_file_idx = start
+
+            def _drain_buffered_chunks():
+                """Yield every complete seq_len+1 chunk already in the buffer.
+
+                Called at two points: (1) once at the very start of the
+                per-file loop so any chunks remaining in `_start_buffer` (a
+                mid-drain save point) are emitted *before* the next text is
+                tokenised — this is what preserves tensor-for-tensor resume
+                when a text produced more chunks than fit between saves;
+                (2) immediately after each text is absorbed, to drain new
+                chunks that text contributed. Both call sites share the
+                legacy skip-seqs semantics so a pre-Round-1 resume lands at
+                the same position the old code did.
+                """
+                nonlocal skip_seqs
+                while len(token_buffer) >= seq_len + 1:
+                    if cur_file_idx == start and skip_seqs > 0:
+                        del token_buffer[:seq_len]
+                        skip_seqs -= 1
+                        continue
+                    chunk = token_buffer[: seq_len + 1]
+                    # Advance in place to preserve `_live_buffer` aliasing
+                    # and keep get_state() authoritative during iteration.
+                    del token_buffer[:seq_len]
+                    self._cur_seq_idx += 1
+                    yield {
+                        "input_ids": torch.tensor(chunk[:-1], dtype=torch.long),
+                        "labels": torch.tensor(chunk[1:], dtype=torch.long),
+                    }
+
             while True:
                 self._cur_file_idx = cur_file_idx
                 self._cur_seq_idx = 0
@@ -234,6 +274,15 @@ class StatefulParquetDataset(IterableDataset):
                 first_text = start_text_idx if cur_file_idx == start else 0
                 self._cur_text_idx = first_text
 
+                # Pre-loop drain: emit any complete chunks already in
+                # `_start_buffer` *before* the first text of this file is
+                # tokenised. This fixes the tensor-for-tensor resume
+                # guarantee for mid-drain save points — without this, new
+                # text tokens get appended ahead of buffered continuation
+                # chunks (or dropped if the last text ran into its own
+                # inner drain and no more texts remain).
+                yield from _drain_buffered_chunks()
+
                 texts = df[self.config.text_column]
                 for text_idx in range(first_text, len(texts)):
                     text = texts.iat[text_idx]
@@ -242,31 +291,15 @@ class StatefulParquetDataset(IterableDataset):
                         token_buffer.extend(ids)
                         token_buffer.append(eos)
 
-                    # Text `text_idx` is now fully absorbed into the buffer (or
-                    # skipped as empty). Advance the "next text to consume"
-                    # marker BEFORE yielding so a save between yields still
-                    # points at the next un-consumed text.
+                    # Text `text_idx` is now fully absorbed into the buffer
+                    # (or skipped as empty). Advance the "next text to
+                    # consume" marker BEFORE yielding so a save between
+                    # yields still points at the next un-consumed text;
+                    # the pre-loop drain above handles the case where that
+                    # save leaves complete chunks behind.
                     self._cur_text_idx = text_idx + 1
 
-                    while len(token_buffer) >= seq_len + 1:
-                        if cur_file_idx == start and skip_seqs > 0:
-                            # Legacy-payload fallback (pre-Round-1 resume).
-                            # Drop this chunk without yielding so the iterator
-                            # lands at the same position the old code would.
-                            del token_buffer[:seq_len]
-                            skip_seqs -= 1
-                            continue
-
-                        chunk = token_buffer[: seq_len + 1]
-                        # Advance in place to preserve `_live_buffer` aliasing
-                        # and keep get_state() authoritative during iteration.
-                        del token_buffer[:seq_len]
-                        self._cur_seq_idx += 1
-
-                        yield {
-                            "input_ids": torch.tensor(chunk[:-1], dtype=torch.long),
-                            "labels": torch.tensor(chunk[1:], dtype=torch.long),
-                        }
+                    yield from _drain_buffered_chunks()
 
                 # Finishing a file resets the per-file start offset.
                 start_text_idx = 0

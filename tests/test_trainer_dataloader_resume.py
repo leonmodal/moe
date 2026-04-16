@@ -177,6 +177,82 @@ def test_trainer_dataloader_exact_resume(tmp_path, requested_workers, prefetch_f
         )
 
 
+def _write_long_row_fixture(root: Path) -> Path:
+    """Fixture with one very long row so a single text contributes many
+    complete seq_len+1 chunks in succession, making it easy to save mid-
+    drain while the buffer still holds pending chunks from that text.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    # One ~800-word row → ~800 tokens → ~50 chunks at seq_len=16. Plenty of
+    # mid-drain save points.
+    rows = [" ".join(f"word{w}" for w in range(800))] + [f"short {i}" for i in range(4)]
+    pd.DataFrame({"text": rows}).to_parquet(root / "shard_0000.parquet")
+    pd.DataFrame({"text": [f"file1_text_{r}" for r in range(40)]}).to_parquet(
+        root / "shard_0001.parquet"
+    )
+    return root
+
+
+def test_midchunk_resume_preserves_tensor_for_tensor_continuation(tmp_path):
+    """If a save lands mid-drain (buffer still holds complete chunks from the
+    current or prior text), the resumed iterator must emit those pending
+    chunks *before* tokenising the next text. The Round 13 pre-loop drain
+    is the fix; without it, the new text's tokens would get appended ahead
+    of the pending buffer, or the tail of the file would be dropped entirely.
+    """
+    data_dir = _write_long_row_fixture(tmp_path)
+    tokenizer = _IdentityTokenizer()
+    # seq_len small enough that the long row produces many chunks.
+    config = DataConfig(
+        data_dir=str(data_dir), seq_len=16, tokenizer_name="stub", prefetch_files=0,
+    )
+    B = 1
+    N_TOTAL = 40
+
+    # Uninterrupted reference.
+    ref_ds = StatefulParquetDataset(config, tokenizer, rank=0, world_size=1, seed=0)
+    ref_it = iter(DataLoader(ref_ds, batch_size=B, num_workers=0))
+    ref_batches = [next(ref_it)["input_ids"].clone() for _ in range(N_TOTAL)]
+
+    # Walk until the buffer is certain to hold ≥1 more complete chunk, save
+    # state, then resume on a fresh dataset. We iterate batch-by-batch and
+    # capture the state after each one; the first index where the saved
+    # state would "drop" pending buffer content under the old code is the
+    # most useful one to pin.
+    for save_after in range(1, N_TOTAL - 1):
+        probe = StatefulParquetDataset(config, tokenizer, rank=0, world_size=1, seed=0)
+        probe_it = iter(DataLoader(probe, batch_size=B, num_workers=0))
+        for _ in range(save_after):
+            next(probe_it)
+        saved = probe.get_state()
+        # Only exercise save points that genuinely carry buffered complete
+        # chunks — those are the ones the Round 13 fix is about.
+        if len(saved["buffer"]) < config.seq_len + 1:
+            continue
+
+        # Resume a fresh dataset from `saved` and compare.
+        fresh = StatefulParquetDataset(config, tokenizer, rank=0, world_size=1, seed=0)
+        fresh.set_state(saved)
+        fresh_it = iter(DataLoader(fresh, batch_size=B, num_workers=0))
+        remaining = N_TOTAL - save_after
+        fresh_batches = [next(fresh_it)["input_ids"].clone() for _ in range(remaining)]
+        for i, (r, f) in enumerate(zip(ref_batches[save_after:], fresh_batches)):
+            assert torch.equal(r, f), (
+                f"Mid-drain resume diverged at save_after={save_after}, "
+                f"post-resume batch {i}. Buffer had "
+                f"{len(saved['buffer'])} tokens at save; the pre-loop "
+                "drain should emit the pending chunks before the next "
+                "text is tokenised."
+            )
+        return  # One proof is enough; don't exhaustively iterate.
+
+    pytest.fail(
+        "Fixture did not produce any mid-drain save state with ≥seq_len+1 "
+        "buffered tokens — tighten the fixture so the long-row case "
+        "actually exercises the pre-loop drain."
+    )
+
+
 def test_legacy_seq_idx_state_resumes_without_restart(tmp_path):
     """Backward compat: a pre-Round-1 `data_state.pt` payload (no `text_idx`,
     `seq_idx` carries the skip counter) must resume at the same position the
