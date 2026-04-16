@@ -2,9 +2,10 @@
 Modal multi-node training launcher for MoE pretraining.
 
 Features:
-  1. Multi-node distributed training via torchrun + Accelerate
+  1. Multi-node distributed training via torchrun
   2. Auto-resume from latest checkpoint on Modal Volume
   3. Fault tolerance via checkpoint resume
+  4. Unified trainer for all supported models (dense, standard_moe, global_moe, moe_everything)
 
 Configuration:
   Edit N_NODES, GPUS_PER_NODE, GPU_TYPE at the top of this file.
@@ -60,7 +61,7 @@ image = (
     )
     .pip_install(
         "torch>=2.8.0",
-        "accelerate>=0.30.0",
+        "safetensors>=0.4.0",
         "transformers>=5.0.0",
         "datasets>=2.19.0",
         "pyarrow>=15.0.0",
@@ -80,8 +81,7 @@ image = (
     .run_commands(
         'python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained(\'Qwen/Qwen3-0.6B\')"'
     )
-    .add_local_file(str(moe_dir / "train.py"), remote_path="/root/moe/train.py")
-    .add_local_file(str(moe_dir / "train_torch.py"), remote_path="/root/moe/train_torch.py")
+    .add_local_dir(str(moe_dir / "scripts"), remote_path="/root/moe/scripts")
     .add_local_dir(str(moe_dir / "src"), remote_path="/root/moe/src")
     .add_local_dir(str(moe_dir / "configs"), remote_path="/root/moe/configs")
     .add_local_python_source("torchrun_util")
@@ -149,25 +149,14 @@ def train(config: str = CONFIG_FILE):
     print(f"  Master     : {cluster_info.container_ips[0]}")
     print(f"  GPUs       : {N_NODES} x {GPUS_PER_NODE} = {N_NODES * GPUS_PER_NODE}")
 
-    # Use train_torch.py for speedrun model types, train.py for others
-    speedrun_types = {"speedrun_gpt", "speedrun_moe_fully_independent", "speedrun_moe_precompute_kv"}
-    model_type = cfg.get("model", {}).get("type", "")
-    if model_type in speedrun_types:
-        training_script = "/root/moe/train_torch.py"
-        script_args = [
-            "--config", f"/root/moe/{config}",
-            "--output_dir", output_dir,
-            "--dist-strategy", "none",  # speedrun models use DistAdam/DistMuon (no DDP)
-        ]
-    else:
-        training_script = "/root/moe/train.py"
-        script_args = [
-            "--config", f"/root/moe/{config}",
-            "--auto_resume",
-            "--data_dir", "/data/parquet",
-            "--output_dir", output_dir,
-            "--max_checkpoints", str(MAX_CHECKPOINTS),
-        ]
+    training_script = "/root/moe/scripts/train.py"
+    script_args = [
+        "--config", f"/root/moe/{config}",
+        "--auto_resume",
+        "--data_dir", "/data/parquet",
+        "--output_dir", output_dir,
+        "--max_checkpoints", str(MAX_CHECKPOINTS),
+    ]
 
     torchrun.run(
         node_rank=cluster_info.rank,

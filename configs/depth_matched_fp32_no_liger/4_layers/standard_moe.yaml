@@ -3,7 +3,8 @@
 experiment_name: depth_matched_fp32_no_liger_4_layers_standard_moe
 
 model:
-  type: deepseek_standard_moe
+  type: standard_moe
+  router_type: deepseek
   vocab_size: 151936
   hidden_size: 1024
   num_hidden_layers: 4

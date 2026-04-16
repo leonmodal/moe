@@ -2,7 +2,8 @@
 experiment_name: plan_standard_moe_our_data
 
 model:
-  type: deepseek_standard_moe
+  type: standard_moe
+  router_type: deepseek
   vocab_size: 151936
   hidden_size: 1024
   num_hidden_layers: 16

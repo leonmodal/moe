@@ -4,7 +4,8 @@
 experiment_name: l_deepseek_standard_moe
 
 model:
-  type: deepseek_standard_moe
+  type: standard_moe
+  router_type: deepseek
   vocab_size: 151936
   hidden_size: 2048
   num_hidden_layers: 16

@@ -1,161 +1,61 @@
 # Distributed Training
 
-This document covers DDP, FSDP, multi-node setup, and deployment strategies.
+## Strategies
 
-## Table of Contents
+The unified trainer (`scripts/train.py`) supports three distributed strategies via `--dist-strategy`:
 
-- [1. Distributed Strategies](#1-distributed-strategies)
-- [2. Multi-Node on Modal](#2-multi-node-on-modal)
-- [3. Multi-Node on GCP](#3-multi-node-on-gcp)
-- [4. Checkpointing](#4-checkpointing)
+### DDP (default)
+```bash
+torchrun --nproc_per_node=8 scripts/train.py --config config.yaml --dist-strategy ddp
+```
+- Standard `DistributedDataParallel` wrapping
+- Each GPU holds a full model replica
+- Gradients synchronized via all-reduce
 
----
+### FSDP
+```bash
+torchrun --nproc_per_node=8 scripts/train.py --config config.yaml --dist-strategy fsdp
+```
+- `FullyShardedDataParallel` with `FULL_SHARD` strategy
+- Model parameters sharded across GPUs
+- Mixed-precision: all dtypes (param, reduce, buffer) set to the configured precision (default bf16)
+- `sync_module_states=True` for consistent initialization
 
-## 1. Distributed Strategies
+### None (single GPU)
+```bash
+python scripts/train.py --config config.yaml --dist-strategy none
+```
 
-### DDP (Distributed Data Parallel)
+## Modal Multi-Node
 
-**Implementation**: Manual `torch.nn.parallel.DistributedDataParallel` wrapping in `train_torch.py`.
-
-Each rank holds a full copy of the model. Gradients are all-reduced after each step (or accumulation boundary). Data is sharded across ranks.
+`modal_train.py` provides multi-node training on Modal cloud infrastructure:
 
 ```bash
-torchrun --nproc_per_node=8 train_torch.py --config config.yaml --dist-strategy ddp
+modal run modal_train.py --config configs/scaling/m_standard.yaml
 ```
 
-**Key detail for MoE-Everything**: Uses `static_graph=False` because shared parameters across depths are not safe with DDP's static graph optimization.
+Configuration at top of `modal_train.py`:
+- `N_NODES`: Number of containers
+- `GPUS_PER_NODE`: GPUs per container (default 8)
+- `GPU_TYPE`: B200, H200, or H100
+- `TIMEOUT_HOURS`: Max wall-clock time
 
-### FSDP (Fully Sharded Data Parallel)
+The launcher uses `torchrun` with RDMA-enabled NCCL communication.
 
-**Implementation**: `torch.distributed.fsdp.FullyShardedDataParallel` in `train_torch.py`.
+## Implementation
 
-Shards model parameters, gradients, and optimizer states across ranks. Each rank holds only a fraction of the model. Parameters are gathered on-demand for forward/backward.
+`src/training/distributed.py` provides:
 
-```bash
-torchrun --nproc_per_node=8 train_torch.py --config config.yaml --dist-strategy fsdp
-```
+- `setup_distributed()` — Initialize process group, set devices, return rank/device info
+- `cleanup_distributed()` — Destroy process group
+- `wrap_model()` — Apply DDP or FSDP wrapping based on strategy
+- `unwrap_model()` — Get underlying model from wrapper
+- `barrier()` — Distributed barrier with CUDA device
+- `reduce_scalar()` — All-reduce a scalar value with mean/sum
+- `seed_everything()` — Deterministic seeding with per-rank offset
 
-**Mixed precision**: FSDP uses `MixedPrecision` config for bf16 compute with fp32 parameter reduction.
+## Checkpoints in Distributed
 
-**Checkpointing**: Uses `FullStateDictConfig(offload_to_cpu=True, rank0_only=True)` to gather full state on rank 0 for saving.
-
-### Distributed Optimizers (Speedrun Path)
-
-For speedrun models, `DistMuon` and `DistAdam` handle gradient communication internally via `reduce_scatter` / `all_gather`. No DDP wrapper is needed -- the optimizer IS the communication layer.
-
----
-
-## 2. Multi-Node on Modal
-
-**File**: `modal_train.py`
-
-### Setup
-
-```python
-# In modal_train.py
-N_NODES = 2
-GPUS_PER_NODE = 8
-GPU_TYPE = "H100"
-
-# Volumes for persistent storage
-data_volume = modal.Volume.from_name("moe-training-data")
-ckpt_volume = modal.Volume.from_name("moe-checkpoints")
-```
-
-### How it works
-
-1. Modal provisions `N_NODES` machines with `GPUS_PER_NODE` GPUs each
-2. Each node runs `torchrun` with appropriate `--nnodes`, `--node-rank`, `--master-addr`
-3. NCCL handles inter-node communication (RDMA when available)
-4. Data and checkpoints are stored on Modal Volumes (persistent across runs)
-5. On failure/timeout, the job restarts and auto-resumes from the latest checkpoint
-
-### Running
-
-```bash
-# Upload data first
-modal run modal_train.py::upload_data
-
-# Launch training
-modal run modal_train.py --config configs/scaling/xs_standard.yaml
-```
-
-See `MULTINODE_README.md` for full setup instructions.
-
----
-
-## 3. Multi-Node on GCP
-
-**File**: `gcp_setup.sh`
-
-### Setup
-
-The `gcp_setup.sh` script provisions GCE instances with:
-- NVIDIA drivers and CUDA toolkit
-- Python environment with all dependencies
-- NCCL configuration for GCP networking
-
-### Running
-
-```bash
-# On each node (adjust --node-rank):
-torchrun \
-  --nproc_per_node=8 \
-  --nnodes=2 \
-  --node-rank=0 \
-  --master-addr=<master-ip> \
-  --master-port=29500 \
-  train_torch.py --config config.yaml
-```
-
-See `MULTINODE_README.md` for full GCP setup and networking instructions.
-
----
-
-## 4. Checkpointing
-
-### Save format
-
-Each checkpoint is a directory `{output_dir}/checkpoint-{step}/` containing:
-
-```
-checkpoint-1000/
-  model_state.pt      # model parameters (or FSDP full state dict)
-  optimizer_state.pt   # optimizer state (or FSDP optimizer state dict)
-  scheduler_state.pt   # LR scheduler state
-  meta.json            # metadata:
-    {
-      "step": 1000,
-      "tokens_seen": 134217728,
-      "dataset_state": {...},     # StatefulParquetDataset state
-      "wandb_run_id": "abc123"    # for WandB resume
-    }
-```
-
-### Auto-resume
-
-When `--auto_resume` is set, the training script scans `output_dir` for the highest `checkpoint-N` directory and resumes from it.
-
-```python
-def find_latest_checkpoint(output_dir):
-    # Scans for checkpoint-(\d+) directories
-    # Returns path to highest-numbered checkpoint
-```
-
-### Checkpoint cleanup
-
-`max_checkpoints` controls how many checkpoints are retained. After each save, older checkpoints are deleted to save disk space.
-
-```yaml
-# Keep only 3 most recent checkpoints
---max_checkpoints 3
-```
-
-### Resume flow
-
-1. Load model state dict
-2. Load optimizer state dict (handles FSDP sharded states)
-3. Load scheduler state dict
-4. Restore dataset state from `meta.json`
-5. Restore WandB run ID for logging continuity
-6. Resume training from `step + 1`
+- DDP: Checkpoint saved on rank 0 only; model state from `unwrap_model()`
+- FSDP: Uses `FullStateDictConfig(offload_to_cpu=True, rank0_only=True)` for saving
+- Resume: Both formats supported transparently via `load_checkpoint()`

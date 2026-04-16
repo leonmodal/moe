@@ -3,7 +3,8 @@
 experiment_name: l_deepseek_global_moe
 
 model:
-  type: deepseek_global_moe
+  type: global_moe
+  router_type: deepseek
   vocab_size: 151936
   hidden_size: 2048
   num_hidden_layers: 16

@@ -18,9 +18,6 @@ __all__ = [
     "MoEverythingConfig",
     "MoEverythingForCausalLM",
     "MoEverythingModel",
-    "SpeedrunMoEverythingConfig",
-    "SpeedrunMoEverythingForCausalLM",
-    "SpeedrunMoEverythingModel",
 ]
 
 _LAZY_IMPORTS = {
@@ -42,9 +39,6 @@ _LAZY_IMPORTS = {
     "MoEverythingConfig": ("src.models.mixture_of_everything", "MoEverythingConfig"),
     "MoEverythingForCausalLM": ("src.models.mixture_of_everything", "MoEverythingForCausalLM"),
     "MoEverythingModel": ("src.models.mixture_of_everything", "MoEverythingModel"),
-    "SpeedrunMoEverythingConfig": ("src.models.speedrun_mixture_of_everything", "SpeedrunMoEverythingConfig"),
-    "SpeedrunMoEverythingForCausalLM": ("src.models.speedrun_mixture_of_everything", "SpeedrunMoEverythingForCausalLM"),
-    "SpeedrunMoEverythingModel": ("src.models.speedrun_mixture_of_everything", "SpeedrunMoEverythingModel"),
 }
 
 
