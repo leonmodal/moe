@@ -123,6 +123,12 @@ class StatefulParquetDataset(IterableDataset):
         self._start_file_idx: int = 0
         self._start_text_idx: int = 0
         self._start_buffer: list[int] = []
+        # Backward-compat: if a pre-Round-1 `data_state.pt` is restored
+        # (only `file_idx` / `seq_idx` / `buffer`, no `text_idx`), we fall back
+        # to the old skip-seqs resume semantics by tokenising the start file
+        # from the top and dropping the first `_start_seq_skip` seq_len chunks
+        # before yielding. Always 0 for post-Round-1 state dicts.
+        self._start_seq_skip: int = 0
 
         # Live tracking (updated during __iter__)
         self._cur_file_idx: int = 0
@@ -150,13 +156,26 @@ class StatefulParquetDataset(IterableDataset):
         }
 
     def set_state(self, state: dict) -> None:
-        """Restore iteration position. Reads `file_idx`, `text_idx`, `buffer`.
+        """Restore iteration position.
 
-        `seq_idx` is ignored by design (see get_state docstring).
+        Post-Round-1 payloads carry `text_idx` and that marker is authoritative.
+        If the payload predates that change (a legacy `data_state.pt` produced
+        by the skip-seqs resume code, with `seq_idx` but no `text_idx`) this
+        falls back to the old semantics: start the current file from text 0,
+        prepend the saved `buffer`, and drop the first `seq_idx` full seq_len
+        chunks during iteration. That reproduces the pre-Round-1 resume path
+        so auto-resume across the Round-1 upgrade does not silently reset to
+        the start of the current file.
         """
         self._start_file_idx = int(state.get("file_idx", 0))
-        self._start_text_idx = int(state.get("text_idx", 0))
         self._start_buffer = list(state.get("buffer", []))
+        if "text_idx" in state:
+            self._start_text_idx = int(state["text_idx"])
+            self._start_seq_skip = 0
+        else:
+            # Legacy payload — no `text_idx` was ever written.
+            self._start_text_idx = 0
+            self._start_seq_skip = int(state.get("seq_idx", 0))
 
     def save_state(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -202,6 +221,9 @@ class StatefulParquetDataset(IterableDataset):
             )
 
             start_text_idx = self._start_text_idx
+            # Only applies to a legacy-format restore; consumed and cleared
+            # while walking the start file.
+            skip_seqs = self._start_seq_skip
             cur_file_idx = start
             while True:
                 self._cur_file_idx = cur_file_idx
@@ -227,6 +249,14 @@ class StatefulParquetDataset(IterableDataset):
                     self._cur_text_idx = text_idx + 1
 
                     while len(token_buffer) >= seq_len + 1:
+                        if cur_file_idx == start and skip_seqs > 0:
+                            # Legacy-payload fallback (pre-Round-1 resume).
+                            # Drop this chunk without yielding so the iterator
+                            # lands at the same position the old code would.
+                            del token_buffer[:seq_len]
+                            skip_seqs -= 1
+                            continue
+
                         chunk = token_buffer[: seq_len + 1]
                         # Advance in place to preserve `_live_buffer` aliasing
                         # and keep get_state() authoritative during iteration.

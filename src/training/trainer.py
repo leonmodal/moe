@@ -206,9 +206,13 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
     eval_dataloader = None
     if eval_dataset is not None:
         eval_cfg = cfg.get("eval", {})
-        eval_workers = _stateful_dataloader_workers(
-            eval_dataset, data_num_workers, role="eval", verbose=is_main_process()
-        )
+        # Eval dataset state is never serialized/restored by `save_checkpoint`
+        # / `load_checkpoint`, so there is no resume-safety reason to clamp
+        # eval workers to 0 even when the dataset exposes `get_state`. Honour
+        # the configured `data.num_workers` directly — clamping here would
+        # regress throughput on large val sets at every `eval_every` step
+        # with no correctness benefit.
+        eval_workers = max(0, int(data_num_workers))
         eval_dataloader = DataLoader(
             eval_dataset,
             batch_size=int(eval_cfg.get("batch_size", train_cfg.batch_size)),
