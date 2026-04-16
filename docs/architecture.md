@@ -85,7 +85,7 @@ Layer N:
 ## 4. MoE-Everything
 
 **Config type**: `moe_everything`
-**File**: `src/models/mixture_of_everything.py` (~2300 lines)
+**Package**: `src/models/moe_everything/` (config.py, attention_bank.py, mlp_bank.py, model.py)
 **Config class**: `MoEverythingConfig` (extends `Qwen3MoeConfig`)
 
 The most advanced architecture. Routes **both** attention and MLP through shared expert banks, with a branch router deciding whether each token gets attention or MLP at each depth step. All expert weights are shared across depths (Universal Transformer style) -- only activations change per depth, not weights.

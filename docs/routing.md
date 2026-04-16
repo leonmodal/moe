@@ -67,7 +67,7 @@ if training and exploration_rate > 0:
 
 ### Branch Router
 
-**Location**: `src/models/mixture_of_everything.py` (within MoE-Everything)
+**Location**: `src/models/routing/routers.py` (BranchRouter), `src/models/moe_everything/attention_bank.py` (per-head attention routing)
 
 Binary hard router: each token picks ATTENTION (0) or MLP (1).
 

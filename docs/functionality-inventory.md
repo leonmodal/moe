@@ -9,7 +9,7 @@ Post-reorganization inventory of active features and archived components.
 | Dense | `dense` | `Qwen3ForCausalLM` | Qwen3 backbone |
 | Standard MoE | `standard_moe` | `src/models/standard_moe.py` | Per-layer MoE, softmax or DeepSeek routing |
 | Global MoE | `global_moe` | `src/models/global_moe.py` | Shared expert pool |
-| MoE-Everything | `moe_everything` | `src/models/mixture_of_everything.py` | Branch routing + expert banks |
+| MoE-Everything | `moe_everything` | `src/models/moe_everything/` (config.py, attention_bank.py, mlp_bank.py, model.py) | Branch routing + expert banks |
 
 ## Active Training Infrastructure
 
