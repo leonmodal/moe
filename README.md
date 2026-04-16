@@ -98,7 +98,7 @@ Key config fields:
 
 Checkpoints are saved as separate files:
 - `model.pt` — model weights
-- `optimizer.pt` — optimizer state
+- `optimizer_adam.pt` or `optimizer_muon.pt` — optimizer state (type-specific)
 - `training_state.pt` — scheduler, step count, tokens seen
 - `data_state.pt` — dataset position for deterministic resume
 

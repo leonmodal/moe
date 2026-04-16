@@ -58,4 +58,4 @@ The launcher uses `torchrun` with RDMA-enabled NCCL communication.
 
 - DDP: Checkpoint saved on rank 0 only; model state from `unwrap_model()`
 - FSDP: Uses `FullStateDictConfig(offload_to_cpu=True, rank0_only=True)` for saving
-- Resume: Both formats supported transparently via `load_checkpoint()`
+- Resume: Supports separate files (model.pt), safetensors (model.safetensors), and legacy (trainer.pt) via `load_checkpoint()`

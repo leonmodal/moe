@@ -109,11 +109,22 @@ def load_checkpoint(
     scheduler,
     resume_from: str,
 ) -> tuple[int, dict | None, float]:
-    """Load checkpoint from directory. Supports both new separate format and legacy monolithic format."""
+    """Load checkpoint from directory.
+
+    Supports:
+    - New separate format: model.pt + optimizer_adam.pt/optimizer_muon.pt + training_state.pt
+    - Safetensors format: model.safetensors (for model weights after conversion)
+    - Legacy monolithic format: trainer.pt
+    """
     # Try new format first (separate files)
     model_path = os.path.join(resume_from, "model.pt")
     if os.path.exists(model_path):
         return _load_separate_checkpoint(model, optimizer, scheduler, resume_from)
+
+    # Try safetensors model weights
+    safetensors_path = os.path.join(resume_from, "model.safetensors")
+    if os.path.exists(safetensors_path):
+        return _load_safetensors_checkpoint(model, optimizer, scheduler, resume_from)
 
     # Fall back to legacy monolithic format
     trainer_path = os.path.join(resume_from, "trainer.pt")
@@ -121,6 +132,54 @@ def load_checkpoint(
         return _load_legacy_checkpoint(model, optimizer, scheduler, resume_from)
 
     raise FileNotFoundError(f"No checkpoint found in {resume_from}")
+
+
+def _load_safetensors_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    resume_from: str,
+) -> tuple[int, dict | None, float]:
+    """Load checkpoint from safetensors model weights + other state files."""
+    from safetensors.torch import load_file
+
+    model_state = load_file(os.path.join(resume_from, "model.safetensors"))
+
+    if FSDP is not None and isinstance(model, FSDP):
+        load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, load_policy):
+            model.load_state_dict(model_state)
+    else:
+        unwrap_model(model).load_state_dict(model_state)
+
+    # Load optimizer if available
+    try:
+        optim_state = _load_optimizer_state(resume_from)
+        if FSDP is not None and isinstance(model, FSDP):
+            optim_policy = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=False)
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, optim_policy=optim_policy):
+                loaded_optim = FSDP.optim_state_dict_to_load(model, optimizer, optim_state)
+                optimizer.load_state_dict(loaded_optim)
+        else:
+            optimizer.load_state_dict(optim_state)
+    except FileNotFoundError:
+        print("No optimizer state found in safetensors checkpoint, starting fresh", flush=True)
+
+    # Load training state
+    training_state_path = os.path.join(resume_from, "training_state.pt")
+    step, tokens_seen = 0, 0.0
+    if os.path.exists(training_state_path):
+        training_state = torch.load(training_state_path, map_location="cpu")
+        scheduler.load_state_dict(training_state["scheduler"])
+        step = training_state.get("step", 0)
+        tokens_seen = training_state.get("tokens_seen", 0.0)
+
+    data_state = None
+    data_state_path = os.path.join(resume_from, "data_state.pt")
+    if os.path.exists(data_state_path):
+        data_state = torch.load(data_state_path, map_location="cpu")
+
+    return step, data_state, tokens_seen
 
 
 def _load_optimizer_state(resume_from: str) -> dict:

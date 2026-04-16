@@ -192,16 +192,20 @@ def test_checkpoint_roundtrip(name, cfg):
     scheduler.step()
     optimizer.zero_grad()
 
+    test_dataset_state = {"file_idx": 3, "seq_idx": 42, "buffer": [100, 200]}
+
     with tempfile.TemporaryDirectory() as tmpdir:
         save_checkpoint(
             model=model, optimizer=optimizer, scheduler=scheduler,
             step=1, output_dir=tmpdir, tokens_seen=500.0,
+            dataset_state=test_dataset_state,
         )
 
         ckpt_dir = os.path.join(tmpdir, "checkpoint-1")
         assert os.path.isdir(ckpt_dir)
         assert os.path.exists(os.path.join(ckpt_dir, "model.pt"))
         assert os.path.exists(os.path.join(ckpt_dir, "training_state.pt"))
+        assert os.path.exists(os.path.join(ckpt_dir, "data_state.pt"))
 
         model2, _ = build_model(cfg)
         model2 = model2.cuda()
@@ -211,6 +215,10 @@ def test_checkpoint_roundtrip(name, cfg):
         step, data_state, tokens = load_checkpoint(model2, optimizer2, scheduler2, ckpt_dir)
         assert step == 1
         assert tokens == 500.0
+        assert data_state is not None, "data_state should be restored"
+        assert data_state["file_idx"] == 3
+        assert data_state["seq_idx"] == 42
+        assert data_state["buffer"] == [100, 200]
 
         model.eval()
         model2.eval()
