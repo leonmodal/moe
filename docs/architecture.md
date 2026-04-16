@@ -267,8 +267,9 @@ Token x (hidden_size=1024)
 ├─ Run standard attention: attn_out = Attention(Q, K, V)
 │
 └─ O path (num_heads separate top-1 routers):
-    For each head h: o_routers[h](attn_out) -> picks 1 expert
-    o_h = attn_out[h] @ o_proj[e_h] * w_h
+    attn_flat = concat(all head outputs) -> (num_heads * head_dim)
+    For each head h: o_routers[h](attn_flat) -> picks 1 expert
+    o_h = attn_heads[h] @ o_proj[e_h] * w_h  # head_dim -> hidden_size
     Sum across heads: output = sum(o_0, ..., o_{num_heads-1})
 ```
 

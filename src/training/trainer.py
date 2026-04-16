@@ -338,6 +338,7 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
                     is_dense=is_dense,
                     seq_aux_loss_coef=seq_aux_loss_coef,
                     device=device,
+                    step=global_step,
                 )
                 log_eval_metrics(wandb_run, step=global_step, eval_metrics=eval_metrics)
 

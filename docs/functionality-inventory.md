@@ -49,7 +49,7 @@ Post-reorganization inventory of active features and archived components.
 | Load balancing | `src/models/routing/load_balancing.py` | Batch + sequence-level aux losses |
 | Bias management | `src/models/routing/bias.py` | Per-projection global bias update |
 | Routing stats | `src/models/routing/stats.py` | Per-forward-pass accumulation |
-| Routing helpers | `src/models/routing/helpers.py` | Top-1 dispatch, sparse gather-project |
+| Routing helpers | `src/models/routing/helpers.py` | Top-1 router factory (`make_top1_router`), sparse path helpers; per-head dispatch logic still in `attention_bank.py` |
 
 ## Archived to legacy/speedrun/
 
