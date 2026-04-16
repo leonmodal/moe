@@ -191,7 +191,7 @@ def build_model(cfg: dict):
             num_experts=mcfg["num_experts"],
             num_attn_experts=mcfg.get("num_attn_experts", 4),
             num_attn_experts_per_tok=mcfg.get("num_attn_experts_per_tok", 1),
-            attn_expert_mode=mcfg.get("attn_expert_mode", "bundled"),
+            attn_expert_mode=mcfg.get("attn_expert_mode", "per_head_fully_independent"),
             branch_router_aux_loss_coef=mcfg.get("branch_router_aux_loss_coef", 0.0),
             use_deepseek_routing=use_deepseek,
             topk_scaling_factor=mcfg.get("topk_scaling_factor", None),

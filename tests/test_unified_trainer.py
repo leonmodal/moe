@@ -251,5 +251,31 @@ def test_unknown_type_rejected():
         build_model(cfg)
 
 
+def test_bundled_attn_expert_mode_rejected():
+    """`attn_expert_mode: "bundled"` is the deprecated 1-router-top-K design.
+
+    The active moe_everything architecture uses H routers per projection, each
+    top-1 (`per_head_fully_independent` / `per_head_precompute_kv`). Requesting
+    the old mode must fail explicitly so a stale config doesn't silently fall
+    back to a valid default and mask the drift.
+    """
+    cfg = _moe_everything_config("bundled")
+    with pytest.raises(ValueError, match="attn_expert_mode"):
+        build_model(cfg)
+
+
+def test_moe_everything_default_attn_expert_mode_is_per_head_fully_independent():
+    """Omitting `attn_expert_mode` must produce a valid default, not fall into
+    the rejected `"bundled"` mode. This pins the model-factory fallback.
+    """
+    cfg = _moe_config(
+        model_type="moe_everything",
+        num_attn_experts=4,
+        num_attn_experts_per_tok=1,
+    )  # no attn_expert_mode key set
+    model, _ = build_model(cfg)
+    assert model.config.attn_expert_mode == "per_head_fully_independent"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

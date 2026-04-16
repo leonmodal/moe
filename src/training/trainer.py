@@ -56,6 +56,29 @@ from .model_factory import build_model, configure_liger_kernels
 from .routing import get_bias_rate, update_expert_biases
 
 
+def _stateful_dataloader_workers(dataset, requested: int, *, role: str, verbose: bool) -> int:
+    """Return the safe `num_workers` for a DataLoader wrapping `dataset`.
+
+    `StatefulParquetDataset.get_state()` reads live attributes that are only
+    mutated inside `__iter__` on the dataset copy that is actually iterating.
+    When `num_workers > 0` that copy lives in a subprocess, so the checkpointed
+    state pulled from the main-process object is stale and resume lands at the
+    wrong position. To keep deterministic resume (AC-12) authoritative, any
+    dataset that exposes `get_state`/`set_state` is iterated in-process.
+    """
+    is_stateful = hasattr(dataset, "get_state") and hasattr(dataset, "set_state")
+    if is_stateful and requested != 0:
+        if verbose:
+            print(
+                f"[data] {role}: forcing num_workers=0 for stateful dataset "
+                f"{type(dataset).__name__} (config requested {requested}); "
+                "in-process iteration keeps checkpoint state authoritative.",
+                flush=True,
+            )
+        return 0
+    return max(0, int(requested))
+
+
 def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
     """Main training loop for all supported model types."""
     initialization_spec = resolve_initialization_spec(
@@ -154,26 +177,32 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
 
     dataset = build_train_dataset(cfg, tokenizer=tokenizer, rank=rank, world_size=world_size)
     data_num_workers = dcfg_dict.get("num_workers", 4)
+    train_workers = _stateful_dataloader_workers(
+        dataset, data_num_workers, role="train", verbose=is_main_process()
+    )
     dataloader = DataLoader(
         dataset,
         batch_size=train_cfg.batch_size,
-        num_workers=data_num_workers,
+        num_workers=train_workers,
         pin_memory=True,
-        prefetch_factor=2 if data_num_workers > 0 else None,
-        persistent_workers=data_num_workers > 0,
+        prefetch_factor=2 if train_workers > 0 else None,
+        persistent_workers=train_workers > 0,
     )
 
     eval_dataset = build_eval_dataset(cfg, tokenizer=tokenizer, rank=rank, world_size=world_size)
     eval_dataloader = None
     if eval_dataset is not None:
         eval_cfg = cfg.get("eval", {})
+        eval_workers = _stateful_dataloader_workers(
+            eval_dataset, data_num_workers, role="eval", verbose=is_main_process()
+        )
         eval_dataloader = DataLoader(
             eval_dataset,
             batch_size=int(eval_cfg.get("batch_size", train_cfg.batch_size)),
-            num_workers=data_num_workers,
+            num_workers=eval_workers,
             pin_memory=True,
-            prefetch_factor=2 if data_num_workers > 0 else None,
-            persistent_workers=data_num_workers > 0,
+            prefetch_factor=2 if eval_workers > 0 else None,
+            persistent_workers=eval_workers > 0,
         )
 
     # Resume from checkpoint

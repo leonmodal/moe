@@ -96,14 +96,17 @@ class StatefulParquetDataset(IterableDataset):
                 "or different data sharding."
             )
 
-        # Resumption state
+        # Resumption state (authoritative position marker is (file_idx, text_idx);
+        # buffer holds the in-flight leftover tokens from texts already consumed
+        # into the buffer but not yet yielded as full sequences).
         self._start_file_idx: int = 0
-        self._start_seq_skip: int = 0  # how many sequences to skip in the start file
+        self._start_text_idx: int = 0
         self._start_buffer: list[int] = []
 
         # Live tracking (updated during __iter__)
         self._cur_file_idx: int = 0
-        self._cur_seq_idx: int = 0
+        self._cur_text_idx: int = 0
+        self._cur_seq_idx: int = 0  # diagnostic: seqs yielded from current file
         self._live_buffer: list[int] = []
 
     # ------------------------------------------------------------------ #
@@ -111,16 +114,28 @@ class StatefulParquetDataset(IterableDataset):
     # ------------------------------------------------------------------ #
 
     def get_state(self) -> dict:
+        """Capture the current iteration position for deterministic resume.
+
+        Authoritative markers for set_state(): `file_idx`, `text_idx`, `buffer`.
+        `seq_idx` is a diagnostic counter (sequences yielded from the current
+        file since iteration started) and is intentionally NOT restored by
+        set_state() — do not rely on it for resume.
+        """
         return {
             "file_idx": self._cur_file_idx,
+            "text_idx": self._cur_text_idx,
             "seq_idx": self._cur_seq_idx,
-            "buffer": list(self._live_buffer) if self._live_buffer else [],
+            "buffer": list(self._live_buffer),
         }
 
     def set_state(self, state: dict) -> None:
-        self._start_file_idx = state.get("file_idx", 0)
-        self._start_seq_skip = state.get("seq_idx", 0)
-        self._start_buffer = state.get("buffer", [])
+        """Restore iteration position. Reads `file_idx`, `text_idx`, `buffer`.
+
+        `seq_idx` is ignored by design (see get_state docstring).
+        """
+        self._start_file_idx = int(state.get("file_idx", 0))
+        self._start_text_idx = int(state.get("text_idx", 0))
+        self._start_buffer = list(state.get("buffer", []))
 
     def save_state(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -140,42 +155,53 @@ class StatefulParquetDataset(IterableDataset):
         seq_len = self.config.seq_len
         eos = self.tokenizer.eos_token_id or 0
 
+        # The token buffer is mutated in place for the lifetime of iteration
+        # so that `self._live_buffer` remains a live view used by get_state().
         token_buffer: list[int] = list(self._start_buffer)
         self._live_buffer = token_buffer
-        skip_seqs = self._start_seq_skip
 
+        start_text_idx = self._start_text_idx
         for file_idx, file_path in enumerate(self.files):
             if file_idx < self._start_file_idx:
                 continue
 
             self._cur_file_idx = file_idx
             df = self._load_file(file_path)
-            file_seq_count = 0
+            self._cur_seq_idx = 0
 
-            for text in df[self.config.text_column]:
-                if not isinstance(text, str) or not text.strip():
-                    continue
+            # Only the start file honours the resumption text offset; subsequent
+            # files always begin at text 0.
+            first_text = start_text_idx if file_idx == self._start_file_idx else 0
+            self._cur_text_idx = first_text
 
-                ids = self.tokenizer.encode(text, add_special_tokens=False)
-                token_buffer.extend(ids)
-                token_buffer.append(eos)
+            texts = df[self.config.text_column]
+            for text_idx in range(first_text, len(texts)):
+                text = texts.iat[text_idx]
+                if isinstance(text, str) and text.strip():
+                    ids = self.tokenizer.encode(text, add_special_tokens=False)
+                    token_buffer.extend(ids)
+                    token_buffer.append(eos)
+
+                # Text `text_idx` is now fully absorbed into the buffer (or
+                # skipped as empty). Advance the "next text to consume" marker
+                # BEFORE yielding so a save between yields still points at the
+                # correct next text and doesn't re-tokenize text `text_idx`.
+                self._cur_text_idx = text_idx + 1
 
                 while len(token_buffer) >= seq_len + 1:
-                    # Skip sequences when resuming within a file
-                    if file_idx == self._start_file_idx and skip_seqs > 0:
-                        skip_seqs -= 1
-                        token_buffer = token_buffer[seq_len:]
-                        continue
-
                     chunk = token_buffer[: seq_len + 1]
-                    token_buffer = token_buffer[seq_len:]  # slide by seq_len (1-token overlap)
-                    file_seq_count += 1
-                    self._cur_seq_idx = file_seq_count
+                    # Advance in place to preserve `_live_buffer` aliasing
+                    # and keep get_state() authoritative during iteration.
+                    del token_buffer[:seq_len]
+                    self._cur_seq_idx += 1
 
                     yield {
                         "input_ids": torch.tensor(chunk[:-1], dtype=torch.long),
                         "labels": torch.tensor(chunk[1:], dtype=torch.long),
                     }
+
+            # Finishing a file resets the per-file start offset.
+            start_text_idx = 0
 
     def _load_file(self, path: str) -> pd.DataFrame:
         return pd.read_parquet(path, columns=[self.config.text_column])

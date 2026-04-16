@@ -59,7 +59,7 @@ Used when `router_type: deepseek`:
 |-------|------|---------|-------------|
 | `num_attn_experts` | int | 4 | Number of attention experts |
 | `num_attn_experts_per_tok` | int | 1 | Attention experts per token |
-| `attn_expert_mode` | string | "bundled" | Attention mode |
+| `attn_expert_mode` | string | `per_head_fully_independent` | Attention expert routing. Valid values: `per_head_fully_independent` (H routers per Q/K/V/O projection, each top-1) or `per_head_precompute_kv` (H bundled QKVO routers, each top-1). Any other value is rejected with `ValueError`. |
 | `per_layer_router` | bool | false | Per-layer vs shared router |
 | `branch_router_aux_loss_coef` | float | 0.0 | Branch aux loss (0 = no branch balancing) |
 
