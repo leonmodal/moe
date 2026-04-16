@@ -13,9 +13,9 @@
 # limitations under the License.
 """Qwen3MoE model configuration"""
 
-from ...configuration_utils import PreTrainedConfig
-from ...modeling_rope_utils import RopeParameters
-from ...utils import logging
+from transformers.configuration_utils import PreTrainedConfig
+from transformers.modeling_rope_utils import RopeParameters
+from transformers.utils import logging
 
 
 logger = logging.get_logger(__name__)

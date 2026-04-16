@@ -1,6 +1,17 @@
+"""Model exports.
+
+All model configs and classes are imported from local files (Bagel-style),
+not from the transformers package. Local files use transformers utilities
+and PreTrainedModel for checkpoint compatibility, but model forward-pass
+logic is defined locally with our bug fixes and customizations.
+"""
+
 from importlib import import_module
 
-from transformers import Qwen3Config, Qwen3ForCausalLM, Qwen3MoeConfig
+# Import configs and dense model from local files
+from .configuration_qwen3 import Qwen3Config
+from .configuration_qwen3_moe import Qwen3MoeConfig
+from .modeling_qwen3 import Qwen3ForCausalLM
 
 __all__ = [
     "Qwen3MoeConfig",
@@ -21,10 +32,8 @@ __all__ = [
 ]
 
 _LAZY_IMPORTS = {
-    "Qwen3MoeForCausalLM": (
-        "transformers.models.qwen3_moe.modeling_qwen3_moe",
-        "Qwen3MoeForCausalLM",
-    ),
+    # MoE model from local file (with double-softmax fix and Triton GEMM)
+    "Qwen3MoeForCausalLM": ("src.models.modeling_qwen3_moe", "Qwen3MoeForCausalLM"),
     "DeepSeekRouter": ("src.models.router", "DeepSeekRouter"),
     "StandardMoEConfig": ("src.models.standard_moe", "StandardMoEConfig"),
     "StandardMoEModel": ("src.models.standard_moe", "StandardMoEModel"),

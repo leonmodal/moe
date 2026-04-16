@@ -18,8 +18,8 @@ would immediately be thrown away.
 import copy
 
 import torch.nn as nn
-from transformers import Qwen3MoeConfig
-from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+from .configuration_qwen3_moe import Qwen3MoeConfig
+from .modeling_qwen3_moe import (
     Qwen3MoeDecoderLayer,
     Qwen3MoeExperts,
     Qwen3MoeForCausalLM,

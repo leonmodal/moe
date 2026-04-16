@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from contextlib import contextmanager
 from contextvars import ContextVar
 
-from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeTopKRouter
+from .modeling_qwen3_moe import Qwen3MoeTopKRouter
 
 
 def group_limited_topk(

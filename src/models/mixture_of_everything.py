@@ -38,10 +38,10 @@ import torch.nn.functional as F
 from src.models.fp32_routing import fp32_index_add, fp32_index_put, fp32_index_select
 from src.models.triton_grouped_gemm import triton_grouped_gemm
 from torch.utils.checkpoint import checkpoint
-from transformers import Qwen3MoeConfig
+from .configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+from .modeling_qwen3_moe import (
     Qwen3MoeExperts,
     Qwen3MoePreTrainedModel,
     Qwen3MoeRMSNorm,
