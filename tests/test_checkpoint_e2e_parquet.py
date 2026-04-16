@@ -81,9 +81,14 @@ def _build_loader(dataset: StatefulParquetDataset, batch_size: int) -> DataLoade
     )
 
 
-def _train_one_batch(model: _TinyModel, optimizer, scheduler, batch) -> torch.Tensor:
-    """One deterministic forward/backward/optimizer/scheduler step."""
+def _train_one_batch(model: _TinyModel, optimizer, scheduler, batch):
+    """One deterministic forward/backward/optimizer/scheduler step.
+
+    Returns (pre_step_logits, loss) so the caller can pin the logits against
+    an uninterrupted reference BEFORE the optimizer mutates the weights.
+    """
     logits = model(batch["input_ids"])
+    pre_step_logits = logits.detach().clone()
     loss = torch.nn.functional.cross_entropy(
         logits.reshape(-1, logits.size(-1)), batch["labels"].reshape(-1)
     )
@@ -91,7 +96,7 @@ def _train_one_batch(model: _TinyModel, optimizer, scheduler, batch) -> torch.Te
     loss.backward()
     optimizer.step()
     scheduler.step()
-    return loss.detach()
+    return pre_step_logits, loss.detach()
 
 
 def _new_run(tmp_path: Path, data_dir: Path):
@@ -141,15 +146,19 @@ def test_end_to_end_checkpoint_roundtrip_with_parquet_dataset(tmp_path):
     N_BEFORE = 5
     N_AFTER = 5
 
-    # Reference run: N_BEFORE + N_AFTER steps, uninterrupted.
+    # Reference run: N_BEFORE + N_AFTER steps, uninterrupted. Capture the
+    # pre-step logits each step so we can pin them against the resumed run.
     ref_model, ref_opt, ref_sched, _, ref_loader = _new_run(tmp_path, data_dir)
     ref_it = iter(ref_loader)
     ref_batches = []
+    ref_logits = []
     ref_losses = []
     for _ in range(N_BEFORE + N_AFTER):
         batch = next(ref_it)
         ref_batches.append(batch["input_ids"].clone())
-        ref_losses.append(_train_one_batch(ref_model, ref_opt, ref_sched, batch).item())
+        logits, loss = _train_one_batch(ref_model, ref_opt, ref_sched, batch)
+        ref_logits.append(logits)
+        ref_losses.append(loss.item())
 
     # Interrupted run: N_BEFORE steps, save, fresh init, load, N_AFTER more.
     run_model, run_opt, run_sched, run_ds, run_loader = _new_run(tmp_path, data_dir)
@@ -206,64 +215,97 @@ def test_end_to_end_checkpoint_roundtrip_with_parquet_dataset(tmp_path):
     )
     assert fresh_sched.state_dict()["_step_count"] == run_sched.state_dict()["_step_count"]
 
-    # Continue N_AFTER steps on the restored run; batches must continue the reference.
+    # Continue N_AFTER steps on the restored run; batches, pre-step logits, and
+    # losses must all exactly continue the reference (same inputs + restored
+    # parameters + restored optimizer state ⇒ same forward pass ⇒ same loss).
     fresh_loader = _build_loader(fresh_ds, batch_size=2)
     fresh_it = iter(fresh_loader)
+    fresh_logits = []
     fresh_losses = []
     for i in range(N_AFTER):
         batch = next(fresh_it)
         assert torch.equal(batch["input_ids"], ref_batches[N_BEFORE + i]), (
             f"Post-checkpoint batch {i} diverged from the uninterrupted reference"
         )
-        fresh_losses.append(
-            _train_one_batch(fresh_model, fresh_opt, fresh_sched, batch).item()
-        )
+        logits, loss = _train_one_batch(fresh_model, fresh_opt, fresh_sched, batch)
+        fresh_logits.append(logits)
+        fresh_losses.append(loss.item())
 
-    # Per-step loss must match the reference after resume (same inputs + same
-    # restored parameters + same optimizer state ⇒ same gradients ⇒ same loss).
     for i, (r, f) in enumerate(zip(ref_losses[N_BEFORE:], fresh_losses)):
         assert abs(r - f) < 1e-5, (
             f"Post-resume loss at step {N_BEFORE + i} diverged from reference: "
             f"ref={r:.6f} vs fresh={f:.6f}"
         )
+    for i, (r, f) in enumerate(zip(ref_logits[N_BEFORE:], fresh_logits)):
+        torch.testing.assert_close(
+            f, r, rtol=0.0, atol=1e-5,
+            msg=lambda s, step=N_BEFORE + i: (
+                f"Post-resume pre-step logits at step {step} diverged: {s}"
+            ),
+        )
 
 
-def test_checkpoint_roundtrip_preserves_empty_buffer_state(tmp_path):
-    """Edge case: saving at a file-boundary (empty buffer) must still round-trip."""
-    data_dir = _write_parquet_fixture(tmp_path / "data", num_files=3, rows_per_file=8)
+def test_checkpoint_roundtrip_at_empty_buffer_file_boundary(tmp_path):
+    """File-boundary empty-buffer state round-trips through real save/load.
+
+    `StatefulParquetDataset.__iter__` never produces `buffer == []` mid-run
+    (the `del token_buffer[:seq_len]` slide from a seq_len+1 chunk always
+    leaves at least one overlap token). The one state shape the runtime does
+    observe with `buffer == []` is the synthetic file-boundary state a
+    training loop would materialize after cleanly finishing a file before any
+    yield from the next file — e.g. when resuming with
+    `set_state({"file_idx": k, "text_idx": 0, "buffer": []})`.
+
+    This test pins that exact state shape through the real `save_checkpoint()`
+    + `load_checkpoint()` path and proves iteration from the loaded state
+    matches an uninterrupted reference that was set to the same boundary.
+    """
+    data_dir = _write_parquet_fixture(tmp_path / "data", num_files=3, rows_per_file=16)
     ckpt_root = tmp_path / "ckpts"
     ckpt_root.mkdir()
-
-    # Consume enough batches to fully exhaust the first file and land on a
-    # buffer state that can be empty depending on byte alignment.
     cfg = DataConfig(data_dir=str(data_dir), seq_len=16, tokenizer_name="stub", prefetch_files=1)
-    ds = StatefulParquetDataset(cfg, _IdentityTokenizer(), rank=0, world_size=1, seed=0)
-    it = iter(DataLoader(ds, batch_size=1, num_workers=0))
-    for _ in range(3):
-        next(it)
 
-    model = _TinyModel()
-    opt = AdamW(model.parameters(), lr=1e-3)
+    # The file-boundary empty-buffer state at the start of file index 1.
+    boundary_state = {"file_idx": 1, "text_idx": 0, "buffer": []}
+
+    # Reference: dataset constructed fresh, set to the boundary state, iterate.
+    ref_ds = StatefulParquetDataset(cfg, _IdentityTokenizer(), rank=0, world_size=1, seed=0)
+    ref_ds.set_state(boundary_state)
+    ref_it = iter(DataLoader(ref_ds, batch_size=1, num_workers=0))
+    ref_batches = [next(ref_it)["input_ids"].clone() for _ in range(6)]
+
+    # Round-trip the boundary state through the real checkpoint I/O path.
+    model, opt, sched = _TinyModel(), AdamW(_TinyModel().parameters(), lr=1e-3), None
     sched = StepLR(opt, step_size=1, gamma=1.0)
-
     save_checkpoint(
         model=model,
         optimizer=opt,
         scheduler=sched,
-        step=3,
+        step=0,
         output_dir=str(ckpt_root),
-        dataset_state=ds.get_state(),
-        tokens_seen=48.0,
+        dataset_state=boundary_state,
+        tokens_seen=0.0,
     )
 
-    # Roundtrip the data_state through the checkpoint and assert semantic equality.
-    fresh_ds = StatefulParquetDataset(cfg, _IdentityTokenizer(), rank=0, world_size=1, seed=0)
+    fresh_model = _TinyModel()
+    fresh_opt = AdamW(fresh_model.parameters(), lr=1e-3)
+    fresh_sched = StepLR(fresh_opt, step_size=1, gamma=1.0)
     _, loaded_state, _ = load_checkpoint(
-        _TinyModel(), AdamW(_TinyModel().parameters(), lr=1e-3),
-        StepLR(AdamW(_TinyModel().parameters(), lr=1e-3), step_size=1),
-        str(ckpt_root / "checkpoint-3"),
+        fresh_model, fresh_opt, fresh_sched, str(ckpt_root / "checkpoint-0")
     )
     assert loaded_state is not None
-    assert loaded_state["file_idx"] == ds.get_state()["file_idx"]
-    assert loaded_state["text_idx"] == ds.get_state()["text_idx"]
-    assert loaded_state["buffer"] == ds.get_state()["buffer"]
+    assert loaded_state["buffer"] == [], (
+        "empty-buffer marker must round-trip through save/load as an empty list"
+    )
+    assert loaded_state["file_idx"] == 1
+    assert loaded_state["text_idx"] == 0
+
+    # Resume a fresh dataset from the loaded state and continue iterating.
+    fresh_ds = StatefulParquetDataset(cfg, _IdentityTokenizer(), rank=0, world_size=1, seed=0)
+    fresh_ds.set_state(loaded_state)
+    fresh_it = iter(DataLoader(fresh_ds, batch_size=1, num_workers=0))
+    fresh_batches = [next(fresh_it)["input_ids"].clone() for _ in range(6)]
+    for i, (r, f) in enumerate(zip(ref_batches, fresh_batches)):
+        assert torch.equal(r, f), (
+            f"Batch {i} after empty-buffer file-boundary resume diverged from reference"
+        )

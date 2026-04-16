@@ -53,7 +53,12 @@ from .logging import (
 )
 from .metrics import compute_output_metrics
 from .model_factory import build_model, configure_liger_kernels
-from .routing import get_bias_rate, update_expert_biases
+from .routing import (
+    apply_router_exploration_rate,
+    exploration_rate_schedule,
+    get_bias_rate,
+    update_expert_biases,
+)
 
 
 def _stateful_dataloader_workers(dataset, requested: int, *, role: str, verbose: bool) -> int:
@@ -247,8 +252,22 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
     heatmap_every = int(cfg.get("training", {}).get("heatmap_every", eval_cfg.get("every", 0)))
     distributed = is_distributed()
 
+    # Read the model-side target exploration rate once; the trainer schedules
+    # the effective rate between warmup_start and this target when warmup_steps > 0.
+    router_exploration_target = float(
+        cfg.get("model", {}).get("router_exploration_rate", 0.0) or 0.0
+    )
+
     while global_step < train_cfg.max_steps:
         step_start = time.perf_counter()
+        if train_cfg.router_exploration_warmup_steps > 0 or router_exploration_target > 0.0:
+            current_rate = exploration_rate_schedule(
+                global_step,
+                target=router_exploration_target,
+                warmup_start=train_cfg.router_exploration_warmup_start,
+                warmup_steps=train_cfg.router_exploration_warmup_steps,
+            )
+            apply_router_exploration_rate(model, current_rate)
         optimizer.zero_grad(set_to_none=True)
         window_metrics = {
             "loss": 0.0, "ce_loss": 0.0, "aux_loss": 0.0,

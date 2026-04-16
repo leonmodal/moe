@@ -112,6 +112,42 @@ app = modal.App(
 )
 
 
+TRAINING_SCRIPT = "/root/moe/scripts/train.py"
+REMOTE_DATA_DIR = "/data/parquet"
+CHECKPOINT_ROOT = "/checkpoints"
+
+
+def build_train_script_args(
+    config_path: str,
+    *,
+    data_dir: str = REMOTE_DATA_DIR,
+    output_dir: str,
+    max_checkpoints: int,
+    auto_resume: bool = True,
+) -> list[str]:
+    """Assemble the `scripts/train.py` argv for the Modal launcher.
+
+    Kept as a pure function so tests can pin the exact command shape without
+    importing the Modal decorators. Mirrors what `modal_train.train()` passes
+    to `torchrun_util.torchrun.run(..., training_script_args=...)`.
+    """
+    args = ["--config", config_path]
+    if auto_resume:
+        args.append("--auto_resume")
+    args += [
+        "--data_dir", data_dir,
+        "--output_dir", output_dir,
+        "--max_checkpoints", str(max_checkpoints),
+    ]
+    return args
+
+
+def resolve_output_dir(cfg: dict, checkpoint_root: str = CHECKPOINT_ROOT) -> str:
+    """Derive the checkpoint output directory from the parsed YAML config."""
+    experiment_name = cfg.get("experiment_name", "default")
+    return f"{checkpoint_root}/{experiment_name}"
+
+
 # --------------------------------------------------------------------------- #
 #  Training function                                                           #
 # --------------------------------------------------------------------------- #
@@ -128,16 +164,14 @@ def train(config: str = CONFIG_FILE):
 
     cluster_info = modal.experimental.get_cluster_info()
 
-    # Read experiment name from config for checkpoint directory
-    with open(f"/root/moe/{config}") as f:
+    remote_config_path = f"/root/moe/{config}"
+    with open(remote_config_path) as f:
         cfg = yaml.safe_load(f)
+    output_dir = resolve_output_dir(cfg)
     experiment_name = cfg.get("experiment_name", "default")
-    output_dir = f"/checkpoints/{experiment_name}"
 
-    # Force unbuffered stdout so logs appear in real time
     os.environ["PYTHONUNBUFFERED"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-    # NVLS (NVLink SHARP) auto-enables on B200 and hangs — force disable
     os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["NCCL_DEBUG"] = "WARN"
 
@@ -145,18 +179,15 @@ def train(config: str = CONFIG_FILE):
     print(f"  Config     : {config}")
     print(f"  Experiment : {experiment_name}")
     print(f"  Output     : {output_dir}")
-    print(f"  Data       : /data/parquet")
+    print(f"  Data       : {REMOTE_DATA_DIR}")
     print(f"  Master     : {cluster_info.container_ips[0]}")
     print(f"  GPUs       : {N_NODES} x {GPUS_PER_NODE} = {N_NODES * GPUS_PER_NODE}")
 
-    training_script = "/root/moe/scripts/train.py"
-    script_args = [
-        "--config", f"/root/moe/{config}",
-        "--auto_resume",
-        "--data_dir", "/data/parquet",
-        "--output_dir", output_dir,
-        "--max_checkpoints", str(MAX_CHECKPOINTS),
-    ]
+    script_args = build_train_script_args(
+        remote_config_path,
+        output_dir=output_dir,
+        max_checkpoints=MAX_CHECKPOINTS,
+    )
 
     torchrun.run(
         node_rank=cluster_info.rank,
@@ -164,7 +195,7 @@ def train(config: str = CONFIG_FILE):
         master_port=1234,
         nnodes=str(N_NODES),
         nproc_per_node=str(GPUS_PER_NODE),
-        training_script=training_script,
+        training_script=TRAINING_SCRIPT,
         training_script_args=script_args,
     )
 

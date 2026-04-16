@@ -51,6 +51,14 @@ class TrainingConfig:
     bias_update_rate: float = 0.0
     bias_warmup_start: float = 0.0
     bias_warmup_steps: int = 0
+    # Router-exploration warmup (AC-10, from docs/research/external_moe_techniques.md).
+    # The "target" rate is the model-side `router_exploration_rate`. When
+    # `router_exploration_warmup_steps > 0` the trainer lineartly schedules the
+    # effective rate from `router_exploration_warmup_start` at step 0 to the
+    # model's target at step `router_exploration_warmup_steps`, then holds at
+    # the target. Default (steps=0) is a no-op and preserves existing configs.
+    router_exploration_warmup_start: float = 0.0
+    router_exploration_warmup_steps: int = 0
 
 
 def load_config(path: str) -> dict:
@@ -95,6 +103,8 @@ def build_training_config(cfg: dict) -> TrainingConfig:
         bias_update_rate=tcfg.get("bias_update_rate", 0.0),
         bias_warmup_start=tcfg.get("bias_warmup_start", 0.0),
         bias_warmup_steps=tcfg.get("bias_warmup_steps", 0),
+        router_exploration_warmup_start=tcfg.get("router_exploration_warmup_start", 0.0),
+        router_exploration_warmup_steps=tcfg.get("router_exploration_warmup_steps", 0),
     )
 
 

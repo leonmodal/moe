@@ -96,3 +96,43 @@ def get_bias_rate(
         frac = step / warmup_steps
         return warmup_start + (base_rate - warmup_start) * frac
     return base_rate
+
+
+def exploration_rate_schedule(
+    step: int,
+    target: float,
+    warmup_start: float,
+    warmup_steps: int,
+) -> float:
+    """Linear schedule from `warmup_start` to `target` over `warmup_steps`.
+
+    After `warmup_steps` the rate stays at `target`. `warmup_steps <= 0` means
+    no schedule (the rate is `target` for every step). Used to implement the
+    "early-step router exploration warmup" technique from
+    docs/research/external_moe_techniques.md: start at a lower exploration rate
+    so random expert picks do not destabilize the router before it has learned,
+    then ramp to the configured target over the first N steps.
+    """
+    if warmup_steps <= 0:
+        return target
+    if step >= warmup_steps:
+        return target
+    frac = max(0.0, step) / warmup_steps
+    return warmup_start + (target - warmup_start) * frac
+
+
+def apply_router_exploration_rate(model, rate: float) -> int:
+    """Push `rate` onto every router-like submodule with an `exploration_rate`.
+
+    Returns the number of router modules updated (useful for asserting
+    coverage in tests). Safe for DDP/FSDP-wrapped models — the iteration goes
+    through the unwrapped model and mutates the shared tensor-free attribute
+    directly.
+    """
+    raw_model = unwrap_model(model)
+    count = 0
+    for module in raw_model.modules():
+        if hasattr(module, "exploration_rate"):
+            module.exploration_rate = float(rate)
+            count += 1
+    return count

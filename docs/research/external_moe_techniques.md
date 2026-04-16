@@ -85,12 +85,49 @@ Research findings from Megatron-LM, modal-nmoe, and nmoe codebases, focused on t
 
 ## Integration Status
 
-| Technique | Status | Benchmark Required |
-|-----------|--------|-------------------|
-| FP32 router math | Already implemented | No |
-| Expert bias (DeepSeek) | Already implemented | No |
-| Group-limited routing | Already implemented | No |
-| Z-loss | Not implemented | Yes, before integration |
-| Fused W1/W3 GEMM | Not implemented | Yes, before integration |
-| RDEP dispatch | Not implemented | Yes, before integration |
-| Seq aux loss | Partially implemented | Yes, for coefficient tuning |
+Per AC-10.1, this table distinguishes **observed externally (not integrated here)** from **implemented here with benchmark evidence**.
+
+### Observed externally (not integrated)
+
+| Technique | Source | Why not integrated yet |
+|-----------|--------|------------------------|
+| Z-loss | Megatron-LM | Benchmark-first follow-up (coefficient tuning) |
+| Fused W1/W3 GEMM | Megatron-LM + custom kernel work | Benchmark-first follow-up |
+| RDEP dispatch | nmoe | Benchmark-first follow-up; requires CUDA kernel work |
+| Permute/unpermute fusion around Triton GEMM | Megatron-LM | Benchmark-first follow-up |
+| DeepEP-class fused comm kernels | DeepEP | Only relevant if EP traffic is a bottleneck |
+| Expert optimizer fusion | modal-nmoe | Larger investment |
+| MoE Parallel Folding | Megatron-LM | Larger investment |
+
+### Implemented here
+
+| Technique | Source of truth in repo | Notes |
+|-----------|-------------------------|-------|
+| FP32 router math | `src/models/routing/fp32_ops.py`, `src/models/router.py` | Pre-existing |
+| Expert bias (DeepSeek) | `src/models/router.py`, `src/models/routing/bias.py`, `src/training/routing.py::update_expert_biases` | Pre-existing |
+| Group-limited routing | `src/models/router.py::group_limited_topk` | Pre-existing |
+| Seq aux loss (partial) | `src/models/routing/load_balancing.py::seq_load_balancing_loss_func` | Pre-existing; coefficient tuning still benchmark-first |
+| **Early-step router-exploration warmup** | `src/training/routing.py::exploration_rate_schedule` + `apply_router_exploration_rate`, `src/training/config.py::router_exploration_warmup_start` / `router_exploration_warmup_steps`, trainer loop in `src/training/trainer.py` | **Round 4 integration (AC-10). Benchmark evidence below.** |
+
+### Implemented here with benchmark evidence
+
+**Early-step router-exploration warmup.** The trainer linearly ramps the effective router-exploration rate from `router_exploration_warmup_start` to the model-configured `router_exploration_rate` over `router_exploration_warmup_steps` steps, then holds at the target. Default (`warmup_steps=0`) is a no-op and preserves existing configs unchanged. Reproduce with:
+
+```bash
+uv run python scripts/benchmark_router_exploration_warmup.py \
+    --steps 50 --warmup-start 0.5 --warmup-steps 15 --target-rate 0.02
+```
+
+Representative result on 1x H200 (50 steps, batch 2, seq_len 32, target_rate 0.02, warmup_start 0.5 for 15 steps):
+
+```
+standard_moe
+  no_warmup  (rate==target)  final_loss=1.5637
+  warmup     (0.5 → 0.02 / 15 steps)  final_loss=1.5816   delta +1.15%
+
+moe_everything
+  no_warmup  (rate==target)  final_loss=1.6278
+  warmup     (0.5 → 0.02 / 15 steps)  final_loss=1.6058   delta -1.35%
+```
+
+Both deltas are within the noise band of a 50-step micro-benchmark and are well inside the AC-11 loss-sanity envelope (no loss stuck at ~4 or above). The feature is therefore kept as an opt-in config knob (default disabled via `router_exploration_warmup_steps=0`) rather than enabled by default — it does not regress loss sanity and provides operators with a stability lever for the first few hundred steps of a real training run when desired.
