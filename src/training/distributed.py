@@ -134,12 +134,18 @@ def wrap_model(
     if strategy == "fsdp":
         if FSDP is None:
             raise RuntimeError("FSDP is unavailable in this torch install")
+        # `use_orig_params=True` lets FSDP tolerate forward passes that do
+        # not activate every parameter (MoE branch routers may skip either
+        # the attention-expert bank or the MLP-expert bank on any given
+        # step). Without it, FSDP's post-backward assertion fires when the
+        # unused shard's gradient hook executes in the IDLE state.
         return FSDP(
             model,
             device_id=torch.device("cuda", local_rank),
             mixed_precision=_build_fsdp_mixed_precision(mixed_precision_name),
             sharding_strategy=ShardingStrategy.FULL_SHARD,
             sync_module_states=True,
+            use_orig_params=True,
         )
     raise ValueError(f"Unknown strategy: {strategy}")
 

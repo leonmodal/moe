@@ -187,25 +187,115 @@ def test_build_torchrun_invocation_defaults_experiment_name_when_missing(tmp_pat
     assert invocation["training_script_args"][idx] == "/checkpoints/default"
 
 
-def test_modal_train_calls_build_torchrun_invocation():
-    """Pin that `train()` invokes `build_torchrun_invocation` rather than
-    reassembling the kwargs inline. Modal's `@app.function` +
-    `@modal.experimental.clustered` wrap `train` into a `modal.Function`
-    object that `inspect.getsource` cannot resolve, so we read the module
-    file directly and scan for the call.
+def test_modal_train_raw_function_forwards_expected_torchrun_kwargs(monkeypatch, tmp_path):
+    """Execute `modal_train.train`'s real body (not just scan its source).
+
+    The Modal decorators (`@app.function`, `@modal.experimental.clustered`)
+    wrap `train` into a `modal.Function`; `train.get_raw_f()` returns the
+    underlying Python callable. We patch the three external dependencies
+    (`modal.experimental.get_cluster_info` for cluster coordinates, the
+    `open` the function uses to read the YAML config, and
+    `torchrun_util.torchrun.run` to capture the forwarded kwargs), invoke
+    the raw function, and assert the exact command shape passed to
+    `torchrun.run(**invocation)`.
     """
-    source_path = Path(modal_train.__file__).resolve()
-    module_src = source_path.read_text()
-    # Find the def train(...) block.
-    assert "def train(" in module_src, f"`def train(...)` not found in {source_path}"
-    train_start = module_src.index("def train(")
-    train_block = module_src[train_start:]
-    assert "build_torchrun_invocation" in train_block, (
-        "modal_train.train() should call build_torchrun_invocation(...) so the "
-        "test-covered helper is the single source of truth for the launcher "
-        "command shape."
+    # Build a real YAML config on disk — the raw function opens its config
+    # via f"/root/moe/{config}", so we stage the file there via monkeypatched
+    # open rather than actually touching /root/moe.
+    yaml_payload = (
+        "experiment_name: raw_launcher_smoke\n"
+        "model:\n"
+        "  type: dense\n"
+        "  vocab_size: 128\n"
+        "  hidden_size: 32\n"
+        "  num_hidden_layers: 1\n"
+        "  head_dim: 8\n"
+        "  num_attention_heads: 2\n"
+        "  num_key_value_heads: 1\n"
+        "  intermediate_size: 64\n"
+        "  max_position_embeddings: 64\n"
+        "training:\n"
+        "  learning_rate: 1.0e-3\n"
+        "  weight_decay: 0.0\n"
+        "  max_grad_norm: 1.0\n"
+        "  lr_scheduler: constant\n"
+        "  warmup_steps: 0\n"
+        "  max_steps: 2\n"
+        "  batch_size: 1\n"
+        "  gradient_accumulation: 1\n"
+        "  mixed_precision: bf16\n"
+        "  output_dir: /checkpoints/raw_launcher_smoke\n"
+        "data:\n"
+        "  data_dir: /data/parquet\n"
+        "  text_column: text\n"
+        "  seq_len: 16\n"
+        "  tokenizer_name: gpt2\n"
+        "eval:\n"
+        "  enabled: false\n"
     )
-    assert "torchrun.run(**invocation)" in train_block, (
-        "modal_train.train() should pass the helper's kwargs verbatim to "
-        "torchrun.run(...); otherwise the test-covered shape can drift."
-    )
+
+    expected_config_path = f"/root/moe/configs/{tmp_path.name}/raw.yaml"
+    real_open = open
+
+    def patched_open(path, *args, **kwargs):
+        if str(path) == expected_config_path:
+            from io import StringIO
+            return StringIO(yaml_payload)
+        return real_open(path, *args, **kwargs)
+
+    class _FakeClusterInfo:
+        def __init__(self):
+            self.rank = 0
+            self.container_ips = ["10.0.0.7"]
+
+    captured_kwargs: dict = {}
+
+    def _fake_torchrun_run(**kwargs):
+        captured_kwargs.update(kwargs)
+
+    # modal.experimental.get_cluster_info is looked up dynamically inside
+    # train() via `modal.experimental.get_cluster_info()`, so we patch the
+    # attribute on the module modal_train already has imported.
+    import modal.experimental as modal_experimental  # noqa: E402
+    monkeypatch.setattr(modal_experimental, "get_cluster_info",
+                        lambda: _FakeClusterInfo())
+
+    # torchrun_util.torchrun.run is imported lazily inside train(). Pre-inject
+    # a stub into sys.modules so the inner `from torchrun_util import torchrun`
+    # binds to our fake.
+    import sys
+    import types
+    fake_torchrun_util = types.ModuleType("torchrun_util")
+    fake_torchrun = types.SimpleNamespace(run=_fake_torchrun_run)
+    fake_torchrun_util.torchrun = fake_torchrun
+    monkeypatch.setitem(sys.modules, "torchrun_util", fake_torchrun_util)
+
+    # The raw function opens f"/root/moe/{config}" as a string; intercept
+    # builtins.open so we can return our in-memory YAML without touching disk.
+    import builtins
+    monkeypatch.setattr(builtins, "open", patched_open)
+
+    raw_train = modal_train.train.get_raw_f()
+    relative_config = expected_config_path.replace("/root/moe/", "")
+    raw_train(config=relative_config)
+
+    # Capture must contain exactly the kwargs build_torchrun_invocation produces.
+    assert set(captured_kwargs.keys()) == {
+        "node_rank", "master_addr", "master_port",
+        "nnodes", "nproc_per_node",
+        "training_script", "training_script_args",
+    }, f"Unexpected kwargs forwarded to torchrun.run: {captured_kwargs.keys()}"
+    assert captured_kwargs["node_rank"] == 0
+    assert captured_kwargs["master_addr"] == "10.0.0.7"
+    assert captured_kwargs["master_port"] == 1234
+    # Modal-side N_NODES / GPUS_PER_NODE come from module globals; pin them.
+    assert captured_kwargs["nnodes"] == str(modal_train.N_NODES)
+    assert captured_kwargs["nproc_per_node"] == str(modal_train.GPUS_PER_NODE)
+    assert captured_kwargs["training_script"] == modal_train.TRAINING_SCRIPT
+    assert captured_kwargs["training_script_args"] == [
+        "--config", expected_config_path,
+        "--auto_resume",
+        "--data_dir", modal_train.REMOTE_DATA_DIR,
+        "--output_dir", "/checkpoints/raw_launcher_smoke",
+        "--max_checkpoints", str(modal_train.MAX_CHECKPOINTS),
+    ]

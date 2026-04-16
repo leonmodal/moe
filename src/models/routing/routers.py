@@ -67,14 +67,21 @@ class BranchRouter(nn.Module):
     def forward(self, hidden_states: torch.Tensor):
         device_type = hidden_states.device.type
         with torch.autocast(device_type=device_type, enabled=False):
+            # Route in the gate's weight dtype. Under standard DDP/fp32 training
+            # the weight is fp32 so this preserves the prior "route in fp32"
+            # behavior; under FSDP with `MixedPrecision(param_dtype=bf16)` the
+            # weight is bf16 and casting hidden_states to float() would mix
+            # dtypes in the matmul. Matching the weight dtype keeps both paths
+            # valid.
+            gate_dtype = self.gate.weight.dtype
             # Seq-level routing: mean-pool then broadcast
             B, T = None, None
             if self.use_seq_level and hidden_states.ndim == 3:
                 B, T, D = hidden_states.shape
-                seq_repr = hidden_states.float().mean(dim=1)
+                seq_repr = hidden_states.to(gate_dtype).mean(dim=1)
                 logits = self.gate(seq_repr)
             else:
-                logits = self.gate(hidden_states.float())
+                logits = self.gate(hidden_states.to(gate_dtype))
 
             if self.use_deepseek_style:
                 scores = torch.sigmoid(logits)
