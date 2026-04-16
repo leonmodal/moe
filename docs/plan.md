@@ -7,7 +7,11 @@ Reorganize and clean up the MoE training codebase to achieve a clean, maintainab
 1. **Documentation correction** — fix all docs to match actual codebase behavior, eliminating aspirational statements presented as current. Docs must include detailed coverage of: MoE-Everything model architecture, global load-imbalancing router, expert bias normalization, branch routing, and per-head attention routing modes.
 2. **Unified torch-native training stack** — remove the Accelerator-based `train.py` entirely; extract shared modules from `train_torch.py` into a clean `src/training/` library with a single CLI entrypoint. Support DDP, FSDP, and Modal multi-node training. The training pipeline must include a loss sanity check: loss should converge to sensible values (~3.28 on FineWeb GPT-2 reference); loss stuck at ~4 after 1k steps indicates a bug (reference: the shifted-logits CE label bug fixed in commit `740f306`).
 3. **Bagel-style custom model architecture** — copy and customize Qwen3 HuggingFace components (attention, MLP, RMSNorm, RoPE) into our own standalone model files. Keep HF `PreTrainedModel` base for checkpoint compatibility but do not depend on `transformers` for model forward-pass logic at runtime. This gives full customization control while preserving HF ecosystem compatibility. Supported models: dense, standard MoE, global MoE, and MoE-Everything (both `per_head_fully_independent` and `per_head_precompute_kv` modes). DeepSeek routing becomes a config option (`router_type`) within standard MoE and global MoE, not a separate model type.
-4. **Speedrun archival** — move speedrun model architecture code (speedrun_gpt, speedrun_moe_gpt, speedrun_mixture_of_everything) and their configs/tests to a `legacy/` directory. **Decoupled speedrun utilities stay in active code**: routing stats (`routing_stats.py`), routing visualization/graphs (`routing_plots.py`), Muon optimizer (`muon.py`), Triton grouped GEMM (`triton_grouped_gemm.py`), Newton-Schulz iteration (`triton_newton_schulz.py`), distributed optimizers (`dist_optimizers.py`), and momentum warmup schedule.
+4. **Speedrun archival with extraction** — move speedrun model architecture *assembly* code (speedrun_gpt, speedrun_moe_gpt, speedrun_mixture_of_everything) and their configs/tests to a `legacy/` directory. Before archiving, **extract reusable components into active code**:
+   - From `speedrun_gpt.py`: FlexAttention with doc masking + sliding window (as attention option), FP8 lm_head (as config option), sigmoid logit softcapping (as config option)
+   - From `speedrun_moe_gpt.py`: `RoutingStats` dataclass (forward-pass stats accumulation), `BranchRouter` DeepSeek-style sigmoid+bias variant (merge into active branch router), `RoutedAttentionFullyIndependent` and `RoutedAttentionPrecomputeKV` (compare to mixture_of_everything versions — speedrun versions may be more correct; use the better implementation), `get_bias_rate()` / `update_global_bias()` / `broadcast_global_bias()` (per-projection global bias system with zero-sum update + clamp), helper functions (`_make_router`, `_route_top1`, `_grouped_project`, `_sparse_attn_project`)
+   - From `speedrun_mixture_of_everything.py`: `FunctionalRMSNorm` (`F.rms_norm`, as normalization config option)
+   - **Decoupled speedrun utilities stay in active code**: routing stats (`routing_stats.py`), routing visualization/graphs (`routing_plots.py`), Muon optimizer (`muon.py`), Triton grouped GEMM (`triton_grouped_gemm.py`), Newton-Schulz iteration (`triton_newton_schulz.py`), distributed optimizers (`dist_optimizers.py`), routing loss (`routing_loss.py`), and momentum warmup schedule.
 5. **Data pipeline simplification** — remove token-bin data support entirely; sharded parquet is the sole data path. Optimize data loading performance (prefetching, parallel loading) for throughput.
 6. **Code organization** — split `mixture_of_everything.py` (2311 lines) into coherent modules by API seam using inheritance patterns; normalize naming conventions across all model files.
 7. **External MoE research** — study Megatron-LM, modal-nmoe, and nmoe for techniques that make training more stable and faster (grouped GEMM coverage, dispatcher improvements, expert-bias tuning, communication overlap); integrate only benchmark-validated techniques.
@@ -56,8 +60,8 @@ Following TDD philosophy, each criterion includes positive and negative tests fo
     - Requesting `speedrun_moe_gpt` model type produces a clear error message
     - Requesting `speedrun_moe_everything` model type produces a clear error message
     - Requesting `gpt2_dense` model type produces a clear error message
-  - AC-3.1: DeepSeek routing merged as config option
-    - Positive: `router_type: deepseek` in standard_moe/global_moe config activates DeepSeek sigmoid+expert-bias routing
+  - AC-3.1: DeepSeek routing as pluggable config option for any model
+    - Positive: `router_type: deepseek` in any model config activates DeepSeek sigmoid+expert-bias routing
     - Negative: `deepseek_standard_moe` and `deepseek_global_moe` are not valid model types
   - AC-3.2: Bagel-style custom model architecture
     - Positive: Model files contain copied+customized Qwen3 components (attention, MLP, RMSNorm, RoPE) in standalone files
@@ -169,10 +173,10 @@ The implementation includes docs corrected for factual errors with key topics co
 ### Allowed Choices
 
 - Can use: `torch.distributed` (DDP, FSDP), Triton kernels, WandB, liger_kernel (optional), Muon optimizer, HF `PreTrainedModel` base class for checkpoint compat
-- Cannot use: `accelerate` library, speedrun model architectures in main training path, token-bin data format in active code, runtime imports of `transformers` model layers in forward pass
+- Cannot use: `accelerate` library, speedrun model *assembly* code in main training path (extracted components are fine), token-bin data format in active code, runtime imports of `transformers` model layers in forward pass
 - Trainer structure: shared modules in `src/training/` with a thin CLI wrapper — not a monolithic training function
 - Model architecture: Bagel-style — copy Qwen3 components locally and customize, inheriting from HF `PreTrainedModel`
-- Model taxonomy: DeepSeek routing as `router_type` config option within standard_moe/global_moe, not as separate model classes
+- Model taxonomy: DeepSeek routing as pluggable `router_type` config option available to any model, not as separate model classes
 - Architecture scope: Qwen3-based custom models; Llama 3.1 not needed
 
 ## Feasibility Hints and Suggestions
@@ -195,30 +199,35 @@ src/training/
 └── logging.py        # WandB logging, console output, metrics formatting, routing graphs
 ```
 
-2. **Bagel-style model architecture**: Copy Qwen3 components from HuggingFace into our own files:
+2. **Bagel-style model architecture**: Copy Qwen3 components from HuggingFace into our own files. Organize with clear module boundaries:
 
 ```
 src/models/
 ├── base/
 │   ├── __init__.py
-│   ├── attention.py      # Copied+customized Qwen3 attention (GQA, QK norm)
+│   ├── attention.py      # Copied+customized Qwen3 attention (GQA, QK norm), FlexAttention with doc masking + sliding window as option
 │   ├── mlp.py            # Copied+customized Qwen3 MLP
-│   ├── normalization.py  # RMSNorm
+│   ├── normalization.py  # RMSNorm (learned) + FunctionalRMSNorm (F.rms_norm, parameterless) as config option
 │   ├── embeddings.py     # Token embeddings, RoPE
+│   ├── output_head.py    # LM head with optional FP8 matmul and sigmoid logit softcapping as config options
 │   └── config.py         # Base model configuration
+├── routing/
+│   ├── __init__.py
+│   ├── routers.py        # DeepSeekRouter, ExplorationTopKRouter, BranchRouter (with DeepSeek sigmoid+bias variant)
+│   ├── load_balancing.py # Unified loss functions (batch, sequence, switch, normalized)
+│   ├── bias.py           # Global bias management: per-projection rates, zero-sum update, clamp, warmup, broadcast
+│   ├── stats.py          # RoutingStats dataclass (per-forward-pass accumulation) + routing stats computation
+│   ├── helpers.py        # _make_router, _route_top1, _grouped_project, _sparse_attn_project
+│   └── fp32_ops.py       # FP32 index_select, index_put, index_add for numerical stability
 ├── dense.py              # Dense model (inherits from base)
 ├── standard_moe.py       # Standard MoE with router_type config
 ├── global_moe.py         # Global MoE with shared expert pool
 ├── moe_everything/       # Split by API seam with inheritance
 │   ├── __init__.py
 │   ├── config.py         # Config dataclass, type definitions
-│   ├── routing.py        # Branch router, routing logic
-│   ├── attention_bank.py # AttentionExpertBank, per-head modes
+│   ├── attention_bank.py # AttentionExpertBank, per-head modes (fully_independent + precompute_kv — use best implementation from speedrun vs mixture_of_everything comparison)
 │   ├── mlp_bank.py       # MlpExpertBank
 │   └── model.py          # MoEverythingForCausalLM assembly
-├── router.py             # DeepSeekRouter, ExplorationTopKRouter
-├── load_balancing.py     # Unified loss functions
-├── fp32_routing.py       # Numerical stability helpers
 └── triton_grouped_gemm.py # Expert dispatch kernel
 ```
 
@@ -231,11 +240,16 @@ src/models/
    - `training_state.pt` — step count, LR scheduler, RNG states
    - Conversion utility: `convert_checkpoint.py` to export model weights to safetensors format
 
-5. **Merge DeepSeek routing**: In `standard_moe.py` and `global_moe.py`, accept a `router_type` config field. When `router_type: deepseek`, use `DeepSeekRouter`; when `router_type: softmax` (or default), use `ExplorationTopKRouter`.
+5. **Merge DeepSeek routing**: Make `router_type` a pluggable config field available to any model. When `router_type: deepseek`, use `DeepSeekRouter`; when `router_type: softmax` (or default), use `ExplorationTopKRouter`.
 
-6. **Archive speedrun models**: Move `speedrun_gpt.py`, `speedrun_moe_gpt.py`, `speedrun_mixture_of_everything.py` and their configs/tests to `legacy/speedrun/`. Keep all decoupled utilities (`routing_stats.py`, `routing_plots.py`, `muon.py`, `dist_optimizers.py`, `triton_grouped_gemm.py`, `triton_newton_schulz.py`) in active `src/utils/` and `src/models/`.
+6. **Extract then archive speedrun models**: First extract reusable components (see Goal Description point 4) into the structured `src/models/routing/`, `src/models/base/`, and `src/training/` packages. Then move the remaining speedrun model *assembly* code (`speedrun_gpt.py`, `speedrun_moe_gpt.py`, `speedrun_mixture_of_everything.py`) and their configs/tests to `legacy/speedrun/`. Keep all decoupled utilities in active `src/utils/` and `src/models/`.
 
-7. **Update `modal_train.py`** to use the unified trainer entrypoint instead of dispatching between `train.py` and `train_torch.py`.
+7. **⚠️ CRITICAL: Use speedrun per-head attention implementations, NOT mixture_of_everything.py**. The two codebases implement per-head routing differently and `mixture_of_everything.py` has the WRONG design:
+   - **`speedrun_moe_gpt.py` (CORRECT)**: H separate routers per projection type, each doing **top-1**. For `fully_independent` with H=6 heads: 6 Q-routers + 6 K-routers + 6 V-routers + 6 O-routers = 24 routers per depth, each picking 1 expert. For `precompute_kv`: 6 bundled QKVO-routers, each picking 1 expert. This is the intended design: each head slot independently picks its own expert.
+   - **`mixture_of_everything.py` (WRONG)**: 1 router per projection type doing **top-num_kv_heads**. For `fully_independent`: 1 Q-router + 1 K-router + 1 V-router + 1 O-router = 4 routers per depth, each picking `num_kv_heads` experts. This collapses the per-head independence into a single routing decision — NOT the intended architecture.
+   - The active code in `moe_everything/attention_bank.py` MUST use the speedrun design (H routers, each top-1), not the mixture_of_everything.py design (1 router, top-K). Extract `RoutedAttentionFullyIndependent` and `RoutedAttentionPrecomputeKV` from `speedrun_moe_gpt.py` as the source of truth.
+
+8. **Update `modal_train.py`** to use the unified trainer entrypoint instead of dispatching between `train.py` and `train_torch.py`.
 
 ### Relevant References
 
@@ -445,7 +459,7 @@ Each task must include exactly one routing tag:
   - Claude Position: Merge into standard_moe/global_moe as `router_type` config option
   - Codex Position: Merge is reasonable but migration path must be explicit
   - Tradeoff Summary: Merged reduces model surface area; separate preserves explicitness but adds maintenance
-  - Decision Status: **Keep as routing options** — `router_type: deepseek` config flag within standard_moe/global_moe
+  - Decision Status: **Pluggable utility for any model** — `router_type: deepseek` as a config option available to any model, not limited to standard_moe/global_moe
 
 - DEC-3: Checkpoint backward compatibility
   - Claude Position: Clean break, no migration
@@ -487,13 +501,21 @@ Each task must include exactly one routing tag:
 ### Key Technical Notes
 - The existing `modeling_qwen3_moe.py` (locally shadowed HF code with double-softmax fix) serves as the starting point for Bagel-style custom components. The bug fixes must be preserved when copying components into `src/models/base/`.
 - The shifted-logits CE label bug (commit `740f306`) was caused by datasets pre-shifting labels AND HF models shifting them again internally. The fix sets `labels = input_ids` and lets the model handle the shift once. The unified trainer must preserve this fix and include a loss sanity check.
-- `mixture_of_everything.py` contains the `BranchRouter` which has NO load-balancing loss by design — do not add one during routing unification.
+- `mixture_of_everything.py` contains the `BranchRouter` which has NO load-balancing loss by design — do not add one during routing unification. However, the speedrun `BranchRouter` in `speedrun_moe_gpt.py` adds DeepSeek-style sigmoid+bias, seq-level routing, and sampling — these features should be merged into the active `BranchRouter` as config options.
 - Expert bias updates in `DeepSeekRouter` are non-gradient (buffer-based) — this must be preserved when unifying bias update logic.
+- The global bias system in `speedrun_moe_gpt.py` (per-projection-type global bias: Q/K/V/O/MLP/branch, zero-sum update `s - s.mean()`, ±16 clamp, linear warmup, broadcast to per-depth routers) must be extracted to `src/models/routing/bias.py` before archiving speedrun code.
 - Triton grouped GEMM kernel (`src/models/triton_grouped_gemm.py`) is already used by moe_everything and stays in active code — verify it continues to work after the model architecture rewrite.
 - `modal_train.py` currently dispatches non-speedrun jobs to `train.py` (Accelerator); it must be updated to use the unified trainer.
 - Speedrun tracking capabilities (routing_stats.py, routing_plots.py) are already fully decoupled from speedrun model code — they work with any model that outputs routing statistics. Keep them in active `src/utils/`.
-- The `RoutingStats` dataclass in `speedrun_moe_gpt.py` is separate from `src/utils/routing_stats.py` — only the latter survives in active code. The speedrun-specific dataclass moves to legacy.
+- The `RoutingStats` dataclass in `speedrun_moe_gpt.py` (per-forward-pass accumulation of aux losses, router records, branch records, seq aux loss) must be extracted to `src/models/routing/stats.py`. This is separate from `src/utils/routing_stats.py` (count-based statistics). Both survive in active code.
+- The routing helper functions in `speedrun_moe_gpt.py` (`_make_router`, `_route_top1`, `_grouped_project`, `_sparse_attn_project`) must be extracted to `src/models/routing/helpers.py`. These provide efficient top-1 routing dispatch with Triton grouped GEMM.
 - Checkpoint module must handle both Adam and Muon optimizer states. Current Muon implementation is in `src/utils/muon.py` (already decoupled). The hybrid optimizer (Muon for weight matrices, Adam for scalars) requires saving both optimizer states separately.
+- `FunctionalRMSNorm` (`F.rms_norm`, parameterless) from `speedrun_mixture_of_everything.py` must be extracted to `src/models/base/normalization.py` as a config option alongside learned RMSNorm.
+- FlexAttention with document boundary masking + sliding window from `speedrun_gpt.py` must be extracted to `src/models/base/attention.py` as an attention mode option.
+- FP8 lm_head matmul from `speedrun_gpt.py` must be extracted to `src/models/base/output_head.py` as a config option.
+- Sigmoid logit softcapping from `speedrun_gpt.py` must be extracted to `src/models/base/output_head.py` as a config option.
+- **⚠️ CRITICAL**: The per-head attention routing in `mixture_of_everything.py` is WRONG. It uses 1 router per projection doing top-K (e.g., `self.q_router` selecting `num_kv_heads` experts). The CORRECT design is in `speedrun_moe_gpt.py`: H separate routers per projection, each doing top-1 (e.g., `q_routers = ModuleList([router for _ in range(H)])`). The correct design means each head slot independently picks its own expert. The active code MUST use the speedrun design. Do NOT copy the mixture_of_everything.py router structure for per-head modes.
+- DeepSeek router (`router_type: deepseek`) is a pluggable utility available to any model, not limited to standard_moe/global_moe.
 
 --- Original Design Draft Start ---
 

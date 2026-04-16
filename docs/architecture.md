@@ -189,6 +189,26 @@ def should_use_sparse_path(token_mask):
 
 This is the most expressive attention routing mode. Each projection type (Q, K, V, O) has its own independent router, and each router selects from its own expert pool.
 
+#### Why it's called "Fully Independent"
+
+Q, K, and V are routed **independently** — for the same head slot, Q might come from expert 7 while K comes from expert 12 and V from expert 3. This means Q and K can live in **different learned subspaces**. Token at position `t` with Q from expert 7 may attend against token at position `s` with K from expert 12 — the dot product is between weight matrices that were never trained together. This is the fundamental tradeoff: **maximum routing flexibility at the cost of Q-K subspace alignment**.
+
+**Cost**: 1 standard attention call per depth — same as a normal transformer. Very cheap.
+
+#### Router structure
+
+Each head slot has its **own dedicated router** doing **top-1** from the expert pool. This is NOT one router picking top-K — it is H separate routers each picking top-1.
+
+- Q: H routers (one per head), each selecting 1 expert → H experts total
+- K: H routers (one per head), each selecting 1 expert → H experts total
+- V: H routers (one per head), each selecting 1 expert → H experts total
+- O: H routers (one per head, routing on attention output), each selecting 1 expert → H experts total
+- Total: **4H routers** per depth
+
+Each router is `nn.Linear(dim, num_experts)` → top-1. Different head-slot routers learn to specialize independently.
+
+> **Note**: The reference implementation for this is in `speedrun_moe_gpt.py`, not `mixture_of_everything.py`. The latter incorrectly uses 1 router per projection doing top-K, which collapses the per-head independence.
+
 #### Weight Banks
 
 Four separate expert weight banks, stored as 3D parameter tensors:
@@ -206,18 +226,17 @@ Where:
 - `E_o` = `E * q_heads_per_kv` (larger pool for O to match per-layer O projection parameter count)
 - `q_group_dim` = `q_heads_per_kv * head_dim` (GQA: each Q expert produces queries for all Q heads in a KV group)
 
-#### Four Independent Routers
+#### Per-Head Routers (4H total)
 
 ```python
-self.q_router = Router(hidden_size -> E)              # selects num_kv_heads experts
-self.k_router = Router(hidden_size -> E_kv)           # selects num_kv_heads experts
-self.v_router = Router(hidden_size -> E_kv)           # selects num_kv_heads experts
-self.o_router = Router(q_dim -> E_o)                  # selects num_heads experts
+# H routers per projection type, each doing top-1
+q_routers = ModuleList([Router(hidden_size -> E) for _ in range(H)])   # H routers, each picks 1 expert
+k_routers = ModuleList([Router(hidden_size -> E) for _ in range(H)])   # H routers, each picks 1 expert
+v_routers = ModuleList([Router(hidden_size -> E) for _ in range(H)])   # H routers, each picks 1 expert
+o_routers = ModuleList([Router(head_dim -> E) for _ in range(H)])      # H routers, each picks 1 expert
 ```
 
-**Why `num_kv_heads` selections?** With GQA, the model has `num_kv_heads` KV groups. Each Q/K/V router selects `num_kv_heads` experts -- one expert per KV group. Each Q expert produces the queries for all Q heads within that KV group (`q_group_dim = q_heads_per_kv * head_dim`).
-
-The O router selects `num_heads` experts (one per attention head, since O projection is per-head).
+Each head slot has its own router that independently picks one expert. With H=6 heads, that's 24 routers per depth doing top-1, not 4 routers doing top-6.
 
 #### Forward Flow (per token)
 
@@ -287,6 +306,24 @@ This is much faster than per-expert loops on GPU because it maximizes parallelis
 
 This mode uses a **single router** to select experts for all four projections (Q, K, V, O). The key optimization: since all tokens in a batch see the same expert's K and V weights, K and V can be precomputed once per expert and reused across all tokens routed to that expert.
 
+#### Why it's called "Precompute KV"
+
+Because the same expert provides both Q and K, we know which K/V weight matrix each head slot will use before running attention. So we can **precompute the full K/V tables** for each active expert once, then run attention against those tables. This guarantees **Q-K subspace alignment** — Q and K always come from the same learned projection, so dot-product attention scores are always meaningful.
+
+**Cost**: `num_active_experts` separate full attention passes per depth. More expensive than fully independent, but guarantees correctness of attention.
+
+#### Router structure
+
+Each head slot has its **own dedicated router** doing **top-1** — one routing decision per head that picks Q+K+V+O together from the same expert.
+
+- H routers (one per head slot), each selecting 1 expert → H experts total
+- Same expert index provides Q, K, V, and O for that head slot
+- Total: **H routers** per depth
+
+Each router is `nn.Linear(dim, num_experts)` → top-1. The bundled decision means Q and K always come from the same learned subspace.
+
+> **Note**: The reference implementation for this is in `speedrun_moe_gpt.py`, not `mixture_of_everything.py`. The latter incorrectly uses 1 router doing top-K, which is a fundamentally different routing architecture.
+
 #### Weight Banks
 
 ```python
@@ -298,13 +335,14 @@ self.o_proj = Parameter(E, q_group_dim, hidden_size)     # O experts (takes grou
 
 Note: all four banks have the same number of experts `E`, and the O projection takes `q_group_dim` input (not `head_dim`) because it operates on the grouped-query output.
 
-#### Single Router
+#### Per-Head Bundled Routers (H total)
 
 ```python
-self.router = Router(hidden_size -> E)    # selects num_kv_heads experts
+# H routers, each doing top-1 (one bundled QKVO decision per head)
+routers = ModuleList([Router(hidden_size -> E) for _ in range(H)])   # H routers, each picks 1 expert
 ```
 
-One router selects `num_kv_heads` experts. Each expert represents one "attention head slot" -- it provides Q, K, V, and O projections together. The same expert index is used for all four projection types.
+Each head slot has its own router that picks one expert. That single expert provides Q, K, V, and O projections together for that head. With H=6 heads, that's 6 routers per depth doing top-1, not 1 router doing top-6.
 
 #### Forward Flow
 
@@ -369,7 +407,7 @@ Sum across KV groups -> final output (B, T, hidden_size)
 
 | Aspect | Fully Independent | Precompute KV |
 |--------|-------------------|---------------|
-| **Routers** | 4 (Q, K, V, O each independent) | 1 (shared across Q/K/V/O) |
+| **Routers** | 4H (H per Q, K, V, O — each top-1) | H (one bundled QKVO per head — each top-1) |
 | **Expert selection** | Different expert per Q, K, V, O | Same expert for all four |
 | **Q/K norm** | Per-expert (from bank) or per-layer | Per-expert (from bank) or per-layer |
 | **O pool size** | `E * q_heads_per_kv` (larger) | `E` (same as others) |
@@ -377,9 +415,9 @@ Sum across KV groups -> final output (B, T, hidden_size)
 | **KV computation** | Per-token: each token gets its own KV | Per-expert: KV precomputed once per expert for ALL tokens |
 | **Attention** | Standard (all tokens share K/V) | Per-expert (separate attention per active expert) |
 | **KV state persistence** | Yes (tokens carry K, V across depths) | No (K, V recomputed each depth from hidden states) |
-| **Expressiveness** | Maximum (4 independent routing decisions) | Lower (1 routing decision controls all 4 projections) |
+| **Expressiveness** | Maximum (4H independent routing decisions) | Lower (H routing decisions, each controls all 4 projections) |
 | **Efficiency** | More routing overhead | Fewer routing decisions, KV reuse across tokens |
-| **Aux losses** | 4 separate load-balancing losses (Q, K, V, O) | 1 load-balancing loss |
+| **Aux losses** | 4H separate load-balancing losses (H per Q, K, V, O) | H load-balancing losses (one per bundled router) |
 
 ### 4.5 MLP Expert Bank
 
