@@ -121,6 +121,30 @@ def exploration_rate_schedule(
     return warmup_start + (target - warmup_start) * frac
 
 
+def collect_router_z_loss(model) -> torch.Tensor | None:
+    """Sum the most recent per-router z-loss contributions.
+
+    Each `ExplorationTopKRouter` / `DeepSeekRouter` caches its per-call z-loss
+    contribution on `_last_z_loss` (a scalar tensor when `router_z_loss_coef > 0`,
+    `None` otherwise). This walker gathers those scalars across the whole model
+    and returns their sum with autograd intact, so the trainer can add it to
+    the total loss before `backward()`.
+
+    Returns `None` when every router has `_last_z_loss is None` — i.e. the
+    feature is disabled; callers should treat `None` as "add nothing" so
+    models configured without z-loss pay no extra Python work beyond the
+    module-tree walk.
+    """
+    raw_model = unwrap_model(model)
+    acc: torch.Tensor | None = None
+    for module in raw_model.modules():
+        z = getattr(module, "_last_z_loss", None)
+        if z is None:
+            continue
+        acc = z if acc is None else acc + z
+    return acc
+
+
 def apply_router_exploration_rate(model, rate: float) -> int:
     """Push `rate` onto every router submodule with an `exploration_rate`.
 

@@ -124,33 +124,143 @@ def collect_router_topk_indices(routers: Iterable[nn.Module]) -> tuple[torch.Ten
     return tuple(selected) if selected else None
 
 
+def collect_router_z_losses(routers: Iterable[nn.Module]) -> torch.Tensor | None:
+    """Sum the most recent per-router z-losses across routers with `z_loss_coef > 0`.
+
+    Routers cache their per-call contribution on `_last_z_loss` (a scalar tensor,
+    or `None` when the coefficient is zero). The returned tensor preserves
+    autograd so the caller can add it directly to the total loss.
+    """
+    acc = None
+    for router in routers:
+        z = getattr(router, "_last_z_loss", None)
+        if z is None:
+            continue
+        acc = z if acc is None else acc + z
+    return acc
+
+
+_SCORE_FUNCTIONS = {"softmax", "sigmoid", "sqrtsoftplus"}
+_TOPK_ORDERINGS = {"post", "pre"}
+
+
+def _apply_score_function(logits: torch.Tensor, score_function: str) -> torch.Tensor:
+    """Compute per-expert scores from raw router logits.
+
+    - ``softmax``: competing probabilities summing to 1 across experts (Switch / Qwen3 default).
+    - ``sigmoid``: independent (0, 1) scores per expert (DeepSeek-style, non-competing).
+    - ``sqrtsoftplus``: sqrt(softplus(x)); non-competing, smoother floor than sigmoid for large negatives.
+    """
+    if score_function == "softmax":
+        return F.softmax(logits, dim=-1, dtype=torch.float)
+    if score_function == "sigmoid":
+        return torch.sigmoid(logits)
+    if score_function == "sqrtsoftplus":
+        return torch.sqrt(F.softplus(logits))
+    raise ValueError(f"Unknown router_score_function: {score_function!r} (expected one of {sorted(_SCORE_FUNCTIONS)})")
+
+
 class ExplorationTopKRouter(Qwen3MoeTopKRouter):
-    """Softmax top-k router with optional random expert exploration."""
+    """Top-k router with configurable scoring function and top-k ordering.
+
+    Config knobs (all optional, sensible defaults preserve the pre-existing softmax
+    post-softmax-topk behaviour):
+
+    - ``router_score_function`` ∈ {``softmax``, ``sigmoid``, ``sqrtsoftplus``}
+      (default ``softmax``). Maps raw logits to per-expert scores.
+    - ``router_topk_ordering`` ∈ {``post``, ``pre``} (default ``post``).
+      * ``post``: apply score function to all experts → top-k on scored values → gather.
+      * ``pre``: top-k on raw logits → apply score function only to the k selected logits.
+      Indices are the same either way for softmax (monotonic), but weight values (and
+      gradients) differ, and for sigmoid / sqrtsoftplus the two orderings are distinct.
+    - ``num_groups`` / ``group_topk``: optional group-limited top-k. When set, picks the
+      top ``group_topk`` expert groups first (groups scored by sum of their top-``(topk // group_topk)``
+      expert scores), then top-k among experts in those groups. Matches the DeepSeek path.
+    - ``router_exploration_rate``: per-token probability of replacing the selection
+      scores with uniform noise during training. Used by the warmup schedule.
+    - ``router_z_loss_coef``: magnitude regularizer on the raw logits; the per-call
+      z-loss is cached on ``_last_z_loss`` and the training loop accumulates it into
+      the auxiliary-loss term.
+    """
 
     def __init__(self, config):
         super().__init__(config)
         self.exploration_rate = float(getattr(config, "router_exploration_rate", 0.0) or 0.0)
+        self.score_function = getattr(config, "router_score_function", "softmax")
+        if self.score_function not in _SCORE_FUNCTIONS:
+            raise ValueError(
+                f"router_score_function must be one of {sorted(_SCORE_FUNCTIONS)}, "
+                f"got {self.score_function!r}"
+            )
+        self.topk_ordering = getattr(config, "router_topk_ordering", "post")
+        if self.topk_ordering not in _TOPK_ORDERINGS:
+            raise ValueError(
+                f"router_topk_ordering must be one of {sorted(_TOPK_ORDERINGS)}, "
+                f"got {self.topk_ordering!r}"
+            )
+        self.num_groups = getattr(config, "num_groups", None)
+        self.group_topk = getattr(config, "group_topk", None)
+        self.z_loss_coef = float(getattr(config, "router_z_loss_coef", 0.0) or 0.0)
         self._last_top_k_idx = None
         self._last_exploration_mask = None
+        self._last_z_loss = None
 
     def forward(self, hidden_states: torch.Tensor):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
-            router_logits = F.linear(hidden_states.float(), self.weight.float())
-            router_logits = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
-            exploration_mask = None
-            selection_scores = router_logits
-            if self.training and self.exploration_rate > 0.0:
-                exploration_mask = sample_router_exploration_mask(router_logits, self.exploration_rate)
-                selection_scores = apply_router_exploration(router_logits, exploration_mask)
-            _, router_indices = torch.topk(selection_scores, self.top_k, dim=-1)
-            router_top_value = router_logits.gather(1, router_indices)
+        device_type = hidden_states.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            raw_logits = F.linear(hidden_states.float(), self.weight.float())  # (T, E) fp32
+            probs = _apply_score_function(raw_logits, self.score_function)      # (T, E) fp32
+
+            if self.topk_ordering == "pre":
+                # Top-k directly on raw logits; score function only applies to the
+                # k selected logits afterwards.
+                exploration_mask = None
+                selection_scores = raw_logits
+                if self.training and self.exploration_rate > 0.0:
+                    exploration_mask = sample_router_exploration_mask(raw_logits, self.exploration_rate)
+                    selection_scores = apply_router_exploration(raw_logits, exploration_mask)
+                if self.num_groups is not None and self.group_topk is not None:
+                    _, router_indices = group_limited_topk(
+                        selection_scores, self.top_k, self.num_groups, self.group_topk,
+                    )
+                else:
+                    _, router_indices = torch.topk(selection_scores, self.top_k, dim=-1)
+                selected_logits = raw_logits.gather(1, router_indices)
+                router_top_value = _apply_score_function(selected_logits, self.score_function)
+            else:
+                # Default: score function on all experts, then top-k on the scored values.
+                exploration_mask = None
+                selection_scores = probs
+                if self.training and self.exploration_rate > 0.0:
+                    exploration_mask = sample_router_exploration_mask(probs, self.exploration_rate)
+                    selection_scores = apply_router_exploration(probs, exploration_mask)
+                if self.num_groups is not None and self.group_topk is not None:
+                    _, router_indices = group_limited_topk(
+                        selection_scores, self.top_k, self.num_groups, self.group_topk,
+                    )
+                else:
+                    _, router_indices = torch.topk(selection_scores, self.top_k, dim=-1)
+                router_top_value = probs.gather(1, router_indices)
+
+            if self.z_loss_coef > 0.0:
+                # Router z-loss: penalize large logit magnitudes to keep the router
+                # numerics stable. `logsumexp(logits)^2` averaged over tokens,
+                # then scaled by the configured coefficient.
+                z = torch.logsumexp(raw_logits, dim=-1)
+                self._last_z_loss = (z * z).mean() * self.z_loss_coef
+            else:
+                self._last_z_loss = None
+
         if self.norm_topk_prob:
-            router_top_value /= router_top_value.sum(dim=-1, keepdim=True) + 1e-20
-        router_scores = router_top_value.to(router_logits.dtype)
+            router_top_value = router_top_value / (router_top_value.sum(dim=-1, keepdim=True) + 1e-20)
+        router_scores = router_top_value.to(raw_logits.dtype)
         self._last_top_k_idx = router_indices.detach()
         self._last_exploration_mask = None if exploration_mask is None else exploration_mask.detach()
-        return router_logits, router_scores, router_indices
+        # First return value keeps the prior contract: the per-expert scored probs
+        # (post-softmax / post-sigmoid / post-sqrtsoftplus) are what downstream aux
+        # loss and routing stats read.
+        return probs, router_scores, router_indices
 
 
 class DeepSeekRouter(Qwen3MoeTopKRouter):
@@ -168,6 +278,9 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
         self.num_groups = getattr(config, "num_groups", None)
         self.group_topk = getattr(config, "group_topk", None)
         self.exploration_rate = float(getattr(config, "router_exploration_rate", 0.0) or 0.0)
+        # Optional z-loss — regularises raw-logit magnitudes. Independent of the
+        # DeepSeek bias-update balancing signal; both can be on simultaneously.
+        self.z_loss_coef = float(getattr(config, "router_z_loss_coef", 0.0) or 0.0)
 
         # Persistent buffer: survives checkpointing
         self.register_buffer(
@@ -184,6 +297,7 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
         # so f_i matches actual biased routing assignments.
         self._last_top_k_idx = None
         self._last_exploration_mask = None
+        self._last_z_loss = None
 
     def forward(self, hidden_states: torch.Tensor):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
@@ -193,6 +307,12 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
             router_logits = F.linear(
                 hidden_states.float(), self.weight.float()
             )  # (T, E) in fp32
+
+            if self.z_loss_coef > 0.0:
+                z = torch.logsumexp(router_logits, dim=-1)
+                self._last_z_loss = (z * z).mean() * self.z_loss_coef
+            else:
+                self._last_z_loss = None
 
             # 2. Sigmoid scoring in fp32
             scores = torch.sigmoid(router_logits)  # (T, E) in (0, 1), fp32

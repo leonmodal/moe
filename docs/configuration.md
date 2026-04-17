@@ -41,6 +41,9 @@ python scripts/validate_configs.py configs/standard_moe.yaml  # specific config
 | `seq_aux_loss_coef` | float | 0.0 | Sequence-level aux loss coefficient |
 | `norm_topk_prob` | bool | true | Normalize top-k routing probabilities |
 | `router_exploration_rate` | float | 0.0 | Random exploration rate during training |
+| `router_score_function` | string | `softmax` | Softmax-family router scoring: `softmax`, `sigmoid`, `sqrtsoftplus`. Ignored by DeepSeek router. See `docs/routing.md` §1.5.1. |
+| `router_topk_ordering` | string | `post` | Softmax-family router: `post` (score function on all experts → top-K) or `pre` (top-K on raw logits → score function on K). Ignored by DeepSeek router. See `docs/routing.md` §1.5.2. |
+| `router_z_loss_coef` | float | 0.0 | Logit-magnitude regularizer summed across routers and added to the output loss pre-backward. `0.0` = disabled (the `collect_router_z_loss` walk short-circuits). See `docs/routing.md` §1.5.4. |
 
 ### DeepSeek Routing Fields
 
@@ -49,7 +52,7 @@ Used when `router_type: deepseek`:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `topk_scaling_factor` | float | null | Post-normalization scaling factor |
-| `num_groups` | int | null | Expert groups for group-limited routing |
+| `num_groups` | int | null | Expert groups for group-limited routing (now also honoured by the softmax-family router) |
 | `group_topk` | int | null | Groups selected per token |
 | `use_deepseek_routing` | bool | false | Legacy flag (use `router_type` instead) |
 

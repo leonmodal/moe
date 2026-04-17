@@ -5,6 +5,7 @@ This document covers all router implementations, expert selection mechanisms, lo
 ## Table of Contents
 
 - [1. Router Implementations](#1-router-implementations)
+- [1.5. Router Options (scoring, ordering, z-loss, group-limited top-K)](#15-router-options)
 - [2. Load Balancing Losses](#2-load-balancing-losses)
 - [3. Expert Bias Updates (DeepSeek V3)](#3-expert-bias-updates-deepseek-v3)
 - [4. Routing Statistics & Monitoring](#4-routing-statistics--monitoring)
@@ -81,6 +82,112 @@ output = weight * selected_branch(hidden_state)
 ```
 
 The hard decision makes this non-differentiable at the selection point, but the soft weight multiplication keeps gradients flowing to the router.
+
+---
+
+## 1.5. Router Options
+
+`ExplorationTopKRouter` (the softmax-family router used by `standard_moe` / `global_moe` / `moe_everything` when `router_type != deepseek`) exposes four independent configuration knobs. `DeepSeekRouter` honours the z-loss knob; its scoring (sigmoid) and selection path (biased top-K, gather unbiased) are defining features of that router family and stay fixed. These options are parity with Megatron-LM's `TopKRouter`, and they default to behaviour-preserving values so any pre-existing config keeps its old numerics.
+
+### High-level overview
+
+| Option | Values | Default | Affects | Notes |
+|---|---|---|---|---|
+| `router_score_function` | `softmax`, `sigmoid`, `sqrtsoftplus` | `softmax` | `ExplorationTopKRouter` | Maps raw logits → per-expert scores. |
+| `router_topk_ordering` | `post`, `pre` | `post` | `ExplorationTopKRouter` | When to apply the score function relative to top-K. |
+| `num_groups` / `group_topk` | positive ints | `None` / `None` | both routers | Group-limited top-K (Megatron / DeepSeek style). |
+| `router_z_loss_coef` | float ≥ 0 | `0.0` | both routers | Per-call logit-magnitude regularizer added to aux loss. |
+
+Source: `src/models/router.py::ExplorationTopKRouter`, `::DeepSeekRouter`; trainer integration at `src/training/routing.py::collect_router_z_loss` and `src/training/trainer.py`.
+
+### 1.5.1 `router_score_function`
+
+Controls how raw router logits become per-expert scores inside the softmax-family router.
+
+| Value | Formula | Properties |
+|---|---|---|
+| `softmax` | `exp(x_i) / Σ_j exp(x_j)` | Probabilities, competing — all experts sum to 1 per token. |
+| `sigmoid` | `1 / (1 + exp(-x))` elementwise | Scores in (0, 1) per expert, independent. Cannot saturate one expert's score without information from the others. |
+| `sqrtsoftplus` | `sqrt(log(1 + exp(x)))` elementwise | Non-negative, non-competing, with a smooth floor near 0 for large negatives. Megatron offers this as a softer alternative to sigmoid when they want a monotone-non-competing score without the sigmoid saturation. |
+
+**When to use**:
+- Keep `softmax` (the default) when you want standard competing routing — the small weight you gather after top-K is already a valid probability.
+- Pick `sigmoid` when you want per-expert independent scores (useful for ablations against the DeepSeek router — same scoring, no bias update).
+- Pick `sqrtsoftplus` when you want a non-competing score without sigmoid's saturation (rare; include it mainly for Megatron-parity experiments).
+
+`DeepSeekRouter` ignores this knob — its sigmoid + bias path is its defining contract.
+
+### 1.5.2 `router_topk_ordering`
+
+Controls whether top-K runs on the **scored** values (`post`) or directly on the **raw logits** (`pre`):
+
+```
+# post (default):
+scored = score_function(logits)                 # (T, E)
+topk_idx = topk(scored).indices
+weights = gather(scored, topk_idx)
+
+# pre:
+topk_idx = topk(logits).indices                 # top-K on raw logits
+weights = score_function(gather(logits, topk_idx))  # score function over K only
+```
+
+**Functional implication**:
+- **Same indices for softmax and sigmoid** (monotonic score functions): `argmax(score(x)) == argmax(x)`, so post and pre pick the same K experts. Weights differ: under `pre` the softmax is normalized across the K selected logits (so selected weights sum to 1 when `norm_topk_prob=False`); under `post` the gathered weights are a subset of the full-softmax distribution and sum to less than 1.
+- **Potentially different indices for `sqrtsoftplus`** at the ties / near-equal logit regime — because `sqrtsoftplus` is monotonic it shouldn't reorder either, but the regularized form means the ordering is the same.
+- **Gradient path changes**: in `pre`, the score function is only evaluated on K elements, so the gradient only flows through those K logits. Under `post` the gradient flows through all E logits via the softmax normalizer. The `post` path is therefore denser per-step; `pre` is cheaper.
+
+**When to use**:
+- Keep `post` for baseline runs — that's the behaviour you've been training against.
+- Try `pre` when doing Megatron-parity ablations or when you specifically want the "softmax over K" weight semantics (each selected weight is renormalized against the K peers, not against all E).
+
+### 1.5.3 `num_groups` / `group_topk` on the softmax router
+
+The group-limited top-K path that the DeepSeek router already supports is now also available on the softmax-family router. Mechanics:
+
+1. Partition the E experts into `num_groups` equal-sized groups (assumes `E % num_groups == 0`).
+2. Score each group by the sum of its top `(top_k // group_topk)` expert scores.
+3. Pick the top `group_topk` groups per token.
+4. Run top-K over the experts inside those groups only.
+
+**Motivation**: prevents the selected K from clustering in one region of the expert space. Useful when you have many experts and want to nudge routing toward structural diversity without adding an auxiliary loss. Megatron's own DeepSeek test configs use group-limited top-K by default.
+
+**When to use**: skip unless you already use group-limited top-K in your DeepSeek configs and want feature parity in the softmax path.
+
+### 1.5.4 `router_z_loss_coef`
+
+A scalar regularizer on the **raw** router logits (before softmax / sigmoid). Per router call:
+
+```
+z = logsumexp(raw_logits, dim=-1)             # (T,)
+z_loss_per_call = mean(z^2) * router_z_loss_coef
+```
+
+The router caches `z_loss_per_call` on `self._last_z_loss` (a scalar tensor with autograd); the training loop walks the model via `collect_router_z_loss(model)`, sums across routers, and adds the total to the output loss **before** `backward()`.
+
+**What it does**: keeps the logsumexp of the router logits from drifting large, which is a proxy for "don't let any single expert's score explode under bf16 gradient scaling". The quadratic-in-logsumexp shape means the gradient pressure grows smoothly as logits grow.
+
+**When to enable**:
+- Long or unstable training runs where router logits occasionally spike into 10+ and push one expert's softmax probability to ~1.0 at the cost of the others.
+- Any training setup where you want Megatron's z-loss stability lever.
+- Reasonable starting coefficient: `1e-3` (small enough to not fight the main loss, large enough to notice on router logit magnitudes after a few hundred steps).
+
+**When to leave off**:
+- Short (< 1k-step) runs; the feature is an insurance policy, not a correctness fix.
+- Runs already stabilized via bias updates (DeepSeek) and/or reasonable aux-loss coefs.
+
+**No-cost default**: the trainer's z-loss integration path is a no-op when every router has `router_z_loss_coef = 0.0` (the default) — `collect_router_z_loss` returns `None` and the branch in the trainer is a single `is not None` check.
+
+### Cross-ref: comparison to external stacks
+
+| Stack | softmax top-K ordering | score fn | z-loss | group-limited top-K | bias-update balancing |
+|---|---|---|---|---|---|
+| This repo (`ExplorationTopKRouter`) | `post` / `pre` | `softmax` / `sigmoid` / `sqrtsoftplus` | yes | yes (any softmax family) | no (aux loss only) |
+| This repo (`DeepSeekRouter`) | N/A — sigmoid-forced | sigmoid | yes | yes | yes (expert bias) |
+| Megatron-LM `TopKRouter` | `post` / `pre` | `softmax` / `sigmoid` / `sqrtsoftplus` | yes | yes | yes (aux-free bias) + others |
+| nmoe / modal-nmoe | N/A — sigmoid-only | sigmoid | (inherited from router precision) | yes | yes |
+
+The Megatron parity gaps we still do **not** expose: aux-loss auto-scaler, `global_aux_loss` (cross-DP-group balance), `sinkhorn` routing. See `docs/research/task2-megatron-research.md` for notes on when they might become worthwhile.
 
 ---
 

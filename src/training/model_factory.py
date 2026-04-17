@@ -82,14 +82,23 @@ def configure_liger_kernels(cfg: dict) -> str:
 
 
 def _set_router_params(config, model_cfg: dict) -> None:
+    """Plumb shared router knobs (softmax-family and DeepSeek both honour these)."""
     config.router_exploration_rate = model_cfg.get("router_exploration_rate", 0.0)
+    # Scoring function and top-k ordering (softmax-family router only; DeepSeek
+    # forces sigmoid + its own selection path).
+    config.router_score_function = model_cfg.get("router_score_function", "softmax")
+    config.router_topk_ordering = model_cfg.get("router_topk_ordering", "post")
+    # Group-limited top-k (applies to both router families when set).
+    config.num_groups = model_cfg.get("num_groups", None)
+    config.group_topk = model_cfg.get("group_topk", None)
+    # Z-loss stabiliser on raw router logits (independent of scoring function;
+    # cached per router call, accumulated into aux loss by the trainer).
+    config.router_z_loss_coef = model_cfg.get("router_z_loss_coef", 0.0)
 
 
 def _set_deepseek_router_params(config, model_cfg: dict) -> None:
     _set_router_params(config, model_cfg)
     config.topk_scaling_factor = model_cfg.get("topk_scaling_factor", None)
-    config.num_groups = model_cfg.get("num_groups", None)
-    config.group_topk = model_cfg.get("group_topk", None)
 
 
 def build_model(cfg: dict):
@@ -220,6 +229,12 @@ def build_model(cfg: dict):
             branch_deepseek=mcfg.get("branch_deepseek", False),
             **common,
         )
+        # Router-option knobs attached post-construction (the config __init__
+        # does not currently enumerate them; _set_router_params is the single
+        # source of truth across all MoE families).
+        config.router_score_function = mcfg.get("router_score_function", "softmax")
+        config.router_topk_ordering = mcfg.get("router_topk_ordering", "post")
+        config.router_z_loss_coef = mcfg.get("router_z_loss_coef", 0.0)
         model = MoEverythingForCausalLM(config)
 
     if hasattr(model, "set_experts_implementation"):

@@ -56,6 +56,7 @@ from .metrics import compute_output_metrics
 from .model_factory import build_model, configure_liger_kernels
 from .routing import (
     apply_router_exploration_rate,
+    collect_router_z_loss,
     exploration_rate_schedule,
     get_bias_rate,
     update_expert_biases,
@@ -325,6 +326,15 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
                         labels=labels,
                         **({} if is_dense else {"output_router_logits": True}),
                     )
+                # Router z-loss (if any router has `router_z_loss_coef > 0`)
+                # is accumulated per-router during forward and summed here so
+                # it rides the same gradient-accumulation scaling as the base
+                # loss. No cost when every router has the feature disabled —
+                # `collect_router_z_loss` returns None in that case.
+                if not is_dense:
+                    z_loss = collect_router_z_loss(model)
+                    if z_loss is not None:
+                        output.loss = output.loss + z_loss
                 loss = output.loss / train_cfg.gradient_accumulation
                 loss.backward()
 
