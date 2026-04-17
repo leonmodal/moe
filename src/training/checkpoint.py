@@ -9,7 +9,7 @@ import shutil
 
 import torch
 
-from .distributed import is_main_process, barrier, unwrap_model
+from .distributed import dist_rank, dist_world_size, is_main_process, barrier, unwrap_model
 
 try:
     from torch.distributed.fsdp import (
@@ -58,9 +58,22 @@ def save_checkpoint(
     wandb_run_id: str | None = None,
     tokens_seen: float = 0.0,
 ) -> None:
-    """Save checkpoint with separate model/optimizer/training/data state files."""
-    ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
-    os.makedirs(ckpt_dir, exist_ok=True)
+    """Save checkpoint with separate model/optimizer/training/data state files.
+
+    Writes go into `checkpoint-{step}.tmp/` and the directory is atomically
+    renamed to `checkpoint-{step}/` once every rank has finished flushing.
+    `find_latest_checkpoint` only sees the renamed directory, so a crash
+    mid-save leaves a `.tmp` sibling behind rather than a torn checkpoint
+    that resume would try to use.
+    """
+    final_dir = os.path.join(output_dir, f"checkpoint-{step}")
+    tmp_dir = os.path.join(output_dir, f"checkpoint-{step}.tmp")
+    if is_main_process():
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir)
+        os.makedirs(tmp_dir, exist_ok=True)
+    # Every rank writes into `tmp_dir`; main must create it first.
+    barrier()
 
     if FSDP is not None and isinstance(model, FSDP):
         save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
@@ -74,10 +87,10 @@ def save_checkpoint(
 
     if is_main_process():
         # Save model weights separately
-        torch.save(model_state, os.path.join(ckpt_dir, "model.pt"))
+        torch.save(model_state, os.path.join(tmp_dir, "model.pt"))
 
         # Save optimizer state — detect Muon hybrid and save separately
-        _save_optimizer_state(optimizer, optim_state, ckpt_dir)
+        _save_optimizer_state(optimizer, optim_state, tmp_dir)
 
         # Save training state (scheduler, step, etc.)
         training_state = {
@@ -87,19 +100,34 @@ def save_checkpoint(
         }
         if wandb_run_id:
             training_state["wandb_run_id"] = wandb_run_id
-        torch.save(training_state, os.path.join(ckpt_dir, "training_state.pt"))
-
-        # Save data state
-        if dataset_state:
-            torch.save(dataset_state, os.path.join(ckpt_dir, "data_state.pt"))
+        torch.save(training_state, os.path.join(tmp_dir, "training_state.pt"))
 
         # Save metadata as JSON for easy inspection
         meta = {"step": step, "tokens_seen": tokens_seen}
         if wandb_run_id:
             meta["wandb_run_id"] = wandb_run_id
-        with open(os.path.join(ckpt_dir, "meta.json"), "w") as f:
+        with open(os.path.join(tmp_dir, "meta.json"), "w") as f:
             json.dump(meta, f)
-        print(f"Saved checkpoint to {ckpt_dir}", flush=True)
+
+    # Data state is per-rank — the parquet dataset shards files by
+    # `i % world_size == rank`, so rank 0's state is meaningless for other
+    # ranks. Every rank writes its own `data_state_rank{r}.pt`; rank 0 also
+    # writes the legacy unsuffixed `data_state.pt` so single-process and
+    # pre-fix multi-rank checkpoints stay resumable (via the fallback in
+    # `_load_data_state`).
+    if dataset_state:
+        rank = dist_rank()
+        torch.save(dataset_state, os.path.join(tmp_dir, f"data_state_rank{rank}.pt"))
+        if is_main_process():
+            torch.save(dataset_state, os.path.join(tmp_dir, "data_state.pt"))
+
+    # All files flushed; barrier then atomic rename on rank 0.
+    barrier()
+    if is_main_process():
+        if os.path.exists(final_dir):
+            shutil.rmtree(final_dir)
+        os.rename(tmp_dir, final_dir)
+        print(f"Saved checkpoint to {final_dir}", flush=True)
     barrier()
 
 
@@ -174,12 +202,28 @@ def _load_safetensors_checkpoint(
         step = training_state.get("step", 0)
         tokens_seen = training_state.get("tokens_seen", 0.0)
 
-    data_state = None
-    data_state_path = os.path.join(resume_from, "data_state.pt")
-    if os.path.exists(data_state_path):
-        data_state = torch.load(data_state_path, map_location="cpu")
+    data_state = _load_data_state(resume_from)
 
     return step, data_state, tokens_seen
+
+
+def _load_data_state(resume_from: str) -> dict | None:
+    """Load this rank's data state, preferring per-rank file over the legacy
+    unsuffixed one.
+
+    Parquet sharding gives each rank a distinct set of files; pre-fix
+    checkpoints only saved rank 0's state, so when a non-zero rank sees
+    only `data_state.pt` it falls back to that shared state (the old
+    behaviour). New checkpoints write `data_state_rank{r}.pt` per rank.
+    """
+    rank = dist_rank()
+    per_rank_path = os.path.join(resume_from, f"data_state_rank{rank}.pt")
+    if os.path.exists(per_rank_path):
+        return torch.load(per_rank_path, map_location="cpu")
+    shared_path = os.path.join(resume_from, "data_state.pt")
+    if os.path.exists(shared_path):
+        return torch.load(shared_path, map_location="cpu")
+    return None
 
 
 def _load_optimizer_state(resume_from: str) -> dict:
@@ -234,10 +278,7 @@ def _load_separate_checkpoint(
         step = 0
         tokens_seen = 0.0
 
-    data_state = None
-    data_state_path = os.path.join(resume_from, "data_state.pt")
-    if os.path.exists(data_state_path):
-        data_state = torch.load(data_state_path, map_location="cpu")
+    data_state = _load_data_state(resume_from)
 
     return step, data_state, tokens_seen
 

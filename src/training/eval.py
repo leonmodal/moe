@@ -78,35 +78,40 @@ def run_validation(
     }
     batches = 0
 
-    for batch_idx, batch in enumerate(eval_dataloader):
-        if max_batches > 0 and batch_idx >= max_batches:
-            break
-        batch = {
-            key: value.to(device, non_blocking=True)
-            if isinstance(value, torch.Tensor)
-            else value
-            for key, value in batch.items()
-        }
-        input_ids = batch["input_ids"]
-        labels = input_ids
-        output = model(
-            input_ids=input_ids,
-            labels=labels,
-            **({} if is_dense else {"output_router_logits": True}),
-        )
-        metrics, _, _ = compute_output_metrics(
-            output,
-            raw_model,
-            model_cfg,
-            input_ids,
-            seq_aux_loss_coef=seq_aux_loss_coef,
-        )
-        for key in totals:
-            totals[key] += metrics[key]
-        batches += 1
+    try:
+        for batch_idx, batch in enumerate(eval_dataloader):
+            if max_batches > 0 and batch_idx >= max_batches:
+                break
+            batch = {
+                key: value.to(device, non_blocking=True)
+                if isinstance(value, torch.Tensor)
+                else value
+                for key, value in batch.items()
+            }
+            input_ids = batch["input_ids"]
+            labels = input_ids
+            output = model(
+                input_ids=input_ids,
+                labels=labels,
+                **({} if is_dense else {"output_router_logits": True}),
+            )
+            metrics, _, _ = compute_output_metrics(
+                output,
+                raw_model,
+                model_cfg,
+                input_ids,
+                seq_aux_loss_coef=seq_aux_loss_coef,
+            )
+            for key in totals:
+                totals[key] += metrics[key]
+            batches += 1
+    finally:
+        # Restore training mode even if the eval loop raises (e.g. OOM on an
+        # outlier batch). Leaving the model in .eval() would silently disable
+        # dropout for the rest of training.
+        if was_training:
+            model.train()
 
-    if was_training:
-        model.train()
     if batches == 0:
         return {}
 

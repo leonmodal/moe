@@ -21,7 +21,6 @@ from src.utils.training import (
     build_muon_optimizer,
     build_optimizer,
     count_parameters,
-    get_grad_norm,
 )
 
 from .checkpoint import (
@@ -347,8 +346,14 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
             local_tokens_in_step += input_ids.numel()
 
         if train_cfg.max_grad_norm > 0:
-            grad_norm = get_grad_norm(raw_model)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
+            # `clip_grad_norm_` returns the pre-clip total norm, so there's no
+            # need for a separate `get_grad_norm(...)` traversal — that used to
+            # double the per-step parameter walk (and do one CPU↔GPU sync per
+            # parameter via `.item()` inside the utility).
+            grad_norm_t = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), train_cfg.max_grad_norm,
+            )
+            grad_norm = grad_norm_t.item() if isinstance(grad_norm_t, torch.Tensor) else float(grad_norm_t)
         optimizer.step()
         scheduler.step()
 
