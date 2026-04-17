@@ -122,18 +122,26 @@ def exploration_rate_schedule(
 
 
 def apply_router_exploration_rate(model, rate: float) -> int:
-    """Push `rate` onto every expert-router submodule with an `exploration_rate`.
+    """Push `rate` onto every router submodule with an `exploration_rate`.
 
     Returns the number of router modules updated (useful for asserting
     coverage in tests). Safe for DDP/FSDP-wrapped models — the iteration goes
     through the unwrapped model and mutates the shared tensor-free attribute
     directly.
 
-    `BranchRouter` instances are deliberately skipped: MoE-Everything configs
-    can set `branch_router_exploration_rate` independently of the model-wide
-    `router_exploration_rate`, so the training-time warmup must not clobber
-    that separate value. Branch-router rate control remains a model-config
-    knob, not a trainer-side schedule.
+    BranchRouter handling: MoE-Everything configs can set
+    `branch_router_exploration_rate` independently of the model-wide
+    `router_exploration_rate`. `MoEverythingConfig.__init__` also defaults
+    the branch value to the model-wide value when left unset, so in that
+    inherited / explicit-match case the BranchRouter should follow the
+    warmup schedule alongside the expert routers (AC-10). The applier
+    therefore includes every `BranchRouter` iff the unwrapped model's
+    `config.branch_router_exploration_rate == config.router_exploration_rate`;
+    when the two diverge, the user has opted into an independent branch
+    rate and the applier leaves every `BranchRouter` alone. A model
+    without a `config` attribute (unit-test stubs) keeps the skip
+    behaviour — the trainer only calls this with real MoE models whose
+    config is always present.
     """
     # Lazy import — the router module pulls torch dependencies and we do not
     # want to force those on code paths that only inspect this helper.
@@ -143,10 +151,19 @@ def apply_router_exploration_rate(model, rate: float) -> int:
         BranchRouter = None  # type: ignore[assignment]
 
     raw_model = unwrap_model(model)
+    cfg = getattr(raw_model, "config", None)
+    model_rate = getattr(cfg, "router_exploration_rate", None)
+    branch_rate = getattr(cfg, "branch_router_exploration_rate", None)
+    include_branch_router = (
+        model_rate is not None
+        and branch_rate is not None
+        and model_rate == branch_rate
+    )
     count = 0
     for module in raw_model.modules():
         if BranchRouter is not None and isinstance(module, BranchRouter):
-            continue
+            if not include_branch_router:
+                continue
         if hasattr(module, "exploration_rate"):
             module.exploration_rate = float(rate)
             count += 1

@@ -97,10 +97,17 @@ def test_apply_is_idempotent_and_accepts_zero():
     assert m.r1.exploration_rate == 0.0
 
 
-def test_apply_skips_branch_router():
-    """`BranchRouter.exploration_rate` is controlled by the model-level
-    `branch_router_exploration_rate` config and must not be overwritten by
-    the trainer-side warmup schedule.
+class _FakeConfig:
+    """Minimal config stub exposing the two rate fields the applier reads."""
+    def __init__(self, *, router_exploration_rate, branch_router_exploration_rate):
+        self.router_exploration_rate = router_exploration_rate
+        self.branch_router_exploration_rate = branch_router_exploration_rate
+
+
+def test_apply_skips_branch_router_when_model_has_no_config():
+    """Without a `config` attribute (unit-test stub), the applier keeps the
+    pre-Round-15 skip behaviour so plain `nn.Module` fixtures in the tests
+    still pin the default-skip contract.
     """
     from src.models.routing.routers import BranchRouter
 
@@ -112,12 +119,65 @@ def test_apply_skips_branch_router():
 
     m = _Mixed()
     n = apply_router_exploration_rate(m, 0.42)
-    # The non-branch router is updated; the branch router is untouched.
     assert n == 1, "applier must update exactly one non-BranchRouter module"
     assert m.expert_router.exploration_rate == 0.42
-    assert m.branch_router.exploration_rate == 0.05, (
-        "BranchRouter.exploration_rate must be preserved so the "
-        "model-config `branch_router_exploration_rate` still takes effect."
+    assert m.branch_router.exploration_rate == 0.05
+
+
+def test_apply_includes_branch_router_when_rate_is_inherited():
+    """Default `MoEverythingConfig`: `branch_router_exploration_rate` is
+    unset and the config collapses it to `router_exploration_rate`. Round
+    15 includes such BranchRouters in the warmup walk so expert and branch
+    routers ramp together.
+    """
+    from src.models.routing.routers import BranchRouter
+
+    class _Mixed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = _FakeConfig(
+                router_exploration_rate=0.1,
+                branch_router_exploration_rate=0.1,  # inherited / explicit match
+            )
+            self.expert_router = _FakeRouter(0.0)
+            self.branch_router = BranchRouter(hidden_size=16, exploration_rate=0.1)
+
+    m = _Mixed()
+    n = apply_router_exploration_rate(m, 0.0)
+    # Both the expert router and the branch router should be updated.
+    assert n == 2, f"expected 2 routers updated (expert + branch), got {n}"
+    assert m.expert_router.exploration_rate == 0.0
+    assert m.branch_router.exploration_rate == 0.0, (
+        "BranchRouter must follow the warmup schedule when its config rate "
+        "equals the model-wide router_exploration_rate."
+    )
+
+
+def test_apply_skips_branch_router_when_rate_is_independent():
+    """When the user sets `branch_router_exploration_rate` to a different
+    value than `router_exploration_rate`, the trainer-side warmup must not
+    clobber that independent value.
+    """
+    from src.models.routing.routers import BranchRouter
+
+    class _Mixed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = _FakeConfig(
+                router_exploration_rate=0.1,
+                branch_router_exploration_rate=0.3,  # independent
+            )
+            self.expert_router = _FakeRouter(0.0)
+            self.branch_router = BranchRouter(hidden_size=16, exploration_rate=0.3)
+
+    m = _Mixed()
+    n = apply_router_exploration_rate(m, 0.0)
+    assert n == 1, "only the non-BranchRouter must be updated"
+    assert m.expert_router.exploration_rate == 0.0
+    assert m.branch_router.exploration_rate == 0.3, (
+        "BranchRouter with an independently configured "
+        "`branch_router_exploration_rate` must not be overwritten by the "
+        "trainer-side warmup schedule."
     )
 
 
