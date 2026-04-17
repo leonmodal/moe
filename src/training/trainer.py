@@ -274,6 +274,10 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
     router_exploration_target = float(
         cfg.get("model", {}).get("router_exploration_rate", 0.0) or 0.0
     )
+    # Cache the last applied rate so we skip the module-tree walk once the
+    # schedule converges (or for constant non-warmup runs). Using `None` as
+    # the sentinel forces an apply on the first step. See AC-10 benchmark.
+    last_applied_exploration_rate: float | None = None
 
     while global_step < train_cfg.max_steps:
         step_start = time.perf_counter()
@@ -284,7 +288,9 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
                 warmup_start=train_cfg.router_exploration_warmup_start,
                 warmup_steps=train_cfg.router_exploration_warmup_steps,
             )
-            apply_router_exploration_rate(model, current_rate)
+            if current_rate != last_applied_exploration_rate:
+                apply_router_exploration_rate(model, current_rate)
+                last_applied_exploration_rate = current_rate
         optimizer.zero_grad(set_to_none=True)
         window_metrics = {
             "loss": 0.0, "ce_loss": 0.0, "aux_loss": 0.0,

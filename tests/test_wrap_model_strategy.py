@@ -189,3 +189,41 @@ def test_wrap_model_none_strategy_returns_model_unchanged(fake_world):
 def test_wrap_model_raises_on_unknown_strategy(fake_world):
     with pytest.raises(ValueError, match="Unknown strategy"):
         wrap_model(_FakeModel(), strategy="zero-3", local_rank=0, model_type="dense")
+
+
+def test_wrap_model_moe_everything_fails_fast_when_auto_wrap_policy_unavailable(fake_world, monkeypatch):
+    """If `_moe_everything_auto_wrap_policy()` returns None (older torch
+    without `ModuleWrapPolicy`, or the AttentionExpertBank / MlpExpertBank /
+    BranchRouter classes moved), `wrap_model` must raise a clear
+    RuntimeError at setup rather than hand FSDP a `None` auto_wrap_policy
+    and let the single-unit NO_SHARD wrapper trip the `TrainingState.IDLE`
+    post-backward-hook assertion deep inside the first backward pass.
+    """
+    fake_fsdp, fsdp_calls = _capture_fsdp_kwargs()
+    fake_ddp, _ = _capture_ddp_kwargs()
+
+    # Stub the auto-wrap-policy builder to simulate the unavailable case.
+    monkeypatch.setattr(dist_mod, "_moe_everything_auto_wrap_policy", lambda: None)
+
+    with patch.object(dist_mod, "FSDP", fake_fsdp), \
+         patch.object(dist_mod, "DDP", fake_ddp):
+        with pytest.raises(RuntimeError, match="auto_wrap policy could not be built"):
+            wrap_model(
+                _FakeModel(), strategy="fsdp", local_rank=0,
+                mixed_precision_name="bf16", model_type="moe_everything",
+            )
+
+    # Other families must not be affected by the failed-policy branch — the
+    # top-level fsdp wrap path is still OK when auto_wrap policy is None
+    # (they don't need one).
+    fsdp_calls.clear()
+    monkeypatch.setattr(dist_mod, "_moe_everything_auto_wrap_policy", lambda: None)
+    with patch.object(dist_mod, "FSDP", fake_fsdp), \
+         patch.object(dist_mod, "DDP", fake_ddp):
+        wrap_model(
+            _FakeModel(), strategy="fsdp", local_rank=0,
+            mixed_precision_name="bf16", model_type="dense",
+        )
+    assert len(fsdp_calls) == 1
+    # dense uses no auto_wrap policy, so its call proceeds normally.
+    assert fsdp_calls[0]["auto_wrap_policy"] is None

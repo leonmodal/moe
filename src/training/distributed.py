@@ -286,6 +286,24 @@ def wrap_model(
             mixed_precision = None
         else:
             mixed_precision = _build_fsdp_mixed_precision(mixed_precision_name)
+        auto_wrap_policy = _auto_wrap_policy_for(model_type)
+        # Fail fast: if a model family requires an auto_wrap_policy and none
+        # could be built (older torch without ModuleWrapPolicy, or the
+        # target classes moved), constructing a single-unit FSDP wrapper
+        # here would trip the `TrainingState.IDLE` post-backward-hook
+        # assertion deep inside the first backward pass — an opaque
+        # runtime failure that hides the real cause. Surface it at setup.
+        if model_type == "moe_everything" and auto_wrap_policy is None:
+            raise RuntimeError(
+                "moe_everything under --dist-strategy fsdp requires "
+                "torch.distributed.fsdp.wrap.ModuleWrapPolicy and the "
+                "AttentionExpertBank / MlpExpertBank / BranchRouter classes "
+                "to be importable. The auto_wrap policy could not be built; "
+                "refusing to fall back to a single-unit FSDP wrapper because "
+                "that layout is known to trip the TrainingState.IDLE "
+                "post-backward-hook assertion for branch-routed MoE. Upgrade "
+                "torch (>= 2.0) or restore the expected module paths."
+            )
         return FSDP(
             model,
             device_id=torch.device("cuda", local_rank),
@@ -293,7 +311,7 @@ def wrap_model(
             sharding_strategy=getattr(ShardingStrategy, sharding_name),
             sync_module_states=True,
             use_orig_params=_fsdp_use_orig_params_for(sharding_name),
-            auto_wrap_policy=_auto_wrap_policy_for(model_type),
+            auto_wrap_policy=auto_wrap_policy,
         )
     raise ValueError(f"Unknown strategy: {strategy}")
 
