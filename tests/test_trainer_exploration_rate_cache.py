@@ -63,3 +63,23 @@ def test_trainer_still_applies_first_step_via_none_sentinel():
         "Cache must initialise to `None` so the very first step still "
         "applies (None != any float)."
     )
+
+
+def test_trainer_short_circuits_schedule_past_warmup():
+    """After warmup converges the trainer must stop evaluating the
+    schedule and stop walking `model.modules()`. The plateau guard
+    (`exploration_plateau_applied`) is what makes the cache actually
+    effective — float inequality during warmup produced a distinct
+    rate every step, so the earlier `!=` check always fired.
+    """
+    src = _trainer_source()
+    assert "exploration_plateau_applied" in src, (
+        "Trainer must maintain a plateau flag that is set once the schedule "
+        "has converged; without it every warmup step recomputes the rate "
+        "and re-calls the module-tree walk because `frac = step/warmup` "
+        "produces a fresh float each step."
+    )
+    assert "exploration_plateau_applied = True" in src, (
+        "Trainer must set the plateau flag once past warmup so subsequent "
+        "steps skip the schedule entirely."
+    )

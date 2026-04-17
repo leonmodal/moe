@@ -51,33 +51,43 @@ def update_expert_biases(
 
 
 def _update_single_router_bias(router, bias_rate: float, distributed: bool) -> None:
-    """Update expert bias for a single DeepSeek router."""
+    """Update expert bias for a single DeepSeek router.
+
+    `counts.sum()` was being computed twice — once for the host-side
+    `> 0` check and again for the normaliser — each call a CPU↔GPU sync.
+    Compute it once and branch on a device-side mask so there's no host
+    barrier (the mask yields a zero update when no tokens were seen,
+    which is equivalent to the previous early-return behaviour).
+    """
     with torch.no_grad():
         counts = router.local_tokens_per_expert
         if distributed:
             dist.all_reduce(counts, op=dist.ReduceOp.SUM)
-        if counts.sum() > 0:
-            total = counts.sum()
-            loads = counts / total
-            expected = 1.0 / counts.shape[0]
-            s = torch.sign(loads - expected)
-            router.expert_bias -= (s - s.mean()) * bias_rate
-            router.expert_bias.clamp_(-16.0, 16.0)
+        total = counts.sum()
+        loads = counts / total.clamp_min(1.0)
+        expected = 1.0 / counts.shape[0]
+        s = torch.sign(loads - expected)
+        nonzero = (total > 0).to(s.dtype)
+        router.expert_bias -= (s - s.mean()) * bias_rate * nonzero
+        router.expert_bias.clamp_(-16.0, 16.0)
         router.local_tokens_per_expert.zero_()
 
 
 def _update_branch_router_bias(br, bias_rate: float, distributed: bool) -> None:
-    """Update bias for a branch router."""
+    """Update bias for a branch router. Same single-`sum` contract as
+    `_update_single_router_bias` — zero counts produce a zero update via
+    a device-side mask, avoiding the host-side `> 0` sync.
+    """
     with torch.no_grad():
         if distributed:
             dist.all_reduce(br.local_counts, op=dist.ReduceOp.SUM)
-        if br.local_counts.sum() > 0:
-            total = br.local_counts.sum()
-            loads = br.local_counts / total
-            expected = 1.0 / br.local_counts.shape[0]
-            s = torch.sign(loads - expected)
-            br.branch_bias -= (s - s.mean()) * bias_rate
-            br.branch_bias.clamp_(-16.0, 16.0)
+        total = br.local_counts.sum()
+        loads = br.local_counts / total.clamp_min(1.0)
+        expected = 1.0 / br.local_counts.shape[0]
+        s = torch.sign(loads - expected)
+        nonzero = (total > 0).to(s.dtype)
+        br.branch_bias -= (s - s.mean()) * bias_rate * nonzero
+        br.branch_bias.clamp_(-16.0, 16.0)
         br.local_counts.zero_()
 
 
@@ -122,13 +132,21 @@ def exploration_rate_schedule(
 
 
 def collect_router_z_loss(model) -> torch.Tensor | None:
-    """Sum the most recent per-router z-loss contributions.
+    """Sum the most recent per-router z-loss contributions and clear them.
 
     Each `ExplorationTopKRouter` / `DeepSeekRouter` caches its per-call z-loss
     contribution on `_last_z_loss` (a scalar tensor when `router_z_loss_coef > 0`,
     `None` otherwise). This walker gathers those scalars across the whole model
     and returns their sum with autograd intact, so the trainer can add it to
     the total loss before `backward()`.
+
+    After collecting, every consumed `_last_z_loss` is reset to `None`. Without
+    the reset, a router whose forward is skipped on a later micro-batch
+    (e.g., a depth that the branch router routes around in MoE-Everything)
+    would contribute its stale tensor from the previous step on every
+    subsequent call until its own forward runs again — silently double-counting
+    z-loss into the total. Routers that did run this micro-batch re-populate
+    `_last_z_loss` on the *next* forward, so the clear is safe.
 
     Returns `None` when every router has `_last_z_loss is None` — i.e. the
     feature is disabled; callers should treat `None` as "add nothing" so
@@ -142,6 +160,9 @@ def collect_router_z_loss(model) -> torch.Tensor | None:
         if z is None:
             continue
         acc = z if acc is None else acc + z
+        # Consume: prevent the same tensor from being summed again on a later
+        # call if this router's forward doesn't run next micro-batch.
+        module._last_z_loss = None
     return acc
 
 

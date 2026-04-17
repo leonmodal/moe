@@ -180,7 +180,13 @@ def _load_safetensors_checkpoint(
     else:
         unwrap_model(model).load_state_dict(model_state)
 
-    # Load optimizer if available
+    # Load optimizer if available. Safetensors is the weights-only export
+    # format (produced by `scripts/convert_checkpoint.py`); the optimizer
+    # state is intentionally absent, so a missing optimizer file here is
+    # expected — not a bug. The warning is deliberately noisy so an
+    # unintentional weights-only resume still surfaces; if you meant to
+    # continue training, resume from the separate-files `checkpoint-N/`
+    # (which carries `optimizer_adam.pt`/`optimizer_muon.pt`) instead.
     try:
         optim_state = _load_optimizer_state(resume_from)
         if FSDP is not None and isinstance(model, FSDP):
@@ -191,7 +197,16 @@ def _load_safetensors_checkpoint(
         else:
             optimizer.load_state_dict(optim_state)
     except FileNotFoundError:
-        print("No optimizer state found in safetensors checkpoint, starting fresh", flush=True)
+        if is_main_process():
+            print(
+                "\n*** WARNING: resuming from a safetensors checkpoint without "
+                "optimizer state. Optimizer moments, LR schedule, and momentum "
+                "warmup will start fresh — training will converge like a new "
+                "run from these weights. Resume from the full `checkpoint-N/` "
+                "(with `optimizer_adam.pt`/`optimizer_muon.pt`) to preserve "
+                "optimizer state. ***\n",
+                flush=True,
+            )
 
     # Load training state
     training_state_path = os.path.join(resume_from, "training_state.pt")

@@ -294,7 +294,7 @@ class _Container(torch.nn.Module):
         self.inner = router
 
 
-def test_collect_router_z_loss_sums_across_routers():
+def test_collect_router_z_loss_sums_across_routers_and_clears():
     cfg = _tiny_cfg(router_z_loss_coef=1e-3)
     r1 = ExplorationTopKRouter(cfg).train()
     r2 = ExplorationTopKRouter(cfg).train()
@@ -310,10 +310,18 @@ def test_collect_router_z_loss_sums_across_routers():
     x = torch.randn(4, 8)
     r1(x)
     r2(x)
+    # Capture the expected sum *before* collect consumes the cached values.
+    expected = (r1._last_z_loss + r2._last_z_loss).item()
     total = collect_router_z_loss(model)
     assert total is not None
-    expected = (r1._last_z_loss + r2._last_z_loss).item()
     assert total.item() == pytest.approx(expected, rel=1e-6)
+    # The collector must clear the cached tensors so a router whose forward
+    # is skipped on the next micro-batch doesn't double-count its old
+    # contribution on the next `collect_router_z_loss` call.
+    assert r1._last_z_loss is None
+    assert r2._last_z_loss is None
+    # A second collect without intervening forwards is a no-op.
+    assert collect_router_z_loss(model) is None
 
 
 def test_collect_router_z_loss_returns_none_when_all_disabled():

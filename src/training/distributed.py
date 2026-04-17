@@ -65,6 +65,38 @@ def reduce_scalar(
     return tensor.item()
 
 
+def reduce_scalar_dict(
+    values: dict[str, float],
+    *,
+    reduction: str = "mean",
+    device: torch.device,
+) -> dict[str, float]:
+    """Cross-rank reduce a dict of scalars in one `all_reduce` + one sync.
+
+    `reduce_scalar` allocates a fresh one-element fp64 tensor per call and
+    issues one collective + one `.item()` CPU↔GPU sync; when the trainer
+    reduces 7–8 scalars every logged step this fans out to 7–8 separate
+    NCCL launches and 7–8 device→host copies. Batching them into a single
+    tensor collapses that to one collective and one `.tolist()` sync.
+
+    Returns a new dict with the same keys. In non-distributed runs the
+    original values are returned without touching the GPU.
+    """
+    if not is_distributed():
+        return dict(values)
+    if not values:
+        return {}
+    keys = list(values.keys())
+    tensor = torch.tensor(
+        [values[k] for k in keys], device=device, dtype=torch.float64,
+    )
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    if reduction == "mean":
+        tensor /= dist_world_size()
+    reduced_list = tensor.tolist()
+    return {k: v for k, v in zip(keys, reduced_list)}
+
+
 def setup_distributed(backend: str = "nccl") -> tuple[int, int, int, torch.device]:
     """Initialize distributed training.
 
@@ -106,6 +138,16 @@ def infer_dtype(name: str) -> torch.dtype | None:
 
 
 def _build_fsdp_mixed_precision(mixed_precision_name: str):
+    """FSDP `MixedPrecision` policy for the given autocast dtype.
+
+    Buffers (RoPE cos/sin, RMSNorm epsilons, attention masks, …) stay in
+    fp32 regardless of the compute dtype. This matches Megatron-LM's default
+    stability recommendation: downcasting position-encoding buffers to bf16
+    silently drifts the rotation angle at long positions — a subtle
+    correctness hazard for long-context training that has no runtime
+    signal. Params and reductions run at the requested low-precision dtype;
+    only the non-trainable buffers are pinned to fp32.
+    """
     if FSDP is None or MixedPrecision is None:
         return None
     param_dtype = infer_dtype(mixed_precision_name)
@@ -114,7 +156,7 @@ def _build_fsdp_mixed_precision(mixed_precision_name: str):
     return MixedPrecision(
         param_dtype=param_dtype,
         reduce_dtype=param_dtype,
-        buffer_dtype=param_dtype,
+        buffer_dtype=torch.float32,
     )
 
 

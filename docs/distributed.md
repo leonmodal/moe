@@ -24,7 +24,7 @@ torchrun --nproc_per_node=8 scripts/train.py --config config.yaml --dist-strateg
 
 | Model family | Sharding strategy | `use_orig_params` | FSDP `MixedPrecision` | `auto_wrap_policy` |
 |--------------|-------------------|-------------------|-----------------------|---------------------|
-| `dense` | `FULL_SHARD` | `True` | `MixedPrecision(param_dtype=reduce_dtype=buffer_dtype=training.mixed_precision)` | default (single root unit) |
+| `dense` | `FULL_SHARD` | `True` | `MixedPrecision(param_dtype=reduce_dtype=training.mixed_precision, buffer_dtype=fp32)` | default (single root unit) |
 | `standard_moe` | `FULL_SHARD` | `True` | same | default |
 | `global_moe` | `FULL_SHARD` | `True` | same | default |
 | `moe_everything` | `NO_SHARD` | `True` | **not set** (see §MoE-Everything notes) | `ModuleWrapPolicy({AttentionExpertBank, MlpExpertBank, BranchRouter, nn.Embedding, nn.Linear, Qwen3MoeRMSNorm})` |

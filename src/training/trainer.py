@@ -39,6 +39,7 @@ from .distributed import (
     is_distributed,
     is_main_process,
     reduce_scalar,
+    reduce_scalar_dict,
     seed_everything,
     setup_distributed,
     unwrap_model,
@@ -274,23 +275,42 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
     router_exploration_target = float(
         cfg.get("model", {}).get("router_exploration_rate", 0.0) or 0.0
     )
+    router_exploration_enabled = (
+        train_cfg.router_exploration_warmup_steps > 0
+        or router_exploration_target > 0.0
+    )
     # Cache the last applied rate so we skip the module-tree walk once the
-    # schedule converges (or for constant non-warmup runs). Using `None` as
-    # the sentinel forces an apply on the first step. See AC-10 benchmark.
+    # schedule has plateaued. Float inequality is safe during warmup because
+    # `exploration_rate_schedule` returns `target` verbatim once past
+    # `warmup_steps`; we additionally short-circuit the call entirely after
+    # `warmup_steps` to avoid the Python-side schedule arithmetic on the hot
+    # path. Using `None` as the sentinel forces an apply on the first step.
     last_applied_exploration_rate: float | None = None
+    exploration_plateau_applied = False
 
     while global_step < train_cfg.max_steps:
         step_start = time.perf_counter()
-        if train_cfg.router_exploration_warmup_steps > 0 or router_exploration_target > 0.0:
-            current_rate = exploration_rate_schedule(
-                global_step,
-                target=router_exploration_target,
-                warmup_start=train_cfg.router_exploration_warmup_start,
-                warmup_steps=train_cfg.router_exploration_warmup_steps,
+        if router_exploration_enabled and not exploration_plateau_applied:
+            past_warmup = (
+                train_cfg.router_exploration_warmup_steps <= 0
+                or global_step >= train_cfg.router_exploration_warmup_steps
             )
+            if past_warmup:
+                current_rate = router_exploration_target
+            else:
+                current_rate = exploration_rate_schedule(
+                    global_step,
+                    target=router_exploration_target,
+                    warmup_start=train_cfg.router_exploration_warmup_start,
+                    warmup_steps=train_cfg.router_exploration_warmup_steps,
+                )
             if current_rate != last_applied_exploration_rate:
                 apply_router_exploration_rate(model, current_rate)
                 last_applied_exploration_rate = current_rate
+            if past_warmup:
+                # Rate is now constant for the rest of training; no further
+                # schedule evaluation or module-tree walks are needed.
+                exploration_plateau_applied = True
         optimizer.zero_grad(set_to_none=True)
         window_metrics = {
             "loss": 0.0, "ce_loss": 0.0, "aux_loss": 0.0,
@@ -371,11 +391,27 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
         step_tokens = local_tokens_in_step * world_size
         tok_per_s = step_tokens / max(elapsed, 1e-9)
 
-        reduced = {
-            key: reduce_scalar(value / train_cfg.gradient_accumulation, device=device)
-            for key, value in window_metrics.items()
-        }
-        reduced_grad = reduce_scalar(grad_norm, device=device)
+        # Cross-rank reduction only happens on log steps — non-log steps keep
+        # the per-rank values locally. One batched `all_reduce` replaces the
+        # previous 7–8 separate `reduce_scalar` calls per step (7 window
+        # metrics + grad_norm), which cut out one CPU↔GPU sync per scalar
+        # and collapsed the NCCL collectives into a single launch.
+        is_log_step = (global_step % train_cfg.log_every == 0)
+        if is_log_step:
+            bundle = {
+                key: value / train_cfg.gradient_accumulation
+                for key, value in window_metrics.items()
+            }
+            bundle["__grad_norm"] = grad_norm
+            reduced_bundle = reduce_scalar_dict(bundle, device=device)
+            reduced_grad = reduced_bundle.pop("__grad_norm")
+            reduced = reduced_bundle
+        else:
+            reduced = {
+                key: value / train_cfg.gradient_accumulation
+                for key, value in window_metrics.items()
+            }
+            reduced_grad = grad_norm
 
         log_training_step(
             wandb_run,

@@ -108,14 +108,32 @@ class StatefulParquetDataset(IterableDataset):
         elif split == "val":
             raise ValueError("split='val' requires holdout_fraction > 0 or a dedicated eval data_dir")
 
-        # Shard files across ranks deterministically
-        self.files = [f for i, f in enumerate(all_files) if i % world_size == rank]
-        if not self.files:
-            raise RuntimeError(
-                f"Rank {rank} received 0 parquet files from {len(all_files)} total files "
-                f"with world_size={world_size}. Need at least {world_size} parquet files "
-                "or different data sharding."
-            )
+        # Shard files across ranks deterministically. Truncate the shared
+        # pool to `(N // world_size) * world_size` files so every rank sees
+        # exactly the same number — otherwise ranks with fewer files finish
+        # the epoch earlier and the collective reductions on remaining ranks
+        # stall on `all_reduce`. With large datasets the dropped files are
+        # negligible; with a small `val` split we pad up to world_size instead.
+        usable = (len(all_files) // world_size) * world_size
+        if usable == 0:
+            # Fewer files than ranks — repeat files round-robin so every rank
+            # still sees at least one file. Eval telemetry is mean-of-means
+            # across ranks, so the repeated shards introduce at most a small
+            # duplication bias. Train splits should never hit this path in
+            # practice; config validation should flag < world_size shards.
+            if split == "val" and len(all_files) > 0:
+                reps = (world_size + len(all_files) - 1) // len(all_files)
+                padded = (all_files * reps)[:world_size]
+                self.files = [padded[rank]]
+            else:
+                raise RuntimeError(
+                    f"Need at least {world_size} parquet files in "
+                    f"{config.data_dir} for world_size={world_size}; found "
+                    f"only {len(all_files)}."
+                )
+        else:
+            pool = all_files[:usable]
+            self.files = [f for i, f in enumerate(pool) if i % world_size == rank]
 
         # Resumption state (authoritative position marker is (file_idx, text_idx);
         # buffer holds the in-flight leftover tokens from texts already consumed
