@@ -77,9 +77,35 @@ _REALISTIC_BASE_FIELDS = """  vocab_size: 50304
   attention_dropout: 0.0"""
 
 
+# GPT-2-base-class config for Stage B "large" — 16 layers × 1024 hidden,
+# ~GPT2-base param count. Matches the scale at which FineWeb reference
+# numbers (~3.28 CE) are achieved; 10k+ steps at batch ~128 land there.
+_LARGE_BASE_FIELDS = """  vocab_size: 50304
+  hidden_size: 1024
+  num_hidden_layers: 16
+  head_dim: 64
+  num_attention_heads: 16
+  num_key_value_heads: 8
+  intermediate_size: 2048
+  max_position_embeddings: 1024
+  rms_norm_eps: 1.0e-6
+  rope_theta: 1000000.0
+  tie_word_embeddings: true
+  attention_bias: false
+  attention_dropout: 0.0"""
+
+
 _MOE_COMMON = """  num_experts: 8
   num_experts_per_tok: 2
   moe_intermediate_size: 256
+  norm_topk_prob: true
+  router_aux_loss_coef: 0.001
+  output_router_logits: true"""
+
+
+_MOE_COMMON_LARGE = """  num_experts: 16
+  num_experts_per_tok: 2
+  moe_intermediate_size: 512
   norm_topk_prob: true
   router_aux_loss_coef: 0.001
   output_router_logits: true"""
@@ -90,7 +116,13 @@ _DEEPSEEK_EXTRA = """  topk_scaling_factor: 2.5
   group_topk: 1"""
 
 
-def _model_block(variant: str, *, base_fields: str, experiment_name: str) -> str:
+_DEEPSEEK_EXTRA_LARGE = """  topk_scaling_factor: 2.5
+  num_groups: 4
+  group_topk: 2"""
+
+
+def _model_block(variant: str, *, base_fields: str, experiment_name: str,
+                 moe_common: str = _MOE_COMMON, deepseek_extra: str = _DEEPSEEK_EXTRA) -> str:
     """Return a YAML fragment for the `model:` section of the given variant."""
     if variant == "dense":
         return f"experiment_name: {experiment_name}\nmodel:\n  type: dense\n" + base_fields + "\n"
@@ -98,36 +130,36 @@ def _model_block(variant: str, *, base_fields: str, experiment_name: str) -> str
         return (
             f"experiment_name: {experiment_name}\n"
             "model:\n  type: standard_moe\n  router_type: softmax\n"
-        ) + base_fields + "\n" + _MOE_COMMON + "\n"
+        ) + base_fields + "\n" + moe_common + "\n"
     if variant == "standard_moe_deepseek":
         return (
             f"experiment_name: {experiment_name}\n"
             "model:\n  type: standard_moe\n  router_type: deepseek\n"
-        ) + base_fields + "\n" + _MOE_COMMON + "\n" + _DEEPSEEK_EXTRA + "\n"
+        ) + base_fields + "\n" + moe_common + "\n" + deepseek_extra + "\n"
     if variant == "global_moe_softmax":
         return (
             f"experiment_name: {experiment_name}\n"
             "model:\n  type: global_moe\n  router_type: softmax\n"
-        ) + base_fields + "\n" + _MOE_COMMON + "\n"
+        ) + base_fields + "\n" + moe_common + "\n"
     if variant == "global_moe_deepseek":
         return (
             f"experiment_name: {experiment_name}\n"
             "model:\n  type: global_moe\n  router_type: deepseek\n"
-        ) + base_fields + "\n" + _MOE_COMMON + "\n" + _DEEPSEEK_EXTRA + "\n"
+        ) + base_fields + "\n" + moe_common + "\n" + deepseek_extra + "\n"
     if variant == "moe_everything_fully_independent":
         return (
             f"experiment_name: {experiment_name}\n"
             "model:\n  type: moe_everything\n  router_type: softmax\n"
             "  num_attn_experts: 4\n  num_attn_experts_per_tok: 1\n"
             "  attn_expert_mode: per_head_fully_independent\n"
-        ) + base_fields + "\n" + _MOE_COMMON + "\n"
+        ) + base_fields + "\n" + moe_common + "\n"
     if variant == "moe_everything_precompute_kv":
         return (
             f"experiment_name: {experiment_name}\n"
             "model:\n  type: moe_everything\n  router_type: softmax\n"
             "  num_attn_experts: 4\n  num_attn_experts_per_tok: 1\n"
             "  attn_expert_mode: per_head_precompute_kv\n"
-        ) + base_fields + "\n" + _MOE_COMMON + "\n"
+        ) + base_fields + "\n" + moe_common + "\n"
     raise ValueError(f"Unknown variant: {variant}")
 
 
@@ -325,9 +357,26 @@ def stage_a_broad_smoke(
 
 def stage_b_loss_evidence(
     run_dir: Path, data_dir: Path, *, variants: list[str], max_steps: int = 5000,
-    nproc_per_node: int = 8,
+    nproc_per_node: int = 8, scale: str = "medium",
 ) -> list[RunResult]:
-    """Longer runs on a representative subset; target is loss approaching ~3.3."""
+    """Longer runs on a representative subset; target is loss approaching ~3.3.
+
+    `scale` picks the model size:
+      - "medium" (default): 8L × 512H, seq 512, batch 16 (fast, reaches ~4 in 3k steps).
+      - "large": 16L × 1024H, seq 1024, batch 16 (GPT2-base class, reaches ~3.3 in 10k+ steps).
+    """
+    if scale == "large":
+        base_fields = _LARGE_BASE_FIELDS
+        moe_common = _MOE_COMMON_LARGE
+        deepseek_extra = _DEEPSEEK_EXTRA_LARGE
+        batch_size = 16
+        seq_len = 1024
+    else:
+        base_fields = _REALISTIC_BASE_FIELDS
+        moe_common = _MOE_COMMON
+        deepseek_extra = _DEEPSEEK_EXTRA
+        batch_size = 16
+        seq_len = 512
     results: list[RunResult] = []
     stage_dir = run_dir / "stage_b"
     stage_dir.mkdir(parents=True, exist_ok=True)
@@ -337,18 +386,21 @@ def stage_b_loss_evidence(
         out.mkdir(parents=True, exist_ok=True)
         config_path = out / "config.yaml"
         config_path.write_text(
-            _model_block(variant, base_fields=_REALISTIC_BASE_FIELDS,
-                         experiment_name=f"lossB_{variant}")
+            _model_block(
+                variant, base_fields=base_fields,
+                experiment_name=f"lossB_{variant}",
+                moe_common=moe_common, deepseek_extra=deepseek_extra,
+            )
             + _training_block(
                 output_dir=out, data_dir=data_dir, max_steps=max_steps,
-                batch_size=16, grad_accum=1, seq_len=512,
+                batch_size=batch_size, grad_accum=1, seq_len=seq_len,
                 save_every=max_steps, log_every=50,
             )
         )
         r = run_training_subprocess(
             config_path, dist_strategy="ddp", data_dir=data_dir,
             output_dir=out, nproc_per_node=nproc_per_node, name=name,
-            timeout=14400,
+            timeout=28800,
         )
         results.append(r)
         _print_run_summary(r)
@@ -537,6 +589,10 @@ def main() -> int:
     parser.add_argument("--resume-total", type=int, default=200)
     parser.add_argument("--stage-b-variants", default="dense,standard_moe_deepseek,moe_everything_fully_independent",
                         help="Comma-separated variants for stage B.")
+    parser.add_argument("--stage-b-scale", default="medium", choices=("medium", "large"),
+                        help="Stage B model scale. 'medium' = 8L x 512H, fast. "
+                             "'large' = 16L x 1024H (GPT2-base class), reaches ~3.3 "
+                             "in 10k+ steps but takes several hours per config.")
     parser.add_argument("--stage-c-variants", default="standard_moe_softmax:ddp,moe_everything_fully_independent:fsdp",
                         help="Comma-separated `variant:strategy` pairs for stage C.")
     args = parser.parse_args()
@@ -568,7 +624,7 @@ def main() -> int:
         print(f"\n[stage B] long runs for {variants}", flush=True)
         stage_b_results = stage_b_loss_evidence(
             run_dir, data_dir, variants=variants, max_steps=args.loss_steps,
-            nproc_per_node=args.nproc_per_node,
+            nproc_per_node=args.nproc_per_node, scale=args.stage_b_scale,
         )
         write_report(report_path, stage_a=stage_a_results,
                      stage_b=stage_b_results, stage_c=stage_c_results)

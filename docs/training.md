@@ -81,6 +81,18 @@ Configuration:
   - `attention_aux_loss`: Attention routing auxiliary loss
   - `aux_loss_normalized`: Normalized load-balancing metric
 
+## Reference Loss Trajectories
+
+Loss sanity checks from a 10,000-step multi-GPU run against `leonli66/latent-cot-finewebedu` (FineWeb-Edu derivative). Each config uses the GPT-2-base-class scale (16 layers × 1024 hidden, seq_len 1024, batch 128 global, bf16 AdamW). See `status.md` §"Current-Stack Loss Evidence" for the full table and `scripts/validate_multi_gpu_pipeline.py` for the orchestration code.
+
+| Config | Final CE at step 10000 |
+|---|---|
+| `dense` | **3.022** |
+| `standard_moe` softmax (16 experts × top-2) | **3.006** |
+| `standard_moe` deepseek (group-limited 4/2) | **3.035** |
+
+All three land under the 3.28 FineWeb GPT-2 reference target. A loss stuck at ~4.0+ after 1k steps on this data is a regression signal, not the normal trajectory.
+
 ## Checkpoints
 
 Saved as separate files per checkpoint directory:
