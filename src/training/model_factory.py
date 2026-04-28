@@ -349,4 +349,31 @@ def build_model(cfg: dict):
 
     _stamp_per_class_router_fields(config, mcfg)
 
+    # Per-class method override on the model: when the nested-schema
+    # yaml has set `model.mlp_router.balancing` to a real method, that
+    # value WINS over any top-level method for the post-step
+    # bias-update dispatch. Standard / Global MoE families have only
+    # an MLP router class, so stamping the MLP per-class method onto
+    # `model._load_balancing_method` makes `update_expert_biases`
+    # dispatch on the per-class value automatically. MoE-Everything
+    # has its own per-class gating in `forward`; we still stamp here
+    # so the post-step walker sees the right method when MLP is the
+    # active one.
+    mlp_class_method = mcfg.get("mlp_router", {}).get("balancing") if isinstance(
+        mcfg.get("mlp_router"), dict,
+    ) else None
+    if mlp_class_method is not None and mlp_class_method != "none":
+        model._load_balancing_method = mlp_class_method
+        config.load_balancing_method = mlp_class_method
+        # Per-class deepseek_bias / quantile knobs feed the trainer's
+        # bias-update path. The trainer reads `bias_update_rate` from
+        # `TrainingConfig`, so we mirror the per-class value onto the
+        # config object's training-side surface for runtime visibility.
+        if mlp_class_method == "deepseek_bias":
+            mlp_block = mcfg["mlp_router"]
+            for key in ("bias_update_rate", "bias_update_zero_sum",
+                        "bias_warmup_start", "bias_warmup_steps"):
+                if key in mlp_block:
+                    setattr(config, f"effective_{key}", mlp_block[key])
+
     return model, config

@@ -36,7 +36,16 @@ def _load_validator():
 
 
 def _nested_yamls() -> list[Path]:
-    return sorted((REPO / "configs" / "nested").rglob("*.yaml"))
+    """All nested-schema yamls in the repo. After the in-place
+    migration, the original `configs/{4,8,16}_layers/*.yaml` are
+    nested too, plus the additional `configs/nested/*.yaml`
+    examples. Both directories are walked here so the drift check
+    catches a regression anywhere in the active config tree."""
+    paths: list[Path] = []
+    for sub in ("configs/4_layers", "configs/8_layers",
+                "configs/16_layers", "configs/nested"):
+        paths.extend(sorted((REPO / sub).rglob("*.yaml")))
+    return paths
 
 
 def test_nested_directory_has_yamls():
@@ -51,16 +60,17 @@ def test_nested_directory_has_yamls():
 
 
 def test_every_nested_yaml_has_per_class_blocks():
-    """Every yaml under `configs/nested/` MUST set at least one of
-    the per-class router blocks (`mlp_router` / `attn_router` /
-    `branch_router`). A nested-schema yaml with no per-class block
-    is functionally flat and defeats the purpose of the nested
-    directory."""
+    """Every MoE yaml in the active config tree MUST set at least
+    one of the per-class router blocks (`mlp_router` / `attn_router`
+    / `branch_router`). Dense yamls have no MoE routers so they're
+    exempt from the per-class requirement."""
     deficits: list[tuple[str, str]] = []
     for p in _nested_yamls():
         with p.open() as f:
             cfg = yaml.safe_load(f)
         mcfg = cfg.get("model", {}) or {}
+        if mcfg.get("type") == "dense":
+            continue  # dense has no MoE routers
         has_any = any(
             isinstance(mcfg.get(name), dict) and mcfg[name]
             for name in ("mlp_router", "attn_router", "branch_router")
@@ -68,7 +78,7 @@ def test_every_nested_yaml_has_per_class_blocks():
         if not has_any:
             deficits.append((str(p), "no per-class router blocks"))
     assert not deficits, (
-        f"nested yamls without per-class blocks: {deficits}"
+        f"MoE yamls without per-class blocks: {deficits}"
     )
 
 

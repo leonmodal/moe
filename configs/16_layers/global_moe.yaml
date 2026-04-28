@@ -16,7 +16,7 @@ model:
   router_exploration_rate: 0.02
   bias_interpolation: false
   global_router_update: true
-  # DeepSeek-V3 paper Section 3.2 default 2.5; matches nmoe.Router routed_scaling_factor
+  # DeepSeek-V3 paper Section 3.2 default 2.5
   topk_scaling_factor: 2.5
   num_groups: 8
   group_topk: 4
@@ -27,6 +27,14 @@ model:
   max_position_embeddings: 32768
   tie_word_embeddings: true
   output_router_logits: true
+  mlp_router:
+    balancing: aux_loss
+    router_aux_loss_coef: 0.001
+  attn_router:
+    balancing: aux_loss
+    router_aux_loss_coef: 0.001
+  branch_router:
+    balancing: none
 training:
   learning_rate: 0.001
   weight_decay: 0.01
@@ -48,10 +56,8 @@ training:
   output_dir: ./outputs/16_layers/global_moe
   wandb_project: moe-scaling
   wandb_run_name: 16_layers_global_moe
-  router_aux_loss_coef: 0.001
   seq_aux_loss_coef: 0.0001
   bias_update_rate: 0.001
-  load_balancing_method: aux_loss
 data:
   data_dir: ./data/parquet
   text_column: text

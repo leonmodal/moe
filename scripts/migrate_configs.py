@@ -252,6 +252,82 @@ def _expand_top_level_method_to_per_class(cfg: dict) -> list[str]:
             f"model.mlp_router / model.attn_router (branch_router stays "
             f"`none` until runtime supports broader methods)"
         )
+        # After expansion, remove the top-level method + coefficients
+        # that were just copied into the per-class blocks. This makes
+        # the migrated yaml nested-only — the runtime falls back to
+        # the per-class blocks (or the configured `none`) without a
+        # parallel flat shim. Repo yamls should never carry both
+        # forms after migration; the validator now enforces this.
+        if "load_balancing_method" in tcfg:
+            del tcfg["load_balancing_method"]
+            changes.append("removed top-level training.load_balancing_method (now in per-class blocks)")
+        if "load_balancing_method" in model_cfg:
+            del model_cfg["load_balancing_method"]
+            changes.append("removed top-level model.load_balancing_method (now in per-class blocks)")
+        # Remove top-level coefficients that the per-class blocks now carry.
+        for old_key in ("router_aux_loss_coef", "seq_aux_loss_coef", "bias_update_rate"):
+            if method == "aux_loss" and old_key == "router_aux_loss_coef" and old_key in tcfg:
+                del tcfg[old_key]
+                changes.append(f"removed redundant top-level training.{old_key}")
+            elif method == "seq_aux_loss" and old_key == "seq_aux_loss_coef" and old_key in tcfg:
+                del tcfg[old_key]
+                changes.append(f"removed redundant top-level training.{old_key}")
+            elif method == "deepseek_bias" and old_key == "bias_update_rate" and old_key in tcfg:
+                del tcfg[old_key]
+                changes.append(f"removed redundant top-level training.{old_key}")
+    return changes
+
+
+def _remove_redundant_top_level_balancing(cfg: dict) -> list[str]:
+    """When per-class blocks are already populated, the top-level
+    `training.load_balancing_method` and the matching coefficient
+    are redundant: the runtime reads the per-class fields. This
+    cleanup runs unconditionally so a yaml that was migrated with
+    an older migrator version (which left the top-level fields
+    in place) gets fully cutover on the next run.
+    """
+    changes: list[str] = []
+    if "model" not in cfg or not isinstance(cfg["model"], dict):
+        return changes
+    model_cfg = cfg["model"]
+    has_per_class = any(
+        isinstance(model_cfg.get(name), dict) and model_cfg[name]
+        for name in ("mlp_router", "attn_router", "branch_router")
+    )
+    if not has_per_class:
+        return changes
+    tcfg = cfg.get("training", {})
+    # Top-level method is now redundant.
+    if isinstance(tcfg, dict) and "load_balancing_method" in tcfg:
+        del tcfg["load_balancing_method"]
+        changes.append(
+            "removed redundant top-level training.load_balancing_method "
+            "(per-class blocks are now authoritative)"
+        )
+    if "load_balancing_method" in model_cfg:
+        del model_cfg["load_balancing_method"]
+        changes.append(
+            "removed redundant top-level model.load_balancing_method"
+        )
+    # Top-level coefficients that match a per-class field are
+    # redundant. Conservative cleanup: only remove the top-level
+    # coefficient if at least one per-class block carries the SAME
+    # coefficient at the SAME value, so an operator's hand-edited
+    # divergent values are never silently dropped.
+    if isinstance(tcfg, dict):
+        for coef_key in ("router_aux_loss_coef", "seq_aux_loss_coef", "bias_update_rate"):
+            if coef_key not in tcfg:
+                continue
+            top_val = tcfg[coef_key]
+            for group in ("mlp_router", "attn_router", "branch_router"):
+                block = model_cfg.get(group)
+                if isinstance(block, dict) and block.get(coef_key) == top_val:
+                    del tcfg[coef_key]
+                    changes.append(
+                        f"removed redundant top-level training.{coef_key}={top_val!r} "
+                        f"(matched model.{group}.{coef_key})"
+                    )
+                    break
     return changes
 
 
@@ -266,6 +342,7 @@ def migrate_config(cfg: dict) -> list[str]:
         changes.extend(_migrate_branch_router_block(model_cfg))
     changes.extend(_rewrite_balancing_method_tokens(cfg))
     changes.extend(_expand_top_level_method_to_per_class(cfg))
+    changes.extend(_remove_redundant_top_level_balancing(cfg))
     return changes
 
 

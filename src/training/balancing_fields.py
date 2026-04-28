@@ -263,55 +263,51 @@ def _validate_mlp_or_attn_router(cfg: dict, group: str) -> None:
     # Illegal-combination rejection. Each balancing method has a
     # well-defined "active knobs" set; specifying a knob outside
     # that set is rejected so a yaml can't silently mix methods.
+    # The active sets cover EVERY field the runtime consumes for
+    # the method:
+    #   * `aux_loss`        -> {router_aux_loss_coef}
+    #   * `seq_aux_loss`    -> {seq_aux_loss_coef}
+    #   * `deepseek_bias`   -> {bias_update_rate, bias_update_zero_sum,
+    #                           bias_warmup_start, bias_warmup_steps}
+    #   * `quantile`        -> {quantile_eta, quantile_target_q,
+    #                           quantile_global_state}
+    #   * `none`            -> {} (every active knob is rejected)
+    aux_fields = {"router_aux_loss_coef"}
+    seq_fields = {"seq_aux_loss_coef"}
+    bias_fields = {
+        "bias_update_rate", "bias_update_zero_sum",
+        "bias_warmup_start", "bias_warmup_steps",
+    }
+    quantile_fields = {
+        "quantile_eta", "quantile_target_q", "quantile_global_state",
+    }
+    all_active = aux_fields | seq_fields | bias_fields | quantile_fields
+
+    method_to_allowed = {
+        "aux_loss": aux_fields,
+        "seq_aux_loss": seq_fields,
+        "deepseek_bias": bias_fields,
+        "quantile": quantile_fields,
+        "none": set(),
+    }
+    method_summary = {
+        "aux_loss": "aux_loss only uses router_aux_loss_coef.",
+        "seq_aux_loss": "seq_aux_loss only uses seq_aux_loss_coef.",
+        "deepseek_bias": "deepseek_bias only uses bias_update_* knobs.",
+        "quantile": "quantile only uses quantile_* knobs.",
+        "none": "the `none` method disables every balancing knob by definition.",
+    }
     bal = nested.get("balancing")
-    if bal is not None:
-        if bal == "aux_loss":
-            for incompat in ("seq_aux_loss_coef", "bias_update_rate",
-                             "quantile_eta", "quantile_target_q"):
-                if incompat in nested and nested[incompat]:
-                    raise ValueError(
-                        f"model.{group}.balancing=aux_loss is incompatible "
-                        f"with {incompat}={nested[incompat]!r}; "
-                        f"aux_loss only uses router_aux_loss_coef. Drop "
-                        f"the conflicting field or change `balancing`."
-                    )
-        elif bal == "seq_aux_loss":
-            for incompat in ("router_aux_loss_coef", "bias_update_rate",
-                             "quantile_eta", "quantile_target_q"):
-                if incompat in nested and nested[incompat]:
-                    raise ValueError(
-                        f"model.{group}.balancing=seq_aux_loss is incompatible "
-                        f"with {incompat}={nested[incompat]!r}; "
-                        f"seq_aux_loss only uses seq_aux_loss_coef."
-                    )
-        elif bal == "deepseek_bias":
-            for incompat in ("router_aux_loss_coef", "seq_aux_loss_coef",
-                             "quantile_eta", "quantile_target_q"):
-                if incompat in nested and nested[incompat]:
-                    raise ValueError(
-                        f"model.{group}.balancing=deepseek_bias is incompatible "
-                        f"with {incompat}={nested[incompat]!r}; "
-                        f"deepseek_bias only uses bias_update_* knobs."
-                    )
-        elif bal == "quantile":
-            for incompat in ("router_aux_loss_coef", "seq_aux_loss_coef",
-                             "bias_update_rate"):
-                if incompat in nested and nested[incompat]:
-                    raise ValueError(
-                        f"model.{group}.balancing=quantile is incompatible "
-                        f"with {incompat}={nested[incompat]!r}; "
-                        f"quantile only uses quantile_* knobs."
-                    )
-        elif bal == "none":
-            for incompat in ("router_aux_loss_coef", "seq_aux_loss_coef",
-                             "bias_update_rate", "quantile_eta",
-                             "quantile_target_q"):
-                if incompat in nested and nested[incompat]:
-                    raise ValueError(
-                        f"model.{group}.balancing=none is incompatible with "
-                        f"{incompat}={nested[incompat]!r}; the `none` method "
-                        f"disables every balancing knob by definition."
-                    )
+    if bal in method_to_allowed:
+        allowed = method_to_allowed[bal]
+        for field in sorted(all_active - allowed):
+            if field in nested and nested[field]:
+                raise ValueError(
+                    f"model.{group}.balancing={bal} is incompatible "
+                    f"with {field}={nested[field]!r}; "
+                    f"{method_summary[bal]} Drop the conflicting "
+                    f"field or change `balancing`."
+                )
 
 
 def validate_branch_router_config(cfg: dict) -> None:

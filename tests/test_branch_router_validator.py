@@ -445,6 +445,96 @@ def test_validator_rejects_none_with_any_active_knob():
         _validator()(cfg)
 
 
+def test_validator_rejects_aux_loss_with_bias_update_zero_sum():
+    """Round 28 review Finding 3: bias_update_zero_sum is a bias-method
+    knob; aux_loss must reject it."""
+    cfg = {"model": {"mlp_router": {
+        "balancing": "aux_loss",
+        "router_aux_loss_coef": 0.001,
+        "bias_update_zero_sum": True,
+    }}}
+    with pytest.raises(ValueError, match="aux_loss is incompatible with bias_update_zero_sum"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_aux_loss_with_bias_warmup_steps():
+    cfg = {"model": {"mlp_router": {
+        "balancing": "aux_loss",
+        "router_aux_loss_coef": 0.001,
+        "bias_warmup_steps": 100,
+    }}}
+    with pytest.raises(ValueError, match="aux_loss is incompatible with bias_warmup_steps"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_aux_loss_with_bias_warmup_start():
+    cfg = {"model": {"mlp_router": {
+        "balancing": "aux_loss",
+        "router_aux_loss_coef": 0.001,
+        "bias_warmup_start": 0.0001,
+    }}}
+    with pytest.raises(ValueError, match="aux_loss is incompatible with bias_warmup_start"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_seq_aux_with_bias_warmup_steps():
+    cfg = {"model": {"mlp_router": {
+        "balancing": "seq_aux_loss",
+        "seq_aux_loss_coef": 0.0001,
+        "bias_warmup_steps": 100,
+    }}}
+    with pytest.raises(ValueError, match="seq_aux_loss is incompatible with bias_warmup_steps"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_none_with_bias_update_zero_sum():
+    cfg = {"model": {"mlp_router": {
+        "balancing": "none",
+        "bias_update_zero_sum": True,
+    }}}
+    with pytest.raises(ValueError, match="none is incompatible with bias_update_zero_sum"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_none_with_quantile_global_state():
+    cfg = {"model": {"mlp_router": {
+        "balancing": "none",
+        "quantile_global_state": True,
+    }}}
+    with pytest.raises(ValueError, match="none is incompatible with quantile_global_state"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_quantile_with_bias_warmup_steps():
+    cfg = {"model": {"attn_router": {
+        "balancing": "quantile",
+        "quantile_eta": 0.005,
+        "bias_warmup_steps": 100,
+    }}}
+    with pytest.raises(ValueError, match="quantile is incompatible with bias_warmup_steps"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_quantile_with_bias_update_zero_sum():
+    cfg = {"model": {"attn_router": {
+        "balancing": "quantile",
+        "quantile_eta": 0.005,
+        "bias_update_zero_sum": True,
+    }}}
+    with pytest.raises(ValueError, match="quantile is incompatible with bias_update_zero_sum"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_deepseek_bias_with_quantile_global_state():
+    cfg = {"model": {"mlp_router": {
+        "balancing": "deepseek_bias",
+        "bias_update_rate": 0.001,
+        "quantile_global_state": True,
+    }}}
+    with pytest.raises(ValueError, match="deepseek_bias is incompatible with quantile_global_state"):
+        _validator()(cfg)
+
+
 def test_validator_accepts_each_method_with_only_its_active_knobs():
     """Sanity: every per-class method with ONLY its active knobs
     is accepted. Mirror of the rejection-set tests above."""

@@ -66,8 +66,27 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
         # is belt-and-suspenders against any future default that leaks a
         # non-zero coefficient into a non-active method.
         method = getattr(self, "_load_balancing_method", None)
-        aux_active = method is None or method == "aux_loss"
-        seq_aux_active = method is None or method == "seq_aux_loss"
+        # Per-class method override: when the nested-schema yaml sets
+        # `model.mlp_router.balancing`, that value WINS over the
+        # top-level method for the standard_moe family (which has only
+        # an MLP router). Falls back to top-level when unset so legacy
+        # yamls keep working.
+        mlp_class_method = getattr(self.config, "mlp_router_balancing", None)
+        if mlp_class_method is not None:
+            aux_active = mlp_class_method == "aux_loss"
+            seq_aux_active = mlp_class_method == "seq_aux_loss"
+        else:
+            aux_active = method is None or method == "aux_loss"
+            seq_aux_active = method is None or method == "seq_aux_loss"
+        # Per-class coefficients: nested values WIN over top-level.
+        aux_coef = getattr(
+            self.config, "mlp_router_router_aux_loss_coef",
+            self.router_aux_loss_coef,
+        )
+        seq_coef_per_class = getattr(
+            self.config, "mlp_router_seq_aux_loss_coef",
+            getattr(self, "_seq_aux_loss_coef", 0.0),
+        )
 
         # Recompute aux loss with our fixed loss function. The base class
         # already added `self.router_aux_loss_coef * old_aux` to the loss; we
@@ -92,7 +111,7 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
                 )
                 if output.loss is not None:
                     output.loss = output.loss - self.router_aux_loss_coef * old_aux
-                    output.loss = output.loss + self.router_aux_loss_coef * new_aux
+                    output.loss = output.loss + aux_coef * new_aux
                 output.aux_loss = new_aux
             else:
                 if output.loss is not None:
@@ -107,10 +126,11 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
                 output.aux_loss = new_aux  # already detached via no_grad context
 
         # Sequence-level aux loss (DeepSeek V2/V3) — gated by method.
-        seq_coef = getattr(self, "_seq_aux_loss_coef", 0.0)
+        # `seq_coef_per_class` was resolved above (nested wins over
+        # top-level).
         if (
             seq_aux_active
-            and seq_coef > 0
+            and seq_coef_per_class > 0
             and output.router_logits is not None
             and output.loss is not None
         ):
@@ -123,7 +143,7 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
                 batch_size=bsz,
                 selected_experts=selected_experts,
             )
-            output.loss = output.loss + seq_coef * seq_aux
+            output.loss = output.loss + seq_coef_per_class * seq_aux
 
         # DETACH-ONLY: for non-aux methods, the model output's
         # `router_logits` must be detached even if the caller forced

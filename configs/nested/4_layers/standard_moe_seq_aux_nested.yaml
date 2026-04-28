@@ -1,4 +1,4 @@
-experiment_name: 4_layers_standard_moe
+experiment_name: 4_layers_standard_moe_seq_aux_loss_nested
 model:
   type: standard_moe
   router_type: deepseek
@@ -28,11 +28,10 @@ model:
   tie_word_embeddings: true
   output_router_logits: true
   mlp_router:
-    balancing: aux_loss
-    router_aux_loss_coef: 0.001
+    balancing: seq_aux_loss
+    seq_aux_loss_coef: 0.0001
   attn_router:
-    balancing: aux_loss
-    router_aux_loss_coef: 0.001
+    balancing: none
   branch_router:
     balancing: none
 training:
@@ -53,9 +52,9 @@ training:
   log_every: 1
   routing_log_every: 50
   save_every: 1000
-  output_dir: ./outputs/4_layers/standard_moe
+  output_dir: ./outputs/nested/4_layers/standard_moe_seq_aux_loss_nested
   wandb_project: moe-scaling
-  wandb_run_name: 4_layers_standard_moe
+  wandb_run_name: 4_layers_standard_moe_seq_aux_loss_nested
   seq_aux_loss_coef: 0.0001
   bias_update_rate: 0.001
 data:

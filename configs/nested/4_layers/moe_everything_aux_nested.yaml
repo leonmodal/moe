@@ -1,25 +1,32 @@
-experiment_name: 4_layers_standard_moe
+experiment_name: 4_layers_moe_everything_per_head_fully_independent_aux_loss_nested
 model:
-  type: standard_moe
-  router_type: deepseek
+  type: moe_everything
   vocab_size: 151936
   hidden_size: 1024
-  num_hidden_layers: 4
+  num_hidden_layers: 8
   head_dim: 128
   num_attention_heads: 16
   num_key_value_heads: 8
-  num_experts: 16
+  num_experts: 64
   num_experts_per_tok: 4
   moe_intermediate_size: 768
   intermediate_size: 3072
   norm_topk_prob: true
+  branch_router_aux_loss_coef: 0.0
   router_exploration_rate: 0.02
   bias_interpolation: false
-  global_router_update: true
   # DeepSeek-V3 paper Section 3.2 default 2.5
   topk_scaling_factor: 2.5
   num_groups: 8
   group_topk: 4
+  num_attn_experts: 32
+  num_attn_experts_per_tok: 1
+  attn_expert_mode: per_head_fully_independent
+  scale_attn_by_routing_weight: true
+  scale_branch_by_routing_weight: true
+  per_head_compute_mode: dense
+  use_deepseek_routing: true
+  global_router_update: true
   attention_bias: false
   attention_dropout: 0.0
   rms_norm_eps: 1.0e-06
@@ -31,8 +38,7 @@ model:
     balancing: aux_loss
     router_aux_loss_coef: 0.001
   attn_router:
-    balancing: aux_loss
-    router_aux_loss_coef: 0.001
+    balancing: none
   branch_router:
     balancing: none
 training:
@@ -49,13 +55,13 @@ training:
   gradient_accumulation: 2
   mixed_precision: bf16
   disable_liger: true
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   log_every: 1
   routing_log_every: 50
   save_every: 1000
-  output_dir: ./outputs/4_layers/standard_moe
+  output_dir: ./outputs/nested/4_layers/moe_everything_per_head_fully_independent_aux_loss_nested
   wandb_project: moe-scaling
-  wandb_run_name: 4_layers_standard_moe
+  wandb_run_name: 4_layers_moe_everything_per_head_fully_independent_aux_loss_nested
   seq_aux_loss_coef: 0.0001
   bias_update_rate: 0.001
 data:
