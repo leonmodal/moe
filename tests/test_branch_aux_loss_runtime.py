@@ -439,6 +439,244 @@ def test_walker_quantile_dispatch_no_op_on_empty_accumulator():
     torch.testing.assert_close(m.owner.quantile_ema, initial_ema)
 
 
+def test_deepseek_router_forward_appends_quantile_scores_in_training():
+    """Round 41 review Finding 2: forward-side accumulation.
+
+    `DeepSeekRouter.forward()` appends `scores.detach().float()` to
+    `local_quantile_scores` whenever grad is enabled and the call
+    is not a checkpoint recompute (mirrors the existing count-buffer
+    guard). Production trainer eval runs the model under
+    `torch.no_grad()` which suppresses both the count update and
+    the score append.
+    """
+    from src.models.router import DeepSeekRouter
+
+    class _Cfg:
+        hidden_size = 16
+        num_experts = 4
+        num_experts_per_tok = 2
+        norm_topk_prob = True
+        topk_scaling_factor = 2.5
+        router_exploration_rate = 0.0
+        router_z_loss_coef = 0.0
+
+    r = DeepSeekRouter(_Cfg())
+    h = torch.randn(2, 5, 16)  # (B, T, D)
+    # Training + grad enabled: append.
+    r.train()
+    assert r.local_quantile_scores == []
+    _scores, _topk_w, _topk_idx = r(h)
+    assert len(r.local_quantile_scores) == 1, (
+        f"training-mode forward did not append scores; "
+        f"len={len(r.local_quantile_scores)}"
+    )
+    assert r.local_quantile_scores[0].dtype == torch.float32
+    assert r.local_quantile_scores[0].shape == (2 * 5, 4)
+
+    # Grad-disabled (no_grad) — production trainer evaluation
+    # context. Must NOT append (mirrors `local_tokens_per_expert`).
+    pre_len = len(r.local_quantile_scores)
+    with torch.no_grad():
+        _ = r(h)
+    assert len(r.local_quantile_scores) == pre_len, (
+        f"no_grad forward should not append scores; "
+        f"len went from {pre_len} to {len(r.local_quantile_scores)}"
+    )
+
+
+def test_deepseek_router_grad_accumulation_concatenates_quantile_scores():
+    """Round 41 review Finding 2: grad-accumulation coverage.
+
+    Four micro-batches in training mode produce four entries in the
+    accumulator; the walker concatenates them along dim=0.
+    """
+    from src.models.router import DeepSeekRouter
+
+    class _Cfg:
+        hidden_size = 16
+        num_experts = 4
+        num_experts_per_tok = 2
+        norm_topk_prob = True
+        topk_scaling_factor = 2.5
+        router_exploration_rate = 0.0
+        router_z_loss_coef = 0.0
+
+    r = DeepSeekRouter(_Cfg())
+    r.train()
+    for _ in range(4):
+        _ = r(torch.randn(1, 3, 16))
+    assert len(r.local_quantile_scores) == 4, (
+        f"expected 4 micro-batch score tensors; got "
+        f"{len(r.local_quantile_scores)}"
+    )
+    concat = torch.cat(r.local_quantile_scores, dim=0)
+    assert concat.shape == (4 * 3, 4), (
+        f"grad-accumulation concat shape mismatch: {concat.shape}"
+    )
+
+
+def test_walker_drains_quantile_accumulator_on_deepseek_owner():
+    """Round 42 memory bound: forward unconditionally appends scores;
+    walker MUST drain the accumulator on owners running the deepseek
+    path so memory doesn't grow unboundedly across training steps.
+    """
+    import importlib.util as _u
+    import torch.nn as nn
+    repo = Path(__file__).resolve().parent.parent
+    spec = _u.spec_from_file_location(
+        "src.training.routing", str(repo / "src" / "training" / "routing.py"),
+    )
+    routing = _u.module_from_spec(spec)
+    sys.modules["src.training.routing"] = routing
+    spec.loader.exec_module(routing)
+
+    class _Owner(nn.Module):
+        def __init__(self, n=4):
+            super().__init__()
+            self.register_buffer("expert_bias", torch.zeros(n, dtype=torch.float32))
+            self.register_buffer(
+                "local_tokens_per_expert",
+                torch.zeros(n, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer("quantile_ema", torch.zeros(n, dtype=torch.float32))
+            self.local_quantile_scores: list[torch.Tensor] = []
+
+    class _MockConfig:
+        mlp_router_balancing = "deepseek_bias"
+
+    class _MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.owner = _Owner(4)
+            self._load_balancing_method = "deepseek_bias"
+            self.config = _MockConfig()
+
+        def get_all_balancing_owners(self):
+            yield self.owner, "mlp"
+
+    m = _MockModel()
+    # Pre-populate counts AND a stale quantile accumulator.
+    m.owner.local_tokens_per_expert[:] = torch.tensor([100.0, 1.0, 1.0, 1.0])
+    m.owner.local_quantile_scores.append(torch.zeros(3, 4, dtype=torch.float32))
+    with torch.no_grad():
+        routing.update_expert_biases(m, bias_rate=0.5, distributed=False)
+    assert m.owner.local_quantile_scores == [], (
+        f"deepseek-method walker must drain stale quantile accumulator; "
+        f"left len={len(m.owner.local_quantile_scores)}"
+    )
+
+
+def test_pure_quantile_production_trainer_path_drives_walker(tmp_path):
+    """Round 41 review Finding 1 closure: pure quantile config that
+    fires the walker via the real `trainer_post_optimizer_bias_update`
+    path.
+
+    Build a nested quantile config (no DeepSeek bias-rate triple).
+    Run a training-mode forward (which accumulates scores in
+    `local_quantile_scores`). Call the trainer's post-step helper.
+    Assert:
+      - `quantile_ema` updated (the walker fired).
+      - `expert_bias` updated (quantile-from-EMA drove it).
+      - the accumulator was drained.
+    """
+    import importlib.util as _u
+    repo = Path(__file__).resolve().parent.parent
+    spec = _u.spec_from_file_location(
+        "src.training.routing", str(repo / "src" / "training" / "routing.py"),
+    )
+    routing = _u.module_from_spec(spec)
+    sys.modules["src.training.routing"] = routing
+    spec.loader.exec_module(routing)
+
+    yaml_text = """experiment_name: pure_quantile_e2e
+model:
+  type: standard_moe
+  router_type: deepseek
+  vocab_size: 32
+  hidden_size: 16
+  num_hidden_layers: 1
+  head_dim: 8
+  num_attention_heads: 2
+  num_key_value_heads: 2
+  num_experts: 4
+  num_experts_per_tok: 2
+  moe_intermediate_size: 32
+  intermediate_size: 32
+  norm_topk_prob: true
+  topk_scaling_factor: 2.5
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-06
+  rope_theta: 10000.0
+  max_position_embeddings: 32
+  tie_word_embeddings: true
+  output_router_logits: false
+  attn_implementation: eager
+  mlp_router:
+    balancing: quantile
+    quantile_target_q: 0.5
+    quantile_eta: 0.05
+training:
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 0
+  max_steps: 1
+  batch_size: 1
+  gradient_accumulation: 1
+  mixed_precision: ""
+  output_dir: /tmp
+"""
+    p = tmp_path / "pure_quantile.yaml"
+    p.write_text(yaml_text)
+    cfg = _CFG_MOD.load_config(str(p))
+    torch.manual_seed(20260428)
+    model, _ = _FACTORY_MOD.build_model(cfg)
+    model.train()
+
+    # Run a real forward — this populates `local_quantile_scores`
+    # via the router's training-mode accumulator gate.
+    input_ids = torch.randint(0, model.vocab_size, (1, 8), dtype=torch.long)
+    out = model(input_ids=input_ids, labels=input_ids)
+    out.loss.backward()
+
+    # Find the MLP owner; verify the accumulator filled up.
+    mlp_owner = next(
+        owner for owner, label in model.get_all_balancing_owners()
+        if label == "mlp"
+    )
+    assert len(mlp_owner.local_quantile_scores) >= 1, (
+        f"forward did not append quantile scores; len="
+        f"{len(mlp_owner.local_quantile_scores)}"
+    )
+    initial_bias = mlp_owner.expert_bias.detach().clone()
+    initial_ema = mlp_owner.quantile_ema.detach().clone()
+
+    # Trainer post-step helper. With my F1 fix, the walker fires for
+    # quantile-method models even without DeepSeek bias-rate triples.
+    train_cfg = _CFG_MOD.build_training_config(cfg)
+    routing.trainer_post_optimizer_bias_update(
+        model, train_cfg=train_cfg, cfg=cfg,
+        distributed=False, global_step=1,
+    )
+
+    assert (mlp_owner.quantile_ema != initial_ema).any(), (
+        f"quantile_ema unchanged after walker; pure quantile config "
+        f"did not drive the post-step update. "
+        f"before={initial_ema.tolist()}, after={mlp_owner.quantile_ema.tolist()}"
+    )
+    assert (mlp_owner.expert_bias != initial_bias).any(), (
+        f"expert_bias unchanged after walker; quantile-from-EMA did not "
+        f"write the bias. before={initial_bias.tolist()}, "
+        f"after={mlp_owner.expert_bias.tolist()}"
+    )
+    assert mlp_owner.local_quantile_scores == [], (
+        f"accumulator not drained: len={len(mlp_owner.local_quantile_scores)}"
+    )
+
+
 def test_deepseek_router_registers_quantile_state_unconditionally():
     """Round 41 AC-10: quantile state lives on every DeepSeekRouter
     so the walker can dispatch quantile-method owners without a
@@ -854,16 +1092,20 @@ training:
         )
 
 
-@pytest.mark.parametrize("mlp_method", ["aux_loss", "none"])
+@pytest.mark.parametrize("mlp_method", ["aux_loss", "none", "quantile"])
 def test_mixed_per_class_branch_deepseek_with_various_mlp_methods(tmp_path, mlp_method):
-    """Round 40 review Finding 1: parameterized non-bias MLP variants.
+    """Round 41 review Finding 3: parameterized non-deepseek MLP
+    variants — including `quantile` now that quantile is in
+    `_BIAS_UPDATE_METHODS` and the walker dispatches it.
 
-    The mixed-method gate fix in Round 40 must hold for ANY non-bias
-    MLP method, not just `aux_loss`. Run the same regression for
-    `mlp_router.balancing in {"aux_loss", "none"}`. Quantile is
-    excluded until quantile runtime lands; the validator currently
-    accepts it for MLP but the trainer dispatch on quantile is
-    being added incrementally.
+    Asserts the mixed-method gate fix from Round 40 holds for
+    `mlp_router.balancing in {"aux_loss", "none", "quantile"}`. In
+    every shape:
+      - branch is `deepseek_bias` and gets a non-zero bias delta
+        from imbalanced counts.
+      - MLP is non-deepseek and does NOT receive a deepseek update
+        (the per-owner skip catches it; for quantile the empty
+        accumulator is a quantile no-op too).
     """
     import importlib.util as _u
     repo = Path(__file__).resolve().parent.parent
@@ -881,6 +1123,12 @@ def test_mixed_per_class_branch_deepseek_with_various_mlp_methods(tmp_path, mlp_
         )
     elif mlp_method == "none":
         mlp_block = "    balancing: none\n"
+    elif mlp_method == "quantile":
+        mlp_block = (
+            "    balancing: quantile\n"
+            "    quantile_target_q: 0.5\n"
+            "    quantile_eta: 0.05\n"
+        )
     else:
         raise ValueError(f"unhandled mlp_method={mlp_method}")
 

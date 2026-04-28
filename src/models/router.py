@@ -503,6 +503,16 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
                 ).float()
                 self.local_tokens_per_expert += counts
                 self._last_top_k_idx = top_k_idx.detach()
+                # Quantile-balancing accumulator: append the
+                # per-token, per-expert sigmoid scores for this
+                # forward. The post-step walker concatenates the
+                # list along the token axis and runs a per-expert
+                # quantile reduction. Empty paths (zero active
+                # tokens) skip naturally because `scores.numel()`
+                # is zero. Mirrors the count buffer's recompute
+                # guard so backward replays do not double-append.
+                if scores.numel() > 0:
+                    self.local_quantile_scores.append(scores.detach().float())
         else:
             self._last_top_k_idx = top_k_idx.detach()
 

@@ -155,10 +155,35 @@ def update_bias_from_quantile(
                 f"quantile eta must be in (0, 1]; got {eta}"
             )
         if distributed and dist.is_available() and dist.is_initialized():
+            # Ragged-safe all_gather: per-rank token counts may differ
+            # (e.g. branch-masked paths give different active-token
+            # counts on different ranks). Gather row-counts first,
+            # pad each rank's scores to the max row count, all_gather
+            # the padded tensors, then slice each rank back to its
+            # original row count and concatenate. The fp32 quantile
+            # is computed on the resulting ragged-but-correct global
+            # concatenation.
             world_size = dist.get_world_size()
-            gathered = [torch.zeros_like(scores) for _ in range(world_size)]
-            dist.all_gather(gathered, scores)
-            scores = torch.cat(gathered, dim=0)
+            local_rows = torch.tensor(
+                [scores.shape[0]], dtype=torch.long, device=scores.device,
+            )
+            gathered_counts = [
+                torch.zeros_like(local_rows) for _ in range(world_size)
+            ]
+            dist.all_gather(gathered_counts, local_rows)
+            row_counts = [int(t.item()) for t in gathered_counts]
+            max_rows = max(row_counts)
+            num_experts = scores.shape[1] if scores.ndim > 1 else 0
+            padded = scores.new_zeros((max_rows, num_experts))
+            padded[: scores.shape[0]] = scores
+            gathered_padded = [
+                torch.zeros_like(padded) for _ in range(world_size)
+            ]
+            dist.all_gather(gathered_padded, padded)
+            scores = torch.cat(
+                [g[:n] for g, n in zip(gathered_padded, row_counts) if n > 0],
+                dim=0,
+            )
         # Per-expert target quantile across all observed tokens.
         # `quantile` operates on dim=0 (the n_active_tokens axis) and
         # returns a (num_experts,) tensor.

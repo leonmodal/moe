@@ -315,3 +315,55 @@ def seq_load_balancing_loss_func(
     if num_active_layers == 0:
         return gate_logits[0].new_zeros(())
     return total_loss / num_active_layers
+
+
+def quantile_balancing_update(
+    scores: torch.Tensor,
+    state,
+    *,
+    target_q: float = 0.5,
+    eta: float = 0.05,
+    clamp_range: float = 16.0,
+    distributed: bool = False,
+) -> None:
+    """Public quantile-balancing update.
+
+    Updates the persistent quantile EMA AND derives a per-expert
+    expert-bias from the EMA in place. Wraps the canonical fp32
+    `update_bias_from_quantile` helper from `models.routing.bias`
+    so callers (router classes, bank owners under future bank-level
+    state, ad-hoc tooling) can drive the post-step update through
+    one public API.
+
+    Args:
+      scores: (n_active_tokens, num_experts) fp32 raw scores
+              accumulated since the last update. Empty
+              `n_active_tokens` is a no-op.
+      state: object exposing `expert_bias` and `quantile_ema`
+             attributes (e.g. a router/bank owner). A plain dict
+             with the same string keys is also supported for ad-hoc
+             callers that don't construct a router instance.
+      target_q: per-expert target quantile in [0, 1].
+      eta: EMA learning rate in (0, 1].
+      clamp_range: absolute bias clamp.
+      distributed: when True AND `dist` is initialized, the helper
+                   gathers raw scores across ranks before computing
+                   the global quantile.
+    """
+    from src.models.routing.bias import update_bias_from_quantile
+
+    if isinstance(state, dict):
+        bias = state["expert_bias"]
+        ema = state["quantile_ema"]
+    else:
+        bias = state.expert_bias
+        ema = state.quantile_ema
+    update_bias_from_quantile(
+        bias,
+        ema,
+        scores,
+        target_q=target_q,
+        eta=eta,
+        clamp_range=clamp_range,
+        distributed=distributed,
+    )

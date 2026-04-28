@@ -100,7 +100,9 @@ def trainer_post_optimizer_bias_update(
         getattr(raw_config, "attn_router_balancing", None),
         getattr(raw_config, "branch_balancing", None),
     )
-    if any(m == "deepseek_bias" for m in per_class_methods):
+    any_per_class_deepseek = any(m == "deepseek_bias" for m in per_class_methods)
+    any_per_class_quantile = any(m == "quantile" for m in per_class_methods)
+    if any_per_class_deepseek or any_per_class_quantile:
         method_allows_bias_update = True
 
     # Resolve a `(rate, warmup_start, warmup_steps)` triple for each
@@ -111,6 +113,9 @@ def trainer_post_optimizer_bias_update(
     # `effective_<owner>_bias_*` which `model_factory.py` stamps for
     # every nested per-class block whose `balancing == "deepseek_bias"`.
     # Owners that didn't opt in fall back to the global triple.
+    # Quantile-method owners do NOT have a DeepSeek bias-rate triple;
+    # they fall through this block with `triple == None` and only the
+    # quantile dispatch in the walker fires for them.
     def _resolve_global(field: str, training_field: str) -> float | int | None:
         train_value = getattr(train_cfg, training_field)
         if train_value is not None and train_value > 0:
@@ -151,7 +156,14 @@ def trainer_post_optimizer_bias_update(
 
     if not method_allows_bias_update:
         return
-    if all(triple is None for triple in owner_triples.values()):
+    # Pure quantile configs have no DeepSeek bias-rate triple but
+    # MUST still fire the walker so accumulated scores are drained
+    # through the quantile-update helper.
+    if (
+        all(triple is None for triple in owner_triples.values())
+        and not any_per_class_quantile
+        and method_for_bias_update != "quantile"
+    ):
         return
 
     def _stepped_rate(triple: tuple[float, float, int] | None) -> float:
@@ -367,6 +379,14 @@ def update_expert_biases(
             if per_proj_zero_sum is not None else zero_sum
         )
         _update_single_router_bias(owner, rate, use_dist, zero_sum=owner_zero_sum)
+        # Bound quantile accumulator memory on owners running the
+        # deepseek path. The forward unconditionally appends scores
+        # to `local_quantile_scores` (it doesn't know which method
+        # is active for each owner); without an explicit drain on
+        # non-quantile owners, the list would grow unboundedly across
+        # training steps.
+        if hasattr(owner, "local_quantile_scores") and owner.local_quantile_scores:
+            owner.local_quantile_scores = []
 
 
 def _update_single_router_bias(
