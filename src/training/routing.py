@@ -257,8 +257,28 @@ def update_expert_biases(
     # Respect the stamped method if present. `None` means the caller
     # didn't set a method — preserve legacy unconditional update for
     # back-compat. Set values must be in the bias-update set.
+    #
+    # Mixed per-class override: when a per-class block opts into
+    # `deepseek_bias` (e.g. MLP=aux_loss + branch=deepseek_bias), the
+    # model-level `_load_balancing_method` may be the MLP value (e.g.
+    # `aux_loss`) and would short-circuit the walker. The per-owner
+    # skip logic below already handles non-deepseek owners; the only
+    # gate we need at the model level is "is ANY owner running
+    # deepseek_bias?". Look at both the model-level method AND the
+    # per-class config attributes before returning.
     method = getattr(raw_model, "_load_balancing_method", None)
-    if method is not None and method not in _BIAS_UPDATE_METHODS:
+    config = getattr(raw_model, "config", None)
+    per_class_methods = (
+        getattr(config, "mlp_router_balancing", None),
+        getattr(config, "attn_router_balancing", None),
+        getattr(config, "branch_balancing", None),
+    )
+    any_per_class_deepseek = any(m == "deepseek_bias" for m in per_class_methods)
+    if (
+        method is not None
+        and method not in _BIAS_UPDATE_METHODS
+        and not any_per_class_deepseek
+    ):
         return
 
     get_owners = getattr(raw_model, "get_all_balancing_owners", None)
@@ -295,7 +315,6 @@ def update_expert_biases(
     #   - `config.mlp_router_balancing` for MLP routers
     #   - `config.attn_router_balancing` for attention routers
     #   - `config.branch_balancing` for the branch router
-    config = getattr(raw_model, "config", None)
     label_to_class_method = {
         "mlp": getattr(config, "mlp_router_balancing", None),
         "q":   getattr(config, "attn_router_balancing", None),

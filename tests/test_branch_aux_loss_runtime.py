@@ -608,6 +608,264 @@ training:
             f"before={initial[i].tolist()}, after={r.expert_bias.tolist()}"
         )
 
+    # Round 39 review Finding 2: mutation alone is insufficient — a
+    # subsequent forward through each per-layer router must OBSERVE
+    # the changed bias. Hand-set ATTN-favouring logits on every per-
+    # layer router, run a forward at zero bias (sanity: ATTN), then
+    # write an extreme MLP-favouring `expert_bias` and run again
+    # (must flip to MLP). This proves each per-layer router consumes
+    # its own `expert_bias` during routing.
+    model.eval()  # sampling/training-only branches off
+    for r in branch_routers:
+        with torch.no_grad():
+            r.gate.weight.zero_()
+            r.gate.weight[0, 0] = 4.0
+            r.gate.weight[1, 0] = -4.0
+            r.expert_bias.zero_()
+
+    h = torch.zeros(1, 1, branch_routers[0].gate.in_features)
+    h[0, 0, 0] = 1.0
+    for i, r in enumerate(branch_routers):
+        _, _, attn_mask, mlp_mask = r(h)
+        assert attn_mask[0, 0, 0].item() and not mlp_mask[0, 0, 0].item(), (
+            f"per-layer branch_routers[{i}] zero-bias forward should pick "
+            f"ATTN; got attn={attn_mask[0,0,0].item()}, mlp={mlp_mask[0,0,0].item()}"
+        )
+
+    for r in branch_routers:
+        with torch.no_grad():
+            r.expert_bias[0] = -16.0
+            r.expert_bias[1] = +16.0
+    for i, r in enumerate(branch_routers):
+        _, _, attn_mask, mlp_mask = r(h)
+        assert mlp_mask[0, 0, 0].item() and not attn_mask[0, 0, 0].item(), (
+            f"per-layer branch_routers[{i}] post-bias forward did not flip "
+            f"to MLP; the per-layer router is not consuming its own "
+            f"expert_bias. attn={attn_mask[0,0,0].item()}, "
+            f"mlp={mlp_mask[0,0,0].item()}, expert_bias={r.expert_bias.tolist()}"
+        )
+
+
+def test_mixed_per_class_branch_deepseek_bias_with_mlp_aux_loss(tmp_path):
+    """Round 39 review Finding 1: mixed per-class methods.
+
+    Build moe_everything with `mlp_router.balancing: aux_loss` AND
+    `branch_router.balancing: deepseek_bias`. The factory stamps
+    `model._load_balancing_method = "aux_loss"` because MLP wins. A
+    naive walker then early-returns on the model-level method gate
+    and never updates the branch's `expert_bias` — the post-step
+    walker silently no-ops.
+
+    Pre-populate imbalanced branch counts and identical imbalanced
+    MLP counts. Run `trainer_post_optimizer_bias_update`. Assert:
+      - branch.expert_bias mutates (deepseek path fired for branch).
+      - mlp.expert_bias does NOT receive a deepseek update (MLP class
+        method is `aux_loss`, so the per-owner skip catches it).
+    """
+    import importlib.util as _u
+    repo = Path(__file__).resolve().parent.parent
+    spec = _u.spec_from_file_location(
+        "src.training.routing", str(repo / "src" / "training" / "routing.py"),
+    )
+    routing = _u.module_from_spec(spec)
+    sys.modules["src.training.routing"] = routing
+    spec.loader.exec_module(routing)
+
+    yaml_text = """experiment_name: mixed_mlp_aux_branch_deepseek
+model:
+  type: moe_everything
+  vocab_size: 32
+  hidden_size: 16
+  num_hidden_layers: 1
+  head_dim: 8
+  num_attention_heads: 2
+  num_key_value_heads: 2
+  num_experts: 4
+  num_experts_per_tok: 2
+  moe_intermediate_size: 32
+  intermediate_size: 32
+  norm_topk_prob: true
+  router_exploration_rate: 0.0
+  num_attn_experts: 2
+  num_attn_experts_per_tok: 1
+  attn_expert_mode: per_head_fully_independent
+  scale_attn_by_routing_weight: true
+  scale_branch_by_routing_weight: true
+  per_head_compute_mode: dense
+  use_deepseek_routing: true
+  branch_deepseek: false
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-06
+  rope_theta: 10000.0
+  max_position_embeddings: 32
+  tie_word_embeddings: true
+  output_router_logits: true
+  attn_implementation: eager
+  mlp_router:
+    balancing: aux_loss
+    router_aux_loss_coef: 0.001
+  attn_router:
+    balancing: none
+  branch_router:
+    balancing: deepseek_bias
+    bias_update_rate: 0.5
+    bias_update_zero_sum: true
+training:
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 0
+  max_steps: 1
+  batch_size: 1
+  gradient_accumulation: 1
+  mixed_precision: ""
+  output_dir: /tmp
+"""
+    p = tmp_path / "mixed_mlp_aux_branch_deepseek.yaml"
+    p.write_text(yaml_text)
+    cfg = _CFG_MOD.load_config(str(p))
+    torch.manual_seed(20260428)
+    model, _ = _FACTORY_MOD.build_model(cfg)
+    model.train()
+    branch = model.model.branch_router
+    mlp_owner = next(
+        owner for owner, label in model.get_all_balancing_owners()
+        if label == "mlp"
+    )
+
+    with torch.no_grad():
+        branch.local_tokens_per_expert.zero_()
+        branch.local_tokens_per_expert[0] = 100.0
+        branch.local_tokens_per_expert[1] = 1.0
+        # Same imbalanced shape on MLP — if the walker did the wrong
+        # thing it would mutate this buffer too.
+        mlp_owner.local_tokens_per_expert.zero_()
+        mlp_owner.local_tokens_per_expert[0] = 100.0
+        mlp_owner.local_tokens_per_expert[1:] = 1.0
+        branch_initial = branch.expert_bias.detach().clone()
+        mlp_initial = mlp_owner.expert_bias.detach().clone()
+
+    train_cfg = _CFG_MOD.build_training_config(cfg)
+    routing.trainer_post_optimizer_bias_update(
+        model, train_cfg=train_cfg, cfg=cfg,
+        distributed=False, global_step=1,
+    )
+
+    branch_delta = (branch.expert_bias - branch_initial).abs().max().item()
+    mlp_delta = (mlp_owner.expert_bias - mlp_initial).abs().max().item()
+    assert branch_delta > 1e-4, (
+        f"mixed-method config (MLP=aux_loss + branch=deepseek_bias) failed "
+        f"to update branch.expert_bias; the walker early-returned on the "
+        f"model-level method gate before the per-owner deepseek_bias dispatch "
+        f"could fire. branch_delta={branch_delta:.6e}"
+    )
+    assert mlp_delta == 0.0, (
+        f"MLP class method is `aux_loss`; the walker should have skipped the "
+        f"MLP owner during the deepseek dispatch. mlp_delta={mlp_delta:.6e}"
+    )
+
+
+def test_config_level_branch_sampling_with_nested_deepseek_bias(tmp_path):
+    """Round 39 review Finding 3: config-level branch sampling test.
+
+    `load_config -> build_model` with `branch_sampling: true` AND
+    nested `branch_router.balancing: deepseek_bias`. Verify:
+      - the built BranchRouter has `use_sampling=True`.
+      - the built BranchRouter has `use_deepseek_style=True` (folded
+        from the `balancing` field).
+      - sampling forward consumes `expert_bias` at the config level
+        (not just at the unit-construction level).
+    """
+    yaml_text = """experiment_name: branch_sampling_deepseek
+model:
+  type: moe_everything
+  vocab_size: 32
+  hidden_size: 16
+  num_hidden_layers: 1
+  head_dim: 8
+  num_attention_heads: 2
+  num_key_value_heads: 2
+  num_experts: 4
+  num_experts_per_tok: 2
+  moe_intermediate_size: 32
+  intermediate_size: 32
+  norm_topk_prob: true
+  router_exploration_rate: 0.0
+  num_attn_experts: 2
+  num_attn_experts_per_tok: 1
+  attn_expert_mode: per_head_fully_independent
+  scale_attn_by_routing_weight: true
+  scale_branch_by_routing_weight: true
+  per_head_compute_mode: dense
+  use_deepseek_routing: true
+  branch_deepseek: false
+  branch_sampling: true
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-06
+  rope_theta: 10000.0
+  max_position_embeddings: 32
+  tie_word_embeddings: true
+  output_router_logits: true
+  attn_implementation: eager
+  mlp_router:
+    balancing: none
+  attn_router:
+    balancing: none
+  branch_router:
+    balancing: deepseek_bias
+    bias_update_rate: 0.5
+    bias_update_zero_sum: true
+training:
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 0
+  max_steps: 1
+  batch_size: 1
+  gradient_accumulation: 1
+  mixed_precision: ""
+  output_dir: /tmp
+"""
+    p = tmp_path / "branch_sampling_deepseek.yaml"
+    p.write_text(yaml_text)
+    cfg = _CFG_MOD.load_config(str(p))
+    torch.manual_seed(20260428)
+    model, _ = _FACTORY_MOD.build_model(cfg)
+    branch = model.model.branch_router
+    assert branch.use_sampling is True, (
+        f"build_model did not propagate `branch_sampling: true` to the "
+        f"BranchRouter; got use_sampling={branch.use_sampling}"
+    )
+    assert branch.use_deepseek_style is True, (
+        f"build_model did not fold `branch_router.balancing=deepseek_bias` "
+        f"into BranchRouter.use_deepseek_style; got "
+        f"{branch.use_deepseek_style}"
+    )
+    assert branch.balancing == "deepseek_bias"
+
+    # Forward path test: equal logits + extreme MLP-favouring bias =>
+    # sampling should land overwhelmingly on MLP.
+    model.train()
+    with torch.no_grad():
+        branch.gate.weight.zero_()
+        if branch.gate.bias is not None:
+            branch.gate.bias.zero_()
+        branch.expert_bias[0] = -16.0
+        branch.expert_bias[1] = +16.0
+    h = torch.zeros(1, 2000, branch.gate.in_features)
+    torch.manual_seed(7)
+    _, _, _attn_mask, mlp_mask = branch(h)
+    mlp_fraction = mlp_mask.float().mean().item()
+    assert mlp_fraction > 0.95, (
+        f"config-level `branch_sampling: true` + nested `deepseek_bias` "
+        f"sampling forward did not consume expert_bias; observed MLP fraction "
+        f"= {mlp_fraction:.3f} with extreme MLP-favouring bias; expected > 0.95."
+    )
+
 
 def test_walker_per_proj_zero_sum_dispatches_per_owner_mode():
     """Round 38 review Finding 2: per-owner zero-sum dispatch.
