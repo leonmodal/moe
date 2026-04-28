@@ -100,46 +100,81 @@ def trainer_post_optimizer_bias_update(
     )
     if any(m == "deepseek_bias" for m in per_class_methods):
         method_allows_bias_update = True
-    # Per-class effective rate: when the nested-schema yaml sets
-    # `model.mlp_router.balancing == "deepseek_bias"` and a
-    # per-class `bias_update_rate`, the trainer must run the bias
-    # update on that rate even when top-level
-    # `train_cfg.bias_update_rate` is zero (the migrator strips the
-    # top-level field once a per-class block exists). Read the
-    # mirrored `effective_bias_update_rate` that `model_factory.py`
-    # stamps onto `config` for every nested deepseek_bias build.
-    raw_config = getattr(raw_model, "config", None)
-    effective_rate = getattr(raw_config, "effective_bias_update_rate", None)
-    bias_update_rate = train_cfg.bias_update_rate
-    if (effective_rate is not None and effective_rate > 0
-            and bias_update_rate <= 0):
-        bias_update_rate = float(effective_rate)
-    bias_warmup_start = (
-        getattr(raw_config, "effective_bias_warmup_start", None)
-        if train_cfg.bias_warmup_start <= 0 else train_cfg.bias_warmup_start
-    )
-    if bias_warmup_start is None:
-        bias_warmup_start = train_cfg.bias_warmup_start
-    bias_warmup_steps = (
-        getattr(raw_config, "effective_bias_warmup_steps", None)
-        if train_cfg.bias_warmup_steps <= 0 else train_cfg.bias_warmup_steps
-    )
-    if bias_warmup_steps is None:
-        bias_warmup_steps = train_cfg.bias_warmup_steps
-    if not (bias_update_rate > 0 and method_allows_bias_update):
-        return
-    rate = get_bias_rate(
-        model, global_step, bias_update_rate,
-        bias_warmup_start, bias_warmup_steps,
-    )
-    per_proj_rates = {
-        "q": _resolve_balancing_field(cfg, "bias_rate_q", rate),
-        "k": _resolve_balancing_field(cfg, "bias_rate_k", rate),
-        "v": _resolve_balancing_field(cfg, "bias_rate_v", rate),
-        "o": _resolve_balancing_field(cfg, "bias_rate_o", rate),
-        "mlp": _resolve_balancing_field(cfg, "bias_rate_mlp", rate),
-        "branch": _resolve_balancing_field(cfg, "bias_rate_branch", rate),
+
+    # Resolve a `(rate, warmup_start, warmup_steps)` triple for each
+    # owner — global, MLP, attention, branch. The global triple
+    # comes from `TrainingConfig` (or, when those are zeroed out by
+    # the nested-schema migrator, the un-prefixed `effective_*`
+    # alias). The per-owner triples come from
+    # `effective_<owner>_bias_*` which `model_factory.py` stamps for
+    # every nested per-class block whose `balancing == "deepseek_bias"`.
+    # Owners that didn't opt in fall back to the global triple.
+    def _resolve_global(field: str, training_field: str) -> float | int | None:
+        train_value = getattr(train_cfg, training_field)
+        if train_value is not None and train_value > 0:
+            return train_value
+        return getattr(raw_config, f"effective_{field}", train_value)
+
+    global_rate = _resolve_global("bias_update_rate", "bias_update_rate")
+    global_warm_start = _resolve_global("bias_warmup_start", "bias_warmup_start")
+    global_warm_steps = _resolve_global("bias_warmup_steps", "bias_warmup_steps")
+
+    def _per_owner_triple(owner: str) -> tuple[float, float, int] | None:
+        rate_val = getattr(raw_config, f"effective_{owner}_bias_update_rate", None)
+        if rate_val is None or rate_val <= 0:
+            if global_rate is None or global_rate <= 0:
+                return None
+            return (
+                float(global_rate),
+                float(global_warm_start) if global_warm_start else 0.0,
+                int(global_warm_steps) if global_warm_steps else 0,
+            )
+        warm_start = getattr(
+            raw_config, f"effective_{owner}_bias_warmup_start", global_warm_start,
+        )
+        warm_steps = getattr(
+            raw_config, f"effective_{owner}_bias_warmup_steps", global_warm_steps,
+        )
+        return (
+            float(rate_val),
+            float(warm_start) if warm_start else 0.0,
+            int(warm_steps) if warm_steps else 0,
+        )
+
+    owner_triples = {
+        "mlp": _per_owner_triple("mlp"),
+        "attn": _per_owner_triple("attn"),
+        "branch": _per_owner_triple("branch"),
     }
+
+    if not method_allows_bias_update:
+        return
+    if all(triple is None for triple in owner_triples.values()):
+        return
+
+    def _stepped_rate(triple: tuple[float, float, int] | None) -> float:
+        if triple is None:
+            return 0.0
+        rate_val, warm_start, warm_steps = triple
+        return get_bias_rate(model, global_step, rate_val, warm_start, warm_steps)
+
+    mlp_rate = _stepped_rate(owner_triples["mlp"])
+    attn_rate = _stepped_rate(owner_triples["attn"])
+    branch_rate = _stepped_rate(owner_triples["branch"])
+
+    # Legacy `bias_rate_<proj>` overrides from the canonical
+    # `training:` block continue to win when explicitly set — they
+    # are the user's per-projection escape hatch and are treated as
+    # absolute (no warmup re-application).
+    per_proj_rates = {
+        "q": _resolve_balancing_field(cfg, "bias_rate_q", attn_rate),
+        "k": _resolve_balancing_field(cfg, "bias_rate_k", attn_rate),
+        "v": _resolve_balancing_field(cfg, "bias_rate_v", attn_rate),
+        "o": _resolve_balancing_field(cfg, "bias_rate_o", attn_rate),
+        "mlp": _resolve_balancing_field(cfg, "bias_rate_mlp", mlp_rate),
+        "branch": _resolve_balancing_field(cfg, "bias_rate_branch", branch_rate),
+    }
+
     # Per-class `bias_update_zero_sum` mirror — falls back to
     # top-level when unset.
     effective_zero_sum = getattr(
@@ -147,9 +182,13 @@ def trainer_post_optimizer_bias_update(
     )
     if effective_zero_sum is None:
         effective_zero_sum = train_cfg.bias_update_zero_sum
+    # The fallback `bias_rate` for the walker is the maximum among
+    # per-owner rates so labels not covered by `per_proj_rates` (or
+    # absent owners) keep using a sane positive value rather than 0.
+    fallback_rate = max(mlp_rate, attn_rate, branch_rate)
     with torch.no_grad():
         update_expert_biases(
-            model, bias_rate=rate, distributed=distributed,
+            model, bias_rate=fallback_rate, distributed=distributed,
             per_proj_rates=per_proj_rates,
             zero_sum=bool(effective_zero_sum),
         )

@@ -204,9 +204,9 @@ def _expand_top_level_method_to_per_class(cfg: dict) -> list[str]:
     The migration only fires when the per-class blocks are
     ABSENT (so a yaml already on the nested schema does not
     duplicate entries). The flat `training.load_balancing_method`
-    is left in place — Round 28 keeps it as a runtime input until
-    the full nested-schema cutover lands; the runtime falls back
-    to it when per-class fields are absent.
+    is left in place as a runtime input until the full nested-schema
+    cutover lands; the runtime falls back to it when per-class
+    fields are absent.
     """
     changes: list[str] = []
     if "model" not in cfg or not isinstance(cfg["model"], dict):

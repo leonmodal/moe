@@ -401,27 +401,36 @@ def build_model(cfg: dict):
     if mlp_class_method is not None and mlp_class_method != "none":
         model._load_balancing_method = mlp_class_method
         config.load_balancing_method = mlp_class_method
-        # Per-class deepseek_bias / quantile knobs feed the trainer's
-        # bias-update path. The trainer reads `bias_update_rate` from
-        # `TrainingConfig`, so we mirror the per-class value onto the
-        # config object's training-side surface for runtime visibility.
-        if mlp_class_method == "deepseek_bias":
-            mlp_block = mcfg["mlp_router"]
-            for key in ("bias_update_rate", "bias_update_zero_sum",
-                        "bias_warmup_start", "bias_warmup_steps"):
-                if key in mlp_block:
-                    setattr(config, f"effective_{key}", mlp_block[key])
 
-    # Round 37: same effective_* mirror for the branch router. When
-    # branch_router.balancing == deepseek_bias, the trainer's bias-update
-    # walker needs `effective_bias_update_rate` (etc.) to be visible on
-    # `config` so it can fall back from a zeroed top-level
-    # `train_cfg.bias_update_rate` to the per-class branch value.
-    branch_block = mcfg.get("branch_router") if isinstance(mcfg.get("branch_router"), dict) else None
-    if branch_block is not None and branch_block.get("balancing") == "deepseek_bias":
-        for key in ("bias_update_rate", "bias_update_zero_sum",
-                    "bias_warmup_start", "bias_warmup_steps"):
-            if key in branch_block and not hasattr(config, f"effective_{key}"):
-                setattr(config, f"effective_{key}", branch_block[key])
+    # Per-owner deepseek_bias knob mirroring. When several routers
+    # opt into `deepseek_bias` simultaneously (e.g. MLP at rate 1e-3
+    # and branch at rate 5e-4), the trainer must dispatch the OWNER's
+    # rate / warmup / zero-sum to that owner — not collapse them onto
+    # one global value. Stamp `effective_<owner>_bias_*` for each
+    # nested per-class block; keep the un-prefixed `effective_bias_*`
+    # alias pointing at MLP first then branch for back-compat with
+    # callers that still read the global field.
+    owner_to_block: list[tuple[str, dict]] = []
+    if isinstance(mcfg.get("mlp_router"), dict):
+        owner_to_block.append(("mlp", mcfg["mlp_router"]))
+    if isinstance(mcfg.get("attn_router"), dict):
+        owner_to_block.append(("attn", mcfg["attn_router"]))
+    if isinstance(mcfg.get("branch_router"), dict):
+        owner_to_block.append(("branch", mcfg["branch_router"]))
+    bias_keys = (
+        "bias_update_rate", "bias_update_zero_sum",
+        "bias_warmup_start", "bias_warmup_steps",
+    )
+    for owner, block in owner_to_block:
+        if block.get("balancing") != "deepseek_bias":
+            continue
+        for key in bias_keys:
+            if key in block:
+                setattr(config, f"effective_{owner}_{key}", block[key])
+                # Back-compat global alias: first writer wins so MLP
+                # takes precedence over branch under mixed configs,
+                # matching prior behavior.
+                if not hasattr(config, f"effective_{key}"):
+                    setattr(config, f"effective_{key}", block[key])
 
     return model, config

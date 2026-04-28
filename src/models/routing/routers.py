@@ -60,7 +60,6 @@ class BranchRouter(nn.Module):
         self.scale_by_routing_weight = scale_by_routing_weight
         self.use_sampling = use_sampling
         self.use_seq_level = use_seq_level
-        self.use_deepseek_style = use_deepseek_style
         # `balancing`: branch-router balancing mode. Allowed values:
         #   "none"             - default; no exploration override.
         #   "exploration_only" - every step draws a per-token explore
@@ -82,7 +81,7 @@ class BranchRouter(nn.Module):
         # via the same helpers used for MLP and attention routers.
         # `deepseek_bias`: BranchRouter already owns `expert_bias`
         # and `local_tokens_per_expert` for the binary ATTN/MLP
-        # pool (DEC-18 canonical balancing-owner interface). The
+        # pool via the canonical balancing-owner interface. The
         # post-step walker dispatches per-owner so this update
         # fires regardless of what method MLP / attention pick.
         # `quantile` still needs owner-state plumbing (persistent
@@ -115,6 +114,14 @@ class BranchRouter(nn.Module):
                 f"exploration_only_rate must be in [0, 1], got {exploration_only_rate}"
             )
         self.balancing = balancing
+        # When `balancing == "deepseek_bias"`, the router MUST consume
+        # `expert_bias` during scoring — otherwise the post-step
+        # walker would mutate a buffer that the runtime ignores. Fold
+        # the per-class method choice into the runtime style flag
+        # instead of leaving it gated on a separate legacy
+        # `use_deepseek_style` config knob: a single attribute drives
+        # both buffer creation, count tracking, and biased argmax.
+        self.use_deepseek_style = use_deepseek_style or balancing == "deepseek_bias"
         self.exploration_only_rate = exploration_only_rate
         # Optional `torch.Generator` for deterministic exploration-only
         # draws. Tests inject a seeded generator to assert the
@@ -140,13 +147,12 @@ class BranchRouter(nn.Module):
         # (real forward sampled → 2 saved tensors; recompute used
         # cache → 0 saved tensors). The count-buffer guard in
         # `forward` plus PyTorch's RNG preservation are sufficient.
-        # The DEC-18 canonical balancing-owner buffers are needed
-        # whenever the runtime uses biased argmax (use_deepseek_style)
-        # OR when the per-class branch method is `deepseek_bias`
-        # (since the post-step walker reads these buffers to apply
-        # the bias update).
-        needs_bias_buffers = use_deepseek_style or balancing == "deepseek_bias"
-        if needs_bias_buffers:
+        # The canonical balancing-owner buffers (`expert_bias` and
+        # `local_tokens_per_expert`) are needed whenever the runtime
+        # uses biased argmax — `self.use_deepseek_style` already
+        # subsumes both the explicit flag and the per-class
+        # `balancing == "deepseek_bias"` upgrade above.
+        if self.use_deepseek_style:
             # Every load-balancing owner — standalone DeepSeekRouter,
             # BranchRouter, or shared expert bank — exposes the same
             # `expert_bias` (persistent fp32) and
@@ -280,7 +286,7 @@ class BranchRouter(nn.Module):
         # into a buffer the trainer is asked to never read for this
         # mode.
         if (
-            (self.use_deepseek_style or self.balancing == "deepseek_bias")
+            self.use_deepseek_style
             and self.balancing != "exploration_only"
             and self.training
             and torch.is_grad_enabled()
