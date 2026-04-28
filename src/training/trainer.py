@@ -138,7 +138,11 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
                 print("Gradient checkpointing enabled.", flush=True)
 
     model.to(device)
-    seq_aux_loss_coef = cfg["model"].get("seq_aux_loss_coef", 0.0)
+    # Per DEC-3b: seq_aux_loss_coef lives under `training:` (canonical). The
+    # resolver falls back to `model:` with a deprecation warning for any
+    # unmigrated yamls.
+    from .model_factory import _resolve_balancing_field
+    seq_aux_loss_coef = _resolve_balancing_field(cfg, "seq_aux_loss_coef", 0.0)
     if seq_aux_loss_coef:
         model._seq_aux_loss_coef = seq_aux_loss_coef
 

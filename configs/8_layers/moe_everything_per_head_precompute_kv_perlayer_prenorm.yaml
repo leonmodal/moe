@@ -1,14 +1,4 @@
-# ============================================================================
-# Precompute-KV MoE-Everything with PER-LAYER routers and PER-LAYER prenorms.
-# K/V are shared per token (precompute-KV); Q and O are per-head expert-routed.
-# Each depth iteration has its own routers (branch, MLP, Q, O) and its own
-# pre-attention / pre-MLP RMSNorms, while the expert banks (32 attention,
-# 64 MLP) remain shared across depths.
-#
-# Branch-router aux loss is on (`branch_router_aux_loss_coef: 0.001`).
-# ============================================================================
 experiment_name: 8_layers_moe_everything_per_head_precompute_kv_perlayer_prenorm
-
 model:
   type: moe_everything
   vocab_size: 151936
@@ -23,10 +13,7 @@ model:
   intermediate_size: 3072
   norm_topk_prob: true
   branch_router_aux_loss_coef: 0.001
-  router_aux_loss_coef: 0.001
-  seq_aux_loss_coef: 0.0001
   router_exploration_rate: 0.02
-  bias_update_rate: 0.001
   bias_interpolation: false
   topk_scaling_factor: 2.5
   num_groups: 8
@@ -43,15 +30,13 @@ model:
   per_layer_norm: true
   attention_bias: false
   attention_dropout: 0.0
-  rms_norm_eps: 1.0e-6
+  rms_norm_eps: 1.0e-06
   rope_theta: 1000000.0
   max_position_embeddings: 32768
   tie_word_embeddings: true
   output_router_logits: true
-  load_balancing_method: aux_loss  # aux_loss | seq_aux_loss | deepseek_bias | quantile | none
-
 training:
-  learning_rate: 1.0e-3
+  learning_rate: 0.001
   weight_decay: 0.01
   beta1: 0.9
   beta2: 0.95
@@ -71,20 +56,21 @@ training:
   output_dir: ./outputs/8_layers/moe_everything_per_head_precompute_kv_perlayer_prenorm
   wandb_project: moe-scaling
   wandb_run_name: 8_layers_moe_everything_per_head_precompute_kv_perlayer_prenorm
-
+  router_aux_loss_coef: 0.001
+  seq_aux_loss_coef: 0.0001
+  bias_update_rate: 0.001
+  load_balancing_method: aux_loss
 data:
   data_dir: ./data/parquet
   text_column: text
   seq_len: 1024
   tokenizer_name: Qwen/Qwen3-0.6B
   num_workers: 4
-
 eval:
   enabled: true
   every: 250
   max_batches: 20
   holdout_fraction: 0.05
   seed: 1234
-
 checkpoint:
   resume_from: null

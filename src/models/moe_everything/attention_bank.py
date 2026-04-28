@@ -307,7 +307,8 @@ class AttentionExpertBank(nn.Module):
         norm_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if (
-            os.environ.get("MOE_EVERYTHING_DISABLE_GROUPED_MM", "0") == "0"
+            triton_grouped_gemm is not None
+            and os.environ.get("MOE_EVERYTHING_DISABLE_GROUPED_MM", "0") == "0"
             and os.environ.get("MOE_EVERYTHING_DISABLE_ATTN_GROUPED_MM", "0") == "0"
             and sorted_inputs.is_cuda
             and sorted_inputs.dtype in (torch.bfloat16, torch.float16)
@@ -739,24 +740,46 @@ class AttentionExpertBank(nn.Module):
             # Expand mask to match per-head flattened probs: (N,) -> (N*H,)
             if num_head_repeats > 1:
                 flat_mask = flat_mask.repeat(num_head_repeats)
-            dense_probs = router_probs.new_zeros(flat_mask.numel(), router_probs.shape[-1])
-            dense_probs[flat_mask] = router_probs
+            # AC-8: build the dense `router_logits` via the FUNCTIONAL
+            # `index_copy` (out-of-place) so autograd records a
+            # `IndexCopyBackward` and gradient flows from `dense_probs` back to
+            # `router_probs` and onward to the attention router weight. The
+            # legacy `dense[mask] = src` indexed-assignment pattern is
+            # autograd-opaque when `dense` is a leaf with `requires_grad=False`
+            # (which `new_zeros(...)` produces), and was the root cause of the
+            # AC-8 regression.
+            mask_idx = flat_mask.nonzero(as_tuple=False).squeeze(-1)
+            dense_probs = torch.zeros(
+                flat_mask.numel(),
+                router_probs.shape[-1],
+                dtype=router_probs.dtype,
+                device=router_probs.device,
+            )
+            dense_probs = dense_probs.index_copy(0, mask_idx, router_probs)
 
+            # selected_experts is not gradient-bearing; the legacy in-place
+            # path is fine here.
             if expert_idx.ndim == 1:
                 dense_idx = expert_idx.new_zeros(flat_mask.numel())
             else:
                 dense_idx = expert_idx.new_zeros((flat_mask.numel(), expert_idx.shape[-1]))
             dense_idx[flat_mask] = expert_idx
 
+            # Store an additional `router_logits_detached` view for any
+            # consumer that explicitly needs the no-grad form (telemetry
+            # plots, etc.).
             self.last_router_info[name] = {
-                "router_logits": dense_probs.detach(),
+                "router_logits": dense_probs,
+                "router_logits_detached": dense_probs.detach(),
                 "selected_experts": dense_idx.detach(),
                 "token_mask": flat_mask.detach(),
             }
             return
 
+        # AC-8: same gradient-preserving rule for the non-token-masked path.
         self.last_router_info[name] = {
-            "router_logits": router_probs.detach(),
+            "router_logits": router_probs,
+            "router_logits_detached": router_probs.detach(),
             "selected_experts": expert_idx.detach(),
         }
 

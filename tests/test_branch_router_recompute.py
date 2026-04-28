@@ -95,9 +95,66 @@ def test_branch_router_buffer_names_are_canonical():
     assert not hasattr(router, "local_counts"), "legacy `local_counts` buffer must be removed"
 
 
+def test_branch_router_under_torch_utils_checkpoint_matches_no_checkpoint():
+    """Full AC-9 integration: a forward+backward through `torch.utils.checkpoint`
+    must produce the same `local_tokens_per_expert` as a forward+backward with
+    checkpointing disabled, on the same seed.
+
+    `torch.utils.checkpoint` re-executes the forward during backward; without
+    the `is_checkpoint_recompute()` guard introduced by Round 1 + the
+    exploration-mask cache introduced by Round 2, the recompute would
+    double-count or change the branch decision and the comparison would
+    diverge. This test exercises the same end-to-end path that
+    `MoEverythingModel.gradient_checkpointing_enable` lights up in production.
+    """
+    from src.models.router import checkpoint_recompute_context
+
+    def _checkpoint_context_fn():
+        # Mirrors `MoEverythingModel._checkpoint_context_fn`: real forward
+        # runs with the recompute flag OFF, recompute runs with it ON.
+        return checkpoint_recompute_context(False), checkpoint_recompute_context(True)
+
+    def _make_router_and_input(seed: int):
+        torch.manual_seed(seed)
+        router = BranchRouter(hidden_size=8, use_deepseek_style=True).train()
+        x = torch.randn(2, 4, 8, requires_grad=True)
+        return router, x
+
+    def _ckpt_call(router, x):
+        # `torch.utils.checkpoint` requires a callable taking + returning tensors.
+        # We sum the four returned tensors so backward has something to chain to.
+        def fn(inp):
+            w_attn, w_mlp, attn_mask, mlp_mask = router(inp)
+            return w_attn.sum() + w_mlp.sum() + attn_mask.float().sum() + mlp_mask.float().sum()
+
+        return torch.utils.checkpoint.checkpoint(
+            fn, x, use_reentrant=False, context_fn=_checkpoint_context_fn,
+        )
+
+    # Run A: checkpointing disabled.
+    router_a, x_a = _make_router_and_input(seed=42)
+    out_a = router_a(x_a)
+    (out_a[0].sum() + out_a[1].sum()).backward()
+    counts_a = router_a.local_tokens_per_expert.clone()
+
+    # Run B: checkpointing enabled (single block).
+    router_b, x_b = _make_router_and_input(seed=42)
+    loss = _ckpt_call(router_b, x_b)
+    loss.backward()
+    counts_b = router_b.local_tokens_per_expert
+
+    # The count buffer must be identical between the two runs — recompute did
+    # NOT double-count (AC-9).
+    assert torch.equal(counts_a, counts_b), (
+        f"counts diverged between checkpointed and non-checkpointed runs: "
+        f"{counts_a} vs {counts_b}. AC-9 regression."
+    )
+
+
 if __name__ == "__main__":
     test_branch_router_real_forward_increments_counts()
     test_branch_router_recompute_does_not_double_count()
     test_branch_router_no_grad_does_not_count()
     test_branch_router_buffer_names_are_canonical()
+    test_branch_router_under_torch_utils_checkpoint_matches_no_checkpoint()
     print("ALL OK")

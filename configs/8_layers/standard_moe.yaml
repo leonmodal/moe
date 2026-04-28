@@ -1,17 +1,4 @@
-# ============================================================================
-# Standard MoE — Qwen3-MoE-style PER-LAYER mixture of experts.
-# Each layer has its OWN pool of 16 experts; tokens route within that pool only.
-# Total MLP experts in the model = 16 × num_hidden_layers.
-#
-# Routing (per token, per layer), default `router_type: deepseek`:
-#   - FP32 sigmoid scoring over the 16 experts.
-#   - Group-limited top-k: 8 groups → 4 selected → top-4 experts per token.
-#   - `topk_scaling_factor: 2.5` rescales the gathered routing weights.
-#   - Auxiliary-loss-free expert-bias update applied post-step.
-# Attention is dense (no MoE on attention).
-# ============================================================================
 experiment_name: 8_layers_standard_moe
-
 model:
   type: standard_moe
   router_type: deepseek
@@ -26,10 +13,7 @@ model:
   moe_intermediate_size: 768
   intermediate_size: 3072
   norm_topk_prob: true
-  router_aux_loss_coef: 0.001
-  seq_aux_loss_coef: 0.0001
   router_exploration_rate: 0.02
-  bias_update_rate: 0.001
   bias_interpolation: false
   global_router_update: true
   topk_scaling_factor: 2.5
@@ -37,15 +21,13 @@ model:
   group_topk: 4
   attention_bias: false
   attention_dropout: 0.0
-  rms_norm_eps: 1.0e-6
+  rms_norm_eps: 1.0e-06
   rope_theta: 1000000.0
   max_position_embeddings: 32768
   tie_word_embeddings: true
   output_router_logits: true
-  load_balancing_method: aux_loss  # aux_loss | seq_aux_loss | deepseek_bias | quantile | none
-
 training:
-  learning_rate: 1.0e-3
+  learning_rate: 0.001
   weight_decay: 0.01
   beta1: 0.9
   beta2: 0.95
@@ -65,20 +47,21 @@ training:
   output_dir: ./outputs/8_layers/standard_moe
   wandb_project: moe-scaling
   wandb_run_name: 8_layers_standard_moe
-
+  router_aux_loss_coef: 0.001
+  seq_aux_loss_coef: 0.0001
+  bias_update_rate: 0.001
+  load_balancing_method: aux_loss
 data:
   data_dir: ./data/parquet
   text_column: text
   seq_len: 1024
   tokenizer_name: Qwen/Qwen3-0.6B
   num_workers: 4
-
 eval:
   enabled: true
   every: 250
   max_batches: 20
   holdout_fraction: 0.05
   seed: 1234
-
 checkpoint:
   resume_from: null

@@ -60,6 +60,15 @@ class BranchRouter(nn.Module):
         self.use_deepseek_style = use_deepseek_style
         self.last_probs = None
         self.last_selected_experts = None
+        # AC-9: exploration sampling cache. On the real forward pass we sample
+        # the binary explore mask + the per-token random override values once
+        # and stash detached copies here; under `is_checkpoint_recompute()`
+        # we reuse them so the gradient-checkpoint replay produces an
+        # identical branch decision (and gradient consistency holds). This is
+        # belt-and-suspenders on top of `torch.utils.checkpoint`'s default
+        # `preserve_rng_state=True`, and gives tests a deterministic anchor.
+        self._last_exploration_mask: torch.Tensor | None = None
+        self._last_exploration_random: torch.Tensor | None = None
         if use_deepseek_style:
             # Canonical balancing-owner buffer interface (DEC-18 / DEC-19): every
             # owner — standalone DeepSeekRouter, BranchRouter, or shared expert
@@ -113,10 +122,34 @@ class BranchRouter(nn.Module):
                 else:
                     choice_scores = probs.float()
                     if self.training and self.exploration_rate > 0.0:
-                        explore_mask = torch.rand(choice_scores.shape[:-1], device=choice_scores.device) < self.exploration_rate
+                        # AC-9: under gradient-checkpoint recompute, reuse the
+                        # cached explore mask + override values from the real
+                        # forward pass so the recompute branch decision is
+                        # identical and gradient consistency holds.
+                        if (
+                            is_checkpoint_recompute()
+                            and self._last_exploration_mask is not None
+                            and self._last_exploration_mask.shape == choice_scores.shape[:-1]
+                            and self._last_exploration_mask.device == choice_scores.device
+                        ):
+                            explore_mask = self._last_exploration_mask
+                            random_overrides = self._last_exploration_random
+                        else:
+                            explore_mask = torch.rand(
+                                choice_scores.shape[:-1], device=choice_scores.device
+                            ) < self.exploration_rate
+                            random_overrides = None
+                            # Stash for potential recompute replay (only when this
+                            # is the real forward — see count-buffer guard above).
+                            if torch.is_grad_enabled() and not is_checkpoint_recompute():
+                                self._last_exploration_mask = explore_mask.detach()
                         if explore_mask.any():
                             choice_scores = choice_scores.clone()
-                            choice_scores[explore_mask] = torch.rand_like(choice_scores[explore_mask])
+                            if random_overrides is None:
+                                random_overrides = torch.rand_like(choice_scores[explore_mask])
+                                if torch.is_grad_enabled() and not is_checkpoint_recompute():
+                                    self._last_exploration_random = random_overrides.detach()
+                            choice_scores[explore_mask] = random_overrides
                     choice = choice_scores.argmax(dim=-1)
 
             # Broadcast seq-level decision to all tokens

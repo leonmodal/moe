@@ -10,6 +10,55 @@ Supported model types:
 from __future__ import annotations
 
 import os
+import warnings
+
+
+# Per DEC-3b (RESOLVED 2026-04-27 → AC-3): these balancing fields live ONLY
+# under `training:`. The `model:` block was the old location; we read from
+# `model:` as a deprecated fallback (with a warning) so any unmigrated yamls
+# continue to work, but the canonical home is `training:`.
+_BALANCING_FIELDS_IN_TRAINING = (
+    "router_aux_loss_coef",
+    "seq_aux_loss_coef",
+    "bias_update_rate",
+    "bias_warmup_start",
+    "bias_warmup_steps",
+    "load_balancing_method",
+    "bias_rate_q",
+    "bias_rate_k",
+    "bias_rate_v",
+    "bias_rate_o",
+    "bias_rate_mlp",
+    "bias_rate_branch",
+)
+
+
+def _resolve_balancing_field(cfg: dict, name: str, default):
+    """Read a balancing field from `cfg["training"]`, falling back to
+    `cfg["model"]` with a deprecation warning if found there.
+
+    Returns the resolved value (or `default` if neither block has it).
+    """
+    tcfg = cfg.get("training", {}) or {}
+    mcfg = cfg.get("model", {}) or {}
+    if name in tcfg:
+        if name in mcfg:
+            warnings.warn(
+                f"Config field {name!r} appears in BOTH `training:` and `model:`; "
+                f"using the `training:` value (canonical per DEC-3b). Remove the "
+                f"`model:` copy to silence this warning.",
+                DeprecationWarning, stacklevel=3,
+            )
+        return tcfg[name]
+    if name in mcfg:
+        warnings.warn(
+            f"Config field {name!r} found under `model:` — DEC-3b moved it to "
+            f"`training:`. The `model:` placement is deprecated; run "
+            f"`python scripts/migrate_balancing_fields_to_training.py` to migrate.",
+            DeprecationWarning, stacklevel=3,
+        )
+        return mcfg[name]
+    return default
 
 from src.models import (
     Qwen3Config,
@@ -169,8 +218,10 @@ def build_model(cfg: dict):
         rope_theta=mcfg.get("rope_theta", 1_000_000.0),
         rms_norm_eps=mcfg.get("rms_norm_eps", 1e-6),
         tie_word_embeddings=mcfg.get("tie_word_embeddings", False),
-        router_aux_loss_coef=mcfg.get("router_aux_loss_coef", 0.001),
-        seq_aux_loss_coef=mcfg.get("seq_aux_loss_coef", 0.0),
+        # Per DEC-3b: aux coefficients live in `training:`. Fall back to
+        # `model:` with a deprecation warning for unmigrated yamls.
+        router_aux_loss_coef=_resolve_balancing_field(cfg, "router_aux_loss_coef", 0.001),
+        seq_aux_loss_coef=_resolve_balancing_field(cfg, "seq_aux_loss_coef", 0.0),
         norm_topk_prob=mcfg.get("norm_topk_prob", True),
         num_experts_per_tok=mcfg["num_experts_per_tok"],
         output_router_logits=True,
