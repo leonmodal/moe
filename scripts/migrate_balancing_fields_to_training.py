@@ -1,6 +1,6 @@
 """One-shot yaml migrator: move balancing fields from `model:` to `training:`.
 
-Per DEC-3b (RESOLVED 2026-04-27 → AC-3 in `docs/plan.md`), every yaml under
+Per the canonical-block resolver design, every yaml under
 `configs/` must place the following balancing-related fields in the `training:`
 block, NOT the `model:` block:
 
@@ -34,7 +34,7 @@ from pathlib import Path
 import yaml
 
 
-# Fields that MUST live under the `training:` block per DEC-3b.
+# Fields that MUST live under the `training:` block (canonical-block resolver).
 _BALANCING_FIELDS = {
     "bias_update_rate",
     "bias_warmup_start",
@@ -76,7 +76,7 @@ def migrate_yaml_text(text: str) -> tuple[str, list[str]]:
             print(
                 f"  WARN: {field} disagrees between blocks "
                 f"(model: {model_value!r}, training: {training_cfg[field]!r}); "
-                f"keeping training: value (DEC-3b authoritative).",
+                f"keeping training: value (canonical block authoritative).",
                 file=sys.stderr,
             )
         elif field not in training_cfg:

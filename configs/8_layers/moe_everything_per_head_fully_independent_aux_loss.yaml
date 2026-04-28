@@ -36,8 +36,10 @@ model:
   output_router_logits: true
   mlp_router:
     balancing: aux_loss
+    router_aux_loss_coef: 0.001
   attn_router:
     balancing: aux_loss
+    router_aux_loss_coef: 0.001
   branch_router:
     balancing: none
 training:

@@ -196,6 +196,51 @@ def test_matrix_aux_loss_rows_have_only_aux_coef_in_per_class():
     )
 
 
+# Required active knob values for each method, per the AC-18 matrix
+# spec. Each matrix row's per-class block at `balancing == method`
+# MUST carry the corresponding key at this exact value.
+_REQUIRED_ACTIVE_KNOBS = {
+    "aux_loss": {"router_aux_loss_coef": 0.001},
+    "seq_aux_loss": {"seq_aux_loss_coef": 0.0001},
+    "deepseek_bias": {"bias_update_rate": 0.001},
+    "quantile": {
+        "quantile_eta": 0.005,
+        "quantile_target_q": 0.5,
+        "quantile_global_state": True,
+    },
+}
+
+
+def test_matrix_rows_carry_required_active_knobs_per_method():
+    """Round 31 review Finding 1: every matrix row's per-class
+    block must explicitly carry the active knobs for its method.
+    Aux rows MUST have `router_aux_loss_coef: 0.001`; deepseek
+    rows MUST have `bias_update_rate: 0.001`; quantile rows MUST
+    have the full quantile knob set. Implicit defaults are not
+    acceptable — the per-class block is the source of truth.
+    """
+    deficits: list[tuple[str, str, str]] = []
+    for p in _nested_yamls():
+        with p.open() as f:
+            cfg = yaml.safe_load(f)
+        mcfg = cfg.get("model", {}) or {}
+        if mcfg.get("type") == "dense":
+            continue
+        for group in ("mlp_router", "attn_router", "branch_router"):
+            block = mcfg.get(group, {}) or {}
+            method = block.get("balancing")
+            if method in (None, "none", "exploration_only"):
+                continue
+            required = _REQUIRED_ACTIVE_KNOBS.get(method, {})
+            for key, expected in required.items():
+                actual = block.get(key)
+                if actual != expected:
+                    deficits.append((str(p), f"{group}.{key}", f"expected {expected!r}, got {actual!r}"))
+    assert not deficits, (
+        f"matrix rows missing required active knobs: {deficits}"
+    )
+
+
 def test_matrix_has_quantile_rows():
     """Codex Round 29 review explicitly flagged the absence of
     quantile rows. Pin this contract: every depth must have

@@ -317,7 +317,7 @@ _REQUIRED_CKPT_FILES = ["model.pt", "training_state.pt", "data_state.pt", "meta.
 
 
 def _verify_checkpoint(ckpt: Path) -> list[str]:
-    """Return a list of missing AC-12 checkpoint files (empty = all present)."""
+    """Return a list of missing checkpoint files (empty = all present)."""
     if ckpt is None:
         return list(_REQUIRED_CKPT_FILES)
     return [f for f in _REQUIRED_CKPT_FILES if not (ckpt / f).is_file()]
@@ -445,7 +445,7 @@ def stage_c_auto_resume(
         )
         _print_run_summary(ref)
 
-        # Phase 1: train up to save_at, produce a checkpoint
+        # Stage 1: train up to save_at, produce a checkpoint
         p1_out = slot / "phase1"
         p1_out.mkdir(exist_ok=True)
         p1_cfg = p1_out / "config.yaml"
@@ -464,7 +464,7 @@ def stage_c_auto_resume(
         )
         _print_run_summary(p1)
 
-        # Phase 2: resume from p1 and train for the remainder
+        # Stage 2: resume from p1 and train for the remainder
         p2_out = slot / "phase2"
         p2_out.mkdir(exist_ok=True)
         p2_cfg = p2_out / "config.yaml"

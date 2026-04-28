@@ -165,7 +165,7 @@ def validate_config(path: Path) -> list[str]:
     # balancing fields. The per-class blocks
     # (`model.{mlp,attn,branch}_router`) are authoritative; a
     # top-level coefficient is off-axis pollution that violates
-    # the AC-18 method-axis contract. Yamls under `configs/extras/`
+    # the matrix method-axis contract. Yamls under `configs/extras/`
     # are exempt as legacy / non-matrix fixtures.
     path_str = str(path)
     in_active_matrix = (

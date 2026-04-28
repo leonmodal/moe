@@ -5,7 +5,7 @@ Runs one `standard_moe` and one `moe_everything` debug model for a fixed
 number of optimizer steps with (a) warmup disabled and (b) warmup ramping
 from a chosen start value to the configured target rate over a portion of
 the run. Records walltime and final loss for each condition. Used to pin the
-AC-10 "Early-step capacity warmup" technique against its baseline before
+"Early-step capacity warmup" technique against its baseline before
 recommending it as an integrated default.
 
 Usage:
@@ -127,7 +127,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         print("WARNING: CUDA unavailable; running on CPU (results are indicative only)")
 
-    print("# AC-10 router-exploration warmup benchmark")
+    print("# router-exploration warmup benchmark")
     print(f"  steps={args.steps}, batch_size={args.batch_size}, seq_len={args.seq_len}, "
           f"lr={args.lr}, target_rate={args.target_rate}")
     print()
