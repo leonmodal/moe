@@ -8,6 +8,7 @@ end-to-end invocation contract are.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -90,16 +91,28 @@ def _run_bench(args, cwd):
     return result
 
 
-def test_bench_step_emits_schema_conforming_record(tiny_config_yaml, tmp_path):
-    """End-to-end smoke test: the bench script should run on the
-    tiny CPU config, print a JSON record to stdout, and append the
-    same record to the output JSON file."""
+_EXPECTED_KEYS = {
+    "config", "model_type", "device", "warmup_iters", "measure_iters",
+    "batch_size", "gradient_accumulation", "gradient_checkpointing",
+    "chunked_ce", "seq_len", "tokens_per_step",
+    "wall_seconds_median", "wall_seconds_p5", "wall_seconds_p95",
+    "tokens_per_second_median", "peak_gpu_memory_bytes",
+    "headroom_bytes", "loss_first", "loss_last", "search_mode", "oom",
+}
+
+
+def test_bench_step_emits_ac19_compliant_median_schema(tiny_config_yaml, tmp_path):
+    """End-to-end smoke test: the bench should run the production
+    optimizer-step + post-step bias-update path on the tiny CPU
+    config and emit the AC-19 / AC-24 median-schema record (median,
+    p5, p95 — NOT mean / std).
+    """
     output_path = tmp_path / "results.json"
     result = _run_bench(
         [
             "--config", str(tiny_config_yaml),
-            "--warmup", "1",
-            "--measure", "2",
+            "--warmup", "2",
+            "--measure", "3",
             "--device", "cpu",
             "--output", str(output_path),
         ],
@@ -110,32 +123,33 @@ def test_bench_step_emits_schema_conforming_record(tiny_config_yaml, tmp_path):
         f"STDERR:\n{result.stderr}"
     )
     record = json.loads(result.stdout)
-    expected_keys = {
-        "config", "model_type", "device", "warmup_iters", "measure_iters",
-        "batch_size", "seq_len", "tokens_per_step", "wall_seconds_mean",
-        "wall_seconds_std", "tokens_per_second", "peak_gpu_memory_bytes",
-        "loss_mean", "loss_std", "search_mode", "search_max_batch",
-    }
-    assert set(record.keys()) == expected_keys, (
-        f"output schema drift: expected {expected_keys}, got {set(record.keys())}"
+    assert set(record.keys()) == _EXPECTED_KEYS, (
+        f"output schema drift: expected {_EXPECTED_KEYS}, got {set(record.keys())}"
     )
     assert record["device"] == "cpu"
-    assert record["warmup_iters"] == 1
-    assert record["measure_iters"] == 2
+    assert record["warmup_iters"] == 2
+    assert record["measure_iters"] == 3
     assert record["model_type"] == "moe_everything"
     assert record["search_mode"] is False
-    assert record["wall_seconds_mean"] > 0
-    assert record["tokens_per_second"] > 0
+    assert record["oom"] is False
+    assert record["wall_seconds_median"] > 0
+    assert record["tokens_per_second_median"] > 0
+    # p5 <= median <= p95 (ordering invariant on the timing distribution).
+    assert record["wall_seconds_p5"] <= record["wall_seconds_median"]
+    assert record["wall_seconds_median"] <= record["wall_seconds_p95"]
 
     on_disk = json.loads(output_path.read_text())
     assert isinstance(on_disk, list) and len(on_disk) == 1
     assert on_disk[0] == record
 
 
-def test_bench_step_search_mode_smoke(tiny_config_yaml, tmp_path):
-    """`--search` should find a max stable batch size in the given
-    range and report `search_mode=True` plus a non-null
-    `search_max_batch`."""
+def test_bench_step_search_mode_emits_multi_dim_records(tiny_config_yaml, tmp_path):
+    """`--search` sweeps the AC-24 axes (batch / grad_accum /
+    grad_ckpt / chunked_ce) and emits one record per grid point.
+    Records carry `search_mode=true`. OOM rows would have `oom=true`
+    but the tiny CPU config does not OOM, so all records here have
+    `oom=false`.
+    """
     output_path = tmp_path / "results.json"
     result = _run_bench(
         [
@@ -144,8 +158,11 @@ def test_bench_step_search_mode_smoke(tiny_config_yaml, tmp_path):
             "--measure", "2",
             "--device", "cpu",
             "--search",
-            "--batch-min", "1",
-            "--batch-max", "2",
+            "--search-batch-min", "1",
+            "--search-batch-max", "2",
+            "--search-grad-accum", "1,2",
+            "--search-grad-ckpt", "false",
+            "--search-chunked-ce", "false",
             "--output", str(output_path),
         ],
         cwd=REPO,
@@ -154,9 +171,72 @@ def test_bench_step_search_mode_smoke(tiny_config_yaml, tmp_path):
         f"bench_step.py --search failed:\nSTDOUT:\n{result.stdout}\n\n"
         f"STDERR:\n{result.stderr}"
     )
+    records = json.loads(result.stdout)
+    assert isinstance(records, list)
+    # 2 batches x 2 grad_accum x 1 grad_ckpt x 1 chunked_ce = 4 rows.
+    assert len(records) == 4
+    distinct_points = {
+        (r["batch_size"], r["gradient_accumulation"],
+         r["gradient_checkpointing"], r["chunked_ce"])
+        for r in records
+    }
+    assert distinct_points == {
+        (1, 1, False, False), (1, 2, False, False),
+        (2, 1, False, False), (2, 2, False, False),
+    }
+    for r in records:
+        assert r["search_mode"] is True
+        assert r["oom"] is False
+
+
+def test_bench_step_search_records_oom_without_aborting(tiny_config_yaml, tmp_path):
+    """When no GPU is available, the search loop simply runs every
+    grid point on CPU; the AC-24 OOM-row contract still requires
+    that a real OOM in the matrix is recorded with `oom=true`
+    rather than aborting. We can verify the contract with a
+    bench-internal probe on the OOM-record helper without needing
+    actual CUDA OOMs.
+    """
+    repo = REPO
+    cmd = [
+        sys.executable, "-c",
+        """
+import json
+import sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import importlib.util
+spec = importlib.util.spec_from_file_location("bench_step", "scripts/bench_step.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+# Argparse stub.
+import argparse
+args = argparse.Namespace(
+    config="configs/8_layers/standard_moe.yaml", warmup=10, measure=90,
+)
+record = mod._oom_record(
+    {
+        "args": args, "cfg_template": {"model": {"type": "moe_everything"}},
+        "device": "cuda:0",
+        "batch_size": 64, "gradient_accumulation": 4,
+        "gradient_checkpointing": True, "chunked_ce": False,
+        "seq_len": 2048,
+    },
+    "CUDA out of memory: tried to allocate ...",
+)
+print(json.dumps(record))
+"""
+    ]
+    env = {"PYTHONPATH": str(repo), **os.environ}
+    result = subprocess.run(cmd, cwd=str(repo), env=env, capture_output=True, text=True)
+    assert result.returncode == 0, (
+        f"oom-record probe failed:\nSTDOUT:{result.stdout}\nSTDERR:{result.stderr}"
+    )
     record = json.loads(result.stdout)
-    assert record["search_mode"] is True
-    assert record["search_max_batch"] in (1, 2)
+    assert record["oom"] is True
+    assert record["wall_seconds_median"] is None
+    assert record["batch_size"] == 64
+    assert record["gradient_accumulation"] == 4
 
 
 def test_bench_step_appends_to_existing_results(tiny_config_yaml, tmp_path):
@@ -182,6 +262,39 @@ def test_bench_step_appends_to_existing_results(tiny_config_yaml, tmp_path):
     assert len(on_disk) == 2
     assert on_disk[0] == {"prior": True}
     assert on_disk[1]["model_type"] == "moe_everything"
+
+
+def test_bench_step_disables_wandb_eval_heatmap_paths():
+    """The bench is required by AC-19/DEC-8 to disable W&B,
+    checkpoint, eval, and heatmap paths. The
+    `_disable_w_and_b_eval_heatmaps` helper is the production
+    enforcement point — verify it sets every gate.
+    """
+    repo = REPO
+    cmd = [
+        sys.executable, "-c",
+        """
+import importlib.util, json
+spec = importlib.util.spec_from_file_location("bench_step", "scripts/bench_step.py")
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+cfg = {"training": {
+    "wandb_project": "real-project",
+    "save_every": 100, "log_every": 10,
+    "routing_log_every": 50, "heatmap_every": 100,
+}, "eval": {"every": 100}}
+out = mod._disable_w_and_b_eval_heatmaps(cfg)
+print(json.dumps(out))
+"""
+    ]
+    env = {"PYTHONPATH": str(repo), **os.environ}
+    result = subprocess.run(cmd, cwd=str(repo), env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+    assert out["training"]["wandb_project"] is None
+    assert out["training"]["save_every"] >= 10**8
+    assert out["training"]["log_every"] >= 10**8
+    assert out["training"]["heatmap_every"] == 0
+    assert out["eval"]["every"] == 0
 
 
 if __name__ == "__main__":

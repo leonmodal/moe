@@ -173,6 +173,110 @@ def test_validator_rejects_branch_router_not_a_mapping():
         _validator()(cfg)
 
 
+def test_validator_accepts_mlp_router_aux_loss():
+    cfg = {
+        "model": {
+            "mlp_router": {
+                "balancing": "aux_loss",
+                "router_aux_loss_coef": 0.001,
+                "seq_aux_loss_coef": 0.0,
+            }
+        }
+    }
+    _validator()(cfg)
+
+
+def test_validator_accepts_attn_router_with_specific_knob():
+    cfg = {
+        "model": {
+            "attn_router": {
+                "balancing": "deepseek_bias",
+                "scale_by_routing_weight": True,
+            }
+        }
+    }
+    _validator()(cfg)
+
+
+def test_validator_rejects_mlp_router_unknown_key():
+    cfg = {"model": {"mlp_router": {"baalancing": "aux_loss"}}}
+    with pytest.raises(ValueError, match="model.mlp_router has unknown keys"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_attn_router_unknown_key():
+    cfg = {"model": {"attn_router": {"top_p": 0.9}}}
+    with pytest.raises(ValueError, match="model.attn_router has unknown keys"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_mlp_router_invalid_balancing():
+    cfg = {"model": {"mlp_router": {"balancing": "explore"}}}
+    with pytest.raises(ValueError, match="model.mlp_router.balancing="):
+        _validator()(cfg)
+
+
+def test_validator_rejects_attn_router_invalid_balancing():
+    cfg = {"model": {"attn_router": {"balancing": "freeform"}}}
+    with pytest.raises(ValueError, match="model.attn_router.balancing="):
+        _validator()(cfg)
+
+
+def test_validator_rejects_negative_aux_coef():
+    cfg = {"model": {"mlp_router": {"router_aux_loss_coef": -0.1}}}
+    with pytest.raises(ValueError, match="router_aux_loss_coef="):
+        _validator()(cfg)
+
+
+def test_validator_rejects_negative_seq_aux_coef():
+    cfg = {"model": {"attn_router": {"seq_aux_loss_coef": -0.5}}}
+    with pytest.raises(ValueError, match="seq_aux_loss_coef="):
+        _validator()(cfg)
+
+
+def test_validator_accepts_all_three_groups_together():
+    """A fully nested-schema yaml lists all three router groups; the
+    validator must accept the combination.
+    """
+    cfg = {
+        "model": {
+            "branch_router": {
+                "balancing": "exploration_only",
+                "exploration_rate": 0.3,
+                "exploration_decay": "linear",
+                "exploration_warmup_steps": 1000,
+                "exploration_min": 0.0,
+            },
+            "mlp_router": {
+                "balancing": "aux_loss",
+                "router_aux_loss_coef": 0.001,
+                "seq_aux_loss_coef": 0.0,
+            },
+            "attn_router": {
+                "balancing": "deepseek_bias",
+                "scale_by_routing_weight": True,
+            },
+        }
+    }
+    _validator()(cfg)
+
+
+def test_validator_rejects_mlp_router_min_above_rate():
+    cfg = {
+        "model": {
+            "mlp_router": {"exploration_rate": 0.2, "exploration_min": 0.5}
+        }
+    }
+    with pytest.raises(ValueError, match="exploration_min .* exceeds"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_mlp_router_invalid_decay():
+    cfg = {"model": {"mlp_router": {"exploration_decay": "exp"}}}
+    with pytest.raises(ValueError, match="exploration_decay="):
+        _validator()(cfg)
+
+
 if __name__ == "__main__":
     test_validator_accepts_nested_form_with_known_keys()
     test_validator_accepts_flat_form()

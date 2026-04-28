@@ -134,12 +134,115 @@ _BRANCH_BALANCING_VALID = frozenset({"none", "exploration_only"})
 
 _BRANCH_DECAY_VALID = frozenset({"constant", "linear", "cosine"})
 
+# MLP and attention nested router groups. The fields are a SUPERSET
+# of the branch-router schedule fields plus a `balancing` knob with
+# the broader `_VALID_LOAD_BALANCING_METHODS` set (aux_loss, seq_aux,
+# deepseek_bias, quantile, none) — each MLP/attention router can opt
+# into its own balancing method independently of the others when the
+# nested per-class schema lands.
+_MLP_ROUTER_KNOWN_KEYS = frozenset({
+    "balancing",
+    "router_aux_loss_coef",
+    "seq_aux_loss_coef",
+    "exploration_rate",
+    "exploration_decay",
+    "exploration_min",
+    "exploration_warmup_steps",
+})
+
+_ATTN_ROUTER_KNOWN_KEYS = frozenset(_MLP_ROUTER_KNOWN_KEYS) | frozenset({
+    # attention-specific knobs allowed on the per-class schema:
+    "scale_by_routing_weight",
+})
+
+
+def _validate_mlp_or_attn_router(cfg: dict, group: str) -> None:
+    """Validate one of the per-class router groups
+    (`model.mlp_router` or `model.attn_router`). Each group may
+    define a `balancing` field with the broader balancing-method
+    set, plus shared aux/seq-aux coefficients and the
+    branch-style exploration schedule fields. Unknown keys are
+    rejected with the allowed-keys list.
+    """
+    mcfg = cfg.get("model")
+    if not isinstance(mcfg, dict):
+        return
+    nested = mcfg.get(group)
+    if nested is None:
+        return
+    if not isinstance(nested, dict):
+        raise ValueError(
+            f"model.{group} must be a mapping; got {type(nested).__name__}"
+        )
+
+    if group == "mlp_router":
+        allowed = _MLP_ROUTER_KNOWN_KEYS
+    elif group == "attn_router":
+        allowed = _ATTN_ROUTER_KNOWN_KEYS
+    else:
+        raise ValueError(f"unsupported router group: {group}")
+
+    unknown = set(nested.keys()) - allowed
+    if unknown:
+        raise ValueError(
+            f"model.{group} has unknown keys: {sorted(unknown)}. "
+            f"Allowed keys: {sorted(allowed)}."
+        )
+
+    if "balancing" in nested:
+        bal = nested["balancing"]
+        if bal not in _VALID_LOAD_BALANCING_METHODS:
+            raise ValueError(
+                f"model.{group}.balancing={bal!r} is invalid; "
+                f"must be one of {sorted(_VALID_LOAD_BALANCING_METHODS)}"
+            )
+
+    if "exploration_decay" in nested:
+        decay = nested["exploration_decay"]
+        if decay not in _BRANCH_DECAY_VALID:
+            raise ValueError(
+                f"model.{group}.exploration_decay={decay!r} is invalid; "
+                f"must be one of {sorted(_BRANCH_DECAY_VALID)}"
+            )
+
+    for key in ("exploration_rate", "exploration_min"):
+        if key in nested:
+            v = nested[key]
+            if not (0.0 <= v <= 1.0):
+                raise ValueError(
+                    f"model.{group}.{key}={v} must be in [0.0, 1.0]"
+                )
+    if "exploration_min" in nested and "exploration_rate" in nested:
+        if nested["exploration_min"] > nested["exploration_rate"]:
+            raise ValueError(
+                f"model.{group}.exploration_min ({nested['exploration_min']}) "
+                f"exceeds exploration_rate ({nested['exploration_rate']}); "
+                f"the floor cannot exceed the initial rate."
+            )
+    if "exploration_warmup_steps" in nested:
+        steps = nested["exploration_warmup_steps"]
+        if not isinstance(steps, int) or steps < 0:
+            raise ValueError(
+                f"model.{group}.exploration_warmup_steps={steps} must be "
+                f"a non-negative int"
+            )
+
+    for key in ("router_aux_loss_coef", "seq_aux_loss_coef"):
+        if key in nested:
+            v = nested[key]
+            if not isinstance(v, (int, float)) or v < 0:
+                raise ValueError(
+                    f"model.{group}.{key}={v} must be a non-negative number"
+                )
+
 
 def validate_branch_router_config(cfg: dict) -> None:
     """Validate the `model.branch_router` nested block (and the
     legacy flat-bridge fields) for unknown keys, illegal values, and
-    conflicting nested-vs-flat assignments. Raises `ValueError` on
-    the first issue found.
+    conflicting nested-vs-flat assignments. Also validates the
+    per-class `model.mlp_router` and `model.attn_router` nested
+    blocks when present. Raises `ValueError` on the first issue
+    found.
 
     Validation rules:
       * Unknown keys under `model.branch_router` are rejected with a
@@ -238,6 +341,14 @@ def validate_branch_router_config(cfg: dict) -> None:
                     f"settings. Either drop the legacy flat field or "
                     f"reconcile the values."
                 )
+
+    # Per-class router groups (mlp_router, attn_router). Each is
+    # validated independently so a typo or invalid value in one group
+    # surfaces immediately. The flat-bridge form does not exist for
+    # these two groups (they are nested-only since they are part of
+    # the AC-13 nested-schema deliverable, not a legacy migration).
+    _validate_mlp_or_attn_router(cfg, "mlp_router")
+    _validate_mlp_or_attn_router(cfg, "attn_router")
 
 
 def normalize_balancing_config(cfg: dict) -> dict:
