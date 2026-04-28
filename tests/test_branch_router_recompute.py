@@ -103,6 +103,32 @@ def _checkpoint_ctx_fn():
     return checkpoint_recompute_context(False), checkpoint_recompute_context(True)
 
 
+class _PhasedSnapshotRecorder:
+    """Collects observations made INSIDE the checkpointed callable, one
+    record per `is_checkpoint_recompute()` phase value, in order. AC-9
+    requires one real-forward record (`is_checkpoint_recompute() == False`)
+    AND at least one recompute record (`is_checkpoint_recompute() == True`),
+    with their selections / masks equal under `preserve_rng_state=True`.
+    """
+
+    def __init__(self):
+        self.records: list[dict] = []
+
+    def record(self, **observations):
+        from src.models.router import is_checkpoint_recompute
+        self.records.append({
+            "phase": "recompute" if is_checkpoint_recompute() else "real",
+            **{k: v.clone().detach() if isinstance(v, torch.Tensor) else v
+               for k, v in observations.items()},
+        })
+
+    def real_records(self):
+        return [r for r in self.records if r["phase"] == "real"]
+
+    def recompute_records(self):
+        return [r for r in self.records if r["phase"] == "recompute"]
+
+
 def _run_branch_router(
     *,
     seed: int,
@@ -152,6 +178,143 @@ def _run_branch_router(
     )
 
 
+def test_branch_router_softmax_exploration_first_pass_matches_recompute():
+    """AC-9 (Round 7): record selections INSIDE the checkpointed callable
+    under both `is_checkpoint_recompute()` False (real forward) and True
+    (recompute), then assert real-forward selections equal recompute
+    selections. Codex Round 6 review explicitly asks for this proof.
+
+    Wrapped in `set_checkpoint_early_stop(False)` so the recompute runs the
+    FULL forward including the side-effect-only `recorder.record(...)` call.
+    Without that wrapper, `use_reentrant=False`'s early-stop logic would
+    bail out of the recompute as soon as it had collected the saved tensors
+    it needed — typically before the recorder call.
+    """
+    torch.manual_seed(2031)
+    router = BranchRouter(
+        hidden_size=8,
+        use_deepseek_style=False,
+        exploration_rate=0.5,
+    ).train()
+    x = torch.randn(2, 4, 8, requires_grad=True)
+    recorder = _PhasedSnapshotRecorder()
+
+    def fn(inp):
+        w_attn, w_mlp, attn_mask, mlp_mask = router(inp)
+        recorder.record(selected_experts=router.last_selected_experts)
+        return w_attn.sum() + w_mlp.sum()
+
+    with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+        loss = torch.utils.checkpoint.checkpoint(
+            fn, x, use_reentrant=False, context_fn=_checkpoint_ctx_fn,
+        )
+        loss.backward()
+
+    real = recorder.real_records()
+    recompute = recorder.recompute_records()
+    assert len(real) == 1, f"expected exactly one real-forward record, got {len(real)}"
+    assert len(recompute) >= 1, f"expected at least one recompute record, got {len(recompute)}"
+    real_sel = real[0]["selected_experts"]
+    for r in recompute:
+        assert torch.equal(real_sel, r["selected_experts"]), (
+            f"BranchRouter softmax exploration: selections diverged between "
+            f"real forward and recompute under preserve_rng_state=True. "
+            f"AC-9 first-pass/recompute proof failed."
+        )
+
+
+def test_branch_router_use_sampling_first_pass_matches_recompute():
+    """AC-9 (Round 7): same first-pass-vs-recompute proof for
+    `use_sampling=True` (multinomial path)."""
+    torch.manual_seed(2032)
+    router = BranchRouter(
+        hidden_size=8,
+        use_deepseek_style=True,
+        use_sampling=True,
+    ).train()
+    x = torch.randn(2, 4, 8, requires_grad=True)
+    recorder = _PhasedSnapshotRecorder()
+
+    def fn(inp):
+        w_attn, w_mlp, attn_mask, mlp_mask = router(inp)
+        recorder.record(selected_experts=router.last_selected_experts)
+        return w_attn.sum() + w_mlp.sum()
+
+    with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+        loss = torch.utils.checkpoint.checkpoint(
+            fn, x, use_reentrant=False, context_fn=_checkpoint_ctx_fn,
+        )
+        loss.backward()
+
+    real = recorder.real_records()
+    recompute = recorder.recompute_records()
+    assert len(real) == 1
+    assert len(recompute) >= 1
+    real_sel = real[0]["selected_experts"]
+    for r in recompute:
+        assert torch.equal(real_sel, r["selected_experts"]), (
+            f"BranchRouter use_sampling: multinomial draws diverged between "
+            f"real forward and recompute. AC-9 regression."
+        )
+
+
+def test_deepseek_router_exploration_first_pass_matches_recompute():
+    """AC-9 (Round 7): first-pass-vs-recompute proof for DeepSeekRouter
+    exploration. Records BOTH `_last_top_k_idx` and `_last_exploration_mask`
+    on each phase."""
+    from src.models.router import DeepSeekRouter
+
+    class _MiniCfg:
+        hidden_size = 8
+        num_experts = 4
+        num_experts_per_tok = 2
+        norm_topk_prob = True
+        topk_scaling_factor = None
+        num_groups = None
+        group_topk = None
+        router_exploration_rate = 0.5
+        router_z_loss_coef = 0.0
+
+    torch.manual_seed(2033)
+    router = DeepSeekRouter(_MiniCfg()).train()
+    x = torch.randn(8, 8, requires_grad=True)
+    recorder = _PhasedSnapshotRecorder()
+
+    def fn(inp):
+        scores, weights, idx = router(inp)
+        recorder.record(
+            top_k_idx=router._last_top_k_idx,
+            exploration_mask=router._last_exploration_mask,
+        )
+        return scores.sum() + weights.sum()
+
+    with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+        loss = torch.utils.checkpoint.checkpoint(
+            fn, x, use_reentrant=False, context_fn=_checkpoint_ctx_fn,
+        )
+        loss.backward()
+
+    real = recorder.real_records()
+    recompute = recorder.recompute_records()
+    assert len(real) == 1
+    assert len(recompute) >= 1
+    real_idx = real[0]["top_k_idx"]
+    real_mask = real[0]["exploration_mask"]
+    for r in recompute:
+        assert torch.equal(real_idx, r["top_k_idx"]), (
+            f"DeepSeekRouter top_k_idx diverged between real and recompute. "
+            f"AC-9 regression."
+        )
+        # `exploration_mask` is `None` when exploration_rate==0; ours is 0.5
+        # so it should be a tensor.
+        if real_mask is not None:
+            assert r["exploration_mask"] is not None
+            assert torch.equal(real_mask, r["exploration_mask"]), (
+                f"DeepSeekRouter exploration_mask diverged between real and "
+                f"recompute. AC-9 regression."
+            )
+
+
 def test_branch_router_softmax_exploration_checkpoint_matches_no_checkpoint():
     """AC-9 (Round 6): BranchRouter softmax exploration produces identical
     selected experts AND identical input gradients under
@@ -181,12 +344,14 @@ def test_branch_router_under_torch_utils_checkpoint_matches_no_checkpoint():
     must produce the same `local_tokens_per_expert` as a forward+backward with
     checkpointing disabled, on the same seed.
 
-    `torch.utils.checkpoint` re-executes the forward during backward; without
-    the `is_checkpoint_recompute()` guard introduced by Round 1 + the
-    exploration-mask cache introduced by Round 2, the recompute would
-    double-count or change the branch decision and the comparison would
-    diverge. This test exercises the same end-to-end path that
-    `MoEverythingModel.gradient_checkpointing_enable` lights up in production.
+    `torch.utils.checkpoint` re-executes the forward during backward; the
+    `is_checkpoint_recompute()` count-buffer guard (Round 1) prevents the
+    recompute from double-counting. PyTorch's default `preserve_rng_state=True`
+    keeps stochastic ops (exploration sampling, multinomial) deterministic
+    across the real forward and the recompute (Round 5+). This test
+    exercises the same end-to-end path that
+    `MoEverythingModel.gradient_checkpointing_enable` lights up in
+    production.
     """
     from src.models.router import checkpoint_recompute_context
 
@@ -299,7 +464,8 @@ def test_branch_router_real_checkpoint_stochastic_matches_no_checkpoint():
 
     Round 4's checkpoint-context-manager test only exercised the non-stochastic
     count guard. Codex correctly noted that stochastic paths need real
-    checkpoint backward to prove the cache survives the autograd replay.
+    checkpoint backward to prove RNG-preservation gives identical outputs
+    across the real forward and the recompute (Round 5 design).
 
     Setup: BranchRouter with `exploration_rate=0.5` (softmax path).
     Run A: forward+backward without checkpointing.
@@ -346,7 +512,8 @@ def test_branch_router_real_checkpoint_stochastic_matches_no_checkpoint():
     grad_a = x_a.grad.clone()
 
     # Run B: with `torch.utils.checkpoint`. PyTorch's `preserve_rng_state=True`
-    # default + the cache make the recompute use the same exploration outcomes.
+    # default makes the recompute use the same exploration outcomes as the
+    # real forward (Round 5 design — the explicit cache layer was removed).
     router_b, x_b = _make_router_and_input(seed=2027)
     _do_run(router_b, x_b, use_checkpoint=True)
     sel_b = router_b.last_selected_experts
@@ -435,6 +602,9 @@ if __name__ == "__main__":
     test_branch_router_recompute_does_not_double_count()
     test_branch_router_no_grad_does_not_count()
     test_branch_router_buffer_names_are_canonical()
+    test_branch_router_softmax_exploration_first_pass_matches_recompute()
+    test_branch_router_use_sampling_first_pass_matches_recompute()
+    test_deepseek_router_exploration_first_pass_matches_recompute()
     test_branch_router_softmax_exploration_checkpoint_matches_no_checkpoint()
     test_branch_router_under_torch_utils_checkpoint_matches_no_checkpoint()
     test_branch_router_use_sampling_checkpoint_matches_no_checkpoint()

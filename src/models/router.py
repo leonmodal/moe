@@ -204,6 +204,8 @@ class ExplorationTopKRouter(Qwen3MoeTopKRouter):
         self._last_top_k_idx = None
         self._last_exploration_mask = None
         self._last_z_loss = None
+        # DEC-15 DETACH-ONLY: telemetry state populated on every forward.
+        self._last_router_scores_detached = None
 
     def forward(self, hidden_states: torch.Tensor):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
@@ -257,6 +259,8 @@ class ExplorationTopKRouter(Qwen3MoeTopKRouter):
         router_scores = router_top_value.to(raw_logits.dtype)
         self._last_top_k_idx = router_indices.detach()
         self._last_exploration_mask = None if exploration_mask is None else exploration_mask.detach()
+        # DEC-15 DETACH-ONLY: detached per-expert scores for non-aux telemetry.
+        self._last_router_scores_detached = probs.detach()
         # First return value keeps the prior contract: the per-expert scored probs
         # (post-softmax / post-sigmoid / post-sqrtsoftplus) are what downstream aux
         # loss and routing stats read.
@@ -298,6 +302,8 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
         self._last_top_k_idx = None
         self._last_exploration_mask = None
         self._last_z_loss = None
+        # DEC-15 DETACH-ONLY: telemetry state populated on every forward.
+        self._last_router_scores_detached = None
         # AC-9 (Round 5): rely on `torch.utils.checkpoint`'s default
         # `preserve_rng_state=True` for recompute determinism. An earlier
         # design cached `top_k_idx` here to defend against
@@ -384,6 +390,13 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
                 self._last_top_k_idx = top_k_idx.detach()
         else:
             self._last_top_k_idx = top_k_idx.detach()
+
+        # DEC-15 DETACH-ONLY: stash a detached snapshot of the per-expert
+        # scores so non-aux methods can keep telemetry (`f_i` plots, routing
+        # heatmaps) without retaining the autograd graph.
+        # `output_router_logits=False` skips the model-level model output but
+        # this attribute is still populated.
+        self._last_router_scores_detached = scores.detach()
 
         # Return sigmoid probs as router_logits (values in (0,1), don't sum to 1)
         return scores, router_top_value, top_k_idx

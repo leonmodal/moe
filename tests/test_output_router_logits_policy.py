@@ -66,34 +66,46 @@ def _load_modules():
     return bf, cfg_mod, mf
 
 
-def _make_yaml(method: str | None, tmp: Path) -> Path:
-    """Minimal `standard_moe` yaml with the given method (or no method)."""
-    cfg = {
-        "experiment_name": f"test_orl_{method or 'absent'}",
-        "model": {
-            "type": "standard_moe",
+def _make_yaml(method: str | None, tmp: Path, family: str = "standard_moe") -> Path:
+    """Minimal yaml with the given method (or no method) for a chosen family."""
+    base_model = {
+        "vocab_size": 32,
+        "hidden_size": 16,
+        "num_hidden_layers": 2,
+        "head_dim": 8,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "intermediate_size": 32,
+        "moe_intermediate_size": 32,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "norm_topk_prob": True,
+        "max_position_embeddings": 64,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": True,
+        "attn_implementation": "eager",
+    }
+    if family == "moe_everything":
+        base_model.update({
+            "type": "moe_everything",
             "router_type": "deepseek" if method == "deepseek_bias" else "softmax",
-            "vocab_size": 32,
-            "hidden_size": 16,
-            "num_hidden_layers": 2,
-            "head_dim": 8,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 2,
-            "intermediate_size": 32,
-            "moe_intermediate_size": 32,
-            "num_experts": 4,
-            "num_experts_per_tok": 2,
-            "norm_topk_prob": True,
-            "max_position_embeddings": 64,
-            "rms_norm_eps": 1e-6,
-            "rope_theta": 10000.0,
-            "tie_word_embeddings": True,
-            "attn_implementation": "eager",
-        },
+            "use_deepseek_routing": method == "deepseek_bias",
+            "num_attn_experts": 2,
+            "num_attn_experts_per_tok": 1,
+            "attn_expert_mode": "per_head_fully_independent",
+            "branch_router_aux_loss_coef": 0.0,
+        })
+    else:
+        base_model["type"] = family
+        base_model["router_type"] = "deepseek" if method == "deepseek_bias" else "softmax"
+    cfg = {
+        "experiment_name": f"test_orl_{family}_{method or 'absent'}",
+        "model": base_model,
         "training": {} if method is None else {"load_balancing_method": method},
         "data": {"data_dir": "./fake"},
     }
-    out = tmp / f"test_orl_{method or 'absent'}.yaml"
+    out = tmp / f"test_orl_{family}_{method or 'absent'}.yaml"
     out.write_text(yaml.safe_dump(cfg))
     return out
 
@@ -187,6 +199,113 @@ def test_aux_methods_keep_grad_bearing_router_logits_in_forward():
         )
 
 
+@pytest.mark.parametrize(
+    "family,method,expected",
+    [
+        ("standard_moe",  "aux_loss",      True),
+        ("standard_moe",  "deepseek_bias", False),
+        ("global_moe",    "aux_loss",      True),
+        ("global_moe",    "deepseek_bias", False),
+    ],
+)
+def test_orl_policy_across_standard_and_global_families(family, method, expected):
+    """DEC-15 policy holds across `standard_moe` and `global_moe`."""
+    _, cfg_mod, mf = _load_modules()
+    with tempfile.TemporaryDirectory() as td:
+        yaml_path = _make_yaml(method, Path(td), family=family)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            cfg = cfg_mod.load_config(str(yaml_path))
+        model, model_cfg = mf.build_model(cfg)
+    assert model_cfg.output_router_logits is expected, (
+        f"build_model failed DEC-15 for ({family}, {method}): expected "
+        f"{expected}, got {model_cfg.output_router_logits}"
+    )
+
+
+def test_router_internal_telemetry_present_after_forward():
+    """DEC-15 DETACH-ONLY: routers expose `_last_router_scores_detached`
+    after every forward, even for non-aux methods where the model output
+    skips returning `router_logits`. Telemetry consumers can read this
+    attribute without retaining the autograd graph."""
+    _, cfg_mod, mf = _load_modules()
+    # Use deepseek_bias (non-aux method, output_router_logits=False).
+    with tempfile.TemporaryDirectory() as td:
+        yaml_path = _make_yaml("deepseek_bias", Path(td))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            cfg = cfg_mod.load_config(str(yaml_path))
+        model, _ = mf.build_model(cfg)
+    model.train()
+    input_ids = torch.randint(0, model.vocab_size, (2, 8), dtype=torch.long)
+    _ = model(input_ids=input_ids, labels=input_ids, output_router_logits=False)
+
+    # Walk every router that exposes the canonical `_last_router_scores_detached`
+    # attribute and verify it's populated and detached.
+    from src.models.router import DeepSeekRouter, ExplorationTopKRouter
+    inspected = 0
+    for m in model.modules():
+        if isinstance(m, (DeepSeekRouter, ExplorationTopKRouter)):
+            scores = getattr(m, "_last_router_scores_detached", None)
+            assert scores is not None, (
+                f"{type(m).__name__} did not populate _last_router_scores_detached"
+            )
+            assert not scores.requires_grad, (
+                f"{type(m).__name__}._last_router_scores_detached must be detached"
+            )
+            inspected += 1
+    assert inspected > 0, "no routers inspected — fixture is wrong"
+
+
+def test_moe_everything_aux_method_forward_keeps_grad_bearing_mlp_router_logits():
+    """Codex Round 6 measured `out.router_logits MLP requires_grad flags ->
+    [False, False]` for moe_everything aux_loss — the MLP router_logits were
+    detached unconditionally, breaking aux gradient flow. Round 7 fix: only
+    detach for non-aux methods."""
+    _, cfg_mod, mf = _load_modules()
+    with tempfile.TemporaryDirectory() as td:
+        yaml_path = _make_yaml("aux_loss", Path(td), family="moe_everything")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            cfg = cfg_mod.load_config(str(yaml_path))
+        model, _ = mf.build_model(cfg)
+    model.train()
+    # Use a small input that the moe_everything CPU path can handle.
+    # `per_head_fully_independent` mode has CPU shape constraints around the
+    # attention bank but the MLP path itself is fine.
+    input_ids = torch.randint(0, model.vocab_size, (1, 4), dtype=torch.long)
+    out = model(input_ids=input_ids, labels=input_ids, output_router_logits=True)
+    assert out.router_logits is not None
+    requires_grad_flags = [t.requires_grad for t in out.router_logits]
+    assert all(requires_grad_flags), (
+        f"moe_everything aux_loss MLP router_logits must be gradient-bearing; "
+        f"got requires_grad flags = {requires_grad_flags}"
+    )
+
+
+def test_moe_everything_deepseek_bias_method_forward_detaches_mlp_router_logits():
+    """For non-aux methods, moe_everything's MLP router_logits should be
+    detached — telemetry-only, no autograd graph cost."""
+    _, cfg_mod, mf = _load_modules()
+    with tempfile.TemporaryDirectory() as td:
+        yaml_path = _make_yaml("deepseek_bias", Path(td), family="moe_everything")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            cfg = cfg_mod.load_config(str(yaml_path))
+        model, _ = mf.build_model(cfg)
+    model.train()
+    input_ids = torch.randint(0, model.vocab_size, (1, 4), dtype=torch.long)
+    # output_router_logits=True forces the model to return them; the policy
+    # should still detach for non-aux methods so no grad leaks.
+    out = model(input_ids=input_ids, labels=input_ids, output_router_logits=True)
+    if out.router_logits is not None:
+        requires_grad_flags = [t.requires_grad for t in out.router_logits]
+        assert not any(requires_grad_flags), (
+            f"moe_everything deepseek_bias MLP router_logits should be detached "
+            f"(telemetry only); got requires_grad flags = {requires_grad_flags}"
+        )
+
+
 def test_non_aux_methods_skip_router_logits_in_forward():
     """For non-aux methods, calling forward with `output_router_logits=False`
     (the default the model_factory now resolves) should yield None
@@ -219,9 +338,19 @@ if __name__ == "__main__":
     ]
     for c in cases:
         test_helper_resolves_orl_from_method(*c)
-    for method, expected in cases[:-1]:  # skip the None case (different signature)
+    for method, expected in cases[:-1]:
         test_build_model_sets_output_router_logits_per_method(method, expected)
     test_legacy_no_method_keeps_orl_true_for_back_compat()
     test_aux_methods_keep_grad_bearing_router_logits_in_forward()
     test_non_aux_methods_skip_router_logits_in_forward()
+    for fam_method in [
+        ("standard_moe",  "aux_loss",      True),
+        ("standard_moe",  "deepseek_bias", False),
+        ("global_moe",    "aux_loss",      True),
+        ("global_moe",    "deepseek_bias", False),
+    ]:
+        test_orl_policy_across_standard_and_global_families(*fam_method)
+    test_router_internal_telemetry_present_after_forward()
+    test_moe_everything_aux_method_forward_keeps_grad_bearing_mlp_router_logits()
+    test_moe_everything_deepseek_bias_method_forward_detaches_mlp_router_logits()
     print("ALL OK")

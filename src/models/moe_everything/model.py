@@ -678,7 +678,23 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
             # not something we want to regularize toward 50/50 usage.
 
         if output_router_logits:
-            router_logits_out = tuple(t.detach() for t in mlp_router_logits) if mlp_router_logits is not None else None
+            # DEC-15 (Round 7 fix): aux methods need `router_logits` to be
+            # gradient-bearing in the model output so the aux/seq-aux loss
+            # term can backprop through them. Round 6 detached unconditionally
+            # which silently broke aux-method gradient flow on `moe_everything`
+            # (Codex Round 6 review measured `requires_grad=False` for the
+            # MLP router_logits even with `load_balancing_method=aux_loss`).
+            # Use the resolved method to decide: aux/seq_aux → keep grad;
+            # non-aux → detach for telemetry-only output.
+            method = getattr(self, "_load_balancing_method", None)
+            mlp_grad_bearing = method is None or method in ("aux_loss", "seq_aux_loss")
+            if mlp_router_logits is not None:
+                if mlp_grad_bearing:
+                    router_logits_out = tuple(mlp_router_logits)
+                else:
+                    router_logits_out = tuple(t.detach() for t in mlp_router_logits)
+            else:
+                router_logits_out = None
             selected_experts_out = tuple(t.detach() for t in mlp_selected_experts) if mlp_selected_experts is not None else None
             router_token_masks_out = tuple(t.detach() if t is not None else None for t in mlp_token_masks) if mlp_token_masks is not None else None
             branch_probs_out = tuple(t.detach() for t in branch_prob_tensors) if branch_prob_tensors is not None else None
