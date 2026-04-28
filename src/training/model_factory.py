@@ -253,4 +253,16 @@ def build_model(cfg: dict):
         except Exception:
             model.set_experts_implementation("eager")
 
+    # AC-1 / DEC-3a: stamp the resolved `load_balancing_method` onto BOTH the
+    # model and its config so every caller (the trainer, ad-hoc test fixtures,
+    # the post-step `update_expert_biases` walker) sees the same authoritative
+    # value without needing to re-resolve from `cfg`. `normalize_balancing_config`
+    # has already auto-zeroed conflicting coefficients (called from
+    # `load_config`), so this is the single source of truth that downstream
+    # method-driven dispatch reads.
+    method = _resolve_balancing_field(cfg, "load_balancing_method", None)
+    if method is not None:
+        model._load_balancing_method = method
+        config.load_balancing_method = method
+
     return model, config

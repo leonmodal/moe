@@ -225,20 +225,31 @@ def test_asymmetric_two_rank_global_aggregate_differs_from_rank_local():
         f"top_k = {num_experts * top_k}, got {local_loss}"
     )
 
-    # 2) Asymmetric two-rank loss with the call-order mock injecting rank 1's
-    # tokens_per_expert into the FIRST all_reduce call and rank 1's
-    # router_prob_per_expert into the SECOND.
+    # 2) Asymmetric two-rank loss. After the Round 5 num/den fix, the loss
+    # function makes FOUR all_reduce calls per layer:
+    #   (tpe_num, tpe_den, rpe_num, rpe_den)
+    # Inject rank-1's contribution to each in call order.
+    #
+    # Rank 1: every token (8 of them) → expert 1, no token mask.
+    #   tpe_num_rank1 = [[0, 8, 0, 0]] shape [K, N]
+    #   tpe_den_rank1 = [[8, 8, 8, 8]] (full T per slot, no token mask)
+    #   rpe_num_rank1 = [0, 8, 0, 0]   shape [N]
+    #   rpe_den_rank1 = [8, 8, 8, 8]
+    tpe_num_rank1 = torch.tensor([[0.0, 8.0, 0.0, 0.0]])
+    tpe_den_rank1 = torch.tensor([[8.0, 8.0, 8.0, 8.0]])
+    rpe_num_rank1 = torch.tensor([0.0, 8.0, 0.0, 0.0])
+    rpe_den_rank1 = torch.tensor([8.0, 8.0, 8.0, 8.0])
     with _mock_distributed_with_call_order_queue(
         world_size=2,
-        queue=[tpe_rank1, rpe_rank1],
+        queue=[tpe_num_rank1, tpe_den_rank1, rpe_num_rank1, rpe_den_rank1],
     ) as call_count:
         global_loss = load_balancing_loss_func(
             (probs_rank0,), num_experts=num_experts, top_k=top_k,
             selected_experts=(selected_rank0,),
         ).item()
-    assert call_count["n"] == 2, (
-        f"loss func should call all_reduce exactly twice (tokens_per_expert "
-        f"+ router_prob_per_expert), got {call_count['n']}"
+    assert call_count["n"] == 4, (
+        f"loss func should call all_reduce exactly four times (tpe_num/den "
+        f"+ rpe_num/den), got {call_count['n']}"
     )
 
     # The DEC-4 global aggregate is strictly smaller than the rank-local loss
@@ -258,9 +269,10 @@ def test_asymmetric_two_rank_global_aggregate_differs_from_rank_local():
 
 
 def test_token_mask_path_global_aggregate_under_ddp():
-    """The token-mask path (`attention_mask is not None`) must also flow
-    through the DDP all-reduce. We verify by counting all_reduce calls (the
-    function calls it once per averaged statistic regardless of which path)."""
+    """The token-mask path (`attention_mask is not None`) must flow through
+    DDP all-reduce of NUMERATORS AND DENOMINATORS separately (Round 5 fix).
+    We verify by counting calls (4 per layer) AND by checking the result is
+    finite under symmetric per-rank routing."""
     num_experts = 4
     top_k = 2
     num_tokens = 8
@@ -274,23 +286,108 @@ def test_token_mask_path_global_aggregate_under_ddp():
             selected[t, k] = (t * top_k + k) % num_experts
     attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
 
-    # Identical-rank symmetric mock; we only care that all_reduce is called
-    # the expected number of times under the token-mask path.
-    other_rank_tpe = torch.zeros(top_k, num_experts)  # match shape from token-mask path
-    other_rank_rpe = torch.zeros(num_experts)
+    # Identical-rank symmetric mock — feed zeros for all four queue entries
+    # so the global aggregate equals rank-local.
+    other_tpe_num = torch.zeros(top_k, num_experts)
+    other_tpe_den = torch.zeros(top_k, num_experts)
+    other_rpe_num = torch.zeros(num_experts)
+    other_rpe_den = torch.zeros(num_experts)
     with _mock_distributed_with_call_order_queue(
         world_size=2,
-        queue=[other_rank_tpe, other_rank_rpe],
+        queue=[other_tpe_num, other_tpe_den, other_rpe_num, other_rpe_den],
     ) as call_count:
         loss = load_balancing_loss_func(
             (gate_logits,), num_experts=num_experts, top_k=top_k,
             attention_mask=attention_mask,
             selected_experts=(selected,),
         )
-    assert call_count["n"] == 2, (
-        f"token-mask path must also call all_reduce twice, got {call_count['n']}"
+    assert call_count["n"] == 4, (
+        f"token-mask path must call all_reduce four times (tpe_num/den + "
+        f"rpe_num/den), got {call_count['n']}"
     )
     assert torch.isfinite(loss).all()
+
+
+def test_token_mask_unequal_active_tokens_uses_correct_global_aggregate():
+    """Token-mask path with UNEQUAL active-token counts per rank.
+
+    Codex Round 4 review measured the Round-3 implementation getting 2.0
+    when the exact global aggregate is 3.2098765432098766, on a probe with
+    rank0 having 8 active tokens (all to expert 0) and rank1 having 1
+    active token (to expert 1). The Round 4 per-rank-mean averaging of
+    `tokens_per_expert` and `router_prob_per_expert` is biased for unequal
+    active counts; the Round 5 fix is to all-reduce numerators and
+    denominators separately, then divide globally.
+
+    This test reproduces Codex's probe and asserts the corrected behavior.
+    """
+    num_experts = 4
+    top_k = 1
+    # Rank 0: 8 active tokens (over a longer sequence with 8 padding-style
+    # zero tokens — the test mirrors how MoE-Everything passes token masks).
+    # All 8 active tokens route to expert 0.
+    rank0_total_tokens = 8
+    selected_rank0 = torch.zeros(rank0_total_tokens, top_k, dtype=torch.long)
+    probs_rank0 = torch.zeros(rank0_total_tokens, num_experts)
+    probs_rank0[:, 0] = 1.0  # all weight on expert 0
+    # Rank 0 attention mask: all 8 tokens active.
+    attn_mask_rank0 = torch.ones(1, rank0_total_tokens, dtype=torch.long)
+
+    # Compute rank 1's contribution to each of the four DDP-summed tensors.
+    # Rank 1: 1 active token → expert 1.
+    # tpe_num shape [K, N]; rank1's `(expert_mask * mask).sum(dim=0)` for
+    # 1 active token to expert 1 is [[0, 1, 0, 0]] (top_k=1 → K=1 row).
+    tpe_num_rank1 = torch.tensor([[0.0, 1.0, 0.0, 0.0]])
+    # tpe_den shape [K, N]; rank1's `mask.sum(dim=0)` is 1 broadcast over
+    # all (K, N) cells → [[1, 1, 1, 1]].
+    tpe_den_rank1 = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+    # rpe_num shape [N]; rank1's `(probs * mask).sum(dim=0)` for 1 active
+    # token with all weight on expert 1 is [0, 1, 0, 0].
+    rpe_num_rank1 = torch.tensor([0.0, 1.0, 0.0, 0.0])
+    # rpe_den shape [N]; broadcast scalar 1.
+    rpe_den_rank1 = torch.tensor([1.0, 1.0, 1.0, 1.0])
+
+    with _mock_distributed_with_call_order_queue(
+        world_size=2,
+        queue=[tpe_num_rank1, tpe_den_rank1, rpe_num_rank1, rpe_den_rank1],
+    ) as call_count:
+        global_loss = load_balancing_loss_func(
+            (probs_rank0,), num_experts=num_experts, top_k=top_k,
+            attention_mask=attn_mask_rank0,
+            selected_experts=(selected_rank0,),
+        ).item()
+    assert call_count["n"] == 4, (
+        f"token-mask path with unequal active tokens must call all_reduce "
+        f"four times, got {call_count['n']}"
+    )
+
+    # Closed-form expected:
+    #   tpe_num_global = [[8, 1, 0, 0]];  tpe_den_global = [[9, 9, 9, 9]]
+    #   tpe_global = [[8/9, 1/9, 0, 0]]
+    #   rpe_num_global = [8, 1, 0, 0]; rpe_den_global = [9, 9, 9, 9]
+    #   rpe_global = [8/9, 1/9, 0, 0]
+    #   loss = sum(tpe * rpe.unsqueeze(0)) * num_experts
+    #        = ((8/9)^2 + (1/9)^2 + 0 + 0) * 4
+    #        = (64 + 1) / 81 * 4
+    #        = 260/81
+    #        ≈ 3.2098765...
+    expected_global = (64 + 1) / 81 * num_experts
+    assert global_loss == pytest.approx(expected_global, abs=1e-5), (
+        f"Token-mask DDP global aggregate is wrong for unequal active counts. "
+        f"Got {global_loss}, expected {expected_global} (= 260/81). "
+        f"Codex Round 4 review measured the pre-Round-5 per-rank-mean "
+        f"implementation producing 2.0 here — that's biased; the correct "
+        f"all-reduce-num-and-den path produces {expected_global}."
+    )
+
+    # And it must be STRICTLY GREATER than the Round 4 per-rank-mean shortcut
+    # (which would yield ~2.0 — locked here as a regression guard).
+    biased_per_rank_mean_value = 2.0  # Codex's measured pre-Round-5 value.
+    assert global_loss > biased_per_rank_mean_value, (
+        f"Round 5 num/den fix should produce a LARGER aggregate than the "
+        f"Round 4 per-rank-mean shortcut for unequal active counts; got "
+        f"{global_loss} (must exceed {biased_per_rank_mean_value})."
+    )
 
 
 def test_remove_all_reduce_diverges_under_skewed_per_rank_routing():
@@ -406,6 +503,7 @@ if __name__ == "__main__":
     test_uniform_routing_global_aggregate_matches_single_rank()
     test_asymmetric_two_rank_global_aggregate_differs_from_rank_local()
     test_token_mask_path_global_aggregate_under_ddp()
+    test_token_mask_unequal_active_tokens_uses_correct_global_aggregate()
     test_remove_all_reduce_diverges_under_skewed_per_rank_routing()
     test_selected_experts_divergence_still_works_under_global_aggregate()
     print("ALL OK")

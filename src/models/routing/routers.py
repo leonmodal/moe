@@ -60,22 +60,15 @@ class BranchRouter(nn.Module):
         self.use_deepseek_style = use_deepseek_style
         self.last_probs = None
         self.last_selected_experts = None
-        # AC-9: exploration sampling cache. On the real forward pass we sample
-        # the binary explore mask + the per-token random override values once
-        # and stash detached copies here; under `is_checkpoint_recompute()`
-        # we reuse them so the gradient-checkpoint replay produces an
-        # identical branch decision (and gradient consistency holds). This is
-        # belt-and-suspenders on top of `torch.utils.checkpoint`'s default
-        # `preserve_rng_state=True`, and gives tests a deterministic anchor.
-        self._last_exploration_mask: torch.Tensor | None = None
-        self._last_exploration_random: torch.Tensor | None = None
-        # AC-9 (Round 4 fill): when `use_sampling` is enabled, the
-        # `torch.multinomial` draw on the real forward must be cached and
-        # reused on recompute. PyTorch's `preserve_rng_state=True` handles
-        # this for the default checkpoint path, but the explicit cache
-        # makes the contract testable and survives any future change that
-        # disables RNG preservation.
-        self._last_sampling_choice: torch.Tensor | None = None
+        # AC-9 (Round 5): rely on `torch.utils.checkpoint`'s default
+        # `preserve_rng_state=True` for recompute determinism. Round 2-4 had
+        # explicit caches for `_last_exploration_mask` /
+        # `_last_exploration_random` / `_last_sampling_choice`, but those
+        # caused saved-tensor count mismatches under
+        # `torch.utils.checkpoint(use_reentrant=False)` (real forward sampled
+        # → 2 saved tensors; recompute used cache → 0 saved tensors). The
+        # count-buffer guard in `forward` plus PyTorch's RNG preservation are
+        # sufficient.
         if use_deepseek_style:
             # Canonical balancing-owner buffer interface (DEC-18 / DEC-19): every
             # owner — standalone DeepSeekRouter, BranchRouter, or shared expert
@@ -116,67 +109,41 @@ class BranchRouter(nn.Module):
                 scores = torch.sigmoid(logits)
                 biased = scores + self.expert_bias.to(scores.dtype)
                 if self.training and self.use_sampling:
-                    # AC-9: cache the multinomial draw; reuse on recompute.
-                    cached_choice = getattr(self, "_last_sampling_choice", None)
-                    if (
-                        is_checkpoint_recompute()
-                        and cached_choice is not None
-                        and cached_choice.shape == scores.shape[:-1]
-                        and cached_choice.device == scores.device
-                    ):
-                        choice = cached_choice
-                    else:
-                        flat = scores.view(-1, 2)
-                        choice = torch.multinomial(flat, 1).view(scores.shape[:-1])
+                    # AC-9: rely on `torch.utils.checkpoint`'s default
+                    # `preserve_rng_state=True` so `torch.multinomial`
+                    # produces identical draws on real forward and recompute.
+                    flat = scores.view(-1, 2)
+                    choice = torch.multinomial(flat, 1).view(scores.shape[:-1])
                 else:
                     choice = biased.argmax(dim=-1)
                 probs = scores
             else:
                 probs = F.softmax(logits, dim=-1)
                 if self.training and self.use_sampling:
-                    # AC-9: cache the multinomial draw; reuse on recompute.
-                    cached_choice = getattr(self, "_last_sampling_choice", None)
-                    if (
-                        is_checkpoint_recompute()
-                        and cached_choice is not None
-                        and cached_choice.shape == probs.shape[:-1]
-                        and cached_choice.device == probs.device
-                    ):
-                        choice = cached_choice
-                    else:
-                        flat = probs.view(-1, 2)
-                        choice = torch.multinomial(flat, 1).view(probs.shape[:-1])
+                    # AC-9: same RNG-preservation rationale as above.
+                    flat = probs.view(-1, 2)
+                    choice = torch.multinomial(flat, 1).view(probs.shape[:-1])
                 else:
                     choice_scores = probs.float()
                     if self.training and self.exploration_rate > 0.0:
-                        # AC-9: under gradient-checkpoint recompute, reuse the
-                        # cached explore mask + override values from the real
-                        # forward pass so the recompute branch decision is
-                        # identical and gradient consistency holds.
-                        if (
-                            is_checkpoint_recompute()
-                            and self._last_exploration_mask is not None
-                            and self._last_exploration_mask.shape == choice_scores.shape[:-1]
-                            and self._last_exploration_mask.device == choice_scores.device
-                        ):
-                            explore_mask = self._last_exploration_mask
-                            random_overrides = self._last_exploration_random
-                        else:
-                            explore_mask = torch.rand(
-                                choice_scores.shape[:-1], device=choice_scores.device
-                            ) < self.exploration_rate
-                            random_overrides = None
-                            # Stash for potential recompute replay (only when this
-                            # is the real forward — see count-buffer guard above).
-                            if torch.is_grad_enabled() and not is_checkpoint_recompute():
-                                self._last_exploration_mask = explore_mask.detach()
+                        # AC-9: rely on `torch.utils.checkpoint`'s default
+                        # `preserve_rng_state=True` for recompute determinism.
+                        # Both `torch.rand` for the binary mask and
+                        # `torch.rand_like` for the override values produce
+                        # identical outputs across the real forward and
+                        # the recompute when RNG state is preserved (which it
+                        # is by default). An earlier design cached the mask
+                        # explicitly, but that introduced a saved-tensor
+                        # count mismatch under
+                        # `torch.utils.checkpoint(use_reentrant=False)`.
+                        explore_mask = torch.rand(
+                            choice_scores.shape[:-1], device=choice_scores.device
+                        ) < self.exploration_rate
                         if explore_mask.any():
                             choice_scores = choice_scores.clone()
-                            if random_overrides is None:
-                                random_overrides = torch.rand_like(choice_scores[explore_mask])
-                                if torch.is_grad_enabled() and not is_checkpoint_recompute():
-                                    self._last_exploration_random = random_overrides.detach()
-                            choice_scores[explore_mask] = random_overrides
+                            choice_scores[explore_mask] = torch.rand_like(
+                                choice_scores[explore_mask]
+                            )
                     choice = choice_scores.argmax(dim=-1)
 
             # Broadcast seq-level decision to all tokens
@@ -197,17 +164,13 @@ class BranchRouter(nn.Module):
                 counts = torch.bincount(flat_choice, minlength=2).float()
                 self.local_tokens_per_expert += counts
 
-        # AC-9: cache `choice` for `use_sampling` recompute reuse. We stash on
-        # every real-forward execution (under `torch.is_grad_enabled() and not
-        # is_checkpoint_recompute()`) regardless of `use_sampling`, since
-        # determining "do we need this cache" later is harder than always
-        # caching. Only the `use_sampling` paths ABOVE actually consult it.
-        if (
-            self.training
-            and torch.is_grad_enabled()
-            and not is_checkpoint_recompute()
-        ):
-            self._last_sampling_choice = choice.detach()
+        # AC-9 cache REMOVED in Round 5: relying on `torch.utils.checkpoint`'s
+        # default `preserve_rng_state=True` for recompute determinism. The
+        # earlier explicit cache caused a saved-tensor count mismatch
+        # (real forward sampled, recompute used cache) which
+        # `torch.utils.checkpoint(use_reentrant=False)` rejects. The
+        # count-buffer guard above is the only AC-9-specific state we still
+        # need to manage.
 
         probs = probs.to(hidden_states.dtype)
         self.last_probs = probs

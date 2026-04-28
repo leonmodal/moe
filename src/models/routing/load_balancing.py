@@ -26,18 +26,16 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 
-def _maybe_all_reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
-    """Average `tensor` across DDP ranks, in-place. No-op when distributed is
-    not initialized so single-rank training pays no collective cost.
+def _maybe_all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
+    """Sum `tensor` across DDP ranks, in-place. No-op when distributed is not
+    initialized.
 
-    The DDP "average" is implemented as `all_reduce(SUM) / world_size`. This
-    is mathematically the global mean when every rank's input is itself a
-    per-rank mean of the same number of samples — which holds in standard DDP
-    training where every rank sees the same `batch_size` per step.
+    Used for global-aggregate Switch aux (DEC-4): we sum per-rank numerators
+    and denominators separately and divide globally, which is exact even when
+    per-rank active-token counts disagree (the token-mask path).
     """
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        tensor /= dist.get_world_size()
     return tensor
 
 
@@ -126,12 +124,25 @@ def load_balancing_loss_func(
     selected_experts_tensor = torch.cat(filtered_selected, dim=0)
     expert_mask = F.one_hot(selected_experts_tensor, num_experts)
 
+    # DEC-4 (AC-4): global-aggregate Switch aux. We compute per-rank
+    # numerators and denominators separately, then `all_reduce(SUM)` BOTH
+    # before dividing. This is exact even when per-rank active-token counts
+    # differ (the token-mask path). Per-rank-mean averaging — what Round 3
+    # shipped — is biased for unequal active counts; Codex Round 4 review
+    # measured a 60% error on a deliberate unequal-active probe.
+    expert_mask_f = expert_mask.float()
     if attention_mask is None:
-        # f_i: fraction of tokens routed to each expert (hard assignment)
-        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
-
-        # p_i: average router probability per expert (soft, differentiable)
-        router_prob_per_expert = torch.mean(routing_weights, dim=0)
+        # f_i: numerator = sum of one-hot routing decisions over all tokens;
+        # denominator = total token count. (Per-rank counts are equal under
+        # standard DDP, but using the unified num/den path keeps the math
+        # identical to the token-mask case.)
+        tpe_num = expert_mask_f.sum(dim=0)  # [K, N]
+        tpe_den = torch.full_like(
+            tpe_num, float(expert_mask_f.shape[0]),
+        )
+        # p_i: numerator = sum of router probs; denominator = total token count.
+        rpe_num = routing_weights.sum(dim=0)  # [N]
+        rpe_den = torch.full_like(rpe_num, float(routing_weights.shape[0]))
     else:
         batch_size, sequence_length = attention_mask.shape
         num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
@@ -141,30 +152,30 @@ def load_balancing_loss_func(
             .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
             .reshape(-1, top_k, num_experts)
             .to(compute_device)
+            .to(expert_mask_f.dtype)
         )
-
-        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
-            expert_attention_mask, dim=0
-        )
+        tpe_num = (expert_mask_f * expert_attention_mask).sum(dim=0)  # [K, N]
+        tpe_den = expert_attention_mask.sum(dim=0)  # [K, N]
 
         router_per_expert_attention_mask = (
             attention_mask[None, :, :, None]
             .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
             .reshape(-1, num_experts)
             .to(compute_device)
+            .to(routing_weights.dtype)
         )
+        rpe_num = (routing_weights * router_per_expert_attention_mask).sum(dim=0)  # [N]
+        rpe_den = router_per_expert_attention_mask.sum(dim=0)  # [N]
 
-        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
-            router_per_expert_attention_mask, dim=0
-        )
+    # All-reduce numerators AND denominators with SUM, then divide. Guarded
+    # by `dist.is_initialized()` so single-rank paths pay no collective cost.
+    tpe_num = _maybe_all_reduce_sum(tpe_num.contiguous())
+    tpe_den = _maybe_all_reduce_sum(tpe_den.contiguous())
+    rpe_num = _maybe_all_reduce_sum(rpe_num.contiguous())
+    rpe_den = _maybe_all_reduce_sum(rpe_den.contiguous())
 
-    # DEC-4 (AC-4): global-aggregate Switch aux. Average each per-rank mean
-    # across DDP ranks before forming the loss; matches Megatron-LM's
-    # `global_tokens_per_expert` / `aggregated_probs_per_expert` contract.
-    # Guarded by `dist.is_initialized()` so single-rank paths pay no
-    # collective cost.
-    tokens_per_expert = _maybe_all_reduce_mean(tokens_per_expert.contiguous())
-    router_prob_per_expert = _maybe_all_reduce_mean(router_prob_per_expert.contiguous())
+    tokens_per_expert = tpe_num / tpe_den.clamp_min(1.0)
+    router_prob_per_expert = rpe_num / rpe_den.clamp_min(1.0)
 
     overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
     return overall_loss * num_experts

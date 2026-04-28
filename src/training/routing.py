@@ -9,6 +9,11 @@ from .distributed import is_distributed, unwrap_model
 
 
 _DEFAULT_BIAS_LABELS = ("q", "k", "v", "o", "mlp", "branch")
+# AC-1: methods that drive the post-step bias-update walker. `quantile` will
+# join this set in Milestone D when `_update_single_router_quantile_bias`
+# lands; until then, calling `update_expert_biases` for a `quantile` model is
+# a no-op so we don't accidentally run the wrong update path.
+_BIAS_UPDATE_METHODS = frozenset({"deepseek_bias"})
 
 
 def update_expert_biases(
@@ -28,11 +33,27 @@ def update_expert_biases(
     label yielded alongside each owner (`mlp`/`q`/`k`/`v`/`o`/`branch`) selects
     a per-projection bias rate from `per_proj_rates`.
 
+    AC-1: when `model._load_balancing_method` is stamped (by `build_model`),
+    the function consults it and no-ops for any method outside
+    `_BIAS_UPDATE_METHODS` (`aux_loss`, `seq_aux_loss`, `quantile`, `none`).
+    This is enforcement-by-default: callers that don't go through the trainer
+    (ad-hoc test fixtures, downstream tools, future code paths) still get the
+    correct method-gated behavior. When the method attribute is absent, the
+    function falls back to the legacy unconditional update for back-compat.
+
     The legacy `update_global_bias` early-return path was dead code (no model
     in this repo defined either `update_global_bias` or `global_load_balancing`)
     and has been removed.
     """
     raw_model = unwrap_model(model)
+
+    # AC-1: respect the stamped method if present. `None` means the caller
+    # didn't set a method — preserve legacy unconditional update for
+    # back-compat. Set values must be in the bias-update set.
+    method = getattr(raw_model, "_load_balancing_method", None)
+    if method is not None and method not in _BIAS_UPDATE_METHODS:
+        return
+
     get_owners = getattr(raw_model, "get_all_balancing_owners", None)
     if get_owners is None:
         return
