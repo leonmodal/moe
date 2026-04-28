@@ -678,14 +678,12 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
             # not something we want to regularize toward 50/50 usage.
 
         if output_router_logits:
-            # DEC-15 (Round 7 fix): aux methods need `router_logits` to be
-            # gradient-bearing in the model output so the aux/seq-aux loss
-            # term can backprop through them. Round 6 detached unconditionally
-            # which silently broke aux-method gradient flow on `moe_everything`
-            # (Codex Round 6 review measured `requires_grad=False` for the
-            # MLP router_logits even with `load_balancing_method=aux_loss`).
-            # Use the resolved method to decide: aux/seq_aux → keep grad;
-            # non-aux → detach for telemetry-only output.
+            # Aux methods need `router_logits` to be gradient-bearing
+            # in the model output so the aux/seq-aux loss term can
+            # backprop through them; non-aux methods detach for
+            # telemetry-only output (no autograd graph cost).
+            # Unconditional detach silently breaks aux-method gradient
+            # flow.
             method = getattr(self, "_load_balancing_method", None)
             mlp_grad_bearing = method is None or method in ("aux_loss", "seq_aux_loss")
             if mlp_router_logits is not None:

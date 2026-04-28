@@ -252,10 +252,11 @@ class Qwen3MoeExperts(nn.Module):
         ):
             return None
 
-        # Triton fallback (medium issue from Round 1 review): if the package
-        # isn't installed in this environment, the import fallback set
-        # `triton_grouped_gemm_output_input` to `None`. Skip the kernel path
-        # entirely; let the caller fall through to the eager loop.
+        # Triton fallback: if the package isn't installed in this
+        # environment, the import fallback set
+        # `triton_grouped_gemm_output_input` to `None`. Skip the
+        # kernel path entirely; let the caller fall through to the
+        # eager loop.
         if triton_grouped_gemm_output_input is None:
             return None
 

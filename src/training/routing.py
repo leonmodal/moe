@@ -9,11 +9,46 @@ from .distributed import is_distributed, unwrap_model
 
 
 _DEFAULT_BIAS_LABELS = ("q", "k", "v", "o", "mlp", "branch")
-# AC-1: methods that drive the post-step bias-update walker. `quantile` will
-# join this set in Milestone D when `_update_single_router_quantile_bias`
-# lands; until then, calling `update_expert_biases` for a `quantile` model is
-# a no-op so we don't accidentally run the wrong update path.
+# Methods that trigger the post-step bias-update walker. The
+# DeepSeek-V3-style sigmoid+bias router is the only active method
+# today; quantile-based balancing will be added later. Calling the
+# update path for any other method is a no-op so the wrong update
+# rule never runs by accident.
 _BIAS_UPDATE_METHODS = frozenset({"deepseek_bias"})
+
+
+def trainer_optimizer_step_and_bias_update(
+    model,
+    optimizer,
+    scheduler,
+    train_cfg,
+    cfg: dict,
+    *,
+    distributed: bool,
+    global_step: int,
+) -> None:
+    """The trainer's optimizer-step / scheduler-step / bias-update
+    tail, extracted into a single helper so it can be tested
+    end-to-end with spies on every call.
+
+    Production call order (locked by this helper):
+      1. `optimizer.step()`  — apply gradients to parameters.
+      2. `scheduler.step()`  — advance learning-rate schedule.
+      3. `trainer_post_optimizer_bias_update(...)` — method-gated,
+         no_grad-wrapped expert bias update.
+
+    Tests instrument this helper to verify both the call order and
+    the `torch.is_grad_enabled() == False` contract at the bias-update
+    call site. The production trainer also calls this helper, so a
+    future regression that re-orders or unwraps the no_grad block
+    would be caught.
+    """
+    optimizer.step()
+    scheduler.step()
+    trainer_post_optimizer_bias_update(
+        model, train_cfg, cfg,
+        distributed=distributed, global_step=global_step,
+    )
 
 
 def trainer_post_optimizer_bias_update(
@@ -24,32 +59,29 @@ def trainer_post_optimizer_bias_update(
     distributed: bool,
     global_step: int,
 ) -> None:
-    """The trainer's post-optimizer-step bias-update block, extracted
-    into a single helper so it can be tested directly.
+    """Run the production post-optimizer-step bias-update block.
 
-    Production call site: `src/training/trainer.py` invokes this
-    function once per training step, AFTER `optimizer.step()` and
-    `scheduler.step()`. The function:
+    The trainer invokes this once per training step, after
+    `optimizer.step()` and `scheduler.step()`. The function:
 
-      1. Reads the resolved `load_balancing_method` and gates the
-         bias update on `_BIAS_UPDATE_METHODS` (currently
-         `{deepseek_bias}`).
+      1. Reads the resolved `load_balancing_method` from the
+         (unwrapped) model and gates the bias update on
+         `_BIAS_UPDATE_METHODS` (currently `{deepseek_bias}`).
       2. Computes the current bias rate via `get_bias_rate(...)`
          (linear warmup from `bias_warmup_start` → `bias_update_rate`
          over `bias_warmup_steps`).
-      3. Resolves per-projection rate overrides via the DEC-3b
-         canonical-block resolver.
-      4. Wraps `update_expert_biases(...)` in `torch.no_grad()` to
-         satisfy the AC-6 misuse guard.
+      3. Resolves per-projection rate overrides via the canonical
+         `training:` block resolver.
+      4. Wraps `update_expert_biases(...)` in `torch.no_grad()` so
+         the function's misuse guard is satisfied.
 
-    Round 15 (Codex Round 14 Finding 2): factoring this block out
-    makes the production call path testable. Before, a hand-written
-    test could only mimic the trainer's sequence; now the test calls
-    THIS helper, which is the actual production code.
+    The helper is the canonical production call site for the
+    bias-update; tests instrument it directly.
     """
     from .balancing_fields import _resolve_balancing_field
 
-    method_for_bias_update = getattr(model, "_load_balancing_method", None)
+    raw_model = unwrap_model(model)
+    method_for_bias_update = getattr(raw_model, "_load_balancing_method", None)
     method_allows_bias_update = (
         method_for_bias_update is None
         or method_for_bias_update in _BIAS_UPDATE_METHODS
@@ -86,38 +118,34 @@ def update_expert_biases(
 ) -> None:
     """Update expert biases using DeepSeek V3-style load balancing.
 
-    Walks every load-balancing owner exposed by `raw_model.get_all_balancing_owners()`
-    and runs the unified `_update_single_router_bias` on each. Owners expose the
-    canonical interface — `expert_bias` (persistent fp32) and
-    `local_tokens_per_expert` (non-persistent fp32) — so MLP routers, attention
-    routers, and branch routers all share the same code path (DEC-18). The
-    label yielded alongside each owner (`mlp`/`q`/`k`/`v`/`o`/`branch`) selects
-    a per-projection bias rate from `per_proj_rates`.
+    Walks every load-balancing owner exposed by
+    `raw_model.get_all_balancing_owners()` and runs the unified
+    `_update_single_router_bias` on each. Owners expose the canonical
+    interface — `expert_bias` (persistent fp32) and
+    `local_tokens_per_expert` (non-persistent fp32) — so MLP routers,
+    attention routers, and branch routers all share the same code
+    path. The label yielded alongside each owner
+    (`mlp`/`q`/`k`/`v`/`o`/`branch`) selects a per-projection bias
+    rate from `per_proj_rates`.
 
-    AC-1: when `model._load_balancing_method` is stamped (by `build_model`),
-    the function consults it and no-ops for any method outside
-    `_BIAS_UPDATE_METHODS` (`aux_loss`, `seq_aux_loss`, `quantile`, `none`).
-    This is enforcement-by-default: callers that don't go through the trainer
-    (ad-hoc test fixtures, downstream tools, future code paths) still get the
-    correct method-gated behavior. When the method attribute is absent, the
-    function falls back to the legacy unconditional update for back-compat.
+    Method gating: when `model._load_balancing_method` is stamped (by
+    `build_model`), the function consults it and no-ops for any
+    method outside `_BIAS_UPDATE_METHODS` (`aux_loss`, `seq_aux_loss`,
+    `quantile`, `none`). This is enforcement-by-default: callers that
+    don't go through the trainer (ad-hoc test fixtures, downstream
+    tools) still get the correct method-gated behavior. When the
+    method attribute is absent, the function falls back to the
+    legacy unconditional update for back-compat.
 
-    AC-6 misuse guard (Round 15): when this function would actually mutate
-    `expert_bias`, it MUST be called inside `torch.no_grad()` (post-
-    optimizer-step). The check is gated by the method-dispatch path so
-    non-bias methods still no-op cleanly under the default grad-enabled
-    context — matching the AC-1/AC-2 no-op contract for non-bias
-    methods. Round 14's earlier guard-before-dispatch placement
-    regressed that contract; Round 15 (Codex Round 14 Finding 1)
-    restores it.
-
-    The legacy `update_global_bias` early-return path was dead code (no model
-    in this repo defined either `update_global_bias` or `global_load_balancing`)
-    and has been removed.
+    Misuse guard: when this function would actually mutate
+    `expert_bias`, it must be called inside `torch.no_grad()` (i.e.
+    post-optimizer-step). The check runs after the method-dispatch
+    no-op so non-bias methods still no-op cleanly under the default
+    grad-enabled context.
     """
     raw_model = unwrap_model(model)
 
-    # AC-1: respect the stamped method if present. `None` means the caller
+    # Respect the stamped method if present. `None` means the caller
     # didn't set a method — preserve legacy unconditional update for
     # back-compat. Set values must be in the bias-update set.
     method = getattr(raw_model, "_load_balancing_method", None)
@@ -128,12 +156,13 @@ def update_expert_biases(
     if get_owners is None:
         return
 
-    # AC-6 misuse guard: only bias-update-active methods can reach this
-    # point, so fail fast if the caller is in a grad-enabled context (a
-    # bias update inside backward / before optimizer.step would mutate
-    # `expert_bias` from stale or partially-accumulated counts). Placed
-    # AFTER the method-dispatch return so non-bias methods continue to
-    # no-op cleanly under the default grad-enabled context.
+    # Misuse guard: only bias-update-active methods reach this point,
+    # so fail fast if the caller is in a grad-enabled context (a
+    # bias update inside backward / before optimizer.step would
+    # mutate `expert_bias` from stale or partially-accumulated
+    # counts). Placed AFTER the method-dispatch return so non-bias
+    # methods continue to no-op cleanly under the default
+    # grad-enabled context.
     if torch.is_grad_enabled():
         raise RuntimeError(
             "update_expert_biases must be called inside a `torch.no_grad()` "
@@ -163,8 +192,8 @@ def _update_single_router_bias(
 ) -> None:
     """Update expert bias for a single load-balancing owner.
 
-    Per DEC-2 (RESOLVED → AC-6) two reference modes are supported, selected
-    by the `zero_sum` flag plumbed from `TrainingConfig.bias_update_zero_sum`:
+    Two reference modes are supported, selected by the `zero_sum`
+    flag plumbed from `TrainingConfig.bias_update_zero_sum`:
 
       `zero_sum=True` (default, matches `nmoe.Router.update_bias` — see
       `nmoe/nmoe/model.py:92-97`):
@@ -194,12 +223,11 @@ def _update_single_router_bias(
     with torch.no_grad():
         counts = router.local_tokens_per_expert
         if distributed and dist.is_available() and dist.is_initialized():
-            # Round 12 (Codex Round 11 Finding 1d): only all_reduce when a
-            # process group is actually live. The trainer call site
-            # already gates on `dist.is_initialized()` (see
-            # `update_expert_biases`), but direct callers — unit tests,
-            # debug fixtures — may pass `distributed=True` without
-            # initializing DDP. Defensive guard so neither path crashes.
+            # Only all_reduce when a process group is actually live.
+            # The trainer call site already checks `is_initialized()`,
+            # but direct callers (unit tests, debug fixtures) may pass
+            # `distributed=True` without initializing DDP. Defensive
+            # guard so neither path crashes.
             dist.all_reduce(counts, op=dist.ReduceOp.SUM)
         total = counts.sum()
         loads = counts / total.clamp_min(1.0)
@@ -305,7 +333,7 @@ def apply_router_exploration_rate(model, rate: float) -> int:
     `router_exploration_rate`. `MoEverythingConfig.__init__` also defaults
     the branch value to the model-wide value when left unset, so in that
     inherited / explicit-match case the BranchRouter should follow the
-    warmup schedule alongside the expert routers (AC-10). The applier
+    warmup schedule alongside the expert routers. The applier
     therefore includes every `BranchRouter` iff the unwrapped model's
     `config.branch_router_exploration_rate == config.router_exploration_rate`;
     when the two diverge, the user has opted into an independent branch

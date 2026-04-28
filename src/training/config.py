@@ -82,8 +82,7 @@ def load_config(path: str) -> dict:
     the balancing coefficients. Without this, a caller that loads a yaml
     directly (e.g. for sanity testing) and skips the train script would
     still observe the legacy coefficient-driven behavior the new
-    `load_balancing_method` knob is supposed to gate (Codex Round 3
-    blocker #2).
+    `load_balancing_method` knob is supposed to gate.
     """
     with open(path) as f:
         cfg = yaml.safe_load(f)
@@ -124,13 +123,13 @@ def build_training_config(cfg: dict) -> TrainingConfig:
         torch_compile=tcfg.get("torch_compile", False),
         torch_compile_mode=tcfg.get("torch_compile_mode", "default"),
         disable_liger=tcfg.get("disable_liger", False),
-        # Per DEC-3b (AC-3): the canonical block for these balancing fields is
-        # `training:`. The resolver falls back to `model:` with a deprecation
-        # warning so unmigrated yamls still produce the correct effective rate
-        # instead of silently zeroing it (the production-trainer regression
-        # Codex's Round 1 review identified). Round 2's resolver was only
-        # wired into `model_factory.py`; Round 3 wires it through here so the
-        # same fallback applies to the trainer-side reads as well.
+        # The canonical block for these balancing fields is
+        # `training:`. The resolver falls back to `model:` with a
+        # deprecation warning so unmigrated yamls still produce the
+        # correct effective rate instead of silently zeroing it.
+        # Plumbing the resolver through `build_training_config` here
+        # (in addition to `model_factory.py`) means both
+        # trainer-side and model-side reads see the same fallback.
         bias_update_rate=_resolve_balancing_field(cfg, "bias_update_rate", 0.0),
         bias_warmup_start=_resolve_balancing_field(cfg, "bias_warmup_start", 0.0),
         bias_warmup_steps=_resolve_balancing_field(cfg, "bias_warmup_steps", 0),

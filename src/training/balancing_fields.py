@@ -1,18 +1,18 @@
-"""Canonical-block resolution for DEC-3b balancing fields.
+"""Canonical-block resolution for balancing fields.
 
-Round 2 introduced this resolver in `model_factory.py` so `build_model` could
-read aux coefficients from the canonical `training:` block while warning on
-legacy `model:` placement. Round 3 promotes it to its own module so both
-`config.py` (`build_training_config`) and `model_factory.py` (`build_model`)
-can import it without circular-init pain — and so tests can import the
-helper without dragging the rest of `src/training/__init__.py` into scope
-(that path transitively imports pandas / liger).
+Both `build_training_config` (`config.py`) and `build_model`
+(`model_factory.py`) need to read aux coefficients from the canonical
+`training:` block while warning on legacy `model:` placement; this
+module owns that resolver so neither caller has a circular-import on
+the other, and tests can import the helper without dragging
+`src/training/__init__.py` into scope (that path transitively imports
+pandas / liger).
 
-Per `docs/plan.md` DEC-3b (RESOLVED 2026-04-27 → AC-3): every balancing-
-related field lives under `cfg["training"]`, NOT `cfg["model"]`. Today's
-yamls have already been migrated by `scripts/migrate_balancing_fields_to_training.py`.
-The resolver below tolerates unmigrated yamls (warning + reads the legacy
-location) so external configs remain bootable for one release.
+Every balancing-related field lives under `cfg["training"]`, NOT
+`cfg["model"]`. Today's yamls have already been migrated by
+`scripts/migrate_balancing_fields_to_training.py`. The resolver below
+tolerates unmigrated yamls (warning + reads the legacy location) so
+external configs remain bootable for one release.
 """
 from __future__ import annotations
 

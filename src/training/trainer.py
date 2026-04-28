@@ -59,6 +59,7 @@ from .routing import (
     collect_router_z_loss,
     exploration_rate_schedule,
     get_bias_rate,
+    trainer_optimizer_step_and_bias_update,
     trainer_post_optimizer_bias_update,
     update_expert_biases,
 )
@@ -71,7 +72,7 @@ def _stateful_dataloader_workers(dataset, requested: int, *, role: str, verbose:
     mutated inside `__iter__` on the dataset copy that is actually iterating.
     When `num_workers > 0` that copy lives in a subprocess, so the checkpointed
     state pulled from the main-process object is stale and resume lands at the
-    wrong position. To keep deterministic resume (AC-12) authoritative, any
+    wrong position. To keep deterministic resume authoritative, any
     dataset that exposes `get_state`/`set_state` is iterated in-process.
     """
     is_stateful = hasattr(dataset, "get_state") and hasattr(dataset, "set_state")
@@ -147,9 +148,9 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
     if seq_aux_loss_coef:
         model._seq_aux_loss_coef = seq_aux_loss_coef
 
-    # AC-1 / DEC-3a: stamp the resolved `load_balancing_method` onto the model
-    # so each family's `forward` gates aux / seq-aux additions explicitly,
-    # not just by coefficient values. `normalize_balancing_config` (called
+    # Stamp the resolved `load_balancing_method` onto the model so each
+    # family's `forward` gates aux / seq-aux additions explicitly, not
+    # just by coefficient values. `normalize_balancing_config` (called
     # from `load_config`) has already auto-zeroed conflicting coefficients,
     # so this is belt-and-suspenders against future regressions where a
     # non-zero default coefficient leaks into a non-active method.
@@ -157,10 +158,10 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
     if load_balancing_method_resolved is not None:
         model._load_balancing_method = load_balancing_method_resolved
 
-    # DEC-15 / task14: resolve `output_router_logits` once and reuse for
-    # every per-step forward. Aux methods need gradient-bearing router
-    # scores in the model output; non-aux methods don't (the routing-
-    # decision state lives in router-internal buffers).
+    # Resolve `output_router_logits` once and reuse for every per-step
+    # forward. Aux methods need gradient-bearing router scores in the
+    # model output; non-aux methods don't (the routing-decision state
+    # lives in router-internal buffers).
     from .balancing_fields import output_router_logits_for_method
     output_router_logits = output_router_logits_for_method(load_balancing_method_resolved)
 
@@ -396,10 +397,22 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
                 model.parameters(), train_cfg.max_grad_norm,
             )
             grad_norm = grad_norm_t.item() if isinstance(grad_norm_t, torch.Tensor) else float(grad_norm_t)
-        optimizer.step()
-        scheduler.step()
+        # Optimizer-step + scheduler-step + post-step bias update,
+        # extracted into a single helper so the production call
+        # sequence is testable end-to-end. The helper locks the
+        # order: optimizer.step → scheduler.step → bias update,
+        # and wraps the bias update in `torch.no_grad()` so the
+        # function's misuse guard is satisfied.
+        global_step += 1
+        trainer_optimizer_step_and_bias_update(
+            model, optimizer, scheduler, train_cfg, cfg,
+            distributed=distributed, global_step=global_step,
+        )
 
-        # Momentum warmup for Muon
+        # Momentum warmup for Muon — applied AFTER the helper so the
+        # next forward picks up the new momentum. Order vs the bias
+        # update is irrelevant (muon mutates optimizer state, bias
+        # update mutates expert_bias buffers — disjoint state).
         if train_cfg.optimizer == "muon":
             from src.utils.muon import get_muon_momentum
             new_mom = get_muon_momentum(global_step, warmup_steps=train_cfg.momentum_warmup_steps)
@@ -407,7 +420,6 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
                 if group.get("is_muon", False):
                     group["momentum"] = new_mom
 
-        global_step += 1
         tokens_seen += local_tokens_in_step * world_size
         elapsed = time.perf_counter() - step_start
         step_tokens = local_tokens_in_step * world_size
@@ -445,17 +457,6 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
             tokens_seen=tokens_seen,
             elapsed=elapsed,
             log_every=train_cfg.log_every,
-        )
-
-        # Expert bias updates. Round 15 extracts the bias-update block
-        # into `trainer_post_optimizer_bias_update` so the production
-        # call sequence is testable end-to-end (Codex Round 14 Finding
-        # 2). The helper handles method gating, warmup-rate
-        # computation, per-projection rate resolution, and the
-        # `with torch.no_grad():` wrap.
-        trainer_post_optimizer_bias_update(
-            model, train_cfg, cfg,
-            distributed=distributed, global_step=global_step,
         )
 
         # Routing heatmaps

@@ -60,15 +60,15 @@ class BranchRouter(nn.Module):
         self.use_deepseek_style = use_deepseek_style
         self.last_probs = None
         self.last_selected_experts = None
-        # AC-9 (Round 5): rely on `torch.utils.checkpoint`'s default
-        # `preserve_rng_state=True` for recompute determinism. Round 2-4 had
-        # explicit caches for `_last_exploration_mask` /
-        # `_last_exploration_random` / `_last_sampling_choice`, but those
-        # caused saved-tensor count mismatches under
-        # `torch.utils.checkpoint(use_reentrant=False)` (real forward sampled
-        # → 2 saved tensors; recompute used cache → 0 saved tensors). The
-        # count-buffer guard in `forward` plus PyTorch's RNG preservation are
-        # sufficient.
+        # Rely on `torch.utils.checkpoint`'s default
+        # `preserve_rng_state=True` for recompute determinism. An
+        # earlier design had explicit caches for
+        # `_last_exploration_mask` / `_last_exploration_random` /
+        # `_last_sampling_choice`, but those caused saved-tensor count
+        # mismatches under `torch.utils.checkpoint(use_reentrant=False)`
+        # (real forward sampled → 2 saved tensors; recompute used
+        # cache → 0 saved tensors). The count-buffer guard in
+        # `forward` plus PyTorch's RNG preservation are sufficient.
         if use_deepseek_style:
             # Canonical balancing-owner buffer interface (DEC-18 / DEC-19): every
             # owner — standalone DeepSeekRouter, BranchRouter, or shared expert
@@ -164,13 +164,13 @@ class BranchRouter(nn.Module):
                 counts = torch.bincount(flat_choice, minlength=2).float()
                 self.local_tokens_per_expert += counts
 
-        # AC-9 cache REMOVED in Round 5: relying on `torch.utils.checkpoint`'s
-        # default `preserve_rng_state=True` for recompute determinism. The
+        # Rely on `torch.utils.checkpoint`'s default
+        # `preserve_rng_state=True` for recompute determinism: an
         # earlier explicit cache caused a saved-tensor count mismatch
         # (real forward sampled, recompute used cache) which
         # `torch.utils.checkpoint(use_reentrant=False)` rejects. The
-        # count-buffer guard above is the only AC-9-specific state we still
-        # need to manage.
+        # count-buffer guard above is the only checkpoint-specific
+        # state we still need to manage.
 
         probs = probs.to(hidden_states.dtype)
         self.last_probs = probs

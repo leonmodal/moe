@@ -113,7 +113,7 @@ def _collect_detached_router_scores(model) -> tuple[torch.Tensor, ...] | None:
     Attention routers (`q`/`k`/`v`/`o`) and branch router(s) are
     intentionally excluded — their expert dimensions differ from MLP
     `num_experts` and would crash `normalized_load_balancing_loss_func`
-    (Codex Round 8 Blocker #2). Attention diagnostics, when needed,
+    if mixed into a single tuple. Attention diagnostics, when needed,
     must be computed separately with their own `num_attn_experts` /
     per-head top-k.
 

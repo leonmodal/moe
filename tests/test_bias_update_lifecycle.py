@@ -734,75 +734,220 @@ def test_ddp_two_rank_all_reduce_produces_identical_biases(tmp_path):
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_trainer_calls_bias_update_after_optimizer_step():
-    """AC-6 ordering (source-level): in the trainer's main step loop,
+def test_routing_helper_invokes_bias_update_after_optimizer_step():
+    """AC-6 source-level ordering check: in
+    `src/training/routing.py:trainer_optimizer_step_and_bias_update`,
     the bias-update entry point must be invoked strictly AFTER
     `optimizer.step()`. The bias update reads stale
     `local_tokens_per_expert` if it runs before the optimizer step
     has consumed the current step's gradients.
 
-    Round 15: the trainer now calls
-    `trainer_post_optimizer_bias_update(...)` (a helper extracted
-    from the inline bias-update block) instead of
-    `update_expert_biases(...)` directly. This AST test locks the
-    source-code structure so a future refactor that re-inlines the
-    block AND re-orders its position is caught.
+    The trainer's `run_training()` calls
+    `trainer_optimizer_step_and_bias_update(...)`, which is the
+    canonical extracted helper for the optimizer-step + bias-update
+    sequence. This AST walk locks the helper's source-level order
+    so a future refactor cannot re-arrange the calls without
+    failing the test.
 
     The companion runtime test
-    (`test_trainer_post_optimizer_bias_update_runtime_order`) tests
-    the actual production helper end-to-end with spies — together
-    the two tests catch both source and runtime ordering
-    regressions.
+    (`test_trainer_optimizer_step_and_bias_update_runtime_order`)
+    additionally instruments the helper with spies and proves the
+    runtime call order matches.
+    """
+    import ast
+    repo = Path(__file__).resolve().parent.parent
+    routing_src = (repo / "src" / "training" / "routing.py").read_text()
+    module = ast.parse(routing_src)
+
+    BIAS_UPDATE_ENTRY_POINTS = {
+        "update_expert_biases",
+        "trainer_post_optimizer_bias_update",
+    }
+
+    target_func = None
+    for node in ast.walk(module):
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name == "trainer_optimizer_step_and_bias_update"
+        ):
+            target_func = node
+            break
+    assert target_func is not None, (
+        "expected `trainer_optimizer_step_and_bias_update` function in routing.py"
+    )
+
+    optimizer_step_lines: list[int] = []
+    bias_update_call_lines: list[int] = []
+    for child in ast.walk(target_func):
+        if isinstance(child, ast.Call):
+            if (
+                isinstance(child.func, ast.Attribute)
+                and child.func.attr == "step"
+                and isinstance(child.func.value, ast.Name)
+                and child.func.value.id == "optimizer"
+            ):
+                optimizer_step_lines.append(child.lineno)
+            if isinstance(child.func, ast.Name) and child.func.id in BIAS_UPDATE_ENTRY_POINTS:
+                bias_update_call_lines.append(child.lineno)
+
+    assert optimizer_step_lines, (
+        "expected `optimizer.step()` to appear in "
+        "trainer_optimizer_step_and_bias_update"
+    )
+    assert bias_update_call_lines, (
+        "expected one of the bias-update entry points "
+        f"({sorted(BIAS_UPDATE_ENTRY_POINTS)}) to appear in "
+        "trainer_optimizer_step_and_bias_update"
+    )
+
+    first_opt_step = min(optimizer_step_lines)
+    first_bias_update = min(bias_update_call_lines)
+    assert first_bias_update > first_opt_step, (
+        f"ordering violation: bias-update call (line {first_bias_update}) "
+        f"must appear AFTER `optimizer.step()` (line {first_opt_step}) "
+        f"in trainer_optimizer_step_and_bias_update."
+    )
+
+
+def test_trainer_calls_helper_after_clip_grad_norm():
+    """Round 16 source-level check: trainer.run_training()'s main step
+    loop must call `trainer_optimizer_step_and_bias_update(...)`
+    AFTER `clip_grad_norm_(...)`. Together with the routing-helper
+    test above, this locks the full source-level ordering:
+    clip_grad_norm → optimizer.step → scheduler.step → bias update.
     """
     import ast
     repo = Path(__file__).resolve().parent.parent
     trainer_src = (repo / "src" / "training" / "trainer.py").read_text()
     module = ast.parse(trainer_src)
 
-    optimizer_step_lines: list[int] = []
-    bias_update_call_lines: list[int] = []
-
-    # Either the legacy bare-call (`update_expert_biases(...)`) or the
-    # current helper call (`trainer_post_optimizer_bias_update(...)`)
-    # is acceptable as a "bias update entry point" — the contract is
-    # the post-step ordering, not the specific function name.
-    BIAS_UPDATE_ENTRY_POINTS = {
-        "update_expert_biases",
-        "trainer_post_optimizer_bias_update",
-    }
-
-    class _Visitor(ast.NodeVisitor):
-        def visit_Call(self, node: ast.Call):
+    clip_lines: list[int] = []
+    helper_lines: list[int] = []
+    for node in ast.walk(module):
+        if isinstance(node, ast.Call):
+            # `torch.nn.utils.clip_grad_norm_(...)` and friends.
             if (
                 isinstance(node.func, ast.Attribute)
-                and node.func.attr == "step"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "optimizer"
+                and node.func.attr == "clip_grad_norm_"
             ):
-                optimizer_step_lines.append(node.lineno)
-            if isinstance(node.func, ast.Name) and node.func.id in BIAS_UPDATE_ENTRY_POINTS:
-                bias_update_call_lines.append(node.lineno)
-            self.generic_visit(node)
+                clip_lines.append(node.lineno)
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "trainer_optimizer_step_and_bias_update"
+            ):
+                helper_lines.append(node.lineno)
 
-    _Visitor().visit(module)
-
-    assert optimizer_step_lines, "expected `optimizer.step()` to appear in trainer.py"
-    assert bias_update_call_lines, (
-        "expected one of the bias-update entry points "
-        f"({sorted(BIAS_UPDATE_ENTRY_POINTS)}) to appear in trainer.py"
+    assert clip_lines, "expected `clip_grad_norm_(...)` to appear in trainer.py"
+    assert helper_lines, (
+        "expected `trainer_optimizer_step_and_bias_update(...)` to appear in trainer.py"
     )
-
-    first_opt_step = min(optimizer_step_lines)
-    first_bias_update = min(bias_update_call_lines)
-    assert first_bias_update > first_opt_step, (
-        f"AC-6 ordering violation: bias-update call (line {first_bias_update}) "
-        f"must appear AFTER `optimizer.step()` (line {first_opt_step}) in trainer.py."
+    assert min(helper_lines) > min(clip_lines), (
+        f"ordering: trainer must call the optimizer-step helper "
+        f"(line {min(helper_lines)}) AFTER clip_grad_norm_ "
+        f"(line {min(clip_lines)})."
     )
 
 
 # ──────────────────────────────────────────────────────────────────────
 #  Real trainer call-order instrumentation (Codex Round 13 Finding 2)
 # ──────────────────────────────────────────────────────────────────────
+
+
+def test_trainer_optimizer_step_and_bias_update_runtime_order():
+    """End-to-end runtime ordering test for the full helper:
+    `trainer_optimizer_step_and_bias_update` is the canonical
+    extracted helper that the production trainer calls; it
+    internally invokes `optimizer.step` → `scheduler.step` →
+    `trainer_post_optimizer_bias_update`. Spies on all three
+    confirm the actual production code path runs them in the
+    correct order, AND that `update_expert_biases` runs under
+    `torch.no_grad()`.
+
+    A future regression that re-orders or unwraps this sequence
+    fails this test directly, since the trainer runs THIS helper
+    (not a hand-rolled mock).
+    """
+    routing = _load_routing_module()
+
+    class _TrainCfg:
+        bias_update_rate = 0.01
+        bias_warmup_start = 0.0
+        bias_warmup_steps = 0
+        bias_update_zero_sum = True
+
+    cfg: dict = {}
+
+    router = _make_router(num_experts=4)
+    router.local_tokens_per_expert = torch.tensor([100.0, 1.0, 1.0, 1.0])
+
+    class _Model:
+        def __init__(self, gate, method):
+            self._load_balancing_method = method
+            self._gate = gate
+
+        def get_all_balancing_owners(self):
+            yield self._gate, "mlp"
+
+    # Instrument: wrap optimizer.step / scheduler.step / update_expert_biases
+    # with spies that record call order AND grad-enabled state at the
+    # moment of each call.
+    call_order: list[str] = []
+    grad_enabled_at_call: list[tuple[str, bool]] = []
+
+    class _SpyOptimizer:
+        def step(self):
+            call_order.append("optimizer.step")
+            grad_enabled_at_call.append(("optimizer.step", torch.is_grad_enabled()))
+
+    class _SpyScheduler:
+        def step(self):
+            call_order.append("scheduler.step")
+            grad_enabled_at_call.append(("scheduler.step", torch.is_grad_enabled()))
+
+    real_update = routing.update_expert_biases
+
+    def _spy_update_expert_biases(model, **kwargs):
+        call_order.append("update_expert_biases")
+        grad_enabled_at_call.append(("update_expert_biases", torch.is_grad_enabled()))
+        return real_update(model, **kwargs)
+
+    model = _Model(router, "deepseek_bias")
+    optimizer = _SpyOptimizer()
+    scheduler = _SpyScheduler()
+
+    routing.update_expert_biases = _spy_update_expert_biases
+    try:
+        # Outer context is grad-enabled (matches the trainer's main step
+        # loop); the helper is responsible for the no_grad wrap.
+        assert torch.is_grad_enabled()
+        routing.trainer_optimizer_step_and_bias_update(
+            model, optimizer, scheduler, _TrainCfg(), cfg,
+            distributed=False, global_step=1,
+        )
+    finally:
+        routing.update_expert_biases = real_update
+
+    assert call_order == [
+        "optimizer.step",
+        "scheduler.step",
+        "update_expert_biases",
+    ], (
+        f"runtime ordering violated: expected "
+        f"['optimizer.step', 'scheduler.step', 'update_expert_biases'], "
+        f"got {call_order}"
+    )
+    grad_at_bias = dict(grad_enabled_at_call)["update_expert_biases"]
+    assert grad_at_bias is False, (
+        f"`update_expert_biases` must be invoked under no_grad context, "
+        f"got is_grad_enabled={grad_at_bias}"
+    )
+    # Sanity: optimizer.step and scheduler.step run with grad enabled
+    # (the helper does NOT wrap them — only the bias update is
+    # wrapped). This proves the no_grad wrap is scoped narrowly.
+    grad_at_opt = dict(grad_enabled_at_call)["optimizer.step"]
+    grad_at_sched = dict(grad_enabled_at_call)["scheduler.step"]
+    assert grad_at_opt is True
+    assert grad_at_sched is True
 
 
 def test_trainer_post_optimizer_bias_update_runtime_order():
@@ -931,6 +1076,49 @@ def test_trainer_post_optimizer_bias_update_runtime_order():
     finally:
         routing.update_expert_biases = real_update
     assert captured["calls"] == []
+
+    # Path E: model wrapped in an FSDP-style wrapper. The wrapper
+    # itself does NOT expose `_load_balancing_method`; only the inner
+    # `_fsdp_wrapped_module` does. The helper must call
+    # `unwrap_model(...)` before reading the method attribute,
+    # otherwise the helper's no-op gate misses non-bias methods on
+    # wrapped models.
+    captured = {"calls": [], "grad_enabled_at_call": []}
+
+    class _FSDPWrapper:
+        """Minimal FSDP-style wrapper: `unwrap_model(...)` checks
+        `_fsdp_wrapped_module` (see src/training/distributed.py).
+        The wrapper itself intentionally does NOT have a
+        `_load_balancing_method` attribute — if `getattr(wrapper, ...)`
+        returned the inner attribute by accident, the test would
+        vacuously pass."""
+        def __init__(self, inner):
+            self._fsdp_wrapped_module = inner
+
+    inner = _Model(router, "aux_loss")  # non-bias method
+    wrapped = _FSDPWrapper(inner)
+
+    # Preflight: the wrapper does not directly expose
+    # `_load_balancing_method` (so a non-unwrap-aware getattr would
+    # see `None` → method-allows-bias-update branch via the legacy
+    # back-compat path → unwanted bias update fires).
+    assert not hasattr(wrapped, "_load_balancing_method")
+
+    routing.update_expert_biases = _spy_update_expert_biases
+    try:
+        routing.trainer_post_optimizer_bias_update(
+            wrapped, _TrainCfg(), cfg,
+            distributed=False, global_step=0,
+        )
+    finally:
+        routing.update_expert_biases = real_update
+    assert captured["calls"] == [], (
+        "wrapper-aware no-op: helper must unwrap_model(...) before "
+        "reading _load_balancing_method, so a wrapped model with "
+        "non-bias method (here: aux_loss on the inner module) does "
+        "NOT trigger update_expert_biases. Got "
+        f"{len(captured['calls'])} calls."
+    )
 
     # Path D: bias_update_rate=0 → helper SHOULD no-op even for
     # deepseek_bias (the bias rate is the kill switch).

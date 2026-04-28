@@ -124,12 +124,12 @@ def load_balancing_loss_func(
     selected_experts_tensor = torch.cat(filtered_selected, dim=0)
     expert_mask = F.one_hot(selected_experts_tensor, num_experts)
 
-    # DEC-4 (AC-4): global-aggregate Switch aux. We compute per-rank
-    # numerators and denominators separately, then `all_reduce(SUM)` BOTH
-    # before dividing. This is exact even when per-rank active-token counts
-    # differ (the token-mask path). Per-rank-mean averaging — what Round 3
-    # shipped — is biased for unequal active counts; Codex Round 4 review
-    # measured a 60% error on a deliberate unequal-active probe.
+    # Global-aggregate Switch aux. We compute per-rank numerators and
+    # denominators separately, then `all_reduce(SUM)` BOTH before
+    # dividing. This is exact even when per-rank active-token counts
+    # differ (the token-mask path); per-rank-mean averaging is biased
+    # for unequal active counts (a 60% error on the deliberate
+    # unequal-active probe).
     expert_mask_f = expert_mask.float()
     if attention_mask is None:
         # f_i: numerator = sum of one-hot routing decisions over all tokens;

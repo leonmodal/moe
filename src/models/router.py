@@ -341,16 +341,18 @@ class ExplorationTopKRouter(Qwen3MoeTopKRouter):
             else:
                 self._last_z_loss = None
 
-        # DEC-17 (Round 12): skip the post-topk normalization for top_k=1.
-        # `value / value = 1.0` is constant in any non-degenerate case and
-        # kills the routing-weight gradient — same gradient-kill the
-        # DeepSeekRouter `norm_topk_prob and top_k > 1` guard avoids.
+        # Skip the post-topk normalization for top_k=1: `value /
+        # value = 1.0` is constant in any non-degenerate case and
+        # kills the routing-weight gradient. DeepSeekRouter has the
+        # same `norm_topk_prob and top_k > 1` guard for the same
+        # reason.
         if self.norm_topk_prob and self.top_k > 1:
             router_top_value = router_top_value / (router_top_value.sum(dim=-1, keepdim=True) + 1e-20)
         router_scores = router_top_value.to(raw_logits.dtype)
         self._last_top_k_idx = router_indices.detach()
         self._last_exploration_mask = None if exploration_mask is None else exploration_mask.detach()
-        # DEC-15 DETACH-ONLY: detached per-expert scores for non-aux telemetry.
+        # Detach-only telemetry: per-expert scores for non-aux
+        # methods that don't need gradient flow through router_logits.
         self._last_router_scores_detached = probs.detach()
         # First return value keeps the prior contract: the per-expert scored probs
         # (post-softmax / post-sigmoid / post-sqrtsoftplus) are what downstream aux
@@ -393,15 +395,15 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
         self._last_top_k_idx = None
         self._last_exploration_mask = None
         self._last_z_loss = None
-        # DEC-15 DETACH-ONLY: telemetry state populated on every forward.
+        # Detach-only telemetry state populated on every forward.
         self._last_router_scores_detached = None
-        # AC-9 (Round 5): rely on `torch.utils.checkpoint`'s default
-        # `preserve_rng_state=True` for recompute determinism. An earlier
-        # design cached `top_k_idx` here to defend against
-        # `preserve_rng_state=False`, but the cache caused a saved-tensor
-        # count mismatch under `use_reentrant=False`. The count-buffer
-        # guard in `forward` is the only checkpoint-specific state we need.
-        # See bitlesson `BL-20260428-cache-vs-checkpoint-tensor-count`.
+        # Rely on `torch.utils.checkpoint`'s default
+        # `preserve_rng_state=True` for recompute determinism: an
+        # earlier design cached `top_k_idx` here to defend against
+        # `preserve_rng_state=False`, but the cache caused a
+        # saved-tensor count mismatch under `use_reentrant=False`.
+        # The count-buffer guard in `forward` is the only
+        # checkpoint-specific state we need.
 
     def forward(self, hidden_states: torch.Tensor):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
