@@ -59,6 +59,7 @@ from .routing import (
     collect_router_z_loss,
     exploration_rate_schedule,
     get_bias_rate,
+    trainer_post_optimizer_bias_update,
     update_expert_biases,
 )
 
@@ -446,46 +447,16 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
             log_every=train_cfg.log_every,
         )
 
-        # Expert bias updates. Per DEC-3b (AC-3) the per-projection rates
-        # live under `training:` canonically; resolve via the same helper
-        # so unmigrated yamls fall back with a deprecation warning instead of
-        # silently using `rate` for every class.
-        # AC-1: gate by the resolved `load_balancing_method`. Only
-        # `deepseek_bias` (and `quantile` once implemented in Milestone D)
-        # actually trigger the post-step bias update walker. For
-        # `aux_loss` / `seq_aux_loss` / `none`, even a non-zero
-        # `bias_update_rate` (e.g. left over from a config bug) is ignored.
-        method_for_bias_update = getattr(model, "_load_balancing_method", None)
-        bias_update_methods = {"deepseek_bias"}  # quantile lands in Milestone D
-        method_allows_bias_update = (
-            method_for_bias_update is None
-            or method_for_bias_update in bias_update_methods
+        # Expert bias updates. Round 15 extracts the bias-update block
+        # into `trainer_post_optimizer_bias_update` so the production
+        # call sequence is testable end-to-end (Codex Round 14 Finding
+        # 2). The helper handles method gating, warmup-rate
+        # computation, per-projection rate resolution, and the
+        # `with torch.no_grad():` wrap.
+        trainer_post_optimizer_bias_update(
+            model, train_cfg, cfg,
+            distributed=distributed, global_step=global_step,
         )
-        if train_cfg.bias_update_rate > 0 and method_allows_bias_update:
-            rate = get_bias_rate(
-                model, global_step, train_cfg.bias_update_rate,
-                train_cfg.bias_warmup_start, train_cfg.bias_warmup_steps,
-            )
-            from .balancing_fields import _resolve_balancing_field
-            per_proj_rates = {
-                "q": _resolve_balancing_field(cfg, "bias_rate_q", rate),
-                "k": _resolve_balancing_field(cfg, "bias_rate_k", rate),
-                "v": _resolve_balancing_field(cfg, "bias_rate_v", rate),
-                "o": _resolve_balancing_field(cfg, "bias_rate_o", rate),
-                "mlp": _resolve_balancing_field(cfg, "bias_rate_mlp", rate),
-                "branch": _resolve_balancing_field(cfg, "bias_rate_branch", rate),
-            }
-            # AC-6 misuse guard (Round 14): `update_expert_biases`
-            # requires `torch.no_grad()` context. The trainer is the
-            # canonical production call site; wrap the call so the
-            # contract is explicit and the precondition assertion
-            # inside `update_expert_biases` is satisfied.
-            with torch.no_grad():
-                update_expert_biases(
-                    model, bias_rate=rate, distributed=distributed,
-                    per_proj_rates=per_proj_rates,
-                    zero_sum=train_cfg.bias_update_zero_sum,
-                )
 
         # Routing heatmaps
         if heatmap_every > 0 and global_step > 0 and global_step % heatmap_every == 0:

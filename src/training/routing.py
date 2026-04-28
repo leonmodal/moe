@@ -16,6 +16,66 @@ _DEFAULT_BIAS_LABELS = ("q", "k", "v", "o", "mlp", "branch")
 _BIAS_UPDATE_METHODS = frozenset({"deepseek_bias"})
 
 
+def trainer_post_optimizer_bias_update(
+    model,
+    train_cfg,
+    cfg: dict,
+    *,
+    distributed: bool,
+    global_step: int,
+) -> None:
+    """The trainer's post-optimizer-step bias-update block, extracted
+    into a single helper so it can be tested directly.
+
+    Production call site: `src/training/trainer.py` invokes this
+    function once per training step, AFTER `optimizer.step()` and
+    `scheduler.step()`. The function:
+
+      1. Reads the resolved `load_balancing_method` and gates the
+         bias update on `_BIAS_UPDATE_METHODS` (currently
+         `{deepseek_bias}`).
+      2. Computes the current bias rate via `get_bias_rate(...)`
+         (linear warmup from `bias_warmup_start` → `bias_update_rate`
+         over `bias_warmup_steps`).
+      3. Resolves per-projection rate overrides via the DEC-3b
+         canonical-block resolver.
+      4. Wraps `update_expert_biases(...)` in `torch.no_grad()` to
+         satisfy the AC-6 misuse guard.
+
+    Round 15 (Codex Round 14 Finding 2): factoring this block out
+    makes the production call path testable. Before, a hand-written
+    test could only mimic the trainer's sequence; now the test calls
+    THIS helper, which is the actual production code.
+    """
+    from .balancing_fields import _resolve_balancing_field
+
+    method_for_bias_update = getattr(model, "_load_balancing_method", None)
+    method_allows_bias_update = (
+        method_for_bias_update is None
+        or method_for_bias_update in _BIAS_UPDATE_METHODS
+    )
+    if not (train_cfg.bias_update_rate > 0 and method_allows_bias_update):
+        return
+    rate = get_bias_rate(
+        model, global_step, train_cfg.bias_update_rate,
+        train_cfg.bias_warmup_start, train_cfg.bias_warmup_steps,
+    )
+    per_proj_rates = {
+        "q": _resolve_balancing_field(cfg, "bias_rate_q", rate),
+        "k": _resolve_balancing_field(cfg, "bias_rate_k", rate),
+        "v": _resolve_balancing_field(cfg, "bias_rate_v", rate),
+        "o": _resolve_balancing_field(cfg, "bias_rate_o", rate),
+        "mlp": _resolve_balancing_field(cfg, "bias_rate_mlp", rate),
+        "branch": _resolve_balancing_field(cfg, "bias_rate_branch", rate),
+    }
+    with torch.no_grad():
+        update_expert_biases(
+            model, bias_rate=rate, distributed=distributed,
+            per_proj_rates=per_proj_rates,
+            zero_sum=train_cfg.bias_update_zero_sum,
+        )
+
+
 def update_expert_biases(
     model,
     *,
@@ -24,21 +84,6 @@ def update_expert_biases(
     per_proj_rates: dict[str, float] | None = None,
     zero_sum: bool = True,
 ) -> None:
-    if torch.is_grad_enabled():
-        # AC-6 misuse guard (Round 14, Codex Round 13 Finding 2): the
-        # trainer must call this from a `torch.no_grad()` context. The
-        # update mutates `expert_bias` in-place and zeroes
-        # `local_tokens_per_expert`; calling it from inside a forward
-        # pass / before the optimizer.step has consumed gradients can
-        # silently double-count tokens or update bias from stale
-        # counts. Fail fast so accidental misuse surfaces immediately.
-        raise RuntimeError(
-            "update_expert_biases must be called inside a `torch.no_grad()` "
-            "context (post-optimizer-step). Wrap the call in "
-            "`with torch.no_grad():` — the trainer path already does this. "
-            "If you saw this from a test, your test is missing the no_grad "
-            "wrapper that production code uses."
-        )
     """Update expert biases using DeepSeek V3-style load balancing.
 
     Walks every load-balancing owner exposed by `raw_model.get_all_balancing_owners()`
@@ -57,6 +102,15 @@ def update_expert_biases(
     correct method-gated behavior. When the method attribute is absent, the
     function falls back to the legacy unconditional update for back-compat.
 
+    AC-6 misuse guard (Round 15): when this function would actually mutate
+    `expert_bias`, it MUST be called inside `torch.no_grad()` (post-
+    optimizer-step). The check is gated by the method-dispatch path so
+    non-bias methods still no-op cleanly under the default grad-enabled
+    context — matching the AC-1/AC-2 no-op contract for non-bias
+    methods. Round 14's earlier guard-before-dispatch placement
+    regressed that contract; Round 15 (Codex Round 14 Finding 1)
+    restores it.
+
     The legacy `update_global_bias` early-return path was dead code (no model
     in this repo defined either `update_global_bias` or `global_load_balancing`)
     and has been removed.
@@ -73,6 +127,21 @@ def update_expert_biases(
     get_owners = getattr(raw_model, "get_all_balancing_owners", None)
     if get_owners is None:
         return
+
+    # AC-6 misuse guard: only bias-update-active methods can reach this
+    # point, so fail fast if the caller is in a grad-enabled context (a
+    # bias update inside backward / before optimizer.step would mutate
+    # `expert_bias` from stale or partially-accumulated counts). Placed
+    # AFTER the method-dispatch return so non-bias methods continue to
+    # no-op cleanly under the default grad-enabled context.
+    if torch.is_grad_enabled():
+        raise RuntimeError(
+            "update_expert_biases must be called inside a `torch.no_grad()` "
+            "context (post-optimizer-step). Wrap the call in "
+            "`with torch.no_grad():` — the trainer path already does this. "
+            "If you saw this from a test, your test is missing the no_grad "
+            "wrapper that production code uses."
+        )
 
     rates = {label: bias_rate for label in _DEFAULT_BIAS_LABELS}
     if per_proj_rates:

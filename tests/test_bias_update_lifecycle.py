@@ -735,16 +735,24 @@ def test_ddp_two_rank_all_reduce_produces_identical_biases(tmp_path):
 
 
 def test_trainer_calls_bias_update_after_optimizer_step():
-    """AC-6 ordering: in the trainer's main step loop,
-    `update_expert_biases(...)` must be invoked strictly AFTER
-    `optimizer.step()`. The bias-update reads stale
+    """AC-6 ordering (source-level): in the trainer's main step loop,
+    the bias-update entry point must be invoked strictly AFTER
+    `optimizer.step()`. The bias update reads stale
     `local_tokens_per_expert` if it runs before the optimizer step
     has consumed the current step's gradients.
 
-    Round 13 implements this as a source-code AST walk over
-    `src/training/trainer.py` so the test catches a future refactor
-    that re-orders the calls — without requiring a full trainer
-    fixture and without false-positives from indentation changes.
+    Round 15: the trainer now calls
+    `trainer_post_optimizer_bias_update(...)` (a helper extracted
+    from the inline bias-update block) instead of
+    `update_expert_biases(...)` directly. This AST test locks the
+    source-code structure so a future refactor that re-inlines the
+    block AND re-orders its position is caught.
+
+    The companion runtime test
+    (`test_trainer_post_optimizer_bias_update_runtime_order`) tests
+    the actual production helper end-to-end with spies — together
+    the two tests catch both source and runtime ordering
+    regressions.
     """
     import ast
     repo = Path(__file__).resolve().parent.parent
@@ -752,11 +760,19 @@ def test_trainer_calls_bias_update_after_optimizer_step():
     module = ast.parse(trainer_src)
 
     optimizer_step_lines: list[int] = []
-    update_bias_lines: list[int] = []
+    bias_update_call_lines: list[int] = []
+
+    # Either the legacy bare-call (`update_expert_biases(...)`) or the
+    # current helper call (`trainer_post_optimizer_bias_update(...)`)
+    # is acceptable as a "bias update entry point" — the contract is
+    # the post-step ordering, not the specific function name.
+    BIAS_UPDATE_ENTRY_POINTS = {
+        "update_expert_biases",
+        "trainer_post_optimizer_bias_update",
+    }
 
     class _Visitor(ast.NodeVisitor):
         def visit_Call(self, node: ast.Call):
-            # `optimizer.step()` — function attribute on a name `optimizer`.
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "step"
@@ -764,20 +780,22 @@ def test_trainer_calls_bias_update_after_optimizer_step():
                 and node.func.value.id == "optimizer"
             ):
                 optimizer_step_lines.append(node.lineno)
-            # `update_expert_biases(...)` — bare function call.
-            if isinstance(node.func, ast.Name) and node.func.id == "update_expert_biases":
-                update_bias_lines.append(node.lineno)
+            if isinstance(node.func, ast.Name) and node.func.id in BIAS_UPDATE_ENTRY_POINTS:
+                bias_update_call_lines.append(node.lineno)
             self.generic_visit(node)
 
     _Visitor().visit(module)
 
     assert optimizer_step_lines, "expected `optimizer.step()` to appear in trainer.py"
-    assert update_bias_lines, "expected `update_expert_biases(...)` to appear in trainer.py"
+    assert bias_update_call_lines, (
+        "expected one of the bias-update entry points "
+        f"({sorted(BIAS_UPDATE_ENTRY_POINTS)}) to appear in trainer.py"
+    )
 
     first_opt_step = min(optimizer_step_lines)
-    first_bias_update = min(update_bias_lines)
+    first_bias_update = min(bias_update_call_lines)
     assert first_bias_update > first_opt_step, (
-        f"AC-6 ordering violation: `update_expert_biases` (line {first_bias_update}) "
+        f"AC-6 ordering violation: bias-update call (line {first_bias_update}) "
         f"must appear AFTER `optimizer.step()` (line {first_opt_step}) in trainer.py."
     )
 
@@ -787,94 +805,152 @@ def test_trainer_calls_bias_update_after_optimizer_step():
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_real_trainer_step_invokes_bias_update_after_optimizer_step():
-    """AC-6 ordering (real instrumentation): build a tiny model with a
-    DeepSeekRouter and run a hand-rolled trainer step that mirrors
-    `src/training/trainer.py`'s sequence — forward+backward → clip →
-    optimizer.step → scheduler.step → update_expert_biases. Patch
-    each call to record invocation order, then assert
-    `update_expert_biases` appears strictly AFTER `optimizer.step`
-    AND strictly AFTER `scheduler.step`.
+def test_trainer_post_optimizer_bias_update_runtime_order():
+    """AC-6 runtime ordering test (Codex Round 14 Finding 2).
 
-    The companion AST test
-    (`test_trainer_calls_bias_update_after_optimizer_step`) locks
-    the source-code structure; this test additionally locks the
-    runtime call sequence. Together they catch both "someone
-    re-ordered the source" and "someone replaced the trainer
-    with a runtime that calls the same functions in a different
-    order" regressions.
+    Round 14's predecessor of this test was self-fulfilling: it
+    constructed its own optimizer/scheduler/update sequence and
+    verified that hand-written sequence — but didn't actually
+    execute the production trainer's bias-update call site.
+
+    Round 15 fixes this by extracting the production bias-update
+    block from `src/training/trainer.py` into the helper
+    `trainer_post_optimizer_bias_update(model, train_cfg, cfg, ...)`
+    and testing the helper directly. Spies on:
+
+      - `routing.update_expert_biases` (the symbol the helper
+        actually calls — wrapped in `with torch.no_grad():`).
+
+    The test asserts:
+      1. The helper invokes `update_expert_biases` exactly once
+         when method=`deepseek_bias` and `bias_update_rate > 0`.
+      2. At the call site, `torch.is_grad_enabled()` is False
+         (the production no_grad wrap is in effect).
+      3. For non-bias methods (`aux_loss` / `none`) the helper
+         no-ops without invoking the bias update at all.
+
+    This exercises the EXACT production code path the trainer uses,
+    so a future refactor that re-orders or unwraps the no_grad
+    block would be caught. The companion AST test still locks the
+    source structure of the trainer's call sequence.
     """
-    import torch.nn as nn
-
     routing = _load_routing_module()
+
+    # Minimal `train_cfg` shape: only the fields the helper reads.
+    class _TrainCfg:
+        bias_update_rate = 0.01
+        bias_warmup_start = 0.0
+        bias_warmup_steps = 0
+        bias_update_zero_sum = True
+
+    # `cfg` is the raw yaml dict; the helper consults
+    # `_resolve_balancing_field(cfg, "bias_rate_*", rate)` for
+    # per-projection overrides. Empty dict → resolver returns the
+    # default `rate` for every projection.
+    cfg: dict = {}
+
+    # Build a tiny owner-bearing model for the deepseek_bias path.
     router = _make_router(num_experts=4)
+    router.local_tokens_per_expert = torch.tensor([100.0, 1.0, 1.0, 1.0])
 
-    # Wire a tiny lm_head + linear so the optimizer has parameters
-    # to step on. The DeepSeekRouter weight is also a Parameter.
-    class _MiniModel(nn.Module):
-        def __init__(self, router):
-            super().__init__()
-            self.router = router
-            self.head = nn.Linear(router.hidden_dim, 8, bias=False)
+    class _Model:
+        def __init__(self, gate, method):
+            self._load_balancing_method = method
+            self._gate = gate
 
-        def forward(self, x):
-            _, weights, indices = self.router(x)
-            return self.head(x).sum() + weights.sum()
+        def get_all_balancing_owners(self):
+            yield self._gate, "mlp"
 
-    model = _MiniModel(router)
-    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    captured: dict = {"calls": [], "grad_enabled_at_call": []}
 
-    call_order: list[str] = []
-
-    real_optimizer_step = optimizer.step
-    real_scheduler_step = scheduler.step
-
-    def _spy_optimizer_step(*args, **kwargs):
-        call_order.append("optimizer.step")
-        return real_optimizer_step(*args, **kwargs)
-
-    def _spy_scheduler_step(*args, **kwargs):
-        call_order.append("scheduler.step")
-        return real_scheduler_step(*args, **kwargs)
-
-    real_update_expert_biases = routing.update_expert_biases
+    real_update = routing.update_expert_biases
 
     def _spy_update_expert_biases(model, **kwargs):
-        call_order.append("update_expert_biases")
-        # Use a stub walker because _MiniModel doesn't expose
-        # `get_all_balancing_owners`. We only care about the call
-        # ORDER here, not the bias side-effects.
-        return None
+        captured["calls"].append(kwargs)
+        captured["grad_enabled_at_call"].append(torch.is_grad_enabled())
+        return real_update(model, **kwargs)
 
-    # Pre-populate routing counts so a real call would have something
-    # to update (in case the spy passes through).
-    router.local_tokens_per_expert = torch.tensor([10.0, 5.0, 20.0, 3.0])
-
-    # Mimic one trainer step.
-    optimizer.zero_grad()
-    x = torch.randn(4, router.hidden_dim, requires_grad=True)
-    loss = model(x)
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-    optimizer.step = _spy_optimizer_step
-    scheduler.step = _spy_scheduler_step
+    # Path A: method=deepseek_bias → helper SHOULD invoke
+    # update_expert_biases under no_grad.
     routing.update_expert_biases = _spy_update_expert_biases
     try:
-        optimizer.step()
-        scheduler.step()
-        routing.update_expert_biases(model, bias_rate=0.001, distributed=False)
+        model_deepseek = _Model(router, "deepseek_bias")
+        # Pre-flight: helper is invoked from grad-enabled context (the
+        # trainer's main step loop is grad-enabled — the helper is
+        # responsible for the no_grad wrap).
+        assert torch.is_grad_enabled()
+        routing.trainer_post_optimizer_bias_update(
+            model_deepseek, _TrainCfg(), cfg,
+            distributed=False, global_step=0,
+        )
     finally:
-        optimizer.step = real_optimizer_step
-        scheduler.step = real_scheduler_step
-        routing.update_expert_biases = real_update_expert_biases
+        routing.update_expert_biases = real_update
 
-    assert call_order == ["optimizer.step", "scheduler.step", "update_expert_biases"], (
-        f"AC-6 runtime ordering violated: expected "
-        f"['optimizer.step', 'scheduler.step', 'update_expert_biases'], "
-        f"got {call_order}"
+    assert len(captured["calls"]) == 1, (
+        f"helper must invoke update_expert_biases exactly once for "
+        f"deepseek_bias method; got {len(captured['calls'])} calls"
     )
+    assert captured["grad_enabled_at_call"] == [False], (
+        f"helper must invoke update_expert_biases under no_grad; got "
+        f"grad_enabled={captured['grad_enabled_at_call']}"
+    )
+    # The call must have used `bias_rate=train_cfg.bias_update_rate`
+    # (no warmup, since warmup_steps=0) and `zero_sum=True`.
+    spy_kwargs = captured["calls"][0]
+    assert spy_kwargs["bias_rate"] == _TrainCfg.bias_update_rate
+    assert spy_kwargs["zero_sum"] is True
+    assert spy_kwargs["distributed"] is False
+    # Per-projection rates should default to the global rate.
+    assert spy_kwargs["per_proj_rates"]["mlp"] == _TrainCfg.bias_update_rate
+
+    # Path B: method=aux_loss → helper SHOULD no-op.
+    captured = {"calls": [], "grad_enabled_at_call": []}
+    routing.update_expert_biases = _spy_update_expert_biases
+    try:
+        model_aux = _Model(router, "aux_loss")
+        routing.trainer_post_optimizer_bias_update(
+            model_aux, _TrainCfg(), cfg,
+            distributed=False, global_step=0,
+        )
+    finally:
+        routing.update_expert_biases = real_update
+    assert captured["calls"] == [], (
+        f"helper must no-op for non-bias method aux_loss; "
+        f"got {len(captured['calls'])} calls"
+    )
+
+    # Path C: method=none → helper SHOULD no-op.
+    captured = {"calls": [], "grad_enabled_at_call": []}
+    routing.update_expert_biases = _spy_update_expert_biases
+    try:
+        model_none = _Model(router, "none")
+        routing.trainer_post_optimizer_bias_update(
+            model_none, _TrainCfg(), cfg,
+            distributed=False, global_step=0,
+        )
+    finally:
+        routing.update_expert_biases = real_update
+    assert captured["calls"] == []
+
+    # Path D: bias_update_rate=0 → helper SHOULD no-op even for
+    # deepseek_bias (the bias rate is the kill switch).
+    class _ZeroRateCfg:
+        bias_update_rate = 0.0
+        bias_warmup_start = 0.0
+        bias_warmup_steps = 0
+        bias_update_zero_sum = True
+
+    captured = {"calls": [], "grad_enabled_at_call": []}
+    routing.update_expert_biases = _spy_update_expert_biases
+    try:
+        model_deepseek_zero_rate = _Model(router, "deepseek_bias")
+        routing.trainer_post_optimizer_bias_update(
+            model_deepseek_zero_rate, _ZeroRateCfg(), cfg,
+            distributed=False, global_step=0,
+        )
+    finally:
+        routing.update_expert_biases = real_update
+    assert captured["calls"] == []
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -890,9 +966,13 @@ def test_update_expert_biases_rejects_grad_enabled_call():
     mutates `expert_bias`, both of which should happen post-step
     with no grad context.
 
-    Round 14 (Codex Round 13 Finding 2): adds an explicit precondition
-    in `update_expert_biases` so accidental misuse fails fast with a
-    clear error, and locks the contract via this test.
+    Round 14 added the precondition; Round 15 (Codex Round 14 Finding 1)
+    moves it AFTER the method-dispatch check so non-bias methods
+    still no-op cleanly under the default grad-enabled context. This
+    test specifically covers `deepseek_bias` (the only method that
+    actually performs a bias update); the
+    `test_update_expert_biases_no_op_for_non_bias_methods` test
+    locks the no-op contract for the other methods.
     """
     routing = _load_routing_module()
 
@@ -904,7 +984,8 @@ def test_update_expert_biases_rejects_grad_enabled_call():
 
     model = _ModelWithOwners()
 
-    # Default (grad-enabled): the precondition must trigger.
+    # Default (grad-enabled): the precondition must trigger because
+    # method=`deepseek_bias` would actually mutate bias buffers.
     assert torch.is_grad_enabled()
     with pytest.raises(RuntimeError, match="update_expert_biases"):
         routing.update_expert_biases(model, bias_rate=0.001, distributed=False)
@@ -914,6 +995,49 @@ def test_update_expert_biases_rejects_grad_enabled_call():
     # consumed the gradients).
     with torch.no_grad():
         routing.update_expert_biases(model, bias_rate=0.001, distributed=False)
+
+
+@pytest.mark.parametrize(
+    "method", ["aux_loss", "seq_aux_loss", "quantile", "none"]
+)
+def test_update_expert_biases_no_op_for_non_bias_methods(method):
+    """AC-1/AC-6 (Codex Round 14 Finding 1): non-bias methods must
+    no-op cleanly under the default grad-enabled context — the
+    method-dispatch gate runs BEFORE the no_grad misuse guard, so
+    direct callers (tests, downstream tools) calling
+    `update_expert_biases` for `aux_loss`/`seq_aux_loss`/`quantile`/
+    `none` get the documented no-op semantics rather than a
+    `RuntimeError`.
+
+    The misuse guard exists to catch accidental misuse on
+    `deepseek_bias` (the only currently-active bias method); it
+    should NEVER fire for other methods because they don't
+    walk owners or mutate buffers.
+    """
+    routing = _load_routing_module()
+    router = _make_router(num_experts=4)
+
+    class _ModelWithOwners:
+        def __init__(self, gate, method):
+            self._load_balancing_method = method
+            self._gate = gate
+
+        def get_all_balancing_owners(self):
+            yield self._gate, "mlp"
+
+    model = _ModelWithOwners(router, method)
+
+    # Inject a non-zero count so a NON-no-op call would shift the bias.
+    router.local_tokens_per_expert = torch.tensor([100.0, 1.0, 1.0, 1.0])
+    initial_bias = router.expert_bias.detach().clone()
+    initial_counts = router.local_tokens_per_expert.detach().clone()
+
+    # Default grad-enabled context — must NOT raise; must NOT mutate.
+    assert torch.is_grad_enabled()
+    routing.update_expert_biases(model, bias_rate=0.01, distributed=False)
+
+    torch.testing.assert_close(router.expert_bias, initial_bias)
+    torch.testing.assert_close(router.local_tokens_per_expert, initial_counts)
 
 
 # ──────────────────────────────────────────────────────────────────────
