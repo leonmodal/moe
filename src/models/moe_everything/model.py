@@ -500,12 +500,14 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
     def get_all_balancing_owners(self):
         """Yield (owner_module, label) for every load-balancing owner.
 
-        Pre-the bank-level balancing-state rule implementation: routers across the MLP bank, the four
-        attention router classes, and the branch router(s) each own their own
-        `expert_bias` / `local_tokens_per_expert` buffers. Labels match the
+        Until bank-level balancing state is introduced, routers across
+        the MLP bank, the four attention router classes, and the
+        branch router(s) each own their own `expert_bias` /
+        `local_tokens_per_expert` buffers. Labels match the
         per-projection bias-rate keys consumed by the trainer
-        (`bias_rate_q/k/v/o/mlp/branch`). The the planned bank-level state refactor
-        will collapse the MLP and attention routers to bank-level owners.
+        (`bias_rate_q/k/v/o/mlp/branch`). A future bank-level
+        refactor will collapse the MLP and attention routers to
+        bank-level owners.
         """
         inner = self.model
 

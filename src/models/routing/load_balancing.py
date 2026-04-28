@@ -18,8 +18,9 @@ Fixes vs the HuggingFace transformers implementation:
   1. No double softmax — router already returns softmax probabilities,
      the HF loss applies softmax again which flattens the distribution
      and makes the loss blind to imbalance.
-  2. ((superseded)) `f_i` was previously rank-local; the global-aggregate
-     path is the canonical Megatron-aligned semantics now.
+  2. Global-aggregate `f_i` across DDP ranks (matches Megatron-LM's
+     `global_tokens_per_expert` contract). The earlier rank-local
+     formulation has been replaced.
 """
 import torch
 import torch.distributed as dist

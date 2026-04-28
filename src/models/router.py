@@ -165,9 +165,9 @@ def _resolve_softmax_position(config) -> str:
     `router_topk_ordering` alias with a `DeprecationWarning`.
 
     Returns one of `_SOFTMAX_POSITIONS`. Raises `ValueError` for unknown
-    values. When neither field is set, defaults to `pre_topk` (preserves
-    the pre-the softmax_position naming rule default behaviour: softmax applied to all experts
-    before top-k).
+    values. When neither field is set, defaults to `pre_topk` —
+    softmax applied to all experts before top-k — which preserves
+    the legacy default.
     """
     canonical = getattr(config, "softmax_position", None)
     legacy = getattr(config, "router_topk_ordering", None)

@@ -90,10 +90,10 @@ def run_validation(
             }
             input_ids = batch["input_ids"]
             labels = input_ids
-            # the DETACH-ONLY policy: respect the method-aware `output_router_logits` policy
-            # the model was built with. `getattr` falls back to True for the
-            # legacy back-compat path (no method stamped → preserve pre-the DETACH-ONLY policy
-            # behavior).
+            # Respect the method-aware `output_router_logits` policy
+            # the model was built with. `getattr` falls back to True
+            # for the legacy back-compat path (no method stamped →
+            # preserve the pre-detach-only behavior).
             orl = getattr(raw_model, "config", None)
             orl_value = getattr(orl, "output_router_logits", True) if orl is not None else True
             output = model(

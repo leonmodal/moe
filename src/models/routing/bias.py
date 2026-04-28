@@ -44,8 +44,8 @@ def update_bias_from_counts(
     zero_sum: bool = True,
 ) -> None:
     """Update expert bias in-place using the configured DeepSeek-V3-style
-    sign update. the bias-update mode selector selects between two reference
-    formulations via the `zero_sum` flag.
+    sign update. The `zero_sum` flag selects between two reference
+    formulations:
 
     `zero_sum=True` (default, mirrors `nmoe.Router.update_bias`):
         s     = sign(load - 1/E)

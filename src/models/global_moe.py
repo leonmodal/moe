@@ -176,10 +176,11 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
     def get_all_balancing_owners(self):
         """Yield (owner_module, label) for every load-balancing owner.
 
-        Pre-the bank-level balancing-state rule implementation: each per-layer `GlobalSparseMoeBlock.gate`
-        owns its own `expert_bias` / `local_tokens_per_expert` buffers, so the
-        walker visits all per-layer routers. The the planned bank-level state refactor
-        will collapse these to a single bank-level owner on `self.model`.
+        Until bank-level balancing state is introduced, each per-layer
+        `GlobalSparseMoeBlock.gate` owns its own `expert_bias` /
+        `local_tokens_per_expert` buffers, so the walker visits all
+        per-layer routers. A future bank-level refactor will collapse
+        these to a single bank-level owner on `self.model`.
         """
         for layer in self.model.layers:
             gate = getattr(getattr(layer, "mlp", None), "gate", None)

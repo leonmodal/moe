@@ -95,16 +95,16 @@ _AUX_BEARING_METHODS: frozenset = frozenset({"aux_loss", "seq_aux_loss"})
 def output_router_logits_for_method(method: str | None) -> bool:
     """Resolve the `output_router_logits` flag from `load_balancing_method`.
 
-    Per the DETACH-ONLY policy:
-      - `None` (no method set; legacy back-compat): return True (preserve
-        the pre-the DETACH-ONLY policy default; any caller that opts out can pass `None`
-        explicitly to bypass).
+    Detach-only policy:
+      - `None` (no method set; legacy back-compat): return True
+        (preserves the legacy default — any caller that opts out
+        can pass `None` explicitly to bypass).
       - `aux_loss` / `seq_aux_loss`: return True (router scores are
         gradient-bearing inputs to the aux loss term).
-      - `deepseek_bias` / `quantile` / `none`: return False (no aux loss
-        term reads `router_logits`; the router-internal `_last_top_k_idx`
-        and `local_tokens_per_expert` carry the routing-decision state
-        that the bias-update path consumes).
+      - `deepseek_bias` / `quantile` / `none`: return False (no aux
+        loss term reads `router_logits`; the router-internal
+        `_last_top_k_idx` and `local_tokens_per_expert` carry the
+        routing-decision state that the bias-update path consumes).
     """
     if method is None:
         return True

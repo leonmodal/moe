@@ -74,7 +74,7 @@ class TrainingConfig:
 
 
 def load_config(path: str) -> dict:
-    """Load a YAML configuration file and apply the canonical-block coefficient normalizer method normalization.
+    """Load a YAML configuration file and normalize load-balancing coefficients.
 
     Calling `normalize_balancing_config` here (instead of only in
     `scripts/train.py`) ensures every caller — `build_training_config`,
