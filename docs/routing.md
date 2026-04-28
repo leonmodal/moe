@@ -83,6 +83,43 @@ output = weight * selected_branch(hidden_state)
 
 The hard decision makes this non-differentiable at the selection point, but the soft weight multiplication keeps gradients flowing to the router.
 
+#### Exploration-only branch routing
+
+When `BranchRouter(exploration_only=True)` is set, the routing
+decision is drawn from a uniform Bernoulli — every token picks
+ATTN (0) or MLP (1) with 50% probability each, regardless of the
+gate's score, expert_bias, or input. The gate's projection still
+runs (so the routing-weight tensors stay gradient-bearing for the
+rest of the model's loss), but the SELECTION itself is detached.
+
+This mode is only active during `training()`; under `eval()`, the
+router falls back to the deterministic argmax path so evaluation
+runs are reproducible.
+
+Use `exploration_only=True` for diagnostic runs that need a
+fully randomized branch distribution while keeping the rest of
+the model trainable. Pair it with one of the
+`exploration_decay_schedule(...)` shapes below if you want to
+gradually anneal the exploration rate over training.
+
+#### Exploration rate schedules
+
+`src/training/routing.py:exploration_decay_schedule(...)` returns
+a per-step rate that decays from `initial_rate` to `final_rate`
+over `decay_steps` following one of three shapes:
+
+| Schedule | Shape | When to use |
+|----------|-------|-------------|
+| `constant` | `rate = initial_rate` for every step | Diagnostic runs that want a fixed exploration mix; `decay_steps` is ignored. |
+| `linear` | `rate = initial_rate * (1 - step/decay_steps) + final_rate * step/decay_steps` (clamped) | Smooth-ish anneal; reaches `final_rate` exactly at `step == decay_steps`. |
+| `cosine` | `rate = final_rate + 0.5 * (initial_rate - final_rate) * (1 + cos(pi * step / decay_steps))` | Slow-decay-then-fast-decay shape; matches the LR schedule's cosine taper. |
+
+All three return `final_rate` for `step >= decay_steps` (so the
+caller can keep calling the helper after the schedule ends without
+special-casing the post-decay region). Negative `step` clamps to
+`step = 0`, so a defensive caller bug doesn't extrapolate above
+`initial_rate`.
+
 ---
 
 ## 1.5. Router Options

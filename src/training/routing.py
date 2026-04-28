@@ -285,6 +285,62 @@ def exploration_rate_schedule(
     return warmup_start + (target - warmup_start) * frac
 
 
+_EXPLORATION_DECAY_SCHEDULES = ("constant", "linear", "cosine")
+
+
+def exploration_decay_schedule(
+    step: int,
+    *,
+    schedule: str,
+    initial_rate: float,
+    decay_steps: int,
+    final_rate: float = 0.0,
+) -> float:
+    """Decay an exploration rate from `initial_rate` to `final_rate` over
+    `decay_steps`, following one of `constant` / `linear` / `cosine` shapes.
+
+    This is the companion of `exploration_rate_schedule` for the
+    "exploration_only" branch routing mode and similar use-cases that
+    need a rate scheduler decaying TOWARDS zero, not warming up TO a
+    target. The schedules are:
+
+    * `constant`: returns `initial_rate` for every step (decay_steps
+      ignored). Use when the rate is held flat — typically for
+      diagnostic runs that want a fixed exploration mix.
+    * `linear`: `initial_rate * (1 - step/decay_steps) + final_rate * step/decay_steps`
+      until step == decay_steps; final_rate thereafter.
+    * `cosine`: `final_rate + 0.5 * (initial_rate - final_rate) * (1 + cos(pi * step / decay_steps))`
+      — smooth decay from initial to final following half a cosine.
+      Returns `final_rate` after `decay_steps`.
+
+    Returns the rate as a Python float. Args:
+      step: current step count (clamped to [0, decay_steps] for the
+            non-constant schedules).
+      schedule: one of the shapes listed above.
+      initial_rate: rate at step 0.
+      decay_steps: number of steps over which to decay (>= 0).
+      final_rate: rate at step >= decay_steps. Defaults to 0.0 so the
+                  caller can omit it for the canonical "decay to zero"
+                  case.
+    """
+    import math
+    if schedule not in _EXPLORATION_DECAY_SCHEDULES:
+        raise ValueError(
+            f"exploration schedule must be one of {sorted(_EXPLORATION_DECAY_SCHEDULES)}, "
+            f"got {schedule!r}"
+        )
+    if schedule == "constant":
+        return initial_rate
+    if decay_steps <= 0:
+        return final_rate
+    clamped = min(max(0, step), decay_steps)
+    frac = clamped / decay_steps
+    if schedule == "linear":
+        return initial_rate * (1.0 - frac) + final_rate * frac
+    # schedule == "cosine"
+    return final_rate + 0.5 * (initial_rate - final_rate) * (1.0 + math.cos(math.pi * frac))
+
+
 def collect_router_z_loss(model) -> torch.Tensor | None:
     """Sum the most recent per-router z-loss contributions and clear them.
 

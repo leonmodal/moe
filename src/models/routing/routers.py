@@ -50,7 +50,8 @@ class BranchRouter(nn.Module):
     def __init__(self, hidden_size: int, exploration_rate: float = 0.0,
                  scale_by_routing_weight: bool = True,
                  use_sampling: bool = False, use_seq_level: bool = False,
-                 use_deepseek_style: bool = False):
+                 use_deepseek_style: bool = False,
+                 exploration_only: bool = False):
         super().__init__()
         self.gate = nn.Linear(hidden_size, 2, bias=False)
         self.exploration_rate = exploration_rate
@@ -58,6 +59,14 @@ class BranchRouter(nn.Module):
         self.use_sampling = use_sampling
         self.use_seq_level = use_seq_level
         self.use_deepseek_style = use_deepseek_style
+        # `exploration_only`: when True every routing decision is drawn
+        # uniformly at random (no scoring, no bias). The model still has
+        # to produce real loss values, so the gate weights still receive
+        # gradient through the gate-projection path; the SELECTION
+        # itself is detached from the gate's signal. Use this for
+        # diagnostic runs that need a fully randomized branch
+        # distribution while keeping the rest of the model trainable.
+        self.exploration_only = exploration_only
         self.last_probs = None
         self.last_selected_experts = None
         # Rely on `torch.utils.checkpoint`'s default
@@ -105,7 +114,22 @@ class BranchRouter(nn.Module):
             else:
                 logits = self.gate(hidden_states.to(gate_dtype))
 
-            if self.use_deepseek_style:
+            if self.exploration_only and self.training:
+                # `exploration_only`: every routing decision is drawn
+                # uniformly at random. The probs are populated for
+                # downstream telemetry, but the SELECTION uses a
+                # uniform Bernoulli draw — bypassing scores and
+                # expert_bias entirely. Recompute determinism is
+                # preserved via PyTorch's `preserve_rng_state=True`,
+                # which restores the RNG state before recompute so
+                # `torch.rand` produces identical draws.
+                if self.use_deepseek_style:
+                    probs = torch.sigmoid(logits)
+                else:
+                    probs = F.softmax(logits, dim=-1)
+                random_choice = torch.rand(probs.shape[:-1], device=probs.device) < 0.5
+                choice = random_choice.long()
+            elif self.use_deepseek_style:
                 scores = torch.sigmoid(logits)
                 biased = scores + self.expert_bias.to(scores.dtype)
                 if self.training and self.use_sampling:
