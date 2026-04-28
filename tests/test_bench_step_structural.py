@@ -264,6 +264,128 @@ def test_bench_step_appends_to_existing_results(tiny_config_yaml, tmp_path):
     assert on_disk[1]["model_type"] == "moe_everything"
 
 
+def test_bench_step_single_config_records_oom_without_aborting():
+    """Single-config mode used to call `_bench_one_config` directly,
+    so an OOM in the warmup window aborted the run. The new path
+    routes single-config through `_safe_bench` so OOMs become
+    structured records — the same contract the search matrix uses.
+    Verify by patching `_bench_one_config` to raise an OOM-signaling
+    RuntimeError.
+    """
+    repo = REPO
+    cmd = [
+        sys.executable, "-c",
+        """
+import importlib.util, json, sys, types
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("bench_step", "scripts/bench_step.py")
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+def _raise_oom(*a, **kw):
+    raise RuntimeError("CUDA out of memory: probe")
+mod._bench_one_config = _raise_oom
+import argparse
+args = argparse.Namespace(
+    config='probe.yaml', warmup=10, measure=90,
+)
+record = mod._safe_bench(
+    {"model": {"type": "moe_everything"}}, args=args,
+    batch_size=8, gradient_accumulation=1,
+    gradient_checkpointing=False, chunked_ce=False,
+    seq_len=2048, device="cuda:0",
+)
+print(json.dumps(record))
+"""
+    ]
+    env = {"PYTHONPATH": str(repo), **os.environ}
+    result = subprocess.run(cmd, cwd=str(repo), env=env, capture_output=True, text=True)
+    assert result.returncode == 0, (
+        f"single-config OOM path probe failed:\n"
+        f"STDOUT:{result.stdout}\nSTDERR:{result.stderr}"
+    )
+    record = json.loads(result.stdout)
+    assert record["oom"] is True
+    assert record["batch_size"] == 8
+
+
+def test_bench_step_search_emit_max_row_schema(tiny_config_yaml, tmp_path):
+    """`--search --emit-max-row` collapses the grid into a single
+    per-config max-row summary with the AC-24 schema."""
+    output_path = tmp_path / "results.json"
+    result = _run_bench(
+        [
+            "--config", str(tiny_config_yaml),
+            "--warmup", "1",
+            "--measure", "2",
+            "--device", "cpu",
+            "--search",
+            "--search-batch-min", "1",
+            "--search-batch-max", "2",
+            "--search-grad-accum", "1,2",
+            "--search-grad-ckpt", "false",
+            "--search-chunked-ce", "false",
+            "--emit-max-row",
+            "--output", str(output_path),
+        ],
+        cwd=REPO,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    if isinstance(payload, list):
+        # When `--emit-grid` is also passed, the payload contains both;
+        # without it, the payload is a list with the max-row only.
+        max_row = payload[-1]
+    else:
+        max_row = payload
+    expected_keys = {
+        "config", "device", "seq_len", "summary",
+        "max_per_rank_batch", "max_global_batch",
+        "grad_accum_at_max", "grad_ckpt_at_max", "chunked_ce_at_max",
+        "median_step_s_at_max", "tokens_per_sec_at_max",
+        "peak_mem_gb_at_max", "n_grid_points", "n_eligible",
+    }
+    assert set(max_row.keys()) == expected_keys, (
+        f"max-row schema drift: expected {expected_keys}, got {set(max_row.keys())}"
+    )
+    assert max_row["summary"] == "max_row"
+    assert max_row["n_grid_points"] == 4  # 2 batch x 2 grad_accum
+    assert max_row["max_per_rank_batch"] in (1, 2)
+    assert max_row["grad_accum_at_max"] in (1, 2)
+    assert max_row["max_global_batch"] == max_row["max_per_rank_batch"] * max_row["grad_accum_at_max"]
+
+
+def test_bench_step_rejects_chunked_ce_until_runtime_implemented(tiny_config_yaml, tmp_path):
+    """`--search-chunked-ce=true` must raise `NotImplementedError`
+    rather than silently writing metadata-only rows. The
+    chunked-CE / fused-linear-CE runtime path is not yet
+    implemented in the model code; bench should surface that gap
+    instead of pretending the lever is exercised.
+    """
+    output_path = tmp_path / "results.json"
+    result = _run_bench(
+        [
+            "--config", str(tiny_config_yaml),
+            "--warmup", "1",
+            "--measure", "2",
+            "--device", "cpu",
+            "--search",
+            "--search-batch-min", "1",
+            "--search-batch-max", "1",
+            "--search-grad-accum", "1",
+            "--search-grad-ckpt", "false",
+            "--search-chunked-ce", "true",
+            "--output", str(output_path),
+        ],
+        cwd=REPO,
+    )
+    assert result.returncode != 0, (
+        f"bench should have rejected chunked_ce=true; got return 0\n"
+        f"STDOUT:{result.stdout}\nSTDERR:{result.stderr}"
+    )
+    assert "chunked_ce" in result.stderr or "chunked_ce" in result.stdout, (
+        f"expected error to mention chunked_ce; got\n{result.stderr}"
+    )
+
+
 def test_bench_step_disables_wandb_eval_heatmap_paths():
     """The bench is required by AC-19/DEC-8 to disable W&B,
     checkpoint, eval, and heatmap paths. The

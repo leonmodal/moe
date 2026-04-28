@@ -133,6 +133,33 @@ def validate_config(path: Path) -> list[str]:
         if "files_glob" in data:
             issues.append("'files_glob' field indicates token-bin format — use parquet with 'data_dir'")
 
+    # Nested-schema validator: catches typos / illegal values under
+    # `model.branch_router`, `model.mlp_router`, and `model.attn_router`.
+    # Imported lazily to keep this script's startup fast and avoid
+    # transitively pulling in the data pipeline (which would bring
+    # pandas in via the package init chain).
+    try:
+        import importlib.util
+        import types as _types
+        repo = Path(__file__).resolve().parent.parent
+        if "src.training" not in sys.modules:
+            pkg = _types.ModuleType("src.training")
+            pkg.__path__ = [str(repo / "src" / "training")]
+            sys.modules["src.training"] = pkg
+        spec = importlib.util.spec_from_file_location(
+            "src.training.balancing_fields",
+            str(repo / "src" / "training" / "balancing_fields.py"),
+        )
+        bf = importlib.util.module_from_spec(spec)
+        sys.modules["src.training.balancing_fields"] = bf
+        spec.loader.exec_module(bf)
+        try:
+            bf.validate_branch_router_config(cfg)
+        except ValueError as exc:
+            issues.append(f"nested-schema validator: {exc}")
+    except Exception as exc:
+        issues.append(f"nested-schema validator unavailable: {exc}")
+
     return issues
 
 

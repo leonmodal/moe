@@ -115,6 +115,32 @@ def _set_deepseek_router_params(config, model_cfg: dict) -> None:
     config.topk_scaling_factor = model_cfg.get("topk_scaling_factor", None)
 
 
+def _stamp_per_class_router_fields(config, model_cfg: dict) -> None:
+    """Stamp the per-class nested router fields
+    (`model.mlp_router`, `model.attn_router`) onto `config` so the
+    runtime sees per-class methods. Each field is exposed under a
+    flat attribute name on `config` (`mlp_router_balancing`,
+    `mlp_router_quantile_eta`, etc.) so existing callers that read
+    config attributes directly do not need to traverse the nested
+    structure. The branch_router is plumbed via the dedicated
+    `_get_branch_router_field` helper that supports the legacy
+    flat-bridge form, so it is intentionally left out of this
+    walker.
+
+    When a per-class block is absent from the yaml, no attributes
+    are stamped — the runtime falls back to the top-level
+    `load_balancing_method` and the legacy coefficient defaults,
+    preserving behavior for unmigrated configs.
+    """
+    for group in ("mlp_router", "attn_router"):
+        nested = model_cfg.get(group)
+        if not isinstance(nested, dict):
+            continue
+        prefix = f"{group}_"
+        for key, value in nested.items():
+            setattr(config, prefix + key, value)
+
+
 def _get_branch_router_field(model_cfg: dict, key: str, default):
     """Read a `branch_router.<key>` field with a flat-schema fallback.
 
@@ -320,5 +346,7 @@ def build_model(cfg: dict):
     if method is not None:
         model._load_balancing_method = method
         config.load_balancing_method = method
+
+    _stamp_per_class_router_fields(config, mcfg)
 
     return model, config

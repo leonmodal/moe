@@ -122,35 +122,51 @@ _METHOD_ACTIVE_FIELDS: dict[str, frozenset[str]] = {
 }
 
 
-_BRANCH_ROUTER_KNOWN_KEYS = frozenset({
+# Common balancing-method knobs every router group accepts. These
+# correspond to fields the resolver stamps onto the per-class
+# runtime config: aux/seq-aux coefficients, the DeepSeek-bias
+# update knobs, the quantile-method knobs, and the per-class
+# exploration schedule.
+_COMMON_ROUTER_KNOBS = frozenset({
     "balancing",
+    # Aux/seq-aux loss coefficients (per-class).
+    "router_aux_loss_coef",
+    "seq_aux_loss_coef",
+    # DeepSeek-style bias update knobs (per-class).
+    "bias_update_rate",
+    "bias_update_zero_sum",
+    "bias_warmup_start",
+    "bias_warmup_steps",
+    # Quantile-method knobs (per-class). When the quantile method
+    # lands in the runtime, these fields wire into the per-class
+    # quantile state owners. The validator accepts them now so the
+    # nested-schema configs can be authored ahead of the runtime
+    # implementation.
+    "quantile_eta",
+    "quantile_target_q",
+    "quantile_global_state",
+    # Per-class exploration schedule.
     "exploration_rate",
     "exploration_decay",
     "exploration_min",
     "exploration_warmup_steps",
 })
 
-_BRANCH_BALANCING_VALID = frozenset({"none", "exploration_only"})
+# Branch-router accepts every method + the branch-only
+# `exploration_only` rate-driven mode. The `exploration_only` value
+# is unique to the branch router; the other four methods (aux_loss,
+# seq_aux_loss, deepseek_bias, quantile) and `none` are shared with
+# MLP/attention routers.
+_BRANCH_ROUTER_KNOWN_KEYS = frozenset(_COMMON_ROUTER_KNOBS)
+
+_BRANCH_BALANCING_VALID = frozenset(_VALID_LOAD_BALANCING_METHODS) | frozenset({"exploration_only"})
 
 _BRANCH_DECAY_VALID = frozenset({"constant", "linear", "cosine"})
 
-# MLP and attention nested router groups. The fields are a SUPERSET
-# of the branch-router schedule fields plus a `balancing` knob with
-# the broader `_VALID_LOAD_BALANCING_METHODS` set (aux_loss, seq_aux,
-# deepseek_bias, quantile, none) — each MLP/attention router can opt
-# into its own balancing method independently of the others when the
-# nested per-class schema lands.
-_MLP_ROUTER_KNOWN_KEYS = frozenset({
-    "balancing",
-    "router_aux_loss_coef",
-    "seq_aux_loss_coef",
-    "exploration_rate",
-    "exploration_decay",
-    "exploration_min",
-    "exploration_warmup_steps",
-})
+# MLP and attention nested router groups share the common knobs.
+_MLP_ROUTER_KNOWN_KEYS = frozenset(_COMMON_ROUTER_KNOBS)
 
-_ATTN_ROUTER_KNOWN_KEYS = frozenset(_MLP_ROUTER_KNOWN_KEYS) | frozenset({
+_ATTN_ROUTER_KNOWN_KEYS = frozenset(_COMMON_ROUTER_KNOBS) | frozenset({
     # attention-specific knobs allowed on the per-class schema:
     "scale_by_routing_weight",
 })
@@ -346,7 +362,7 @@ def validate_branch_router_config(cfg: dict) -> None:
     # validated independently so a typo or invalid value in one group
     # surfaces immediately. The flat-bridge form does not exist for
     # these two groups (they are nested-only since they are part of
-    # the AC-13 nested-schema deliverable, not a legacy migration).
+    # the nested-schema deliverable, not a legacy migration).
     _validate_mlp_or_attn_router(cfg, "mlp_router")
     _validate_mlp_or_attn_router(cfg, "attn_router")
 

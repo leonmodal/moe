@@ -1,8 +1,8 @@
 """Production-trainer-path benchmark for the MoE matrix.
 
-This script implements the AC-19 / AC-24 production-trainer-compatible
-benchmark contract. It is NOT a generic forward-backward microbenchmark:
-it builds the model + optimizer + scheduler exactly as
+This script implements the production-trainer-compatible benchmark
+contract. It is NOT a generic forward-backward microbenchmark: it
+builds the model + optimizer + scheduler exactly as
 `scripts/train.py` does, calls the trainer's branch-router pre-forward
 schedule hook, and runs a 100-step measured loop:
 
@@ -12,15 +12,14 @@ schedule hook, and runs a 100-step measured loop:
   * 90 measured iterations — full forward + backward + clip-grad +
     `trainer_optimizer_step_and_bias_update(...)`. Per-iter wall time
     is recorded; the schema reports MEDIAN, p5, and p95 (not mean and
-    std), matching the AC-19 spec.
+    std).
 
 W&B / checkpoint / eval / heatmap paths are explicitly disabled so
 the bench measures only the optimizer-step hot path. Synthetic
 random batches are used in place of the dataset (the dataset path
 adds noise the bench is not measuring).
 
-`--search` mode performs a multi-dimensional sweep across the four
-axes named by AC-24:
+`--search` mode performs a multi-dimensional sweep across four axes:
 
   * `--search-batch-min` / `--search-batch-max`: per-rank batch.
   * `--search-grad-accum`: comma-separated list of gradient-
@@ -122,8 +121,8 @@ _CFG_MOD, _FACTORY_MOD, _BUILD_OPTIM, _BUILD_SCHED, _ROUTING_MOD = _bypass_train
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="Path to yaml config")
-    parser.add_argument("--warmup", type=int, default=10, help="Warmup iters (AC-19 default)")
-    parser.add_argument("--measure", type=int, default=90, help="Measured iters (AC-19 default)")
+    parser.add_argument("--warmup", type=int, default=10, help="Warmup iters (default 10)")
+    parser.add_argument("--measure", type=int, default=90, help="Measured iters (default 90)")
     parser.add_argument(
         "--batch-size", type=int, default=None,
         help="Per-rank batch size (defaults to training.batch_size)",
@@ -152,7 +151,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", default=None,
-        help="Append bench record(s) to this JSON file; bench/results.json is the AC-20 landing zone.",
+        help="Append bench record(s) to this JSON file; bench/results.json is the canonical landing zone.",
     )
     parser.add_argument(
         "--search", action="store_true",
@@ -172,7 +171,30 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--search-chunked-ce", default="false",
-        help="Comma-separated bools (false/true) for chunked_ce.",
+        help="Comma-separated bools (false/true) for chunked_ce. The "
+             "chunked-CE runtime path is not yet implemented in the "
+             "model code; specifying `true` is rejected with a clear "
+             "error rather than silently recording metadata-only rows.",
+    )
+    parser.add_argument(
+        "--emit-max-row", action="store_true",
+        help="In --search mode, emit a per-config summary row "
+             "containing the max stable batch (and the full max-row "
+             "schema: max_per_rank_batch, max_global_batch, "
+             "grad_accum_at_max, grad_ckpt_at_max, chunked_ce_at_max, "
+             "median_step_s_at_max, tokens_per_sec_at_max, "
+             "peak_mem_gb_at_max).",
+    )
+    parser.add_argument(
+        "--emit-grid", action="store_true",
+        help="In --search --emit-max-row mode, additionally emit "
+             "every grid point (default false: just the max-row summary).",
+    )
+    parser.add_argument(
+        "--memory-headroom-gb", type=float, default=0.0,
+        help="In --search mode, reject grid points whose peak memory "
+             "leaves less than this many GB of headroom on a "
+             "CUDA device. CPU-mode runs ignore this gate.",
     )
     return parser.parse_args()
 
@@ -188,7 +210,7 @@ def _make_synthetic_batch(
 
 def _disable_w_and_b_eval_heatmaps(cfg: dict) -> dict:
     """Disable W&B / checkpoint / eval / heatmap paths so the bench
-    measures only the optimizer-step hot path, per AC-19 / DEC-8."""
+    measures only the optimizer-step hot path."""
     tcfg = cfg.setdefault("training", {})
     tcfg["wandb_project"] = None
     tcfg["save_every"] = 10**9
@@ -202,7 +224,7 @@ def _disable_w_and_b_eval_heatmaps(cfg: dict) -> dict:
 def _build_production_optimizer_and_scheduler(model, train_cfg):
     """Mirror `src/training/trainer.py:189-200` so the bench
     exercises the production optimizer + scheduler construction
-    (AC-19: bench reuses the production trainer path)."""
+    (the bench reuses the production trainer path)."""
     if train_cfg.optimizer == "muon":
         # Lazy import: muon path requires CUDA in some configurations,
         # so we defer to the standard AdamW path on CPU sandboxes that
@@ -224,17 +246,26 @@ def _build_production_optimizer_and_scheduler(model, train_cfg):
 
 
 def _maybe_enable_chunked_ce(model, chunked_ce: bool) -> None:
-    """The chunked-CE path is a model-side optimization the bench can
-    toggle when present. Models that do not expose a chunked-CE
-    setter accept the flag silently (no-op) so the sweep can include
-    chunked_ce as a search axis without aborting on configs that do
-    not support it."""
+    """The chunked-CE / fused-linear-CE runtime is not yet
+    implemented in the model code. When `chunked_ce=True` is
+    requested we raise loudly so the bench does not silently
+    record metadata-only rows that misrepresent which lever was
+    actually exercised. `chunked_ce=False` is a no-op (the default
+    forward path is the regular CE).
+    """
+    if not chunked_ce:
+        return
     setter = getattr(model, "set_chunked_ce", None)
     if callable(setter):
-        try:
-            setter(chunked_ce)
-        except Exception:
-            pass
+        setter(True)
+        return
+    raise NotImplementedError(
+        "chunked_ce=true was requested but the model does not expose "
+        "a `set_chunked_ce(...)` runtime hook. The chunked-CE / "
+        "fused-linear-CE path needs to be implemented in the model "
+        "code before it can be a bench search axis. See the AC-25 "
+        "speed-borrowing track for the implementation."
+    )
 
 
 def _bench_one_config(
@@ -299,8 +330,7 @@ def _bench_one_config(
             )
         global_step += 1
         # Production optimizer-step + scheduler-step + post-step
-        # bias-update path. This is what AC-19 requires the bench to
-        # exercise.
+        # bias-update path — the same sequence the trainer runs.
         _ROUTING_MOD.trainer_optimizer_step_and_bias_update(
             model, optimizer, scheduler, train_cfg, cfg,
             distributed=False, global_step=global_step,
@@ -353,15 +383,35 @@ def _bench_one_config(
     }
 
 
-def _safe_bench(*args, **kwargs) -> dict[str, Any]:
+def _safe_bench(cfg_template, *, args, batch_size, gradient_accumulation,
+                gradient_checkpointing, chunked_ce, seq_len, device,
+                ) -> dict[str, Any]:
     """Wrap `_bench_one_config` so OOMs become structured records
-    rather than aborting the matrix. Non-OOM errors propagate."""
+    rather than aborting the matrix. Non-OOM errors propagate.
+
+    The signature is explicit (rather than `*args, **kwargs`) so the
+    OOM record can be assembled from the same parameter set the
+    bench would have used; previous variadic versions could leave
+    `_oom_record` looking for a missing `cfg_template` kwarg.
+    """
+    bench_kwargs = dict(
+        args=args, batch_size=batch_size,
+        gradient_accumulation=gradient_accumulation,
+        gradient_checkpointing=gradient_checkpointing,
+        chunked_ce=chunked_ce, seq_len=seq_len, device=device,
+        cfg_template=cfg_template,
+    )
     try:
-        return _bench_one_config(*args, **kwargs)
+        return _bench_one_config(
+            cfg_template, args=args, batch_size=batch_size,
+            gradient_accumulation=gradient_accumulation,
+            gradient_checkpointing=gradient_checkpointing,
+            chunked_ce=chunked_ce, seq_len=seq_len, device=device,
+        )
     except torch.cuda.OutOfMemoryError as exc:  # type: ignore[attr-defined]
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return _oom_record(kwargs, str(exc))
+        return _oom_record(bench_kwargs, str(exc))
     except RuntimeError as exc:
         # CUDA OOMs sometimes surface as RuntimeError("CUDA out of memory");
         # detect with a substring match before treating as fatal.
@@ -369,7 +419,7 @@ def _safe_bench(*args, **kwargs) -> dict[str, Any]:
         if "out of memory" in msg.lower():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            return _oom_record(kwargs, msg)
+            return _oom_record(bench_kwargs, msg)
         raise
 
 
@@ -419,11 +469,78 @@ def _parse_csv_int(value: str) -> list[int]:
     return [int(v.strip()) for v in value.split(",") if v.strip()]
 
 
+def _summarize_max_row(
+    records: list[dict[str, Any]], *, args: argparse.Namespace,
+    seq_len: int, device: torch.device,
+) -> dict[str, Any]:
+    """Reduce the multi-dim search records to a single per-config
+    "max row" with the schema:
+
+        max_per_rank_batch, max_global_batch, grad_accum_at_max,
+        grad_ckpt_at_max, chunked_ce_at_max, median_step_s_at_max,
+        tokens_per_sec_at_max, peak_mem_gb_at_max.
+
+    "Max" means the FASTEST stable point: among all non-OOM rows
+    that respect the `--memory-headroom-gb` gate, pick the row with
+    the highest `tokens_per_second_median`. The `max_global_batch`
+    is `batch_size * gradient_accumulation` (DDP world-size is
+    factored in by the caller — single-rank runs treat it as
+    world_size=1).
+    """
+    headroom_bytes_gate = int(args.memory_headroom_gb * (1 << 30))
+    eligible = [
+        r for r in records
+        if not r.get("oom", False)
+        and r.get("tokens_per_second_median") is not None
+        and (
+            r.get("headroom_bytes") is None
+            or r["headroom_bytes"] >= headroom_bytes_gate
+        )
+    ]
+    if not eligible:
+        return {
+            "config": args.config,
+            "device": str(device),
+            "seq_len": seq_len,
+            "summary": "max_row",
+            "max_per_rank_batch": None,
+            "max_global_batch": None,
+            "grad_accum_at_max": None,
+            "grad_ckpt_at_max": None,
+            "chunked_ce_at_max": None,
+            "median_step_s_at_max": None,
+            "tokens_per_sec_at_max": None,
+            "peak_mem_gb_at_max": None,
+            "n_grid_points": len(records),
+            "n_eligible": 0,
+        }
+    fastest = max(eligible, key=lambda r: r["tokens_per_second_median"])
+    return {
+        "config": args.config,
+        "device": str(device),
+        "seq_len": seq_len,
+        "summary": "max_row",
+        "max_per_rank_batch": fastest["batch_size"],
+        "max_global_batch": fastest["batch_size"] * fastest["gradient_accumulation"],
+        "grad_accum_at_max": fastest["gradient_accumulation"],
+        "grad_ckpt_at_max": fastest["gradient_checkpointing"],
+        "chunked_ce_at_max": fastest["chunked_ce"],
+        "median_step_s_at_max": fastest["wall_seconds_median"],
+        "tokens_per_sec_at_max": fastest["tokens_per_second_median"],
+        "peak_mem_gb_at_max": (
+            fastest["peak_gpu_memory_bytes"] / (1 << 30)
+            if fastest.get("peak_gpu_memory_bytes") is not None else None
+        ),
+        "n_grid_points": len(records),
+        "n_eligible": len(eligible),
+    }
+
+
 def _bench_search(
     cfg_template: dict, *, args: argparse.Namespace, seq_len: int,
     device: torch.device,
 ) -> list[dict[str, Any]]:
-    """Multi-dim sweep across the AC-24 search axes. OOM rows
+    """Multi-dim sweep across the four search axes. OOM rows
     appear in the record list with `oom=true` rather than
     aborting the matrix."""
     grad_accums = _parse_csv_int(args.search_grad_accum)
@@ -511,8 +628,15 @@ def main() -> None:
 
     if args.search:
         records = _bench_search(cfg, args=args, seq_len=seq_len, device=device)
+        if args.emit_max_row:
+            max_row = _summarize_max_row(records, args=args, seq_len=seq_len, device=device)
+            records = records + [max_row] if args.emit_grid else [max_row]
     else:
-        record = _bench_one_config(
+        # Single-config mode is OOM-safe via `_safe_bench` so an OOM
+        # within the warmup window writes a structured oom-row record
+        # rather than aborting the run; the matrix sweep depends on
+        # the same contract.
+        record = _safe_bench(
             cfg, args=args,
             batch_size=_resolve_batch_size(cfg, args.batch_size),
             gradient_accumulation=_resolve_grad_accum(cfg, args.gradient_accumulation),
