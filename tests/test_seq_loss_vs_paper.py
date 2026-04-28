@@ -246,3 +246,147 @@ def test_seq_loss_token_masks_match_active_token_subset():
     )
 
     torch.testing.assert_close(masked_loss, active_only_loss)
+
+
+# AC-5 / task10: sequence-aux paper-formula extensions.
+#
+# Per `docs/plan.md` AC-5 contract: `seq_load_balancing_loss_func` must
+# (1) normalize sigmoid scores to sum-to-1 (Eq. 19) so uniform routing
+#     yields exactly `1.0`,
+# (2) honor a `token_masks` parameter for the per-rank skipped-token case,
+# (3) accept caller-provided `selected_experts` (when provided, f_i is
+#     computed from those indices rather than re-deriving via top-k of
+#     scores). Reaching parity between the explicit and the implicit path
+#     proves the loss can route through whatever the model actually picked
+#     (e.g. with exploration / `branch_router` overrides).
+
+def test_seq_loss_uniform_routing_yields_one():
+    """AC-5: with perfect uniform routing the loss must equal 1.0.
+
+    The DeepSeek-V3 paper (Eqs. 17-20) calibrates the seq aux loss so that
+    the perfect-uniform baseline is `1.0` — any deviation indicates load
+    imbalance. This test sets every token's pre-normalize sigmoid score to
+    a constant, which after Eq. 19 normalization is 1/E. With explicit
+    selected_experts that perfectly uniform-tile the experts (each expert
+    selected exactly `K/E` of the time per token, summed to `T*K/E` total
+    selections), `f_i = 1.0` and `P_i = 1/E`, so `L_Bal = E * (1/E) = 1.0`.
+    """
+    B, S, E, K = 1, 64, 4, 2
+    T = B * S
+    # Constant scores: after Eq. 19 normalization → uniform 1/E.
+    gate_logits = torch.full((T, E), 0.25)
+
+    # Build a selected_experts that uniformly tiles every (token, expert) cell:
+    # rotate the topK selection through the experts so each expert appears
+    # exactly K*T/E times across all tokens.
+    base_selection = torch.arange(K, dtype=torch.long)        # (K,) e.g. [0, 1]
+    selections = []
+    for t in range(T):
+        rotated = (base_selection + t) % E                    # rotate per token
+        selections.append(rotated)
+    selected = torch.stack(selections, dim=0)                  # (T, K)
+
+    loss = seq_load_balancing_loss_func(
+        (gate_logits,),
+        num_experts=E,
+        top_k=K,
+        batch_size=B,
+        selected_experts=(selected,),
+    )
+    torch.testing.assert_close(loss, torch.tensor(1.0), atol=1e-5, rtol=1e-5)
+
+
+def test_seq_loss_selected_experts_parity_with_default_topk():
+    """AC-5: passing `selected_experts` derived from `topk(scores)` must
+    produce the SAME loss as the implicit top-k fallback.
+
+    This locks the contract that `selected_experts` is a faithful pass-
+    through path (no off-by-one re-derivation, no unintended re-sorting).
+    """
+    B, S, E, K = 2, 16, 6, 2
+    torch.manual_seed(20260428)
+    T = B * S
+    raw = torch.randn(T, E)
+    gate_logits = torch.sigmoid(raw)
+
+    # Default path: function derives selection internally via topk(scores).
+    loss_default = seq_load_balancing_loss_func(
+        (gate_logits,),
+        num_experts=E,
+        top_k=K,
+        batch_size=B,
+        selected_experts=None,
+    )
+
+    # Explicit path: caller hands the SAME topk indices in.
+    scores_normalized = gate_logits / (gate_logits.sum(dim=-1, keepdim=True) + 1e-20)
+    _, idx = torch.topk(scores_normalized.reshape(B, S, E), K, dim=-1)
+    explicit = idx.reshape(T, K)
+    loss_explicit = seq_load_balancing_loss_func(
+        (gate_logits,),
+        num_experts=E,
+        top_k=K,
+        batch_size=B,
+        selected_experts=(explicit,),
+    )
+
+    torch.testing.assert_close(loss_default, loss_explicit)
+
+
+def test_seq_loss_zero_active_layers_returns_zero():
+    """AC-5: when every token is masked out (e.g. branch routing sent all
+    tokens through the OTHER branch), the function must return a finite
+    zero rather than NaN/Inf — no live aux contribution, no divide-by-zero.
+    """
+    B, S, E, K = 1, 4, 2, 1
+    T = B * S
+    gate_logits = torch.tensor([[0.9, 0.1]] * T)
+    selected = torch.tensor([[0]] * T)
+    all_masked = torch.zeros(T, dtype=torch.bool)  # all inactive
+
+    loss = seq_load_balancing_loss_func(
+        (gate_logits,),
+        num_experts=E,
+        top_k=K,
+        batch_size=B,
+        selected_experts=(selected,),
+        token_masks=(all_masked,),
+    )
+    assert torch.isfinite(loss).all(), f"empty-active-token path returned non-finite: {loss}"
+    torch.testing.assert_close(loss, torch.tensor(0.0))
+
+
+def test_seq_loss_skipped_layer_excluded_from_average():
+    """AC-5: when one layer has zero active tokens (token_mask all False)
+    and another has active tokens, the per-layer average must divide by
+    the number of LIVE layers, not by the total layer count.
+    """
+    B, S, E, K = 1, 4, 2, 1
+    T = B * S
+    gate_logits_active = torch.tensor([[0.9, 0.1]] * T)
+    gate_logits_dead = torch.tensor([[0.5, 0.5]] * T)
+    selected_active = torch.tensor([[0]] * T)
+    selected_dead = torch.tensor([[0]] * T)
+    mask_all_active = torch.ones(T, dtype=torch.bool)
+    mask_all_inactive = torch.zeros(T, dtype=torch.bool)
+
+    loss_two_layers = seq_load_balancing_loss_func(
+        (gate_logits_active, gate_logits_dead),
+        num_experts=E,
+        top_k=K,
+        batch_size=B,
+        selected_experts=(selected_active, selected_dead),
+        token_masks=(mask_all_active, mask_all_inactive),
+    )
+
+    # Reference: just the active layer alone.
+    loss_one_layer = seq_load_balancing_loss_func(
+        (gate_logits_active,),
+        num_experts=E,
+        top_k=K,
+        batch_size=B,
+        selected_experts=(selected_active,),
+        token_masks=(mask_all_active,),
+    )
+
+    torch.testing.assert_close(loss_two_layers, loss_one_layer)

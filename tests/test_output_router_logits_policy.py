@@ -362,8 +362,14 @@ def _load_metrics_module():
     "family,method",
     [
         ("standard_moe",   "deepseek_bias"),
+        ("standard_moe",   "quantile"),
+        ("standard_moe",   "none"),
         ("global_moe",     "deepseek_bias"),
+        ("global_moe",     "quantile"),
+        ("global_moe",     "none"),
         ("moe_everything", "deepseek_bias"),
+        ("moe_everything", "quantile"),
+        ("moe_everything", "none"),
     ],
 )
 def test_detached_telemetry_fallback_in_compute_output_metrics(family, method):
@@ -643,8 +649,14 @@ if __name__ == "__main__":
     test_moe_everything_non_aux_attention_router_info_detached()
     for family, method in [
         ("standard_moe",   "deepseek_bias"),
+        ("standard_moe",   "quantile"),
+        ("standard_moe",   "none"),
         ("global_moe",     "deepseek_bias"),
+        ("global_moe",     "quantile"),
+        ("global_moe",     "none"),
         ("moe_everything", "deepseek_bias"),
+        ("moe_everything", "quantile"),
+        ("moe_everything", "none"),
     ]:
         test_detached_telemetry_fallback_in_compute_output_metrics(family, method)
     print("ALL OK")
