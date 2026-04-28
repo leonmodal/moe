@@ -20,7 +20,7 @@ import warnings
 from typing import Any
 
 
-# Fields that MUST live under `cfg["training"]` per the canonical-block resolver rule.
+# Fields that MUST live under `cfg["training"]` per the canonical-block resolver.
 _BALANCING_FIELDS_IN_TRAINING: tuple[str, ...] = (
     "router_aux_loss_coef",
     "seq_aux_loss_coef",
@@ -56,14 +56,14 @@ def _resolve_balancing_field(cfg: dict, name: str, default: Any) -> Any:
         if name in mcfg:
             warnings.warn(
                 f"Config field {name!r} appears in BOTH `training:` and `model:`; "
-                f"using the `training:` value (canonical per the canonical-block resolver rule). Remove the "
+                f"using the `training:` value (canonical per the canonical-block resolver). Remove the "
                 f"`model:` copy to silence this warning.",
                 DeprecationWarning, stacklevel=3,
             )
         return tcfg[name]
     if name in mcfg:
         warnings.warn(
-            f"Config field {name!r} found under `model:` — the canonical-block resolver rule moved it to "
+            f"Config field {name!r} found under `model:` — the canonical-block resolver moved it to "
             f"`training:`. The `model:` placement is deprecated; run "
             f"`python scripts/migrate_balancing_fields_to_training.py` to migrate.",
             DeprecationWarning, stacklevel=3,
@@ -72,7 +72,7 @@ def _resolve_balancing_field(cfg: dict, name: str, default: Any) -> Any:
     return default
 
 
-# the load-balancing-method gating rule / the canonical-block coefficient normalizer: which legacy coefficients are kept active under each
+# method gating / the coefficient normalizer: which legacy coefficients are kept active under each
 # `load_balancing_method`. Anything outside the per-method "active" set is
 # AUTO-ZEROED with a deprecation warning so the trainer's coefficient-driven
 # code paths produce behavior consistent with the resolved method.
@@ -83,7 +83,7 @@ _VALID_LOAD_BALANCING_METHODS: tuple[str, ...] = (
     "quantile",
     "none",
 )
-# the DETACH-ONLY policy: methods whose loss term needs
+# the detach-only policy: methods whose loss term needs
 # `router_logits` exposed as a gradient-bearing model output. For other
 # methods, the model's `forward` should NOT request loss-bearing router
 # logits — non-aux methods drive routing through the router-internal
@@ -136,9 +136,8 @@ def normalize_balancing_config(cfg: dict) -> dict:
     active set is empty, so it zeroes everything (Per the `none` method contract: `balancing: none`
     disables all balancing).
 
-    the load-balancing-method coefficient normalizer: repository configs are stricter
-    (rejection, via the future config validator); external/legacy configs go
-    through AUTO-ZERO at runtime.
+    Repository configs are stricter (rejection, via the future config
+    validator); external/legacy configs go through AUTO-ZERO at runtime.
     """
     method = _resolve_balancing_field(cfg, "load_balancing_method", None)
     if method is None:

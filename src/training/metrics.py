@@ -75,7 +75,7 @@ def get_output_router_token_masks(output, model=None) -> tuple[torch.Tensor | No
     masks = getattr(output, "router_token_masks", None)
     if masks:
         return tuple(masks)
-    # the DETACH-ONLY policy fallback: when the model's forward skipped writing router_token_masks
+    # the detach-only policy fallback: when the model's forward skipped writing router_token_masks
     # to the output (non-aux methods), the moe_everything inner model still
     # accumulates per-depth token masks under `_all_mlp_token_masks`. Use them
     # so non-aux MoE-Everything metrics weight expert load by active tokens
@@ -190,7 +190,7 @@ def compute_output_metrics(
     ce_tensor = getattr(output, "ce_loss", None)
     seq_aux = getattr(output, "seq_aux_loss", None)
     if seq_aux is None and seq_aux_loss_coef > 0 and router_logits_for_metrics is not None:
-        # the DETACH-ONLY policy: same detached fallback for seq aux telemetry.
+        # the detach-only policy: same detached fallback for seq aux telemetry.
         seq_aux = seq_load_balancing_loss_func(
             router_logits_for_metrics,
             model_cfg.num_experts,

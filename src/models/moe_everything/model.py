@@ -540,7 +540,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                     # one router serves all heads); fall back to "q" so the
                     # default per_proj_rates dict still resolves to a numeric
                     # rate. Specialized split-rate users can extend the map
-                    # once the bank-level balancing-state rule lands a cleaner naming.
+                    # once the bank-level state rule lands a cleaner naming.
                     label = "q"
                 yield m, label
 

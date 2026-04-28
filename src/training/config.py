@@ -53,7 +53,7 @@ class TrainingConfig:
     bias_update_rate: float = 0.0
     bias_warmup_start: float = 0.0
     bias_warmup_steps: int = 0
-    # the bias-update mode selector: selects between the nmoe / DeepSeek-V3 zero-sum
+    # the `zero_sum` mode flag: selects between the nmoe / DeepSeek-V3 zero-sum
     # update (default, True) and the Megatron-LM plain-sign update (False).
     #   True  → bias -= (sign(load - 1/E) - mean(sign(load - 1/E))) * rate
     #           Reference: nmoe/nmoe/model.py:Router.update_bias

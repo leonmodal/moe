@@ -44,7 +44,7 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
         """Yield (owner_module, label) for every load-balancing owner.
 
         Standard MoE has per-layer expert pools, so each layer's `gate` owns its
-        own `expert_bias` / `local_tokens_per_expert` buffers (the bank-level balancing-state rule:
+        own `expert_bias` / `local_tokens_per_expert` buffers (the bank-level state rule:
         per-layer pools keep per-router state).
         """
         for layer in self.model.layers:

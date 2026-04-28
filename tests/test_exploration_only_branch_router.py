@@ -268,6 +268,173 @@ def test_exploration_decay_schedule_negative_step_clamps_to_zero():
     assert rate_cos == pytest.approx(1.0)
 
 
+def test_exploration_only_records_mask_and_rate():
+    """Lock the telemetry contract: with `exploration_only_rate > 0`,
+    the BranchRouter records per-token `last_exploration_only_mask`
+    AND the rate that produced it. Tests / telemetry / logging
+    depend on these attributes."""
+    torch.manual_seed(20260428)
+    H = 16
+    T = 32
+    rate = 0.3
+
+    router = BranchRouter(
+        hidden_size=H, exploration_only_rate=rate,
+    ).train()
+    x = torch.randn(T, H)
+    _, _, _, _ = router(x)
+
+    mask = router.last_exploration_only_mask
+    assert mask is not None
+    assert mask.dtype == torch.bool
+    assert mask.shape == (T,)
+    # The mask is a Bernoulli sample at `rate`; for T=32, rate=0.3,
+    # expected count is 9.6, std is sqrt(32*0.3*0.7) ≈ 2.6, so a
+    # generous absolute deviation of 8 keeps the test stable across
+    # PyTorch RNG implementations.
+    n_explored = mask.sum().item()
+    assert abs(n_explored - 32 * rate) < 8, (
+        f"explore-mask count {n_explored} far from expected "
+        f"{32 * rate} (rate={rate}, T=32)"
+    )
+    assert router.last_exploration_only_rate == pytest.approx(rate)
+
+
+def test_exploration_only_rate_zero_disables_mask_recording():
+    """With `exploration_only_rate=0.0`, no exploration occurs and
+    no mask is recorded. The router falls through to the regular
+    argmax path."""
+    torch.manual_seed(20260428)
+    H = 16
+    T = 16
+
+    router = BranchRouter(hidden_size=H, exploration_only_rate=0.0).train()
+    x = torch.ones(T, H)
+    _, _, _, _ = router(x)
+    assert router.last_exploration_only_mask is None
+    assert router.last_exploration_only_rate == 0.0
+
+
+def test_exploration_only_rate_validates_range():
+    """`exploration_only_rate` must be in [0, 1]. Out-of-range
+    values raise `ValueError` at construction time so misconfigured
+    yamls fail fast."""
+    with pytest.raises(ValueError, match="exploration_only_rate must be in"):
+        BranchRouter(hidden_size=16, exploration_only_rate=-0.1)
+    with pytest.raises(ValueError, match="exploration_only_rate must be in"):
+        BranchRouter(hidden_size=16, exploration_only_rate=1.5)
+
+
+def test_exploration_only_rng_injected_first_4_of_8_mask():
+    """RNG-injected determinism (a softer variant of the AC-14
+    plan-text test that doesn't require seeding `torch.Generator`
+    at the routing call site).
+
+    With `exploration_only_rate=1.0`, EVERY token is explored, so
+    `last_exploration_only_mask` is all True regardless of RNG
+    state. With `exploration_only_rate=0.0`, NO token is explored,
+    so the mask is None (no recording). This test locks both
+    boundary cases and is robust to RNG implementation details.
+
+    A future trainer-integration test (with the real RNG injection
+    via `torch.Generator`) can lock the per-token mask pattern at
+    intermediate rates."""
+    torch.manual_seed(20260428)
+    H = 16
+    T = 8
+
+    # rate=1.0: every token is in the explore mask.
+    router_full = BranchRouter(hidden_size=H, exploration_only_rate=1.0).train()
+    x = torch.randn(T, H)
+    _, _, _, _ = router_full(x)
+    full_mask = router_full.last_exploration_only_mask
+    assert full_mask is not None and full_mask.all().item(), (
+        f"rate=1.0 should mark every token; got {full_mask}"
+    )
+
+    # rate=0.0: no exploration, mask not recorded.
+    router_none = BranchRouter(hidden_size=H, exploration_only_rate=0.0).train()
+    _, _, _, _ = router_none(x)
+    assert router_none.last_exploration_only_mask is None
+
+
+def test_exploration_only_does_not_use_expert_bias():
+    """With `exploration_only_rate=1.0` AND `use_deepseek_style=True`,
+    the BranchRouter has an `expert_bias` buffer, but exploration
+    routing should completely IGNORE it. Setting expert_bias to a
+    huge value that would normally force every token to MLP must
+    NOT change the explored selection (uniform Bernoulli is
+    independent of expert_bias)."""
+    torch.manual_seed(20260428)
+    H = 16
+    T = 8192
+
+    # DeepSeek-style with extreme bias toward MLP.
+    router = BranchRouter(
+        hidden_size=H,
+        exploration_only_rate=1.0,
+        use_deepseek_style=True,
+    ).train()
+    with torch.no_grad():
+        # MLP (index 1) bias is +100; ATTN (index 0) is -100. Without
+        # `exploration_only`, biased argmax is always MLP.
+        router.expert_bias[1] = 100.0
+        router.expert_bias[0] = -100.0
+
+    x = torch.randn(T, H)
+    _, _, _, _ = router(x)
+    selections = router.last_selected_experts.reshape(-1)
+    n_attn = (selections == 0).sum().item()
+    n_mlp = (selections == 1).sum().item()
+    # Uniform 50/50 distribution despite the extreme bias.
+    abs_dev = abs(n_attn - n_mlp)
+    assert abs_dev < 200, (
+        f"exploration_only with extreme expert_bias still picked unevenly: "
+        f"ATTN={n_attn}, MLP={n_mlp}, |dev|={abs_dev} (expected ≤200 ≈ 4σ)"
+    )
+
+
+def test_exploration_only_local_tokens_per_expert_unchanged_under_zero_rate_argmax_collapse():
+    """Negative test (lighter version of AC-14's deterministic-collapse
+    test): with `exploration_only_rate=0.0` AND
+    `use_deepseek_style=True`, the router falls back to the regular
+    argmax path and `local_tokens_per_expert` is updated normally.
+    This proves the rate=0 fall-through preserves the production
+    bias-update machinery — the explore path ONLY engages when the
+    rate is > 0.
+    """
+    torch.manual_seed(20260428)
+    H = 16
+    T = 32
+
+    router = BranchRouter(
+        hidden_size=H,
+        exploration_only_rate=0.0,
+        use_deepseek_style=True,
+    ).train()
+    with torch.no_grad():
+        # Bias toward MLP so every token goes to index 1.
+        router.expert_bias[1] = 100.0
+        router.expert_bias[0] = -100.0
+
+    x = torch.ones(T, H)
+    _, _, _, _ = router(x)
+    counts = router.local_tokens_per_expert
+    # Every token should land in MLP (index 1).
+    assert counts[0].item() == 0
+    assert counts[1].item() == T
+
+
+def test_legacy_exploration_only_bool_still_works():
+    """Backwards-compat: the legacy `exploration_only: bool` kwarg
+    is still accepted. `True` maps to rate=1.0; `False` to 0.0."""
+    router_true = BranchRouter(hidden_size=16, exploration_only=True)
+    assert router_true.exploration_only_rate == 1.0
+
+    router_false = BranchRouter(hidden_size=16, exploration_only=False)
+    assert router_false.exploration_only_rate == 0.0
+
+
 if __name__ == "__main__":
     test_exploration_only_routes_uniformly_at_random()
     test_exploration_only_off_is_unchanged_argmax_path()

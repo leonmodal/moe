@@ -51,7 +51,8 @@ class BranchRouter(nn.Module):
                  scale_by_routing_weight: bool = True,
                  use_sampling: bool = False, use_seq_level: bool = False,
                  use_deepseek_style: bool = False,
-                 exploration_only: bool = False):
+                 exploration_only_rate: float = 0.0,
+                 exploration_only: bool | None = None):
         super().__init__()
         self.gate = nn.Linear(hidden_size, 2, bias=False)
         self.exploration_rate = exploration_rate
@@ -59,16 +60,39 @@ class BranchRouter(nn.Module):
         self.use_sampling = use_sampling
         self.use_seq_level = use_seq_level
         self.use_deepseek_style = use_deepseek_style
-        # `exploration_only`: when True every routing decision is drawn
-        # uniformly at random (no scoring, no bias). The model still has
-        # to produce real loss values, so the gate weights still receive
-        # gradient through the gate-projection path; the SELECTION
-        # itself is detached from the gate's signal. Use this for
-        # diagnostic runs that need a fully randomized branch
-        # distribution while keeping the rest of the model trainable.
-        self.exploration_only = exploration_only
+        # `exploration_only_rate`: per-step probability `p_explore` of
+        # routing each token (or sequence under `use_seq_level`) by a
+        # uniform Bernoulli draw rather than the gate's argmax.
+        #   `0.0`  → no exploration override (default; argmax routing).
+        #   `1.0`  → every routing decision is uniformly random.
+        #   `0<p<1` → per-token Bernoulli mask: with probability `p`,
+        #             the token's selection is replaced by a uniform
+        #             50/50 draw; otherwise it follows the regular
+        #             argmax path.
+        # The gate's projection still runs on every token so the
+        # routing-weight tensors stay gradient-bearing for the rest of
+        # the model. Recompute determinism is preserved via
+        # `torch.utils.checkpoint`'s default `preserve_rng_state=True`.
+        # Backwards-compat: the legacy `exploration_only: bool` kwarg is
+        # accepted; True → `exploration_only_rate=1.0`, False → 0.0.
+        if exploration_only is True and exploration_only_rate == 0.0:
+            exploration_only_rate = 1.0
+        elif exploration_only is False:
+            exploration_only_rate = 0.0
+        if not (0.0 <= exploration_only_rate <= 1.0):
+            raise ValueError(
+                f"exploration_only_rate must be in [0, 1], got {exploration_only_rate}"
+            )
+        self.exploration_only_rate = exploration_only_rate
         self.last_probs = None
         self.last_selected_experts = None
+        # Last-step exploration-only mask (per-token bool) and the
+        # rate that produced it. Populated only when
+        # `exploration_only_rate > 0` and the router is in `training()`
+        # mode; tests use these for RNG-injected deterministic
+        # assertions.
+        self.last_exploration_only_mask = None
+        self.last_exploration_only_rate = 0.0
         # Rely on `torch.utils.checkpoint`'s default
         # `preserve_rng_state=True` for recompute determinism. An
         # earlier design had explicit caches for
@@ -79,12 +103,12 @@ class BranchRouter(nn.Module):
         # cache → 0 saved tensors). The count-buffer guard in
         # `forward` plus PyTorch's RNG preservation are sufficient.
         if use_deepseek_style:
-            # Canonical balancing-owner buffer interface (the balancing-owner buffer interface): every
-            # owner — standalone DeepSeekRouter, BranchRouter, or shared expert
-            # bank — exposes the same `expert_bias` (persistent fp32) and
-            # `local_tokens_per_expert` (non-persistent fp32) attributes so the
-            # unified `update_expert_biases` walker can update them without
-            # special-casing the branch path.
+            # Every load-balancing owner — standalone DeepSeekRouter,
+            # BranchRouter, or shared expert bank — exposes the same
+            # `expert_bias` (persistent fp32) and
+            # `local_tokens_per_expert` (non-persistent fp32) buffers so
+            # the unified `update_expert_biases` walker can update them
+            # without special-casing the branch path.
             self.register_buffer(
                 "expert_bias",
                 torch.zeros(2, dtype=torch.float32),
@@ -114,21 +138,33 @@ class BranchRouter(nn.Module):
             else:
                 logits = self.gate(hidden_states.to(gate_dtype))
 
-            if self.exploration_only and self.training:
-                # `exploration_only`: every routing decision is drawn
-                # uniformly at random. The probs are populated for
-                # downstream telemetry, but the SELECTION uses a
-                # uniform Bernoulli draw — bypassing scores and
-                # expert_bias entirely. Recompute determinism is
-                # preserved via PyTorch's `preserve_rng_state=True`,
-                # which restores the RNG state before recompute so
-                # `torch.rand` produces identical draws.
+            if self.exploration_only_rate > 0.0 and self.training:
+                # Exploration-only routing: with probability
+                # `exploration_only_rate` per token (the explore mask),
+                # the token's selection is replaced by a uniform
+                # Bernoulli draw. Otherwise it follows the regular
+                # argmax path. Probs are still populated via the
+                # gate's softmax/sigmoid for downstream telemetry and
+                # weight-gradient flow.
                 if self.use_deepseek_style:
                     probs = torch.sigmoid(logits)
                 else:
                     probs = F.softmax(logits, dim=-1)
-                random_choice = torch.rand(probs.shape[:-1], device=probs.device) < 0.5
-                choice = random_choice.long()
+                # Argmax fallback for non-explored tokens.
+                argmax_choice = probs.argmax(dim=-1)
+                # Per-token explore mask + uniform Bernoulli for masked
+                # tokens. Both `torch.rand` calls inherit the
+                # checkpoint-restored RNG state on recompute.
+                rand_mask = torch.rand(probs.shape[:-1], device=probs.device)
+                explore_mask = rand_mask < self.exploration_only_rate
+                random_choice = (
+                    torch.rand(probs.shape[:-1], device=probs.device) < 0.5
+                ).long()
+                choice = torch.where(explore_mask, random_choice, argmax_choice)
+                # Record for tests / telemetry. `.detach()` on the mask
+                # so storing it doesn't retain gradient history.
+                self.last_exploration_only_mask = explore_mask.detach()
+                self.last_exploration_only_rate = float(self.exploration_only_rate)
             elif self.use_deepseek_style:
                 scores = torch.sigmoid(logits)
                 biased = scores + self.expert_bias.to(scores.dtype)
@@ -176,7 +212,7 @@ class BranchRouter(nn.Module):
                 probs = probs.unsqueeze(1).expand(B, T, 2)
 
         # Track counts for bias update (DeepSeek style). Skip on gradient-checkpoint
-        # recompute so backward replays do not double-count (the recompute-determinism rule / the unified balancing-owner buffer interface).
+        # recompute so backward replays do not double-count (recompute determinism / the shared `expert_bias`/`local_tokens_per_expert` buffer interface).
         if (
             self.use_deepseek_style
             and self.training
