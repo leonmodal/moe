@@ -233,6 +233,12 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
             )
             output.loss = output.loss + seq_coef * seq_aux
 
+        # DEC-15 DETACH-ONLY: for non-aux methods, detach the model output's
+        # `router_logits` even if the caller forced `output_router_logits=True`.
+        # See `StandardMoEModel.forward` for the rationale.
+        if not (aux_active or seq_aux_active) and output.router_logits is not None:
+            output.router_logits = tuple(t.detach() for t in output.router_logits)
+
         return output
 
 

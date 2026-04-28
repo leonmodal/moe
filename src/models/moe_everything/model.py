@@ -700,10 +700,23 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
             branch_probs_out = tuple(t.detach() for t in branch_prob_tensors) if branch_prob_tensors is not None else None
             attention_router_info_out = None
             if attention_router_info is not None:
+                # DEC-15 DETACH-ONLY: for non-aux methods, expose the
+                # `router_logits_detached` side channel that
+                # `attention_bank._store_router_info` always populates. The
+                # gradient-bearing `router_logits` view is reserved for aux
+                # methods that need it for the in-forward aux-loss
+                # accumulator. Falling back to detach() if the side channel
+                # is missing (older paths that may not have populated it).
+                def _attn_router_logits(info):
+                    if mlp_grad_bearing:
+                        return info["router_logits"]
+                    detached = info.get("router_logits_detached")
+                    return detached if detached is not None else info["router_logits"].detach()
+
                 attention_router_info_out = tuple(
                     {
                         name: {
-                            "router_logits": info["router_logits"],
+                            "router_logits": _attn_router_logits(info),
                             "selected_experts": info["selected_experts"],
                             **({"token_mask": info["token_mask"]} if "token_mask" in info else {}),
                         }

@@ -107,6 +107,14 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
             )
             output.loss = output.loss + seq_coef * seq_aux
 
+        # DEC-15 DETACH-ONLY: for non-aux methods, the model output's
+        # `router_logits` must be detached even if the caller forced
+        # `output_router_logits=True`. Telemetry is preserved (the values are
+        # available) but the autograd graph is not retained — so a downstream
+        # consumer can't accidentally backprop through them.
+        if not (aux_active or seq_aux_active) and output.router_logits is not None:
+            output.router_logits = tuple(t.detach() for t in output.router_logits)
+
         return output
 
 

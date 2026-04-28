@@ -78,6 +78,31 @@ def get_output_router_token_masks(output) -> tuple[torch.Tensor | None, ...] | N
     return None
 
 
+def _collect_detached_router_scores(model) -> tuple[torch.Tensor, ...] | None:
+    """DEC-15 DETACH-ONLY telemetry consumer.
+
+    When the model's `forward` skips returning gradient-bearing
+    `router_logits` (non-aux methods), telemetry consumers can still observe
+    per-expert scores by reading the `_last_router_scores_detached` snapshot
+    that every `DeepSeekRouter` and `ExplorationTopKRouter` populates on
+    every forward. This helper walks the model and collects snapshots from
+    the same routers that `compute_output_metrics` would otherwise read
+    from the (missing) `output.router_logits`.
+
+    Returns `None` when no router has produced a snapshot (e.g., dense
+    models or pre-forward calls).
+    """
+    from src.models.router import DeepSeekRouter, ExplorationTopKRouter
+
+    snapshots: list[torch.Tensor] = []
+    for module in model.modules():
+        if isinstance(module, (DeepSeekRouter, ExplorationTopKRouter)):
+            snap = getattr(module, "_last_router_scores_detached", None)
+            if snap is not None:
+                snapshots.append(snap)
+    return tuple(snapshots) if snapshots else None
+
+
 def compute_output_metrics(
     output,
     raw_model,
@@ -95,9 +120,16 @@ def compute_output_metrics(
 
     aux = getattr(output, "aux_loss", None)
     aux_normalized = None
-    if getattr(output, "router_logits", None) is not None:
+    # DEC-15 DETACH-ONLY: when the model output's `router_logits` is None
+    # (non-aux method that skips the gradient-bearing path), fall back to
+    # the per-router `_last_router_scores_detached` snapshot. Telemetry
+    # remains available without retaining the autograd graph.
+    router_logits_for_metrics = getattr(output, "router_logits", None)
+    if router_logits_for_metrics is None:
+        router_logits_for_metrics = _collect_detached_router_scores(raw_model)
+    if router_logits_for_metrics is not None:
         aux_normalized = normalized_load_balancing_loss_func(
-            output.router_logits,
+            router_logits_for_metrics,
             model_cfg.num_experts,
             model_cfg.num_experts_per_tok,
             token_masks=router_token_masks,
@@ -105,9 +137,10 @@ def compute_output_metrics(
         )
     ce_tensor = getattr(output, "ce_loss", None)
     seq_aux = getattr(output, "seq_aux_loss", None)
-    if seq_aux is None and seq_aux_loss_coef > 0 and getattr(output, "router_logits", None) is not None:
+    if seq_aux is None and seq_aux_loss_coef > 0 and router_logits_for_metrics is not None:
+        # DEC-15: same detached fallback for seq aux telemetry.
         seq_aux = seq_load_balancing_loss_func(
-            output.router_logits,
+            router_logits_for_metrics,
             model_cfg.num_experts,
             model_cfg.num_experts_per_tok,
             batch_size=input_ids.shape[0],

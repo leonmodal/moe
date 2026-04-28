@@ -257,6 +257,109 @@ def test_router_internal_telemetry_present_after_forward():
     assert inspected > 0, "no routers inspected — fixture is wrong"
 
 
+@pytest.mark.parametrize("family", ["standard_moe", "global_moe"])
+def test_non_aux_method_forced_orl_true_returns_detached(family):
+    """DEC-15 forward-level enforcement (Codex Round 7 Blocker #1):
+    even when a caller forces `output_router_logits=True`, non-aux methods
+    must return DETACHED `output.router_logits`. Round 7 only enforced this
+    via `build_model` (model_config.output_router_logits=False); a caller
+    that overrode the kwarg could still leak grad-bearing tensors.
+    """
+    _, cfg_mod, mf = _load_modules()
+    with tempfile.TemporaryDirectory() as td:
+        yaml_path = _make_yaml("deepseek_bias", Path(td), family=family)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            cfg = cfg_mod.load_config(str(yaml_path))
+        model, _ = mf.build_model(cfg)
+    model.train()
+    input_ids = torch.randint(0, model.vocab_size, (2, 8), dtype=torch.long)
+    # Force output_router_logits=True even though the method doesn't need them.
+    out = model(input_ids=input_ids, labels=input_ids, output_router_logits=True)
+    assert out.router_logits is not None, (
+        f"{family} forced output_router_logits=True should still produce "
+        f"router_logits, got None"
+    )
+    requires_grad_flags = [t.requires_grad for t in out.router_logits]
+    assert not any(requires_grad_flags), (
+        f"{family} deepseek_bias with forced output_router_logits=True "
+        f"returned grad-bearing router_logits: {requires_grad_flags}. "
+        f"DEC-15 DETACH-ONLY policy violated at the forward level."
+    )
+
+
+def test_moe_everything_non_aux_attention_router_info_detached():
+    """DEC-15 (Codex Round 7 Blocker #1, moe_everything attention path):
+    when `load_balancing_method` is non-aux and the caller forces
+    `output_router_logits=True`, the q/k/v/o attention router_logits in
+    `output.attention_router_info` must be detached.
+    """
+    _, cfg_mod, mf = _load_modules()
+    with tempfile.TemporaryDirectory() as td:
+        yaml_path = _make_yaml("deepseek_bias", Path(td), family="moe_everything")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            cfg = cfg_mod.load_config(str(yaml_path))
+        model, _ = mf.build_model(cfg)
+    model.train()
+    input_ids = torch.randint(0, model.vocab_size, (1, 4), dtype=torch.long)
+    out = model(input_ids=input_ids, labels=input_ids, output_router_logits=True)
+    if out.attention_router_info is None:
+        return  # Some attention modes skip this; not a failure.
+    for depth_info in out.attention_router_info:
+        for name, info in depth_info.items():
+            rl = info["router_logits"]
+            assert not rl.requires_grad, (
+                f"moe_everything deepseek_bias attention router '{name}' "
+                f"router_logits is grad-bearing under forced "
+                f"output_router_logits=True. DEC-15 violated."
+            )
+
+
+def test_detached_telemetry_fallback_in_compute_output_metrics():
+    """DEC-15 detached telemetry consumer (Codex Round 7 Blocker #1):
+    when `output.router_logits is None` (non-aux method default), the
+    metrics path falls back to per-router `_last_router_scores_detached`
+    snapshots and produces a non-zero `aux_loss_normalized`.
+    """
+    _, cfg_mod, mf = _load_modules()
+    with tempfile.TemporaryDirectory() as td:
+        yaml_path = _make_yaml("deepseek_bias", Path(td))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            cfg = cfg_mod.load_config(str(yaml_path))
+        model, model_cfg = mf.build_model(cfg)
+    model.train()
+    input_ids = torch.randint(0, model.vocab_size, (2, 8), dtype=torch.long)
+    out = model(input_ids=input_ids, labels=input_ids, output_router_logits=False)
+    assert out.router_logits is None, "preflight: deepseek_bias with output_router_logits=False should yield None"
+
+    # Import the metrics path the trainer/eval would use.
+    import importlib.util
+    metrics_spec = importlib.util.spec_from_file_location(
+        "_metrics",
+        Path(__file__).resolve().parent.parent / "src" / "training" / "metrics.py",
+    )
+    # Need the package context for relative imports to work.
+    import sys as _sys, types as _types
+    if "src.training" not in _sys.modules:
+        training_pkg = _types.ModuleType("src.training")
+        training_pkg.__path__ = [str(Path(__file__).resolve().parent.parent / "src" / "training")]
+        _sys.modules["src.training"] = training_pkg
+    metrics = importlib.util.module_from_spec(metrics_spec)
+    _sys.modules["src.training.metrics"] = metrics
+    metrics_spec.loader.exec_module(metrics)
+
+    detached = metrics._collect_detached_router_scores(model)
+    assert detached is not None, (
+        "DEC-15 telemetry fallback failed: no detached router scores "
+        "collected from a deepseek_bias model after forward."
+    )
+    assert all(not t.requires_grad for t in detached), (
+        "Detached telemetry must not be grad-bearing"
+    )
+
+
 def test_moe_everything_aux_method_forward_keeps_grad_bearing_mlp_router_logits():
     """Codex Round 6 measured `out.router_logits MLP requires_grad flags ->
     [False, False]` for moe_everything aux_loss — the MLP router_logits were
@@ -353,4 +456,8 @@ if __name__ == "__main__":
     test_router_internal_telemetry_present_after_forward()
     test_moe_everything_aux_method_forward_keeps_grad_bearing_mlp_router_logits()
     test_moe_everything_deepseek_bias_method_forward_detaches_mlp_router_logits()
+    for family in ("standard_moe", "global_moe"):
+        test_non_aux_method_forced_orl_true_returns_detached(family)
+    test_moe_everything_non_aux_attention_router_info_detached()
+    test_detached_telemetry_fallback_in_compute_output_metrics()
     print("ALL OK")

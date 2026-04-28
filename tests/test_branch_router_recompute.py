@@ -597,6 +597,118 @@ def test_deepseek_router_exploration_checkpoint_matches_no_checkpoint():
     )
 
 
+def test_full_model_moe_everything_branch_deepseek_checkpoint_matches_no_checkpoint():
+    """AC-9 (Round 8) full-model regression: build two identical
+    `MoEverythingForCausalLM` models on the same seed with
+    `branch_deepseek=True`. Run model A without gradient checkpointing,
+    model B with `gradient_checkpointing_enable()`. Same input seed.
+    Assert branch `local_tokens_per_expert` and selections match.
+
+    This is the AC-9 positive test the original plan text explicitly
+    requires (see `docs/plan.md:104-105`). Round 7's targeted callable
+    tests covered the routing-level contract; this test covers the full
+    model wiring through `MoEverythingModel._depth_step` and
+    `gradient_checkpointing_enable()`.
+    """
+    from src.models import MoEverythingConfig, MoEverythingForCausalLM
+
+    def _make_model(seed: int):
+        torch.manual_seed(seed)
+        cfg = MoEverythingConfig(
+            vocab_size=32,
+            hidden_size=16,
+            num_hidden_layers=2,  # 2 depth iterations: minimal but exercises checkpoint
+            head_dim=8,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            intermediate_size=32,
+            moe_intermediate_size=32,
+            num_experts=4,
+            num_experts_per_tok=2,
+            num_attn_experts=2,
+            num_attn_experts_per_tok=1,
+            attn_expert_mode="per_head_fully_independent",
+            branch_router_aux_loss_coef=0.0,
+            use_deepseek_routing=True,
+            branch_deepseek=True,  # the AC-9 contract specifies this
+            topk_scaling_factor=2.5,
+            per_layer_router=False,
+            per_layer_mlp_router=False,
+            per_layer_attn_router=False,
+            routed_norm=False,
+            per_layer_norm=False,
+            post_norm=False,
+            dynamic_depth_min=1.0,
+            dynamic_depth_max=1.0,
+            depthwise_attention=False,
+            depthwise_block_size=0,
+            per_head_compute_mode="auto",
+            per_head_dense_fraction_threshold=0.75,
+            scale_attn_by_routing_weight=True,
+            scale_branch_by_routing_weight=True,
+            router_exploration_rate=0.0,
+            branch_router_exploration_rate=0.0,
+            branch_sampling=False,
+            branch_level="token",
+            max_position_embeddings=64,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            tie_word_embeddings=True,
+            norm_topk_prob=True,
+            router_aux_loss_coef=0.0,    # method-driven runtime; coefs zero
+            seq_aux_loss_coef=0.0,
+            output_router_logits=False,  # non-aux method
+            attn_implementation="eager",
+        )
+        torch.manual_seed(seed)
+        model = MoEverythingForCausalLM(cfg).train()
+        return model
+
+    seed = 2034
+    model_a = _make_model(seed)
+    model_b = _make_model(seed)
+    # Confirm parameter parity at init.
+    for (n_a, p_a), (_, p_b) in zip(
+        model_a.named_parameters(), model_b.named_parameters()
+    ):
+        assert torch.equal(p_a.data, p_b.data), f"init param diverged: {n_a}"
+
+    # Identical input across both runs.
+    torch.manual_seed(seed + 1)
+    input_ids = torch.randint(0, model_a.vocab_size, (1, 4), dtype=torch.long)
+    labels = input_ids.clone()
+
+    # Run A: no gradient checkpointing.
+    out_a = model_a(input_ids=input_ids, labels=labels)
+    out_a.loss.backward()
+    branch_a = model_a.model.branch_router
+    counts_a = branch_a.local_tokens_per_expert.clone()
+    sel_a = branch_a.last_selected_experts.clone() if branch_a.last_selected_experts is not None else None
+
+    # Run B: gradient_checkpointing_enable().
+    model_b.gradient_checkpointing_enable()
+    out_b = model_b(input_ids=input_ids, labels=labels)
+    out_b.loss.backward()
+    branch_b = model_b.model.branch_router
+    counts_b = branch_b.local_tokens_per_expert.clone()
+    sel_b = branch_b.last_selected_experts.clone() if branch_b.last_selected_experts is not None else None
+
+    assert torch.equal(counts_a, counts_b), (
+        f"AC-9 full-model regression: branch local_tokens_per_expert "
+        f"diverged between checkpointed and non-checkpointed runs. "
+        f"counts_a={counts_a}, counts_b={counts_b}"
+    )
+    if sel_a is not None and sel_b is not None:
+        # Last-recorded selection: under checkpointing, this is the
+        # recompute's value (recompute overwrites `last_selected_experts`
+        # last); under no-checkpointing, it's the only forward's value. Both
+        # should match per the AC-9 RNG-preservation contract.
+        assert torch.equal(sel_a, sel_b), (
+            f"AC-9 full-model regression: branch_router selections diverged "
+            f"between checkpointed and non-checkpointed runs."
+        )
+
+
 if __name__ == "__main__":
     test_branch_router_real_forward_increments_counts()
     test_branch_router_recompute_does_not_double_count()
@@ -611,4 +723,5 @@ if __name__ == "__main__":
     test_branch_router_use_sampling_diverges_when_rng_state_not_preserved()
     test_branch_router_real_checkpoint_stochastic_matches_no_checkpoint()
     test_deepseek_router_exploration_checkpoint_matches_no_checkpoint()
+    test_full_model_moe_everything_branch_deepseek_checkpoint_matches_no_checkpoint()
     print("ALL OK")
