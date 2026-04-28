@@ -341,7 +341,11 @@ class ExplorationTopKRouter(Qwen3MoeTopKRouter):
             else:
                 self._last_z_loss = None
 
-        if self.norm_topk_prob:
+        # DEC-17 (Round 12): skip the post-topk normalization for top_k=1.
+        # `value / value = 1.0` is constant in any non-degenerate case and
+        # kills the routing-weight gradient — same gradient-kill the
+        # DeepSeekRouter `norm_topk_prob and top_k > 1` guard avoids.
+        if self.norm_topk_prob and self.top_k > 1:
             router_top_value = router_top_value / (router_top_value.sum(dim=-1, keepdim=True) + 1e-20)
         router_scores = router_top_value.to(raw_logits.dtype)
         self._last_top_k_idx = router_indices.detach()

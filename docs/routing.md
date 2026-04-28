@@ -94,7 +94,7 @@ The hard decision makes this non-differentiable at the selection point, but the 
 | Option | Values | Default | Affects | Notes |
 |---|---|---|---|---|
 | `router_score_function` | `softmax`, `sigmoid`, `sqrtsoftplus` | `softmax` | `ExplorationTopKRouter` | Maps raw logits → per-expert scores. |
-| `router_topk_ordering` | `post`, `pre` | `post` | `ExplorationTopKRouter` | When to apply the score function relative to top-K. |
+| `softmax_position` | `pre_topk`, `post_topk` | `pre_topk` | `ExplorationTopKRouter` | DEC-17 (RESOLVED → AC-1 task38): when to apply the score function relative to top-K. Deprecated alias `router_topk_ordering` ∈ `{post, pre}` is accepted with a `DeprecationWarning`; mapping is `post → pre_topk`, `pre → post_topk`. |
 | `num_groups` / `group_topk` | positive ints | `None` / `None` | both routers | Group-limited top-K (Megatron / DeepSeek style). |
 | `router_z_loss_coef` | float ≥ 0 | `0.0` | both routers | Per-call logit-magnitude regularizer added to aux loss. |
 
@@ -117,29 +117,49 @@ Controls how raw router logits become per-expert scores inside the softmax-famil
 
 `DeepSeekRouter` ignores this knob — its sigmoid + bias path is its defining contract.
 
-### 1.5.2 `router_topk_ordering`
+### 1.5.2 `softmax_position`
 
-Controls whether top-K runs on the **scored** values (`post`) or directly on the **raw logits** (`pre`):
+DEC-17 (RESOLVED → AC-1 task38). Controls whether the score function
+runs **before** the top-K selection (`pre_topk`, default — softmax over
+all E experts → top-K → gather) or **after** (`post_topk` — top-K on
+raw logits → softmax over the K selected logits).
 
 ```
-# post (default):
-scored = score_function(logits)                 # (T, E)
+# pre_topk (default; legacy alias `router_topk_ordering=post`):
+scored = score_function(logits)                 # (T, E)  -- softmax BEFORE topk
 topk_idx = topk(scored).indices
 weights = gather(scored, topk_idx)
 
-# pre:
+# post_topk (legacy alias `router_topk_ordering=pre`):
 topk_idx = topk(logits).indices                 # top-K on raw logits
-weights = score_function(gather(logits, topk_idx))  # score function over K only
+weights = score_function(gather(logits, topk_idx))  # softmax AFTER topk, over K only
 ```
 
+The legacy field name `router_topk_ordering` ∈ `{post, pre}` is still
+accepted with a `DeprecationWarning`. Mapping:
+
+| Legacy `router_topk_ordering` | Canonical `softmax_position` |
+|------------------------------|-----------------------------|
+| `post` (legacy default)      | `pre_topk` (canonical default) |
+| `pre`                        | `post_topk`                 |
+
+**Top-1 guard (DEC-17)**: the runtime rejects
+`softmax_position="post_topk"` with `top_k=1` at config-load time
+because softmax of a single selected logit is the constant `1.0`
+weight, which kills the gradient signal that would otherwise flow
+through the routing weight back to the gate. `pre_topk + top_k=1` is
+fine: the softmax is computed across all E logits before the top-K,
+so the gathered weight is a non-constant softmax probability and
+preserves gradient flow.
+
 **Functional implication**:
-- **Same indices for softmax and sigmoid** (monotonic score functions): `argmax(score(x)) == argmax(x)`, so post and pre pick the same K experts. Weights differ: under `pre` the softmax is normalized across the K selected logits (so selected weights sum to 1 when `norm_topk_prob=False`); under `post` the gathered weights are a subset of the full-softmax distribution and sum to less than 1.
+- **Same indices for softmax and sigmoid** (monotonic score functions): `argmax(score(x)) == argmax(x)`, so `pre_topk` and `post_topk` pick the same K experts. Weights differ: under `post_topk` the softmax is normalized across the K selected logits (so selected weights sum to 1 when `norm_topk_prob=False`); under `pre_topk` the gathered weights are a subset of the full-softmax distribution and sum to less than 1.
 - **Potentially different indices for `sqrtsoftplus`** at the ties / near-equal logit regime — because `sqrtsoftplus` is monotonic it shouldn't reorder either, but the regularized form means the ordering is the same.
-- **Gradient path changes**: in `pre`, the score function is only evaluated on K elements, so the gradient only flows through those K logits. Under `post` the gradient flows through all E logits via the softmax normalizer. The `post` path is therefore denser per-step; `pre` is cheaper.
+- **Gradient path changes**: in `post_topk`, the score function is only evaluated on K elements, so the gradient only flows through those K logits. Under `pre_topk` the gradient flows through all E logits via the softmax normalizer. The `pre_topk` path is therefore denser per-step; `post_topk` is cheaper.
 
 **When to use**:
-- Keep `post` for baseline runs — that's the behaviour you've been training against.
-- Try `pre` when doing Megatron-parity ablations or when you specifically want the "softmax over K" weight semantics (each selected weight is renormalized against the K peers, not against all E).
+- Keep `pre_topk` (default) for baseline runs — that's the behaviour configs have been training against.
+- Try `post_topk` when doing Megatron-parity ablations or when you specifically want the "softmax over K" weight semantics (each selected weight is renormalized against the K peers, not against all E). Don't pair `post_topk` with `top_k=1`; the runtime will reject it.
 
 ### 1.5.3 `num_groups` / `group_topk` on the softmax router
 

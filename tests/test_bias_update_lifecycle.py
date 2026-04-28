@@ -288,18 +288,24 @@ def test_local_tokens_per_expert_is_non_persistent():
 # ──────────────────────────────────────────────────────────────────────
 
 def test_distributed_path_calls_all_reduce_sum():
-    """When `distributed=True`, the function calls
-    `dist.all_reduce(counts, op=SUM)` exactly once before computing
-    fractions. This is the AC-6 DDP-correctness contract: unequal
-    per-rank routing must be summed across ranks before the bias
-    update so all ranks compute the same global-balance delta."""
+    """When `distributed=True` AND a process group is initialized, the
+    function calls `dist.all_reduce(counts, op=SUM)` exactly once
+    before computing fractions. This is the AC-6 DDP-correctness
+    contract: unequal per-rank routing must be summed across ranks
+    before the bias update so all ranks compute the same
+    global-balance delta. Round 12 also requires the function to
+    SKIP the all_reduce call when no process group is initialized
+    (Codex Round 11 Finding 1d) — covered by
+    `test_distributed_path_skips_all_reduce_when_not_initialized`.
+    """
     routing = _load_routing_module()
     router = _make_router(num_experts=8)
     router.local_tokens_per_expert = torch.tensor(
         [10.0, 5.0, 20.0, 3.0, 15.0, 8.0, 12.0, 7.0]
     )
 
-    with patch.object(routing.dist, "all_reduce") as mock_ar:
+    with patch.object(routing.dist, "all_reduce") as mock_ar, \
+         patch.object(routing.dist, "is_initialized", return_value=True):
         routing._update_single_router_bias(router, bias_rate=0.001, distributed=True)
 
     # all_reduce must be called once with op=SUM on the counts tensor.
@@ -321,6 +327,36 @@ def test_distributed_path_calls_all_reduce_sum():
     # SUM op
     assert op == routing.dist.ReduceOp.SUM, (
         f"all_reduce op must be SUM, got {op}"
+    )
+
+
+def test_distributed_path_skips_all_reduce_when_not_initialized():
+    """Round 12 (Codex Round 11 Finding 1d): with `distributed=True`
+    but no process group initialized, the function MUST NOT call
+    `dist.all_reduce`. The trainer's caller-side guard already does
+    the same check; this test locks the defensive guard inside
+    `_update_single_router_bias` so direct callers (tests, debug
+    fixtures) can pass `distributed=True` safely.
+    """
+    routing = _load_routing_module()
+    router = _make_router(num_experts=4)
+    router.local_tokens_per_expert = torch.tensor([10.0, 1.0, 1.0, 1.0])
+    initial_bias = router.expert_bias.detach().clone()
+
+    with patch.object(routing.dist, "all_reduce") as mock_ar, \
+         patch.object(routing.dist, "is_initialized", return_value=False):
+        routing._update_single_router_bias(router, bias_rate=0.001, distributed=True)
+
+    assert mock_ar.call_count == 0, (
+        "all_reduce must NOT be called when process group is not "
+        f"initialized; got {mock_ar.call_count} calls."
+    )
+    # The bias still updates (using rank-local counts, since there's
+    # nothing to all-reduce), so the function is still useful for
+    # single-rank dev runs that happen to pass distributed=True.
+    assert (router.expert_bias != initial_bias).any(), (
+        "Bias should still update from rank-local counts when no "
+        "process group is initialized."
     )
 
 
@@ -370,31 +406,182 @@ def test_local_tokens_zeroed_after_update():
 
 
 # ──────────────────────────────────────────────────────────────────────
+#  update_bias_from_counts (src/models/routing/bias.py) coverage
+#  (Codex Round 11 Finding 1c)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _load_bias_module():
+    """Load src.models.routing.bias.update_bias_from_counts directly."""
+    import importlib.util
+    repo = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "src.models.routing.bias",
+        repo / "src" / "models" / "routing" / "bias.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("zero_sum", [True, False])
+def test_update_bias_from_counts_runs_for_both_modes(zero_sum):
+    """`src/models/routing/bias.py:update_bias_from_counts` must
+    accept the `zero_sum` kwarg and update bias in-place for both
+    modes. Both modes target the same routing-direction signal:
+    overloaded experts → bias decreases; underloaded → increases."""
+    bias_mod = _load_bias_module()
+    E = 4
+    bias = torch.zeros(E, dtype=torch.float32)
+    counts = torch.tensor([100.0, 1.0, 1.0, 1.0])  # heavy on expert 0
+
+    bias_mod.update_bias_from_counts(
+        bias, counts.clone(), rate=0.01,
+        clamp_range=16.0, distributed=False, zero_sum=zero_sum,
+    )
+    assert bias[0].item() < 0, (
+        f"zero_sum={zero_sum}: heavy expert 0 must have bias decreased, got {bias[0].item()}"
+    )
+    assert (bias[1:] > 0).all(), (
+        f"zero_sum={zero_sum}: light experts 1-3 must have bias increased, got {bias}"
+    )
+
+
+def test_update_bias_from_counts_zero_sum_true_pins_mean_at_zero():
+    """`zero_sum=True` (default): cumulative bias mean stays at 0.0
+    (within fp32 round-off), even under asymmetric loads. This is
+    the defining property of the nmoe / DeepSeek-V3 formulation."""
+    bias_mod = _load_bias_module()
+    E = 4
+    bias = torch.zeros(E, dtype=torch.float32)
+    counts = torch.tensor([100.0, 1.0, 1.0, 1.0])
+
+    bias_mod.update_bias_from_counts(
+        bias, counts.clone(), rate=0.01,
+        distributed=False, zero_sum=True,
+    )
+    assert bias.mean().abs().item() < 1e-7, (
+        f"zero_sum=True bias mean must be ≈ 0, got {bias.mean().item()}"
+    )
+
+
+def test_update_bias_from_counts_zero_sum_false_drifts_mean():
+    """`zero_sum=False` (Megatron): cumulative bias mean drifts under
+    asymmetric loads. Specifically, with 1 heavy and 3 light experts,
+    `delta = -sign(load - 1/E) * rate` = `[-rate, +rate, +rate, +rate]`,
+    so `sum(delta) = +2*rate ≠ 0`."""
+    bias_mod = _load_bias_module()
+    E = 4
+    bias = torch.zeros(E, dtype=torch.float32)
+    counts = torch.tensor([100.0, 1.0, 1.0, 1.0])
+    rate = 0.01
+
+    bias_mod.update_bias_from_counts(
+        bias, counts.clone(), rate=rate,
+        distributed=False, zero_sum=False,
+    )
+    # Heavy expert: -rate; 3 light experts: +rate each. Sum = +2*rate.
+    expected_sum = 2 * rate
+    assert bias.sum().item() == pytest.approx(expected_sum, rel=1e-6), (
+        f"zero_sum=False bias sum should be {expected_sum}, got {bias.sum().item()}"
+    )
+
+
+def test_update_bias_from_counts_skips_all_reduce_when_not_initialized():
+    """Round 12 (Codex Round 11 Finding 1d): `update_bias_from_counts`
+    must guard `dist.all_reduce` with `dist.is_initialized()` so a
+    direct caller (test, debug fixture) can pass `distributed=True`
+    without crashing on the missing process group."""
+    bias_mod = _load_bias_module()
+    E = 4
+    bias = torch.zeros(E, dtype=torch.float32)
+    counts = torch.tensor([100.0, 1.0, 1.0, 1.0])
+
+    with patch.object(bias_mod.dist, "all_reduce") as mock_ar, \
+         patch.object(bias_mod.dist, "is_initialized", return_value=False):
+        bias_mod.update_bias_from_counts(
+            bias, counts.clone(), rate=0.01,
+            distributed=True, zero_sum=True,
+        )
+    assert mock_ar.call_count == 0, (
+        f"all_reduce must NOT be called when process group is not initialized; "
+        f"got {mock_ar.call_count} calls."
+    )
+
+
+def test_update_bias_from_counts_calls_all_reduce_when_initialized():
+    """Round 12: when `distributed=True` AND a process group is live,
+    `update_bias_from_counts` must call `dist.all_reduce(counts, op=SUM)`
+    exactly once."""
+    bias_mod = _load_bias_module()
+    E = 4
+    bias = torch.zeros(E, dtype=torch.float32)
+    counts = torch.tensor([100.0, 1.0, 1.0, 1.0])
+
+    with patch.object(bias_mod.dist, "all_reduce") as mock_ar, \
+         patch.object(bias_mod.dist, "is_initialized", return_value=True):
+        bias_mod.update_bias_from_counts(
+            bias, counts.clone(), rate=0.01,
+            distributed=True, zero_sum=True,
+        )
+    assert mock_ar.call_count == 1
+    args, kwargs = mock_ar.call_args
+    op = kwargs.get("op")
+    if op is None and len(args) >= 2:
+        op = args[1]
+    assert op == bias_mod.dist.ReduceOp.SUM
+
+
+def test_update_bias_from_counts_clamps_to_plus_minus_16():
+    """`update_bias_from_counts` clamps to ±16 after the update."""
+    bias_mod = _load_bias_module()
+    E = 4
+    bias = torch.full((E,), 15.99, dtype=torch.float32)
+    counts = torch.tensor([100.0, 1.0, 1.0, 1.0])
+    for _ in range(50):
+        bias_mod.update_bias_from_counts(
+            bias, counts.clone(), rate=0.5,
+            clamp_range=16.0, distributed=False, zero_sum=True,
+        )
+    assert bias.max().item() <= 16.0 + 1e-6
+    assert bias.min().item() >= -16.0 - 1e-6
+
+
+def test_update_bias_from_counts_zero_load_no_op():
+    """With zero observed counts (e.g. rank saw no tokens), the
+    function must leave bias unchanged."""
+    bias_mod = _load_bias_module()
+    bias = torch.tensor([0.1, -0.1, 0.05, -0.05], dtype=torch.float32)
+    initial = bias.clone()
+    bias_mod.update_bias_from_counts(
+        bias, torch.zeros(4), rate=0.01, distributed=False, zero_sum=True,
+    )
+    torch.testing.assert_close(bias, initial)
+
+
+# ──────────────────────────────────────────────────────────────────────
 #  Real DDP all-reduce test (gloo backend, 2 spawned processes)
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _ddp_worker(rank: int, world_size: int, port: int, output_path: str):
+def _ddp_worker(rank: int, world_size: int, init_file: str, output_path: str):
     """Worker entry point for the 2-rank DDP all-reduce test.
 
-    Sets up a gloo process group on localhost, runs
-    `_update_single_router_bias(distributed=True)` with ASYMMETRIC
-    per-rank counts, and writes the post-update bias tensor to
-    `output_path` keyed by rank. The parent process then reads both
-    files back and asserts the per-rank biases are identical (the
-    contract: after an all_reduce(SUM) on `local_tokens_per_expert`,
-    every rank computes the same global delta).
+    Uses a file-store rendezvous (`init_method=file://...`) instead of
+    a TCP/localhost rendezvous so the test runs in sandboxed
+    environments that can't bind 127.0.0.1 (Codex Round 11 Finding 1a).
+    The init file is created in `tmp_path` and cleaned up by pytest.
     """
-    import os
     import torch as _torch
-
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-
     import torch.distributed as _dist
-    _dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+
+    init_method = f"file://{init_file}"
+    _dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+    )
 
     routing = _load_routing_module()
     router = _make_router(num_experts=4)
@@ -412,7 +599,6 @@ def _ddp_worker(rank: int, world_size: int, port: int, output_path: str):
         router, bias_rate=0.01, distributed=True, zero_sum=True,
     )
 
-    # Persist post-update bias to disk for the parent to compare.
     _torch.save(router.expert_bias.cpu(), output_path.format(rank=rank))
     _dist.destroy_process_group()
 
@@ -430,26 +616,30 @@ def test_ddp_two_rank_all_reduce_produces_identical_biases(tmp_path):
     was made (which the mocked test in
     `test_distributed_path_calls_all_reduce_sum` already covers).
 
-    Uses `torch.multiprocessing.spawn` with the gloo backend so it runs
-    on CPU.
+    Round 12 (Codex Round 11 Finding 1a): use a `file://` rendezvous
+    so this test runs in sandboxes that can't bind localhost. Skip
+    cleanly if mp.spawn fails for environment reasons (e.g. some CI
+    runners don't allow process forking).
     """
-    import socket
     import torch.multiprocessing as mp
 
-    # Find a free port for the rendezvous.
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-
+    init_file = tmp_path / "ddp_init"
     output_template = str(tmp_path / "rank_{rank}_bias.pt")
 
-    mp.spawn(
-        _ddp_worker,
-        args=(2, port, output_template),
-        nprocs=2,
-        join=True,
-    )
+    try:
+        mp.spawn(
+            _ddp_worker,
+            args=(2, str(init_file), output_template),
+            nprocs=2,
+            join=True,
+        )
+    except (RuntimeError, OSError, PermissionError) as exc:
+        # Some sandboxes block multiprocessing or process-group setup
+        # entirely. The mocked test
+        # (test_distributed_path_calls_all_reduce_sum) still locks the
+        # call signature; this one verifies the cross-rank semantics
+        # opportunistically.
+        pytest.skip(f"DDP environment unavailable: {exc!r}")
 
     rank0_bias = torch.load(output_template.format(rank=0))
     rank1_bias = torch.load(output_template.format(rank=1))

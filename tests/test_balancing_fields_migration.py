@@ -239,6 +239,99 @@ def test_build_training_config_canonical_training_block_quiet():
     )
 
 
+# ──────────────────────────────────────────────────────────────────────
+#  Round 12: DEC-2 `bias_update_zero_sum` config plumbing.
+#  (Codex Round 11 Finding 1b)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_build_training_config_bias_update_zero_sum_default_true():
+    """DEC-2: the default value of `bias_update_zero_sum` is `True`
+    (matches nmoe / DeepSeek-V3 zero-sum). When neither block sets the
+    field, `build_training_config` resolves to `True`."""
+    build_training_config = _load_build_training_config()
+    cfg = {"model": {}, "training": {}}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        train_cfg = build_training_config(cfg)
+    assert train_cfg.bias_update_zero_sum is True
+    # No deprecation warning for the default-absent path.
+    deprecation_msgs = [
+        str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)
+    ]
+    assert deprecation_msgs == []
+
+
+def test_build_training_config_bias_update_zero_sum_explicit_false():
+    """DEC-2: `bias_update_zero_sum: False` in `training:` flows through
+    to `train_cfg.bias_update_zero_sum`. This is the path the trainer
+    consumes to switch to the Megatron-LM plain-sign update mode."""
+    build_training_config = _load_build_training_config()
+    cfg = {
+        "model": {},
+        "training": {"bias_update_zero_sum": False},
+    }
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        train_cfg = build_training_config(cfg)
+    assert train_cfg.bias_update_zero_sum is False
+    deprecation_msgs = [
+        str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)
+    ]
+    assert deprecation_msgs == []
+
+
+def test_build_training_config_bias_update_zero_sum_legacy_model_block_warns():
+    """DEC-3b: `bias_update_zero_sum` is a balancing field, so the
+    DEC-3b canonical-block resolver applies. A yaml with the field
+    under `model:` still resolves correctly via the resolver fallback,
+    but emits a `DeprecationWarning` pointing the user to the
+    migration."""
+    build_training_config = _load_build_training_config()
+    cfg = {
+        "model": {"bias_update_zero_sum": False},  # legacy placement
+        "training": {},
+    }
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        train_cfg = build_training_config(cfg)
+    assert train_cfg.bias_update_zero_sum is False
+    deprecation_msgs = [
+        str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)
+    ]
+    assert any("bias_update_zero_sum" in m for m in deprecation_msgs), (
+        f"Expected a DEC-3b DeprecationWarning for legacy "
+        f"`model.bias_update_zero_sum`; got: {deprecation_msgs}"
+    )
+
+
+def test_build_training_config_bias_update_zero_sum_both_blocks_uses_canonical():
+    """DEC-3b conflict policy: when set in BOTH blocks, the canonical
+    `training:` value wins and a `DeprecationWarning` fires. Locks the
+    `False`-overrides-`True` direction so a misplaced legacy `True`
+    doesn't silently re-enable zero-sum mode for a user who explicitly
+    asked for Megatron-style updates."""
+    build_training_config = _load_build_training_config()
+    cfg = {
+        "model": {"bias_update_zero_sum": True},   # legacy
+        "training": {"bias_update_zero_sum": False},  # canonical wins
+    }
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        train_cfg = build_training_config(cfg)
+    assert train_cfg.bias_update_zero_sum is False, (
+        "Canonical `training:` value must override legacy `model:` value."
+    )
+    deprecation_msgs = [
+        str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)
+    ]
+    assert any(
+        "bias_update_zero_sum" in m and "BOTH" in m for m in deprecation_msgs
+    ), (
+        f"Expected a 'both blocks' DeprecationWarning; got: {deprecation_msgs}"
+    )
+
+
 if __name__ == "__main__":
     test_no_balancing_fields_left_under_model_block()
     test_resolver_reads_training_block_canonically()

@@ -231,6 +231,139 @@ def test_exploration_topk_router_default_no_field_set():
     assert router.softmax_position == "pre_topk"
 
 
+# ──────────────────────────────────────────────────────────────────────
+#  Positive top-1 gradient test for pre_topk (Codex Round 11 Finding 2b)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _init_router_weight(router):
+    """The router's `nn.Linear` weight defaults to zeros under
+    Qwen3MoeTopKRouter — model-construction code initializes it
+    later. For unit gradient tests we need a non-zero init so the
+    softmax derivative isn't degenerate."""
+    with torch.no_grad():
+        torch.nn.init.normal_(router.weight, std=0.02)
+
+
+def test_pre_topk_with_top_k_1_preserves_gradient_signal():
+    """DEC-17 positive case: `softmax_position=pre_topk` + `top_k=1`
+    preserves the routing-weight gradient signal — the softmax is
+    computed over all E logits BEFORE the top-K, so the gathered
+    weight is a non-constant softmax probability and `loss.backward()`
+    yields a non-zero gradient on `router.weight`.
+
+    This is the symmetric companion to
+    `test_exploration_topk_router_top1_guard_in_constructor`, which
+    rejects the dangerous `post_topk + top_k=1` combination. Together
+    they prove the guard is BOTH necessary (post_topk + top_k=1 kills
+    gradients) and sufficient (pre_topk + top_k=1 preserves them).
+
+    The test uses `weights.pow(2).sum()` as the surrogate loss because
+    `weights.sum()` is identically `T` (rows of weights sum to 1 under
+    norm_topk_prob), which makes the gradient zero by construction
+    regardless of routing.
+    """
+    torch.manual_seed(2026_04_28)
+    cfg = _make_config(top_k=1, softmax_position="pre_topk")
+    router = ExplorationTopKRouter(cfg).train()
+    _init_router_weight(router)
+
+    T = 8
+    x = torch.randn(T, cfg.hidden_size, requires_grad=False)
+    probs, weights, indices = router(x)
+
+    # The forward must produce non-constant weights (softmax probability
+    # of the selected expert, NOT the constant 1.0).
+    assert weights.shape == (T, 1)
+    assert (weights < 1.0 - 1e-6).any(), (
+        f"pre_topk + top_k=1 should produce sub-1.0 softmax weights, got {weights}"
+    )
+
+    # Use a non-trivial loss that depends on the weight values (not just
+    # their sum-to-one constraint).
+    loss = weights.pow(2).sum()
+    loss.backward()
+    grad_norm = router.weight.grad.norm().item()
+    assert grad_norm > 1e-6, (
+        f"pre_topk + top_k=1 must produce a non-zero gradient on router.weight; "
+        f"got grad_norm={grad_norm}. Gradient signal is dead — guard regressed."
+    )
+
+
+def test_docs_present_softmax_position_as_canonical():
+    """DEC-17 docs audit (Codex Round 11 Finding 2c): both
+    `docs/configuration.md` and `docs/routing.md` must mention
+    `softmax_position` as the canonical field name. This catches
+    stale docs that still present `router_topk_ordering` as the
+    primary configuration knob."""
+    repo = Path(__file__).resolve().parent.parent
+    config_doc = (repo / "docs" / "configuration.md").read_text()
+    routing_doc = (repo / "docs" / "routing.md").read_text()
+
+    assert "softmax_position" in config_doc, (
+        "docs/configuration.md must document `softmax_position` as the "
+        "canonical DEC-17 field name."
+    )
+    assert "softmax_position" in routing_doc, (
+        "docs/routing.md must document `softmax_position` as the "
+        "canonical DEC-17 field name."
+    )
+
+
+def test_docs_router_topk_ordering_is_only_marked_as_legacy():
+    """DEC-17 docs audit: any remaining mention of
+    `router_topk_ordering` in `docs/configuration.md` or
+    `docs/routing.md` must be in the context of the deprecation alias
+    (i.e., accompanied by 'deprecated', 'alias', or 'legacy' on the
+    same line). This catches stale references that still present
+    `router_topk_ordering` as the primary field name (Codex Round 11
+    Finding 2c).
+    """
+    repo = Path(__file__).resolve().parent.parent
+    offenders: list[str] = []
+    LEGACY_TOKENS = ("deprecated", "alias", "legacy", "Legacy", "DEC-17", "Deprecat")
+    for doc_name in ("configuration.md", "routing.md"):
+        doc_path = repo / "docs" / doc_name
+        text = doc_path.read_text()
+        for line_idx, line in enumerate(text.splitlines(), start=1):
+            if "router_topk_ordering" not in line:
+                continue
+            if any(tok in line for tok in LEGACY_TOKENS):
+                continue
+            offenders.append(f"docs/{doc_name}:{line_idx}: {line.strip()}")
+
+    assert not offenders, (
+        "docs still mention `router_topk_ordering` as a primary field "
+        "(no 'deprecated' / 'legacy' / 'alias' / 'DEC-17' marker on the "
+        f"same line):\n  - " + "\n  - ".join(offenders)
+        + "\n\nUpdate these to either present `softmax_position` as canonical "
+        + "or mark the line as the deprecated alias."
+    )
+
+
+def test_post_topk_with_top_k_2_preserves_gradient_signal():
+    """Sanity check for the `post_topk` path itself: with `top_k=2`
+    (the guard does not fire), `loss.backward()` produces a non-zero
+    router.weight gradient. This locks the contract that `post_topk`
+    is functional for `top_k > 1`, so the top-1 guard is the ONLY
+    rejection criterion — not a blanket disabling of `post_topk`."""
+    torch.manual_seed(2026_04_28)
+    cfg = _make_config(top_k=2, softmax_position="post_topk")
+    router = ExplorationTopKRouter(cfg).train()
+    _init_router_weight(router)
+
+    T = 8
+    x = torch.randn(T, cfg.hidden_size, requires_grad=False)
+    probs, weights, indices = router(x)
+
+    assert weights.shape == (T, 2)
+    loss = weights.pow(2).sum()  # non-trivial in weight values
+    loss.backward()
+    assert router.weight.grad.norm().item() > 1e-6, (
+        f"post_topk + top_k=2 must produce a non-zero gradient on router.weight"
+    )
+
+
 if __name__ == "__main__":
     test_resolve_default_is_pre_topk()
     for canon in ("pre_topk", "post_topk"):

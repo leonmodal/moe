@@ -40,7 +40,7 @@ python scripts/validate_configs.py configs/standard_moe.yaml  # specific config
 | `norm_topk_prob` | bool | true | Normalize top-k routing probabilities |
 | `router_exploration_rate` | float | 0.0 | Random exploration rate during training |
 | `router_score_function` | string | `softmax` | Softmax-family router scoring: `softmax`, `sigmoid`, `sqrtsoftplus`. Ignored by DeepSeek router. See `docs/routing.md` §1.5.1. |
-| `router_topk_ordering` | string | `post` | Softmax-family router: `post` (score function on all experts → top-K) or `pre` (top-K on raw logits → score function on K). Ignored by DeepSeek router. See `docs/routing.md` §1.5.2. |
+| `softmax_position` | string | `pre_topk` | DEC-17 (RESOLVED → AC-1 task38): when to apply the score function relative to top-K. `pre_topk` (default) = score function on all experts → top-K → gather (softmax happens BEFORE the top-K selection). `post_topk` = top-K on raw logits → score function only on the K selected (softmax happens AFTER the top-K selection). Ignored by DeepSeek router (which always uses sigmoid + biased top-K). Deprecated alias `router_topk_ordering` ∈ `{post, pre}` is accepted with a `DeprecationWarning`; mapping is `post → pre_topk`, `pre → post_topk`. The runtime rejects `softmax_position=post_topk` with `top_k=1` because softmax of a single selected logit yields a constant `1.0` weight (gradient kill). See `docs/routing.md` §1.5.2. |
 | `router_z_loss_coef` | float | 0.0 | Logit-magnitude regularizer summed across routers and added to the output loss pre-backward. `0.0` = disabled (the `collect_router_z_loss` walk short-circuits). See `docs/routing.md` §1.5.4. |
 
 ### DeepSeek Routing Fields

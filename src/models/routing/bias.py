@@ -75,7 +75,14 @@ def update_bias_from_counts(
                   `TrainingConfig.bias_update_zero_sum` (default True).
     """
     with torch.no_grad():
-        if distributed:
+        if distributed and dist.is_available() and dist.is_initialized():
+            # Round 12 (Codex Round 11 Finding 1d): only call all_reduce
+            # when a process group is actually live. Treating
+            # `distributed=True` as a hard requirement crashes during
+            # local debugging, importable tests, and the
+            # update_bias_from_counts() unit suite where callers may
+            # propagate `distributed=True` from a config without setting
+            # up DDP first.
             dist.all_reduce(counts, op=dist.ReduceOp.SUM)
         if counts.sum() > 0:
             total = counts.sum()

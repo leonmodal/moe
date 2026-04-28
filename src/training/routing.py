@@ -109,7 +109,13 @@ def _update_single_router_bias(
     """
     with torch.no_grad():
         counts = router.local_tokens_per_expert
-        if distributed:
+        if distributed and dist.is_available() and dist.is_initialized():
+            # Round 12 (Codex Round 11 Finding 1d): only all_reduce when a
+            # process group is actually live. The trainer call site
+            # already gates on `dist.is_initialized()` (see
+            # `update_expert_biases`), but direct callers — unit tests,
+            # debug fixtures — may pass `distributed=True` without
+            # initializing DDP. Defensive guard so neither path crashes.
             dist.all_reduce(counts, op=dist.ReduceOp.SUM)
         total = counts.sum()
         loads = counts / total.clamp_min(1.0)
