@@ -69,6 +69,16 @@ class MoEverythingModel(nn.Module):
         use_sampling = getattr(config, "branch_sampling", False)
         use_seq_level = getattr(config, "branch_level", "token") == "seq"
         use_deepseek_style = getattr(config, "branch_deepseek", False)
+        # Branch-router balancing knobs (flat-schema bridge).
+        # `branch_balancing="exploration_only"` flips every BranchRouter on this
+        # model into rate-driven random branch picks; the trainer's per-step
+        # `apply_branch_exploration_only_rate(model, rate)` hook then pushes the
+        # current `p_explore(step)` into `exploration_only_rate` each step.
+        # The constructor seeds `exploration_only_rate` to
+        # `branch_exploration_rate` so eval-mode forwards (and step-0 forwards
+        # before the trainer hook fires) see the configured initial rate.
+        branch_balancing = getattr(config, "branch_balancing", "none")
+        branch_exploration_only_rate = getattr(config, "branch_exploration_rate", 0.0)
         if self.sanity_check_mode == "alternating_global_moe":
             if self.per_layer_router:
                 self.branch_routers = nn.ModuleList([BranchRouterRecorder() for _ in range(self.num_depths)])
@@ -79,14 +89,18 @@ class MoEverythingModel(nn.Module):
                 BranchRouter(config.hidden_size, exploration_rate=branch_exploration_rate,
                              scale_by_routing_weight=scale_branch,
                              use_sampling=use_sampling, use_seq_level=use_seq_level,
-                             use_deepseek_style=use_deepseek_style)
+                             use_deepseek_style=use_deepseek_style,
+                             exploration_only_rate=branch_exploration_only_rate,
+                             balancing=branch_balancing)
                 for _ in range(self.num_depths)
             ])
         else:
             self.branch_router = BranchRouter(config.hidden_size, exploration_rate=branch_exploration_rate,
                                               scale_by_routing_weight=scale_branch,
                                               use_sampling=use_sampling, use_seq_level=use_seq_level,
-                                              use_deepseek_style=use_deepseek_style)
+                                              use_deepseek_style=use_deepseek_style,
+                                              exploration_only_rate=branch_exploration_only_rate,
+                                              balancing=branch_balancing)
 
         self.attn_bank = AttentionExpertBank(config)
         self.mlp_bank = MlpExpertBank(config)

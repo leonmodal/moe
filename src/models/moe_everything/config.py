@@ -35,6 +35,30 @@ class MoEverythingConfig(Qwen3MoeConfig):
         branch_sampling: bool = False,
         branch_level: str = "token",  # "token" or "seq"
         branch_deepseek: bool = False,
+        # Branch-router balancing knobs (flat-schema bridge until the
+        # nested-schema migration lands). The full nested schema will
+        # eventually live under `branch_router.{...}` in yaml; this
+        # flat surface keeps that migration low-risk.
+        #   `branch_balancing` ∈ {"none", "exploration_only"}.
+        #     Default "none" preserves the existing routing
+        #     behavior. "exploration_only" turns the branch router
+        #     into a uniform-random-with-rate exploration probe and
+        #     disables every branch aux/bias path by construction.
+        #   `branch_exploration_rate`: initial `p_explore` rate at
+        #     step 0. Default 0.0 so the BranchRouter auto-promote
+        #     rule (rate>0 + balancing="none" → balancing="exploration_only")
+        #     never fires when the user has not opted into the mode;
+        #     callers that opt into `branch_balancing="exploration_only"`
+        #     must set this explicitly to a positive value.
+        #   `branch_exploration_decay` ∈ {"constant", "linear", "cosine"}.
+        #     Decay shape applied by the trainer's per-step schedule.
+        #   `branch_exploration_min`: floor for the decay schedule.
+        #   `branch_exploration_warmup_steps`: decay length.
+        branch_balancing: str = "none",
+        branch_exploration_rate: float = 0.0,
+        branch_exploration_decay: str = "constant",
+        branch_exploration_min: float = 0.0,
+        branch_exploration_warmup_steps: int = 0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -68,3 +92,8 @@ class MoEverythingConfig(Qwen3MoeConfig):
         self.branch_sampling = branch_sampling
         self.branch_level = branch_level
         self.branch_deepseek = branch_deepseek
+        self.branch_balancing = branch_balancing
+        self.branch_exploration_rate = branch_exploration_rate
+        self.branch_exploration_decay = branch_exploration_decay
+        self.branch_exploration_min = branch_exploration_min
+        self.branch_exploration_warmup_steps = branch_exploration_warmup_steps

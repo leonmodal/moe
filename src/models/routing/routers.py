@@ -194,7 +194,15 @@ class BranchRouter(nn.Module):
                 choice = torch.where(explore_mask, random_choice, argmax_choice)
                 # Record for tests / telemetry. `.detach()` on the
                 # mask so storing it doesn't retain gradient history.
-                self.last_exploration_only_mask = explore_mask.detach()
+                # When `use_seq_level=True` the per-seq mask is broadcast
+                # to (B, T) so telemetry consumers see the same shape as
+                # the post-broadcast `choice` tensor, mirroring how
+                # `branch_explore_fraction` and the per-token mask probes
+                # in tests treat the mask as token-shaped.
+                stored_mask = explore_mask.detach()
+                if self.use_seq_level and B is not None:
+                    stored_mask = stored_mask.unsqueeze(1).expand(B, T)
+                self.last_exploration_only_mask = stored_mask
                 self.last_exploration_only_rate = float(self.exploration_only_rate)
             elif self.use_deepseek_style:
                 scores = torch.sigmoid(logits)

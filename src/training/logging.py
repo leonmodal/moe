@@ -46,11 +46,27 @@ def log_training_step(
     tokens_seen: float,
     elapsed: float,
     log_every: int,
+    branch_explore_rate: float | None = None,
+    branch_explore_fraction: float | None = None,
 ) -> None:
-    """Log training step to console and WandB."""
+    """Log training step to console and WandB.
+
+    `branch_explore_rate` / `branch_explore_fraction` are optional and
+    only added to the console / wandb payload when the model has an
+    active `balancing == "exploration_only"` branch router. The rate is
+    the per-step `p_explore(step)` resolved from the schedule shape;
+    the fraction is the per-step measured fraction of branch tokens
+    that landed in the exploration_only path (telemetry that the
+    BranchRouter populates on every forward).
+    """
     if step % log_every != 0 or not is_main_process():
         return
 
+    extra = ""
+    if branch_explore_rate is not None:
+        extra += f"  br_explore_rate={branch_explore_rate:.4f}"
+    if branch_explore_fraction is not None:
+        extra += f"  br_explore_frac={branch_explore_fraction:.4f}"
     print(
         f"step {step:6d}  "
         f"loss={metrics['loss']:.4f}  "
@@ -63,27 +79,30 @@ def log_training_step(
         f"lr={lr:.2e}  "
         f"tok/s={tok_per_s/1e3:.1f}k  "
         f"sec/step={elapsed:.3f}  "
-        f"|g|={grad_norm:.3f}",
+        f"|g|={grad_norm:.3f}"
+        f"{extra}",
         flush=True,
     )
 
     if wandb_run is not None:
-        wandb_run.log(
-            {
-                "train/loss": metrics["loss"],
-                "train/ce": metrics["ce_loss"],
-                "train/aux": metrics["aux_loss"],
-                "train/aux_n": metrics["aux_loss_normalized"],
-                "train/seq_aux": metrics["seq_aux_loss"],
-                "train/branch_aux": metrics["branch_aux_loss"],
-                "train/attn_aux": metrics["attention_aux_loss"],
-                "train/grad_norm": grad_norm,
-                "train/tok_per_s": tok_per_s,
-                "train/lr": lr,
-                "train/tokens_seen": tokens_seen,
-            },
-            step=step,
-        )
+        payload = {
+            "train/loss": metrics["loss"],
+            "train/ce": metrics["ce_loss"],
+            "train/aux": metrics["aux_loss"],
+            "train/aux_n": metrics["aux_loss_normalized"],
+            "train/seq_aux": metrics["seq_aux_loss"],
+            "train/branch_aux": metrics["branch_aux_loss"],
+            "train/attn_aux": metrics["attention_aux_loss"],
+            "train/grad_norm": grad_norm,
+            "train/tok_per_s": tok_per_s,
+            "train/lr": lr,
+            "train/tokens_seen": tokens_seen,
+        }
+        if branch_explore_rate is not None:
+            payload["train/branch_explore_rate"] = branch_explore_rate
+        if branch_explore_fraction is not None:
+            payload["train/branch_explore_fraction"] = branch_explore_fraction
+        wandb_run.log(payload, step=step)
 
 
 def log_eval_metrics(

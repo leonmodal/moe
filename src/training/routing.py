@@ -49,6 +49,15 @@ def trainer_optimizer_step_and_bias_update(
         model, train_cfg, cfg,
         distributed=distributed, global_step=global_step,
     )
+    # AC-14: per-step exploration_only rate update. Resolved against
+    # the model's config (so per-config schedule shapes / floors live in
+    # the same place as the rest of the branch_router knobs) and pushed
+    # onto every BranchRouter whose `balancing == "exploration_only"`.
+    # When the feature is inactive on this model, both helpers return
+    # quickly and the rate is left at whatever the constructor seeded.
+    rate = compute_branch_exploration_only_rate(model, global_step)
+    if rate is not None:
+        apply_branch_exploration_only_rate(model, rate)
 
 
 def trainer_post_optimizer_bias_update(
@@ -349,6 +358,92 @@ def exploration_decay_schedule(
         return initial_rate * (1.0 - frac) + final_rate * frac
     # schedule == "cosine"
     return final_rate + 0.5 * (initial_rate - final_rate) * (1.0 + math.cos(math.pi * frac))
+
+
+def apply_branch_exploration_only_rate(model, rate: float) -> int:
+    """Push `rate` into every BranchRouter on `model` whose
+    `balancing == "exploration_only"`.
+
+    The trainer calls this once per training step (after the optimizer
+    + bias-update tail) so the per-step `p_explore(step)` from
+    `exploration_decay_schedule(...)` lands on the actual routers
+    before the next forward. Returns the number of routers updated, so
+    the trainer's logging path can assert at least one router was
+    updated when the schedule is active (catches misconfiguration like
+    "balancing field set on config but never propagated to the
+    BranchRouter constructor").
+
+    The walk is gated on `balancing == "exploration_only"` to keep
+    routers that opted out of the rate-driven mode untouched —
+    pushing a rate into a `balancing == "none"` router would silently
+    enable exploration_only without the config saying so.
+    """
+    raw_model = unwrap_model(model)
+    updated = 0
+    for module in raw_model.modules():
+        if getattr(module, "balancing", "none") != "exploration_only":
+            continue
+        if not hasattr(module, "exploration_only_rate"):
+            continue
+        module.exploration_only_rate = float(rate)
+        updated += 1
+    return updated
+
+
+def collect_branch_explore_fraction(model) -> float | None:
+    """Mean fraction of branch tokens routed via the exploration_only
+    path on the most recent forward, across every BranchRouter on
+    `model` whose `balancing == "exploration_only"`.
+
+    Reads `BranchRouter.last_exploration_only_mask` (a bool tensor of
+    shape `(B, T)` populated on every forward when the rate is > 0 and
+    the router is in training mode; otherwise `None`). Returns `None`
+    when no router has a populated mask (e.g. eval-mode forward, rate
+    == 0, or feature inactive on this model). The trainer's logging
+    path treats `None` as "do not emit the metric this step", so a
+    model without exploration_only does not pay the wandb-payload
+    cost.
+    """
+    raw_model = unwrap_model(model)
+    fractions: list[float] = []
+    for module in raw_model.modules():
+        if getattr(module, "balancing", "none") != "exploration_only":
+            continue
+        mask = getattr(module, "last_exploration_only_mask", None)
+        if mask is None:
+            continue
+        fractions.append(float(mask.float().mean().item()))
+    if not fractions:
+        return None
+    return sum(fractions) / len(fractions)
+
+
+def compute_branch_exploration_only_rate(model, global_step: int) -> float | None:
+    """Resolve the current exploration_only rate from the model's config.
+
+    Returns `None` when the feature is inactive (i.e. no
+    `branch_balancing == "exploration_only"` on the model's config).
+    Otherwise reads the schedule shape / initial rate / floor / decay
+    length from `model.config` and dispatches to
+    `exploration_decay_schedule(...)`.
+    """
+    raw_model = unwrap_model(model)
+    config = getattr(raw_model, "config", None)
+    if config is None:
+        return None
+    if getattr(config, "branch_balancing", "none") != "exploration_only":
+        return None
+    schedule = getattr(config, "branch_exploration_decay", "constant")
+    initial = float(getattr(config, "branch_exploration_rate", 1.0))
+    decay_steps = int(getattr(config, "branch_exploration_warmup_steps", 0))
+    final = float(getattr(config, "branch_exploration_min", 0.0))
+    return exploration_decay_schedule(
+        global_step,
+        schedule=schedule,
+        initial_rate=initial,
+        decay_steps=decay_steps,
+        final_rate=final,
+    )
 
 
 def collect_router_z_loss(model) -> torch.Tensor | None:

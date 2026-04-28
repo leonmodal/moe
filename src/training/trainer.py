@@ -56,7 +56,9 @@ from .metrics import compute_output_metrics
 from .model_factory import build_model, configure_liger_kernels
 from .routing import (
     apply_router_exploration_rate,
+    collect_branch_explore_fraction,
     collect_router_z_loss,
+    compute_branch_exploration_only_rate,
     exploration_rate_schedule,
     get_bias_rate,
     trainer_optimizer_step_and_bias_update,
@@ -447,6 +449,13 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
             }
             reduced_grad = grad_norm
 
+        # AC-14 telemetry: per-step `p_explore(step)` and the measured
+        # branch fraction routed via the exploration_only path. Both
+        # return `None` when the feature is inactive on this model, so
+        # only models with `branch_balancing == "exploration_only"` pay
+        # the extra logging cost.
+        branch_explore_rate = compute_branch_exploration_only_rate(model, global_step)
+        branch_explore_fraction = collect_branch_explore_fraction(model)
         log_training_step(
             wandb_run,
             step=global_step,
@@ -457,6 +466,8 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
             tokens_seen=tokens_seen,
             elapsed=elapsed,
             log_every=train_cfg.log_every,
+            branch_explore_rate=branch_explore_rate,
+            branch_explore_fraction=branch_explore_fraction,
         )
 
         # Routing heatmaps

@@ -494,22 +494,30 @@ def test_telemetry_resets_on_each_forward():
 def test_rng_injected_first_4_of_8_mask_and_choices():
     """AC-14 plan-text deterministic RNG-injected test.
 
-    Build a `torch.Generator` and seed it so the first
-    `torch.rand(8)` draw produces 4 values < 0.5 (these are the
-    `explore_mask`'s True positions: tokens 0-3 are explored,
-    tokens 4-7 fall through to argmax). The router is configured
-    with `balancing="exploration_only"` and
-    `exploration_only_rate=0.5`. The test:
+    Use a seeded `torch.Generator` whose first `torch.rand(8)` draw
+    produces a LITERAL `[True, True, True, True, False, False,
+    False, False]` mask under the `< 0.5` threshold (i.e. the first
+    four values are < 0.5 and the last four are >= 0.5). This is
+    the strict plan-text "first 4 of 8" assertion: the test does not
+    just match whatever the generator happens to produce, it pins
+    the literal mask pattern.
 
-    1. Records the mask the router produced and asserts it
-       matches the expected `[True, True, True, True, False,
-       False, False, False]` pattern.
-    2. Asserts that the masked tokens' choices come from the
-       second `torch.rand` draw (uniform 50/50 random choice),
+    Seed 48 has been verified to produce this exact pattern with
+    `torch` 2.x's default RNG implementation; if a future torch
+    version changes the RNG output and this seed no longer matches,
+    re-derive the seed by brute-forcing
+    `for s in range(N): torch.Generator().manual_seed(s); rand(8)`
+    until a seed produces the desired threshold pattern.
+
+    The router is configured with `balancing="exploration_only"`
+    and `exploration_only_rate=0.5`. The test then:
+
+    1. Asserts the mask is literally `[T,T,T,T,F,F,F,F]`.
+    2. Asserts that masked tokens' choices come from the second
+       `torch.rand(8)` draw (uniform 50/50 random choice),
        NOT from the gate's argmax.
-    3. Asserts that the unmasked tokens' choices match the
-       gate's argmax exactly (set up so all 8 argmax values are
-       index 1 / MLP).
+    3. Asserts that unmasked tokens' choices match the gate's
+       argmax exactly (the gate is biased so argmax = MLP = 1).
     """
     H = 16
     T = 8
@@ -526,21 +534,38 @@ def test_rng_injected_first_4_of_8_mask_and_choices():
         torch.nn.init.constant_(router.gate.weight[1], 100.0)
         torch.nn.init.constant_(router.gate.weight[0], -100.0)
 
-    # Construct a generator whose state produces the desired
-    # explore mask + random-choice pattern. We probe the
-    # generator to capture what `torch.rand(8)` and the second
-    # `torch.rand(8)` will produce, then construct expected
-    # values from those probes.
+    # Seed 48 has been verified to produce the literal
+    # `[T,T,T,T,F,F,F,F]` pattern under `< 0.5` threshold.
+    LITERAL_FIRST_FOUR_SEED = 48
+
+    # Probe the generator to get the random-choice draw too. The
+    # probe consumes the same prefix the router will consume on its
+    # forward (`rand(8)` for the explore mask, then `rand(8)` for
+    # the random choice), so we can construct the expected
+    # `random_choice` tensor before re-seeding the actual generator.
     gen_probe = torch.Generator()
-    gen_probe.manual_seed(20260428)
+    gen_probe.manual_seed(LITERAL_FIRST_FOUR_SEED)
     expected_mask_draw = torch.rand(8, generator=gen_probe)
     expected_choice_draw = torch.rand(8, generator=gen_probe)
-    expected_mask = expected_mask_draw < 0.5
+
+    # The literal-first-four-of-eight assertion: this is what the
+    # plan text and the test name promise. If this assertion ever
+    # fails, the seed produced a different threshold pattern (likely
+    # because torch's RNG output changed) and the seed must be
+    # re-derived; the test is intentionally strict so this drift
+    # surfaces immediately.
+    expected_mask = torch.tensor(
+        [True, True, True, True, False, False, False, False], dtype=torch.bool
+    )
+    assert torch.equal(expected_mask_draw < 0.5, expected_mask), (
+        "RNG drift: seed 48 no longer produces "
+        "[T,T,T,T,F,F,F,F] under `< 0.5`. Re-derive seed."
+    )
     expected_random_choice = (expected_choice_draw < 0.5).long()
 
     # Re-seed the actual generator the router will use.
     gen = torch.Generator()
-    gen.manual_seed(20260428)
+    gen.manual_seed(LITERAL_FIRST_FOUR_SEED)
     router.exploration_generator = gen
 
     # Strictly-positive input so the biased argmax is
@@ -551,7 +576,7 @@ def test_rng_injected_first_4_of_8_mask_and_choices():
     actual_mask = router.last_exploration_only_mask
     actual_choices = router.last_selected_experts.reshape(-1)
 
-    # 1) Mask matches the expected pattern from the seeded generator.
+    # 1) Literal first-4-of-8 mask.
     assert torch.equal(actual_mask, expected_mask), (
         f"explore_mask mismatch: actual={actual_mask.tolist()}, "
         f"expected={expected_mask.tolist()}"
@@ -684,6 +709,210 @@ def test_update_expert_biases_does_update_non_exploration_only_branch():
     assert not torch.equal(branch.expert_bias, initial_bias), (
         "non-exploration_only branch router with deepseek_bias method "
         "should have been updated by the walker; expert_bias unchanged"
+    )
+
+
+def _tiny_moe_everything_with_branch_balancing(
+    *,
+    branch_balancing: str,
+    branch_exploration_rate: float,
+    branch_exploration_decay: str = "constant",
+    branch_exploration_warmup_steps: int = 0,
+    branch_exploration_min: float = 0.0,
+):
+    """Build a tiny MoEverythingForCausalLM end-to-end through the
+    config->model construction path (the same path model_factory.py
+    uses), with the new branch_router fields wired in. This exercises
+    the *call site*: `MoEverythingConfig` -> `MoEverythingModel`
+    constructor -> `BranchRouter(...)` instantiation.
+    """
+    from src.models import MoEverythingConfig, MoEverythingForCausalLM
+
+    cfg = MoEverythingConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        head_dim=8,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        intermediate_size=32,
+        moe_intermediate_size=32,
+        num_experts=4,
+        num_experts_per_tok=2,
+        num_attn_experts=2,
+        num_attn_experts_per_tok=1,
+        attn_expert_mode="per_head_fully_independent",
+        branch_router_aux_loss_coef=0.0,
+        use_deepseek_routing=True,
+        branch_deepseek=True,
+        topk_scaling_factor=2.5,
+        per_layer_router=False,
+        per_layer_mlp_router=False,
+        per_layer_attn_router=False,
+        routed_norm=False,
+        per_layer_norm=False,
+        post_norm=False,
+        dynamic_depth_min=1.0,
+        dynamic_depth_max=1.0,
+        depthwise_attention=False,
+        depthwise_block_size=0,
+        per_head_compute_mode="auto",
+        per_head_dense_fraction_threshold=0.75,
+        scale_attn_by_routing_weight=True,
+        scale_branch_by_routing_weight=True,
+        router_exploration_rate=0.0,
+        branch_router_exploration_rate=0.0,
+        branch_sampling=False,
+        branch_level="token",
+        branch_balancing=branch_balancing,
+        branch_exploration_rate=branch_exploration_rate,
+        branch_exploration_decay=branch_exploration_decay,
+        branch_exploration_min=branch_exploration_min,
+        branch_exploration_warmup_steps=branch_exploration_warmup_steps,
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        tie_word_embeddings=True,
+        norm_topk_prob=True,
+        router_aux_loss_coef=0.0,
+        seq_aux_loss_coef=0.0,
+        output_router_logits=False,
+        attn_implementation="eager",
+    )
+    torch.manual_seed(20260428)
+    model = MoEverythingForCausalLM(cfg)
+    model._load_balancing_method = "deepseek_bias"
+    cfg.load_balancing_method = "deepseek_bias"
+    return model, cfg
+
+
+def test_moe_everything_call_site_propagates_branch_balancing():
+    """Round 22 AC-14 call-site: building a `MoEverythingForCausalLM`
+    with `branch_balancing="exploration_only"` and a non-zero
+    `branch_exploration_rate` MUST result in the constructed
+    `BranchRouter` having both fields populated. Catches any future
+    regression in the
+    `MoEverythingConfig -> MoEverythingModel -> BranchRouter`
+    plumbing chain.
+    """
+    model, cfg = _tiny_moe_everything_with_branch_balancing(
+        branch_balancing="exploration_only",
+        branch_exploration_rate=0.7,
+    )
+    branch = model.model.branch_router
+    assert branch.balancing == "exploration_only", (
+        f"branch.balancing not propagated: got {branch.balancing!r}, "
+        f"expected 'exploration_only'"
+    )
+    assert branch.exploration_only_rate == 0.7, (
+        f"branch.exploration_only_rate not propagated: got "
+        f"{branch.exploration_only_rate!r}, expected 0.7"
+    )
+
+
+def test_moe_everything_call_site_default_branch_balancing_none():
+    """Negative companion: default config (branch_balancing not set)
+    must produce a `BranchRouter` with `balancing == "none"` and
+    `exploration_only_rate == 0.0`. Otherwise, every model would
+    accidentally enable exploration_only just by being built from
+    defaults."""
+    model, cfg = _tiny_moe_everything_with_branch_balancing(
+        branch_balancing="none",
+        branch_exploration_rate=0.0,
+    )
+    branch = model.model.branch_router
+    assert branch.balancing == "none"
+    assert branch.exploration_only_rate == 0.0
+
+
+def test_moe_everything_call_site_trainer_helpers_apply_rate_and_skip_bias():
+    """End-to-end call-site test for the AC-14 trainer hooks.
+
+    Build a tiny moe_everything model with `branch_balancing="
+    exploration_only"`, `branch_exploration_rate=1.0`,
+    `branch_exploration_decay="linear"`,
+    `branch_exploration_warmup_steps=10`,
+    `branch_exploration_min=0.0`. Step the helpers manually:
+
+    1. `compute_branch_exploration_only_rate(model, 0)` returns 1.0
+       (start of linear decay).
+    2. `compute_branch_exploration_only_rate(model, 5)` returns ~0.5
+       (mid-decay).
+    3. `apply_branch_exploration_only_rate(model, 0.5)` pushes the
+       rate onto the branch router and returns 1 (one updated).
+    4. After running a forward, the branch's
+       `local_tokens_per_expert` MUST NOT be incremented by the
+       count path (this is the production guard that proved the
+       walker-side bias-update is inert under exploration_only).
+    """
+    routing = _load_routing_module()
+
+    model, cfg = _tiny_moe_everything_with_branch_balancing(
+        branch_balancing="exploration_only",
+        branch_exploration_rate=1.0,
+        branch_exploration_decay="linear",
+        branch_exploration_warmup_steps=10,
+        branch_exploration_min=0.0,
+    )
+    branch = model.model.branch_router
+
+    # 1. Schedule resolution.
+    rate0 = routing.compute_branch_exploration_only_rate(model, 0)
+    assert rate0 == 1.0, f"linear decay step 0: expected 1.0, got {rate0}"
+    rate5 = routing.compute_branch_exploration_only_rate(model, 5)
+    assert math.isclose(rate5, 0.5, abs_tol=1e-6), (
+        f"linear decay step 5: expected ~0.5, got {rate5}"
+    )
+
+    # 2. Apply rate hook updates the actual router.
+    n = routing.apply_branch_exploration_only_rate(model, 0.42)
+    assert n >= 1, (
+        f"apply_branch_exploration_only_rate updated {n} routers; "
+        f"expected at least 1"
+    )
+    assert branch.exploration_only_rate == 0.42, (
+        f"branch.exploration_only_rate not pushed: got "
+        f"{branch.exploration_only_rate!r}"
+    )
+
+    # 3. Pre-populate counts to a non-zero baseline; forward must
+    # leave them unchanged because the count path skips
+    # exploration_only.
+    branch.local_tokens_per_expert.zero_()
+    branch.local_tokens_per_expert += 7
+    initial = branch.local_tokens_per_expert.clone()
+
+    model.train()
+    input_ids = torch.randint(0, model.vocab_size, (1, 4), dtype=torch.long)
+    _ = model(input_ids=input_ids)
+
+    assert torch.equal(branch.local_tokens_per_expert, initial), (
+        f"branch local_tokens_per_expert mutated under exploration_only: "
+        f"before={initial.tolist()}, after="
+        f"{branch.local_tokens_per_expert.tolist()}"
+    )
+
+
+def test_moe_everything_call_site_apply_rate_returns_zero_on_default_config():
+    """Negative companion: default-config moe_everything (no
+    exploration_only) must have `apply_branch_exploration_only_rate`
+    return 0 (no routers updated). This ensures the trainer's
+    per-step hook is a no-op for models that opted out of the
+    feature."""
+    routing = _load_routing_module()
+    model, _ = _tiny_moe_everything_with_branch_balancing(
+        branch_balancing="none",
+        branch_exploration_rate=0.0,
+    )
+    n = routing.apply_branch_exploration_only_rate(model, 0.42)
+    assert n == 0, (
+        f"apply_branch_exploration_only_rate updated {n} routers on "
+        f"default-config model; expected 0"
+    )
+    rate = routing.compute_branch_exploration_only_rate(model, 5)
+    assert rate is None, (
+        f"compute_branch_exploration_only_rate returned {rate} on "
+        f"default-config model; expected None"
     )
 
 

@@ -115,6 +115,29 @@ def _set_deepseek_router_params(config, model_cfg: dict) -> None:
     config.topk_scaling_factor = model_cfg.get("topk_scaling_factor", None)
 
 
+def _get_branch_router_field(model_cfg: dict, key: str, default):
+    """Read a `branch_router.<key>` field with a flat-schema fallback.
+
+    Nested form (preferred):
+        model:
+          branch_router:
+            balancing: exploration_only
+            exploration_rate: 1.0
+            exploration_decay: cosine
+            exploration_min: 0.0
+            exploration_warmup_steps: 1000
+
+    Flat fallback (pre-AC-13 yamls): `branch_balancing`,
+    `branch_exploration_rate`, etc. live directly on the `model:` block.
+    The nested form wins when both are present.
+    """
+    nested = model_cfg.get("branch_router")
+    if isinstance(nested, dict) and key in nested:
+        return nested[key]
+    flat_key = f"branch_{key}"
+    return model_cfg.get(flat_key, default)
+
+
 def build_model(cfg: dict):
     """Build a model and its config from a raw config dict.
 
@@ -251,6 +274,19 @@ def build_model(cfg: dict):
             branch_sampling=mcfg.get("branch_sampling", False),
             branch_level=mcfg.get("branch_level", "token"),
             branch_deepseek=mcfg.get("branch_deepseek", False),
+            branch_balancing=_get_branch_router_field(mcfg, "balancing", "none"),
+            branch_exploration_rate=_get_branch_router_field(
+                mcfg, "exploration_rate", 0.0
+            ),
+            branch_exploration_decay=_get_branch_router_field(
+                mcfg, "exploration_decay", "constant"
+            ),
+            branch_exploration_min=_get_branch_router_field(
+                mcfg, "exploration_min", 0.0
+            ),
+            branch_exploration_warmup_steps=_get_branch_router_field(
+                mcfg, "exploration_warmup_steps", 0
+            ),
             **common,
         )
         # Router-option knobs attached post-construction (the config __init__
