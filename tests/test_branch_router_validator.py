@@ -277,6 +277,50 @@ def test_validator_rejects_mlp_router_invalid_decay():
         _validator()(cfg)
 
 
+def test_validator_branch_router_rejects_aux_loss_with_seq_aux_coef():
+    """Round 34 review Finding 1: branch_router validator must
+    reject method × incompatible-knob combinations the same way
+    `_validate_mlp_or_attn_router` does. `aux_loss` only consumes
+    `router_aux_loss_coef`; carrying `seq_aux_loss_coef` is the
+    silent-method-mix bug."""
+    cfg = {"model": {"branch_router": {
+        "balancing": "aux_loss",
+        "router_aux_loss_coef": 0.001,
+        "seq_aux_loss_coef": 0.5,
+    }}}
+    with pytest.raises(ValueError, match="branch_router.balancing=aux_loss is incompatible with seq_aux_loss_coef"):
+        _validator()(cfg)
+
+
+def test_validator_branch_router_rejects_seq_aux_loss_with_aux_coef():
+    cfg = {"model": {"branch_router": {
+        "balancing": "seq_aux_loss",
+        "seq_aux_loss_coef": 0.0001,
+        "router_aux_loss_coef": 0.5,
+    }}}
+    with pytest.raises(ValueError, match="branch_router.balancing=seq_aux_loss is incompatible with router_aux_loss_coef"):
+        _validator()(cfg)
+
+
+def test_validator_branch_router_rejects_exploration_only_with_aux_coef():
+    cfg = {"model": {"branch_router": {
+        "balancing": "exploration_only",
+        "exploration_rate": 1.0,
+        "router_aux_loss_coef": 0.001,
+    }}}
+    with pytest.raises(ValueError, match="branch_router.balancing=exploration_only is incompatible with router_aux_loss_coef"):
+        _validator()(cfg)
+
+
+def test_validator_branch_router_rejects_none_with_active_knobs():
+    cfg = {"model": {"branch_router": {
+        "balancing": "none",
+        "router_aux_loss_coef": 0.001,
+    }}}
+    with pytest.raises(ValueError, match="branch_router.balancing=none is incompatible with router_aux_loss_coef"):
+        _validator()(cfg)
+
+
 def test_validator_branch_router_accepts_aux_loss():
     """Round 32 review Finding 4: BranchRouter now accepts
     `aux_loss` and `seq_aux_loss`. The model's forward path

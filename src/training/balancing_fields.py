@@ -396,6 +396,57 @@ def validate_branch_router_config(cfg: dict) -> None:
             f"a non-negative int"
         )
 
+    # Method-specific knob rejection on branch_router (mirrors the
+    # check `_validate_mlp_or_attn_router` runs on MLP / attention
+    # groups). For example, `balancing: aux_loss` with
+    # `seq_aux_loss_coef: 0.5` is rejected because the runtime
+    # ignores the non-active coefficient — silently allowing it
+    # creates a misleading config where the operator thinks the
+    # value is being used.
+    if isinstance(nested, dict):
+        bal = nested.get("balancing")
+        # Branch router currently only supports `none`,
+        # `exploration_only`, `aux_loss`, `seq_aux_loss` at
+        # runtime; the validator already rejected anything outside
+        # that set above. The active-knob rule per method:
+        branch_method_to_allowed = {
+            "aux_loss": {"router_aux_loss_coef"},
+            "seq_aux_loss": {"seq_aux_loss_coef"},
+            # exploration_only consumes the exploration schedule
+            # knobs; aux/seq coefs are not active here.
+            "exploration_only": {
+                "exploration_rate", "exploration_decay",
+                "exploration_min", "exploration_warmup_steps",
+            },
+            # `none` accepts only schedule fields if the operator
+            # leaves them in (no balancing knob is active here).
+            "none": {
+                "exploration_rate", "exploration_decay",
+                "exploration_min", "exploration_warmup_steps",
+            },
+        }
+        # Every active balancing knob the validator knows about,
+        # used as the universe-of-discourse for the per-method
+        # reject set.
+        all_branch_active = {
+            "router_aux_loss_coef", "seq_aux_loss_coef",
+            "bias_update_rate", "bias_update_zero_sum",
+            "bias_warmup_start", "bias_warmup_steps",
+            "quantile_eta", "quantile_target_q",
+            "quantile_global_state",
+        }
+        if bal in branch_method_to_allowed:
+            allowed = branch_method_to_allowed[bal]
+            for field in sorted(all_branch_active - allowed):
+                if field in nested and nested[field]:
+                    raise ValueError(
+                        f"model.branch_router.balancing={bal} is "
+                        f"incompatible with {field}={nested[field]!r}; "
+                        f"the runtime ignores this knob under {bal}. "
+                        f"Drop the conflicting field or change "
+                        f"`balancing`."
+                    )
+
     # Reject conflicting nested-vs-flat assignments on the SAME field.
     if isinstance(nested, dict):
         for key in _BRANCH_ROUTER_KNOWN_KEYS:

@@ -78,9 +78,7 @@ model:
   attn_router:
     balancing: none
   branch_router:
-    balancing: %BAL%
-    router_aux_loss_coef: 0.5
-    seq_aux_loss_coef: 0.5
+%BRANCH_BLOCK%
 training:
   learning_rate: 1.0e-3
   weight_decay: 0.0
@@ -95,8 +93,23 @@ training:
 """
 
 
+# Per-method branch fixture: only the active coefficient is set,
+# matching the AC-17 method-axis rule the validator now enforces.
+_BRANCH_BLOCKS = {
+    "aux_loss": (
+        "    balancing: aux_loss\n"
+        "    router_aux_loss_coef: 0.5\n"
+    ),
+    "seq_aux_loss": (
+        "    balancing: seq_aux_loss\n"
+        "    seq_aux_loss_coef: 0.5\n"
+    ),
+    "none": "    balancing: none\n",
+}
+
+
 def _build_with_branch_method(method: str, tmp_path):
-    yaml_text = _BASE_YAML.replace("%BAL%", method)
+    yaml_text = _BASE_YAML.replace("%BRANCH_BLOCK%", _BRANCH_BLOCKS[method])
     p = tmp_path / f"branch_{method}.yaml"
     p.write_text(yaml_text)
     cfg = _CFG_MOD.load_config(str(p))
@@ -165,14 +178,7 @@ def test_branch_aux_loss_contrastive_vs_none_baseline(tmp_path):
 
     # Build the none baseline with the SAME seed so initialization
     # matches.
-    yaml_text = _BASE_YAML.replace("%BAL%", "none").replace(
-        "    router_aux_loss_coef: 0.5\n    seq_aux_loss_coef: 0.5\n", "",
-    )
-    p = tmp_path / "branch_none_for_contrast.yaml"
-    p.write_text(yaml_text)
-    cfg_none = _CFG_MOD.load_config(str(p))
-    torch.manual_seed(20260428)
-    model_none, _ = _FACTORY_MOD.build_model(cfg_none)
+    model_none = _build_with_branch_method("none", tmp_path)
     model_none.train()
     torch.manual_seed(11111)
     input_ids = torch.randint(0, model_none.vocab_size, (1, 8), dtype=torch.long)
@@ -191,14 +197,7 @@ def test_branch_balancing_none_produces_no_extra_loss_term(tmp_path):
     branch contribution to total loss is zero; loss == ce_loss
     when MLP and attn routers are also `none`.
     """
-    yaml_text = _BASE_YAML.replace("%BAL%", "none").replace(
-        "    router_aux_loss_coef: 0.5\n    seq_aux_loss_coef: 0.5\n", "",
-    )
-    p = tmp_path / "branch_none.yaml"
-    p.write_text(yaml_text)
-    cfg = _CFG_MOD.load_config(str(p))
-    torch.manual_seed(20260428)
-    model, _ = _FACTORY_MOD.build_model(cfg)
+    model = _build_with_branch_method("none", tmp_path)
     model.train()
     torch.manual_seed(11111)
     input_ids = torch.randint(0, model.vocab_size, (1, 8), dtype=torch.long)

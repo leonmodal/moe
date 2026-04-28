@@ -238,8 +238,8 @@ def validate_config(path: Path) -> list[str]:
                         f"balancing={method!r}"
                     )
 
-        # DEC-6 contract: every active matrix yaml whose
-        # `attn_expert_mode == per_head_precompute_kv` must set
+        # precompute_kv branch contract: every active matrix yaml
+        # whose `attn_expert_mode == per_head_precompute_kv` must set
         # `branch_router` to the documented exploration_only
         # schedule. Drift here would silently change branch
         # routing behavior in the precompute_kv variant.
