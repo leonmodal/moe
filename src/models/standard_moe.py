@@ -4,6 +4,8 @@ Standard MoE — Qwen3MoE with fixed load-balancing loss.
 Uses our local load_balancing_loss_func instead of the HF one
 (which has a double-softmax bug).
 """
+import torch
+
 from .configuration_qwen3_moe import Qwen3MoeConfig
 from .modeling_qwen3_moe import (
     Qwen3MoeForCausalLM,
@@ -69,24 +71,40 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
 
         # Recompute aux loss with our fixed loss function. The base class
         # already added `self.router_aux_loss_coef * old_aux` to the loss; we
-        # subtract that and either re-add the corrected `new_aux` (when
-        # `aux_loss` is the active method, or no method is set) or leave the
-        # subtraction as-is (when another method is active and coefs were
-        # auto-zeroed — both terms collapse to zero and the subtraction is a
-        # no-op).
+        # subtract that off in BOTH branches so non-aux methods don't pay for
+        # the base class's broken double-softmax aux contribution. For aux
+        # methods we then add `coef * new_aux` (graph-bearing) so the
+        # corrected aux loss term can backprop through router_logits. For
+        # non-aux methods (DEC-15 DETACH-ONLY) we:
+        #   - subtract `coef * old_aux.detach()` (no gradient flow through
+        #     the base class's old_aux), and
+        #   - compute `new_aux` under `torch.no_grad()` purely as detached
+        #     telemetry on `output.aux_loss` so the model output never
+        #     carries an autograd graph reference through aux tensors.
         if output.router_logits is not None and output.aux_loss is not None:
             old_aux = output.aux_loss
-            new_aux = load_balancing_loss_func(
-                output.router_logits,
-                self.num_experts,
-                self.num_experts_per_tok,
-                selected_experts=selected_experts,
-            )
-            if output.loss is not None:
-                output.loss = output.loss - self.router_aux_loss_coef * old_aux
-                if aux_active:
+            if aux_active:
+                new_aux = load_balancing_loss_func(
+                    output.router_logits,
+                    self.num_experts,
+                    self.num_experts_per_tok,
+                    selected_experts=selected_experts,
+                )
+                if output.loss is not None:
+                    output.loss = output.loss - self.router_aux_loss_coef * old_aux
                     output.loss = output.loss + self.router_aux_loss_coef * new_aux
-            output.aux_loss = new_aux
+                output.aux_loss = new_aux
+            else:
+                if output.loss is not None:
+                    output.loss = output.loss - self.router_aux_loss_coef * old_aux.detach()
+                with torch.no_grad():
+                    new_aux = load_balancing_loss_func(
+                        output.router_logits,
+                        self.num_experts,
+                        self.num_experts_per_tok,
+                        selected_experts=selected_experts,
+                    )
+                output.aux_loss = new_aux  # already detached via no_grad context
 
         # Sequence-level aux loss (DeepSeek V2/V3) — gated by method.
         seq_coef = getattr(self, "_seq_aux_loss_coef", 0.0)

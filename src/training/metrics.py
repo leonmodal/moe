@@ -71,30 +71,82 @@ def get_output_selected_experts(output, model) -> tuple[torch.Tensor, ...] | Non
     return get_selected_experts_for_seq_aux(model)
 
 
-def get_output_router_token_masks(output) -> tuple[torch.Tensor | None, ...] | None:
+def get_output_router_token_masks(output, model=None) -> tuple[torch.Tensor | None, ...] | None:
     masks = getattr(output, "router_token_masks", None)
     if masks:
         return tuple(masks)
+    # DEC-15 fallback: when the model's forward skipped writing router_token_masks
+    # to the output (non-aux methods), the moe_everything inner model still
+    # accumulates per-depth token masks under `_all_mlp_token_masks`. Use them
+    # so non-aux MoE-Everything metrics weight expert load by active tokens
+    # rather than over the zero-padded full sequence.
+    if model is not None:
+        inner = getattr(model, "model", None)
+        inner_masks = getattr(inner, "_all_mlp_token_masks", None)
+        if inner_masks:
+            return tuple(inner_masks)
     return None
 
 
 def _collect_detached_router_scores(model) -> tuple[torch.Tensor, ...] | None:
-    """DEC-15 DETACH-ONLY telemetry consumer.
+    """DEC-15 DETACH-ONLY telemetry consumer (MLP-only).
 
     When the model's `forward` skips returning gradient-bearing
-    `router_logits` (non-aux methods), telemetry consumers can still observe
-    per-expert scores by reading the `_last_router_scores_detached` snapshot
-    that every `DeepSeekRouter` and `ExplorationTopKRouter` populates on
-    every forward. This helper walks the model and collects snapshots from
-    the same routers that `compute_output_metrics` would otherwise read
-    from the (missing) `output.router_logits`.
+    `router_logits` (non-aux methods), telemetry consumers can still
+    observe per-expert scores by reading internal model state. This
+    helper returns a tuple of per-depth MLP router-score tensors with
+    the same shape `[total_tokens, num_experts]` that
+    `output.router_logits` would have had for aux methods.
 
-    Returns `None` when no router has produced a snapshot (e.g., dense
-    models or pre-forward calls).
+    Resolution order (first hit wins):
+
+    1. `model.model._all_mlp_router_logits` (`moe_everything` inner
+       accumulator) — densified per-depth tensors that match the
+       full-sequence shape expected by `normalized_load_balancing_loss_func`.
+       These are grad-bearing internally; we detach them here.
+    2. `get_all_balancing_owners()` walker filtered to MLP routers
+       (`standard_moe` / `global_moe`) — per-layer gate's
+       `_last_router_scores_detached` snapshot.
+    3. Class-based scan over `DeepSeekRouter` / `ExplorationTopKRouter`
+       (older or dense models without the canonical interfaces).
+
+    Attention routers (`q`/`k`/`v`/`o`) and branch router(s) are
+    intentionally excluded — their expert dimensions differ from MLP
+    `num_experts` and would crash `normalized_load_balancing_loss_func`
+    (Codex Round 8 Blocker #2). Attention diagnostics, when needed,
+    must be computed separately with their own `num_attn_experts` /
+    per-head top-k.
+
+    Returns `None` when no MLP router has produced a snapshot.
     """
-    from src.models.router import DeepSeekRouter, ExplorationTopKRouter
+    # Path 1: moe_everything's inner accumulator. The mlp_bank stores the
+    # densified per-depth router logits in `last_router_logits` and the
+    # outer `MoEverythingModel` accumulates them into
+    # `_all_mlp_router_logits`. These have shape `[total_tokens,
+    # num_experts]` — exactly the shape `compute_output_metrics` expects.
+    inner = getattr(model, "model", None)
+    inner_logits = getattr(inner, "_all_mlp_router_logits", None)
+    if inner_logits:
+        return tuple(t.detach() for t in inner_logits)
 
+    # Path 2: walker-based collection for `standard_moe` / `global_moe`.
+    # Each layer's gate populates `_last_router_scores_detached` on every
+    # forward; for these families every token routes through the gate so
+    # the snapshot shape is `[total_tokens, num_experts]`.
+    walker = getattr(model, "get_all_balancing_owners", None)
     snapshots: list[torch.Tensor] = []
+    if walker is not None:
+        for owner, label in walker():
+            if label != "mlp":
+                continue
+            snap = getattr(owner, "_last_router_scores_detached", None)
+            if snap is not None:
+                snapshots.append(snap)
+        if snapshots:
+            return tuple(snapshots)
+
+    # Path 3: legacy class-based fallback.
+    from src.models.router import DeepSeekRouter, ExplorationTopKRouter
     for module in model.modules():
         if isinstance(module, (DeepSeekRouter, ExplorationTopKRouter)):
             snap = getattr(module, "_last_router_scores_detached", None)
@@ -115,7 +167,7 @@ def compute_output_metrics(
 
     Returns (metrics_dict, selected_experts, router_token_masks).
     """
-    router_token_masks = get_output_router_token_masks(output)
+    router_token_masks = get_output_router_token_masks(output, raw_model)
     selected_experts = get_output_selected_experts(output, raw_model)
 
     aux = getattr(output, "aux_loss", None)

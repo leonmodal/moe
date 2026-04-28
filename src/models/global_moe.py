@@ -17,6 +17,7 @@ would immediately be thrown away.
 """
 import copy
 
+import torch
 import torch.nn as nn
 from .configuration_qwen3_moe import Qwen3MoeConfig
 from .modeling_qwen3_moe import (
@@ -199,20 +200,33 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
         aux_active = method is None or method == "aux_loss"
         seq_aux_active = method is None or method == "seq_aux_loss"
 
-        # Recompute aux loss with our fixed loss function
+        # Recompute aux loss. See `StandardMoEModel.forward` for the rationale
+        # behind the aux_active gate plus the detached old_aux subtraction
+        # for non-aux methods (DEC-15 DETACH-ONLY).
         if output.router_logits is not None and output.aux_loss is not None:
             old_aux = output.aux_loss
-            new_aux = load_balancing_loss_func(
-                output.router_logits,
-                self.num_experts,
-                self.num_experts_per_tok,
-                selected_experts=selected_experts,
-            )
-            if output.loss is not None:
-                output.loss = output.loss - self.router_aux_loss_coef * old_aux
-                if aux_active:
+            if aux_active:
+                new_aux = load_balancing_loss_func(
+                    output.router_logits,
+                    self.num_experts,
+                    self.num_experts_per_tok,
+                    selected_experts=selected_experts,
+                )
+                if output.loss is not None:
+                    output.loss = output.loss - self.router_aux_loss_coef * old_aux
                     output.loss = output.loss + self.router_aux_loss_coef * new_aux
-            output.aux_loss = new_aux
+                output.aux_loss = new_aux
+            else:
+                if output.loss is not None:
+                    output.loss = output.loss - self.router_aux_loss_coef * old_aux.detach()
+                with torch.no_grad():
+                    new_aux = load_balancing_loss_func(
+                        output.router_logits,
+                        self.num_experts,
+                        self.num_experts_per_tok,
+                        selected_experts=selected_experts,
+                    )
+                output.aux_loss = new_aux  # already detached via no_grad context
 
         # Sequence-level aux loss (DeepSeek V2/V3) — gated by method.
         seq_coef = getattr(self, "_seq_aux_loss_coef", 0.0)
