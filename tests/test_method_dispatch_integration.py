@@ -185,7 +185,11 @@ def test_load_config_normalizes_then_build_model_stamps_method(
         o.local_tokens_per_expert.zero_()
         o.local_tokens_per_expert[0] = 100.0  # heavy skew
 
-    update_expert_biases(model, bias_rate=0.01, distributed=False)
+    # AC-6 misuse guard (Round 14): `update_expert_biases` requires
+    # `torch.no_grad()` context — wrap the call here just like the
+    # production trainer does.
+    with torch.no_grad():
+        update_expert_biases(model, bias_rate=0.01, distributed=False)
 
     if expected_bias_update:
         # method=deepseek_bias: bias buffers MUST shift.

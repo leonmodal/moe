@@ -542,6 +542,53 @@ def _gloo_loopback_iface() -> str:
     return "lo0" if platform.system() == "Darwin" else "lo"
 
 
+def _ddp_preflight_worker(rank: int, world_size: int, init_file: str):
+    """Minimal init_process_group + destroy_process_group worker
+    for the gloo environment preflight."""
+    import os
+    import torch.distributed as _dist
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", _gloo_loopback_iface())
+    _dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    _dist.destroy_process_group()
+
+
+def _ddp_preflight(tmp_path) -> str | None:
+    """Return None if a 2-rank gloo process group can be initialized
+    in this environment; return a string skip-reason otherwise.
+
+    Round 14 (Codex Round 13 Finding 1): handles BOTH
+    `ProcessRaisedException` (Python exception in worker) and
+    `ProcessExitedException` (worker SIGABRT from libuv `uv_bind:
+    operation not permitted`)."""
+    import torch.multiprocessing as mp
+
+    init_file = tmp_path / "ac23_ddp_preflight"
+    try:
+        mp.spawn(
+            _ddp_preflight_worker,
+            args=(2, str(init_file)),
+            nprocs=2,
+            join=True,
+        )
+    except mp.ProcessExitedException as exc:
+        return f"DDP gloo preflight aborted (likely libuv/uv_bind sandbox restriction): {exc!r}"
+    except mp.ProcessRaisedException as exc:
+        return f"DDP gloo preflight raised in worker: {exc!r}"
+    except (OSError, PermissionError, RuntimeError) as exc:
+        return f"DDP gloo preflight environment error: {exc!r}"
+    finally:
+        try:
+            init_file.unlink()
+        except FileNotFoundError:
+            pass
+    return None
+
+
 def _ddp_sanity_equivalence_worker(
     rank: int, world_size: int, init_file: str, output_path: str
 ):
@@ -601,9 +648,11 @@ def _ddp_sanity_equivalence_worker(
     sys.modules["src.training.routing"] = routing
     spec.loader.exec_module(routing)
 
-    routing.update_expert_biases(
-        sanity_model, bias_rate=0.01, distributed=True, zero_sum=True,
-    )
+    # AC-6 misuse guard: `update_expert_biases` requires `torch.no_grad()`.
+    with _torch.no_grad():
+        routing.update_expert_biases(
+            sanity_model, bias_rate=0.01, distributed=True, zero_sum=True,
+        )
 
     # Persist all DeepSeekRouter expert_bias tensors keyed by name.
     from src.models.router import DeepSeekRouter
@@ -634,32 +683,18 @@ def test_sanity_equivalence_ddp_per_rank_bias(tmp_path):
     """
     import torch.multiprocessing as mp
 
+    skip_reason = _ddp_preflight(tmp_path)
+    if skip_reason is not None:
+        pytest.skip(skip_reason)
+
     init_file = tmp_path / "ac23_ddp_init"
     output_template = str(tmp_path / "ac23_rank_{rank}_bias.pt")
-
-    _ENV_FAIL_HINTS = (
-        "Cannot resolve",
-        "Address family",
-        "Operation not permitted",
-        "Network is unreachable",
-        "GLOO_SOCKET_IFNAME",
-        "Failed to load",
+    mp.spawn(
+        _ddp_sanity_equivalence_worker,
+        args=(2, str(init_file), output_template),
+        nprocs=2,
+        join=True,
     )
-
-    try:
-        mp.spawn(
-            _ddp_sanity_equivalence_worker,
-            args=(2, str(init_file), output_template),
-            nprocs=2,
-            join=True,
-        )
-    except mp.ProcessRaisedException as exc:
-        msg = str(exc)
-        if any(hint in msg for hint in _ENV_FAIL_HINTS):
-            pytest.skip(f"DDP environment unavailable: {exc!r}")
-        raise
-    except (OSError, PermissionError) as exc:
-        pytest.skip(f"DDP environment unavailable: {exc!r}")
 
     rank0_bias = torch.load(output_template.format(rank=0))
     rank1_bias = torch.load(output_template.format(rank=1))
@@ -692,10 +727,10 @@ def test_sanity_equivalence_50_step_training_drift():
     same seed/data stream, the loss values must remain within
     documented tolerance throughout — no compounding drift.
 
-    Round 13 implements a small CPU-runnable variant (1 batch, 4
-    tokens, 50 steps) to lock the contract. A Modal H200 follow-up
-    will run the same test on production batch sizes / sequence
-    lengths.
+    Round 14 (Codex Round 13 Finding 3): use the multi-expert
+    DeepSeek fixture (4 MLP experts, top-2 routing, 2 logical
+    layers / 4 sanity depths). A Modal H200 follow-up will run
+    the same test on the plan-text 8L/16-depth fixture.
     """
     torch.manual_seed(20260428)
 
@@ -748,6 +783,126 @@ def test_sanity_equivalence_50_step_training_drift():
     final_loss = loss_history[-1][0]
     assert initial_loss != final_loss, (
         f"loss did not evolve over 50 steps; the test is degenerate."
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Larger fixture: 4-layer global + 8-depth sanity (Codex Round 13
+#  Finding 3 follow-up). The plan calls for 8L/16-depth on Modal
+#  H200; 4L/8-depth is the largest CPU-feasible step that still
+#  exercises the full DeepSeek routing pipeline through multiple
+#  layers. The Modal H200 follow-up will run the same test on the
+#  full 8L/16-depth fixture.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _larger_deepseek_global_config():
+    """4-layer DeepSeek global config — closer to the plan's 8L
+    headline fixture but small enough to run on CPU."""
+    return GlobalMoEConfig(
+        vocab_size=256,
+        hidden_size=64,
+        num_hidden_layers=4,                # was 2; plan calls for 8
+        head_dim=32,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        intermediate_size=128,
+        max_position_embeddings=128,
+        output_router_logits=True,
+        norm_topk_prob=True,
+        router_aux_loss_coef=0.0,
+    )
+
+
+def _larger_deepseek_alternating_sanity_config():
+    """8-depth DeepSeek sanity config (= 2 * 4 logical layers)."""
+    return MoEverythingConfig(
+        vocab_size=256,
+        hidden_size=64,
+        num_hidden_layers=8,                # was 4; matches 2 * 4-layer global
+        head_dim=32,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        intermediate_size=128,
+        max_position_embeddings=128,
+        num_attn_experts=4,                 # one per logical layer
+        num_attn_experts_per_tok=1,
+        attn_expert_mode="per_head_precompute_kv",
+        use_deepseek_routing=True,
+        norm_topk_prob=True,
+        branch_router_aux_loss_coef=0.0,
+        router_aux_loss_coef=0.0,
+        per_layer_norm=True,
+        sanity_check_mode="alternating_global_moe",
+    )
+
+
+def test_sanity_equivalence_larger_fixture_forward():
+    """AC-23 larger fixture: forward+loss equivalence on the 4L/8-depth
+    DeepSeek pair. Locks the contract for non-trivial depth before the
+    Modal H200 8L/16-depth follow-up."""
+    torch.manual_seed(20260428)
+    global_model = DeepSeekGlobalMoEForCausalLM(_larger_deepseek_global_config()).eval()
+    sanity_model = MoEverythingForCausalLM(_larger_deepseek_alternating_sanity_config()).eval()
+    copy_global_to_alternating_sanity(global_model, sanity_model)
+
+    ids, labels = _dummy_batch(B=1, T=8)
+    with torch.no_grad():
+        global_out = global_model(input_ids=ids, labels=labels, output_router_logits=True)
+        sanity_out = sanity_model(input_ids=ids, labels=labels, output_router_logits=True)
+    torch.testing.assert_close(sanity_out.logits, global_out.logits, atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(sanity_out.loss, global_out.loss, atol=2e-4, rtol=2e-4)
+
+
+def test_sanity_equivalence_larger_fixture_50_step_drift():
+    """AC-23 larger fixture 50-step drift: 4L global + 8-depth sanity,
+    DeepSeek routing, 50 SGD steps on same seed/data — per-step
+    loss diff stays within tolerance throughout. Slow on CPU but
+    runnable; Modal H200 follow-up will use 8L/16-depth and
+    larger sequence lengths."""
+    torch.manual_seed(20260428)
+    global_model = DeepSeekGlobalMoEForCausalLM(_larger_deepseek_global_config()).train()
+    sanity_model = MoEverythingForCausalLM(_larger_deepseek_alternating_sanity_config()).train()
+    copy_global_to_alternating_sanity(global_model, sanity_model)
+
+    opt_global = torch.optim.SGD(global_model.parameters(), lr=1e-3)
+    opt_sanity = torch.optim.SGD(sanity_model.parameters(), lr=1e-3)
+
+    NUM_STEPS = 50
+    loss_history = []
+    for step in range(NUM_STEPS):
+        torch.manual_seed(20260428 + step)
+        ids = torch.randint(0, 256, (1, 4))
+        labels = ids.clone()
+
+        opt_global.zero_grad()
+        opt_sanity.zero_grad()
+
+        out_g = global_model(input_ids=ids, labels=labels)
+        out_s = sanity_model(input_ids=ids, labels=labels)
+        loss_history.append((out_g.loss.item(), out_s.loss.item()))
+
+        out_g.loss.backward()
+        out_s.loss.backward()
+        opt_global.step()
+        opt_sanity.step()
+
+    max_diff = max(abs(g - s) for g, s in loss_history)
+    assert max_diff < 5e-3, (
+        f"AC-23 larger-fixture 50-step drift: max per-step loss diff "
+        f"= {max_diff:.6e}. "
+        f"Tail: global={[g for g, _ in loss_history[-3:]]}, "
+        f"sanity={[s for _, s in loss_history[-3:]]}."
+    )
+    assert loss_history[0][0] != loss_history[-1][0], (
+        "loss did not evolve over 50 steps on the larger fixture; "
+        "the test is degenerate."
     )
 
 

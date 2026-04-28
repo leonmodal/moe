@@ -24,6 +24,21 @@ def update_expert_biases(
     per_proj_rates: dict[str, float] | None = None,
     zero_sum: bool = True,
 ) -> None:
+    if torch.is_grad_enabled():
+        # AC-6 misuse guard (Round 14, Codex Round 13 Finding 2): the
+        # trainer must call this from a `torch.no_grad()` context. The
+        # update mutates `expert_bias` in-place and zeroes
+        # `local_tokens_per_expert`; calling it from inside a forward
+        # pass / before the optimizer.step has consumed gradients can
+        # silently double-count tokens or update bias from stale
+        # counts. Fail fast so accidental misuse surfaces immediately.
+        raise RuntimeError(
+            "update_expert_biases must be called inside a `torch.no_grad()` "
+            "context (post-optimizer-step). Wrap the call in "
+            "`with torch.no_grad():` — the trainer path already does this. "
+            "If you saw this from a test, your test is missing the no_grad "
+            "wrapper that production code uses."
+        )
     """Update expert biases using DeepSeek V3-style load balancing.
 
     Walks every load-balancing owner exposed by `raw_model.get_all_balancing_owners()`

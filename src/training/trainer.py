@@ -475,11 +475,17 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
                 "mlp": _resolve_balancing_field(cfg, "bias_rate_mlp", rate),
                 "branch": _resolve_balancing_field(cfg, "bias_rate_branch", rate),
             }
-            update_expert_biases(
-                model, bias_rate=rate, distributed=distributed,
-                per_proj_rates=per_proj_rates,
-                zero_sum=train_cfg.bias_update_zero_sum,
-            )
+            # AC-6 misuse guard (Round 14): `update_expert_biases`
+            # requires `torch.no_grad()` context. The trainer is the
+            # canonical production call site; wrap the call so the
+            # contract is explicit and the precondition assertion
+            # inside `update_expert_biases` is satisfied.
+            with torch.no_grad():
+                update_expert_biases(
+                    model, bias_rate=rate, distributed=distributed,
+                    per_proj_rates=per_proj_rates,
+                    zero_sum=train_cfg.bias_update_zero_sum,
+                )
 
         # Routing heatmaps
         if heatmap_every > 0 and global_step > 0 and global_step % heatmap_every == 0:
