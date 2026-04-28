@@ -86,11 +86,37 @@ def trainer_post_optimizer_bias_update(
         method_for_bias_update is None
         or method_for_bias_update in _BIAS_UPDATE_METHODS
     )
-    if not (train_cfg.bias_update_rate > 0 and method_allows_bias_update):
+    # Per-class effective rate: when the nested-schema yaml sets
+    # `model.mlp_router.balancing == "deepseek_bias"` and a
+    # per-class `bias_update_rate`, the trainer must run the bias
+    # update on that rate even when top-level
+    # `train_cfg.bias_update_rate` is zero (the migrator strips the
+    # top-level field once a per-class block exists). Read the
+    # mirrored `effective_bias_update_rate` that `model_factory.py`
+    # stamps onto `config` for every nested deepseek_bias build.
+    raw_config = getattr(raw_model, "config", None)
+    effective_rate = getattr(raw_config, "effective_bias_update_rate", None)
+    bias_update_rate = train_cfg.bias_update_rate
+    if (effective_rate is not None and effective_rate > 0
+            and bias_update_rate <= 0):
+        bias_update_rate = float(effective_rate)
+    bias_warmup_start = (
+        getattr(raw_config, "effective_bias_warmup_start", None)
+        if train_cfg.bias_warmup_start <= 0 else train_cfg.bias_warmup_start
+    )
+    if bias_warmup_start is None:
+        bias_warmup_start = train_cfg.bias_warmup_start
+    bias_warmup_steps = (
+        getattr(raw_config, "effective_bias_warmup_steps", None)
+        if train_cfg.bias_warmup_steps <= 0 else train_cfg.bias_warmup_steps
+    )
+    if bias_warmup_steps is None:
+        bias_warmup_steps = train_cfg.bias_warmup_steps
+    if not (bias_update_rate > 0 and method_allows_bias_update):
         return
     rate = get_bias_rate(
-        model, global_step, train_cfg.bias_update_rate,
-        train_cfg.bias_warmup_start, train_cfg.bias_warmup_steps,
+        model, global_step, bias_update_rate,
+        bias_warmup_start, bias_warmup_steps,
     )
     per_proj_rates = {
         "q": _resolve_balancing_field(cfg, "bias_rate_q", rate),
@@ -100,11 +126,18 @@ def trainer_post_optimizer_bias_update(
         "mlp": _resolve_balancing_field(cfg, "bias_rate_mlp", rate),
         "branch": _resolve_balancing_field(cfg, "bias_rate_branch", rate),
     }
+    # Per-class `bias_update_zero_sum` mirror — falls back to
+    # top-level when unset.
+    effective_zero_sum = getattr(
+        raw_config, "effective_bias_update_zero_sum", None,
+    )
+    if effective_zero_sum is None:
+        effective_zero_sum = train_cfg.bias_update_zero_sum
     with torch.no_grad():
         update_expert_biases(
             model, bias_rate=rate, distributed=distributed,
             per_proj_rates=per_proj_rates,
-            zero_sum=train_cfg.bias_update_zero_sum,
+            zero_sum=bool(effective_zero_sum),
         )
 
 

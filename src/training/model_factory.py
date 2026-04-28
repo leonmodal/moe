@@ -223,7 +223,30 @@ def build_model(cfg: dict):
     # model output so the aux loss term can backprop through them. For
     # non-aux methods (deepseek_bias, quantile, none), we don't return
     # them — the routing-decision state lives in router-internal buffers.
+    #
+    # Resolution order:
+    #   1. Top-level `training.load_balancing_method` (or `model:`
+    #      back-compat).
+    #   2. Nested `model.mlp_router.balancing` (the AC-13 nested-only
+    #      runtime — when the migrator has stripped the top-level
+    #      method, this is the authoritative source). Standard /
+    #      Global MoE have only an MLP router class, so the MLP
+    #      method is the model-level method.
+    #   3. Nested `model.attn_router.balancing` (used as a fallback
+    #      for moe_everything when MLP is unset but attention is).
     method_for_orl = _resolve_balancing_field(cfg, "load_balancing_method", None)
+    if method_for_orl is None:
+        nested_mlp = mcfg.get("mlp_router")
+        if isinstance(nested_mlp, dict):
+            cand = nested_mlp.get("balancing")
+            if cand is not None:
+                method_for_orl = cand
+        if method_for_orl is None:
+            nested_attn = mcfg.get("attn_router")
+            if isinstance(nested_attn, dict):
+                cand = nested_attn.get("balancing")
+                if cand is not None:
+                    method_for_orl = cand
     output_router_logits = output_router_logits_for_method(method_for_orl)
 
     # Common MoE parameters

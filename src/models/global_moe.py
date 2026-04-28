@@ -236,7 +236,14 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
                 output.aux_loss = new_aux
             else:
                 if output.loss is not None:
-                    output.loss = output.loss - self.router_aux_loss_coef * old_aux.detach()
+                    # Subtract graph-bearing old_aux so the base
+                    # class's aux contribution to loss truly cancels
+                    # in the autograd graph (was: `old_aux.detach()`,
+                    # which only cancelled the scalar value and left
+                    # a Switch-aux gradient leak under non-aux
+                    # methods). The detach-only contract for
+                    # `output.aux_loss` is honored below.
+                    output.loss = output.loss - self.router_aux_loss_coef * old_aux
                 with torch.no_grad():
                     new_aux = load_balancing_loss_func(
                         output.router_logits,
