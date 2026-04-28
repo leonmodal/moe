@@ -37,8 +37,6 @@ python scripts/validate_configs.py configs/standard_moe.yaml  # specific config
 | `num_experts_per_tok` | int | required | Top-K experts selected per token |
 | `moe_intermediate_size` | int | required | Expert MLP intermediate size |
 | `router_type` | string | "softmax" | `softmax` or `deepseek` |
-| `router_aux_loss_coef` | float | 0.001 | Auxiliary loss coefficient |
-| `seq_aux_loss_coef` | float | 0.0 | Sequence-level aux loss coefficient |
 | `norm_topk_prob` | bool | true | Normalize top-k routing probabilities |
 | `router_exploration_rate` | float | 0.0 | Random exploration rate during training |
 | `router_score_function` | string | `softmax` | Softmax-family router scoring: `softmax`, `sigmoid`, `sqrtsoftplus`. Ignored by DeepSeek router. See `docs/routing.md` §1.5.1. |
@@ -83,9 +81,13 @@ Used when `router_type: deepseek`:
 | `optimizer` | string | "adamw" | `adamw` or `muon` |
 | `output_dir` | string | required | Output directory for checkpoints |
 | `wandb_project` | string | null | WandB project name |
-| `bias_update_rate` | float | 0.0 | Expert bias update rate (0 = disabled) |
-| `bias_warmup_start` | float | 0.0 | Initial bias rate at step 0 (linear ramp to `bias_update_rate`) |
-| `bias_warmup_steps` | int | 0 | Steps to ramp `bias_warmup_start` → `bias_update_rate`; 0 = no warmup |
+| `bias_update_rate` | float | 0.0 | Expert bias update rate (0 = disabled). **Canonical block: `training:` per DEC-3b.** Legacy `model:` placement is deprecated; the resolver emits a `DeprecationWarning` and run [`scripts/migrate_balancing_fields_to_training.py`](../scripts/migrate_balancing_fields_to_training.py) to migrate. |
+| `bias_warmup_start` | float | 0.0 | Initial bias rate at step 0 (linear ramp to `bias_update_rate`). Canonical block: `training:`. |
+| `bias_warmup_steps` | int | 0 | Steps to ramp `bias_warmup_start` → `bias_update_rate`; 0 = no warmup. Canonical block: `training:`. |
+| `router_aux_loss_coef` | float | 0.001 | Switch-Transformer batch-level auxiliary loss coefficient (consumed by every model family's `forward`). **Canonical block: `training:` per DEC-3b** (was previously `model:` — same migration as `bias_update_rate`). |
+| `seq_aux_loss_coef` | float | 0.0 | DeepSeek V3 sequence-level aux loss coefficient. **Canonical block: `training:` per DEC-3b**. |
+| `load_balancing_method` | string | `aux_loss` | `aux_loss \| seq_aux_loss \| deepseek_bias \| quantile \| none`. Canonical block: `training:`. (Round 3+ work: dispatch is being wired to gate aux losses and bias updates by this knob; today's effective behavior is "all coefficient-driven paths run".) |
+| `bias_rate_q` / `bias_rate_k` / `bias_rate_v` / `bias_rate_o` / `bias_rate_mlp` / `bias_rate_branch` | float | `bias_update_rate` | Per-projection DeepSeek bias-update rate overrides. Each defaults to the global `bias_update_rate` if not set. **Canonical block: `training:` per DEC-3b**. |
 | `router_exploration_warmup_start` | float | 0.0 | Initial router-exploration rate at step 0; see `docs/training.md` §Router-Exploration Warmup |
 | `router_exploration_warmup_steps` | int | 0 | Steps to ramp to the model's `router_exploration_rate`; 0 = feature disabled |
 | `momentum_warmup_steps` | int | 300 | Muon optimizer momentum warmup horizon |

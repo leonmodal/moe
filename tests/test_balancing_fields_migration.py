@@ -27,18 +27,18 @@ import yaml
 
 sys.path.insert(0, ".")
 
-# Import the resolver directly from its module file to avoid pulling
-# `src/training/__init__.py` (which imports data utilities that depend on
-# pandas / liger and aren't relevant to this lightweight migration test).
+# Import the resolver directly from its dependency-light module.
+# `src/training/__init__.py` would transitively pull pandas (not available in
+# every test env), so we go directly to `balancing_fields.py`.
 import importlib.util
-_factory_spec = importlib.util.spec_from_file_location(
-    "_model_factory",
-    Path(__file__).resolve().parent.parent / "src" / "training" / "model_factory.py",
+_bf_spec = importlib.util.spec_from_file_location(
+    "_balancing_fields",
+    Path(__file__).resolve().parent.parent / "src" / "training" / "balancing_fields.py",
 )
-_factory = importlib.util.module_from_spec(_factory_spec)
-_factory_spec.loader.exec_module(_factory)
-_BALANCING_FIELDS_IN_TRAINING = _factory._BALANCING_FIELDS_IN_TRAINING
-_resolve_balancing_field = _factory._resolve_balancing_field
+_bf = importlib.util.module_from_spec(_bf_spec)
+_bf_spec.loader.exec_module(_bf)
+_BALANCING_FIELDS_IN_TRAINING = _bf._BALANCING_FIELDS_IN_TRAINING
+_resolve_balancing_field = _bf._resolve_balancing_field
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -130,10 +130,121 @@ def test_resolver_returns_default_when_field_absent():
     assert not any(issubclass(w.category, DeprecationWarning) for w in caught)
 
 
+def _load_build_training_config():
+    """Load `src.training.config.build_training_config` without going through
+    `src.training.__init__` (which imports pandas).
+
+    Strategy: register `_balancing_fields` (already loaded above) under the
+    canonical module name `src.training.balancing_fields` so the
+    `from .balancing_fields import ...` line in `config.py` resolves; then
+    load `config.py` with package context `src.training`.
+    """
+    import importlib.util
+    import sys as _sys
+    import types as _types
+
+    # Build a minimal package shell for `src.training` so relative imports work.
+    if "src" not in _sys.modules:
+        src_pkg = _types.ModuleType("src")
+        src_pkg.__path__ = [str(Path(__file__).resolve().parent.parent / "src")]
+        _sys.modules["src"] = src_pkg
+    if "src.training" not in _sys.modules:
+        training_pkg = _types.ModuleType("src.training")
+        training_pkg.__path__ = [
+            str(Path(__file__).resolve().parent.parent / "src" / "training")
+        ]
+        _sys.modules["src.training"] = training_pkg
+    _sys.modules["src.training.balancing_fields"] = _bf
+
+    config_spec = importlib.util.spec_from_file_location(
+        "src.training.config",
+        Path(__file__).resolve().parent.parent / "src" / "training" / "config.py",
+    )
+    config_module = importlib.util.module_from_spec(config_spec)
+    _sys.modules["src.training.config"] = config_module
+    config_spec.loader.exec_module(config_module)
+    return config_module.build_training_config
+
+
+def test_build_training_config_resolves_legacy_model_block():
+    """`build_training_config` must use the resolver for `bias_update_rate`,
+    `bias_warmup_start`, and `bias_warmup_steps` so that an unmigrated yaml
+    with these fields under `model:` still produces the correct effective
+    rate (with a deprecation warning) instead of silently zero-ing them.
+
+    This was the production-trainer regression Codex's Round 2 review
+    specifically called out: Round 2 added the resolver in `model_factory.py`
+    but `TrainingConfig.from_dict()` still read directly from `cfg["training"]`,
+    so a legacy `model.bias_update_rate: 0.001` yaml still became
+    `train_cfg.bias_update_rate == 0.0` and the trainer's
+    `if train_cfg.bias_update_rate > 0` gate stayed off.
+    """
+    build_training_config = _load_build_training_config()
+
+    legacy_cfg = {
+        "model": {
+            # Legacy placement — should still work via the resolver, with a warning.
+            "bias_update_rate": 0.001,
+            "bias_warmup_start": 0.0001,
+            "bias_warmup_steps": 100,
+        },
+        "training": {},
+    }
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        train_cfg = build_training_config(legacy_cfg)
+
+    assert train_cfg.bias_update_rate == 0.001, (
+        f"build_training_config failed to resolve legacy `model.bias_update_rate`; "
+        f"got {train_cfg.bias_update_rate} instead of 0.001 — the production-trainer "
+        f"regression is back."
+    )
+    assert train_cfg.bias_warmup_start == 0.0001
+    assert train_cfg.bias_warmup_steps == 100
+    deprecation_msgs = [
+        str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)
+    ]
+    assert any("DEC-3b" in m for m in deprecation_msgs), (
+        f"Expected at least one DEC-3b deprecation warning from build_training_config, "
+        f"got: {deprecation_msgs}"
+    )
+
+
+def test_build_training_config_canonical_training_block_quiet():
+    """The canonical case: fields in `training:` produce the right
+    `TrainingConfig` and no deprecation warning."""
+    build_training_config = _load_build_training_config()
+
+    canonical_cfg = {
+        "model": {},
+        "training": {
+            "bias_update_rate": 0.002,
+            "bias_warmup_start": 0.0002,
+            "bias_warmup_steps": 200,
+        },
+    }
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        train_cfg = build_training_config(canonical_cfg)
+
+    assert train_cfg.bias_update_rate == 0.002
+    assert train_cfg.bias_warmup_start == 0.0002
+    assert train_cfg.bias_warmup_steps == 200
+    deprecation_msgs = [
+        str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)
+    ]
+    assert deprecation_msgs == [], (
+        f"Canonical-block placement should NOT emit a deprecation warning, "
+        f"got: {deprecation_msgs}"
+    )
+
+
 if __name__ == "__main__":
     test_no_balancing_fields_left_under_model_block()
     test_resolver_reads_training_block_canonically()
     test_resolver_warns_when_field_still_under_model_block()
     test_resolver_prefers_training_block_when_field_in_both()
     test_resolver_returns_default_when_field_absent()
+    test_build_training_config_resolves_legacy_model_block()
+    test_build_training_config_canonical_training_block_quiet()
     print("ALL OK")

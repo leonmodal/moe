@@ -7,6 +7,8 @@ from pathlib import Path
 
 import yaml
 
+from .balancing_fields import _resolve_balancing_field
+
 
 @dataclass
 class TrainingConfig:
@@ -100,9 +102,16 @@ def build_training_config(cfg: dict) -> TrainingConfig:
         torch_compile=tcfg.get("torch_compile", False),
         torch_compile_mode=tcfg.get("torch_compile_mode", "default"),
         disable_liger=tcfg.get("disable_liger", False),
-        bias_update_rate=tcfg.get("bias_update_rate", 0.0),
-        bias_warmup_start=tcfg.get("bias_warmup_start", 0.0),
-        bias_warmup_steps=tcfg.get("bias_warmup_steps", 0),
+        # Per DEC-3b (AC-3): the canonical block for these balancing fields is
+        # `training:`. The resolver falls back to `model:` with a deprecation
+        # warning so unmigrated yamls still produce the correct effective rate
+        # instead of silently zeroing it (the production-trainer regression
+        # Codex's Round 1 review identified). Round 2's resolver was only
+        # wired into `model_factory.py`; Round 3 wires it through here so the
+        # same fallback applies to the trainer-side reads as well.
+        bias_update_rate=_resolve_balancing_field(cfg, "bias_update_rate", 0.0),
+        bias_warmup_start=_resolve_balancing_field(cfg, "bias_warmup_start", 0.0),
+        bias_warmup_steps=_resolve_balancing_field(cfg, "bias_warmup_steps", 0),
         router_exploration_warmup_start=tcfg.get("router_exploration_warmup_start", 0.0),
         router_exploration_warmup_steps=tcfg.get("router_exploration_warmup_steps", 0),
     )

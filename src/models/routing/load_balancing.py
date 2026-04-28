@@ -2,18 +2,43 @@
 Fixed load-balancing loss for MoE training.
 
 Two variants:
-  1. load_balancing_loss_func — standard batch-level Switch Transformer loss
-  2. seq_load_balancing_loss_func — DeepSeek V2/V3 sequence-level loss
+  1. load_balancing_loss_func — batch-level Switch Transformer loss with global
+     aggregation under DDP (DEC-4): both `tokens_per_expert` and
+     `router_prob_per_expert` are all-reduced (SUM, divided by world_size)
+     across ranks before forming the per-expert product, matching Megatron-LM's
+     `global_tokens_per_expert` / `aggregated_probs_per_expert` contract. The
+     all-reduce is guarded by `dist.is_initialized()` so single-rank training
+     pays no collective cost.
+  2. seq_load_balancing_loss_func — DeepSeek V2/V3 sequence-level loss; stays
+     per-sequence (no DP cross-rank reduction) since each sequence lives on
+     one rank under DDP. Matches Megatron's `tp_cp_group`-only reduce in the
+     no-TP / no-CP case.
 
 Fixes vs the HuggingFace transformers implementation:
   1. No double softmax — router already returns softmax probabilities,
      the HF loss applies softmax again which flattens the distribution
      and makes the loss blind to imbalance.
-  2. f_i is kept local per rank (no all_reduce) to preserve the
-     theoretical minimum of the load-balancing loss.
+  2. (DEC-4 superseded) `f_i` was previously rank-local; the global-aggregate
+     path is the canonical Megatron-aligned semantics now.
 """
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+
+
+def _maybe_all_reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
+    """Average `tensor` across DDP ranks, in-place. No-op when distributed is
+    not initialized so single-rank training pays no collective cost.
+
+    The DDP "average" is implemented as `all_reduce(SUM) / world_size`. This
+    is mathematically the global mean when every rank's input is itself a
+    per-rank mean of the same number of samples — which holds in standard DDP
+    training where every rank sees the same `batch_size` per step.
+    """
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor /= dist.get_world_size()
+    return tensor
 
 
 def normalize_router_scores(
@@ -103,8 +128,6 @@ def load_balancing_loss_func(
 
     if attention_mask is None:
         # f_i: fraction of tokens routed to each expert (hard assignment)
-        # Kept local per rank — no all_reduce — to preserve the theoretical
-        # minimum of the load-balancing loss.
         tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
 
         # p_i: average router probability per expert (soft, differentiable)
@@ -134,6 +157,14 @@ def load_balancing_loss_func(
         router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
             router_per_expert_attention_mask, dim=0
         )
+
+    # DEC-4 (AC-4): global-aggregate Switch aux. Average each per-rank mean
+    # across DDP ranks before forming the loss; matches Megatron-LM's
+    # `global_tokens_per_expert` / `aggregated_probs_per_expert` contract.
+    # Guarded by `dist.is_initialized()` so single-rank paths pay no
+    # collective cost.
+    tokens_per_expert = _maybe_all_reduce_mean(tokens_per_expert.contiguous())
+    router_prob_per_expert = _maybe_all_reduce_mean(router_prob_per_expert.contiguous())
 
     overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
     return overall_loss * num_experts

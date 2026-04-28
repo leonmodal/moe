@@ -429,20 +429,23 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
             log_every=train_cfg.log_every,
         )
 
-        # Expert bias updates
+        # Expert bias updates. Per DEC-3b (AC-3) the per-projection rates
+        # also live under `training:` canonically; resolve via the same helper
+        # so unmigrated yamls fall back with a deprecation warning instead of
+        # silently using `rate` for every class.
         if train_cfg.bias_update_rate > 0:
             rate = get_bias_rate(
                 model, global_step, train_cfg.bias_update_rate,
                 train_cfg.bias_warmup_start, train_cfg.bias_warmup_steps,
             )
-            tcfg = cfg.get("training", {})
+            from .balancing_fields import _resolve_balancing_field
             per_proj_rates = {
-                "q": tcfg.get("bias_rate_q", rate),
-                "k": tcfg.get("bias_rate_k", rate),
-                "v": tcfg.get("bias_rate_v", rate),
-                "o": tcfg.get("bias_rate_o", rate),
-                "mlp": tcfg.get("bias_rate_mlp", rate),
-                "branch": tcfg.get("bias_rate_branch", rate),
+                "q": _resolve_balancing_field(cfg, "bias_rate_q", rate),
+                "k": _resolve_balancing_field(cfg, "bias_rate_k", rate),
+                "v": _resolve_balancing_field(cfg, "bias_rate_v", rate),
+                "o": _resolve_balancing_field(cfg, "bias_rate_o", rate),
+                "mlp": _resolve_balancing_field(cfg, "bias_rate_mlp", rate),
+                "branch": _resolve_balancing_field(cfg, "bias_rate_branch", rate),
             }
             update_expert_biases(
                 model, bias_rate=rate, distributed=distributed,

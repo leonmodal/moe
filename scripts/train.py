@@ -61,6 +61,15 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    # AC-1 / DEC-3a: resolve `load_balancing_method` once and AUTO-ZERO any
+    # legacy coefficients that conflict with it BEFORE either build runs.
+    # This way both `build_training_config` and `build_model` see a
+    # method-consistent view of the coefficients (e.g. with method=aux_loss,
+    # `bias_update_rate` and `seq_aux_loss_coef` resolve to 0 even if the
+    # yaml carried legacy non-zero values, with a one-time deprecation
+    # warning describing the auto-zero).
+    from src.training.balancing_fields import normalize_balancing_config
+    normalize_balancing_config(cfg)
     train_cfg = build_training_config(cfg)
 
     # Apply CLI overrides to train_cfg

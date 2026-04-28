@@ -95,6 +95,69 @@ def test_branch_router_buffer_names_are_canonical():
     assert not hasattr(router, "local_counts"), "legacy `local_counts` buffer must be removed"
 
 
+def test_branch_router_exploration_mask_reused_under_recompute():
+    """AC-9 (Round 3 fill): with `exploration_rate > 0` and the non-deepseek
+    softmax branch path, the exploration mask + random-override values must
+    be CACHED on the first (real) forward and REUSED on the
+    `is_checkpoint_recompute()` replay. Otherwise the recompute would
+    re-sample fresh exploration and change branch choices, breaking gradient
+    consistency.
+
+    Round 2's full-integration test left `exploration_rate=0.0`, so the cache
+    was never exercised. This test explicitly walks the cache path.
+    """
+    from src.models.router import checkpoint_recompute_context
+
+    torch.manual_seed(2026)
+    router = BranchRouter(
+        hidden_size=8,
+        use_deepseek_style=False,  # softmax branch path
+        exploration_rate=0.5,       # half the tokens trip exploration
+    ).train()
+    x = torch.randn(2, 4, 8)
+
+    # Real forward — pass with the recompute context flag OFF, sample mask + overrides.
+    with torch.enable_grad():
+        with checkpoint_recompute_context(False):
+            real_out = router(x)
+    cached_mask = router._last_exploration_mask
+    cached_overrides = router._last_exploration_random
+    assert cached_mask is not None, (
+        "real forward must populate `_last_exploration_mask` for recompute reuse"
+    )
+    assert cached_overrides is not None, (
+        "real forward must populate `_last_exploration_random` for recompute reuse"
+    )
+    assert cached_mask.shape == (2, 4)
+    # Some tokens trip the explore mask (probability 0.5, 8 tokens, seed-fixed).
+    assert cached_mask.any(), "exploration_rate=0.5 should produce at least one masked token"
+
+    real_choice = router.last_selected_experts.clone()
+    cached_mask_snapshot = cached_mask.clone()
+    cached_overrides_snapshot = cached_overrides.clone()
+
+    # Recompute pass — flag ON. The cache must drive the branch decision; if
+    # the recompute were to fresh-sample `torch.rand`, the choice could
+    # diverge.
+    with torch.enable_grad():
+        with checkpoint_recompute_context(True):
+            recompute_out = router(x)
+
+    # The mask + overrides must be EXACTLY what they were on the real forward
+    # (the cache wasn't refreshed).
+    assert torch.equal(router._last_exploration_mask, cached_mask_snapshot), (
+        "recompute must NOT refresh `_last_exploration_mask`"
+    )
+    assert torch.equal(router._last_exploration_random, cached_overrides_snapshot), (
+        "recompute must NOT refresh `_last_exploration_random`"
+    )
+    # Branch choices must match between real and recompute.
+    assert torch.equal(router.last_selected_experts, real_choice), (
+        "recompute branch decision diverged from real forward — exploration "
+        "cache is not being reused (AC-9 regression)."
+    )
+
+
 def test_branch_router_under_torch_utils_checkpoint_matches_no_checkpoint():
     """Full AC-9 integration: a forward+backward through `torch.utils.checkpoint`
     must produce the same `local_tokens_per_expert` as a forward+backward with
@@ -156,5 +219,6 @@ if __name__ == "__main__":
     test_branch_router_recompute_does_not_double_count()
     test_branch_router_no_grad_does_not_count()
     test_branch_router_buffer_names_are_canonical()
+    test_branch_router_exploration_mask_reused_under_recompute()
     test_branch_router_under_torch_utils_checkpoint_matches_no_checkpoint()
     print("ALL OK")
