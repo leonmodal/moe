@@ -7,7 +7,11 @@ from pathlib import Path
 
 import yaml
 
-from .balancing_fields import _resolve_balancing_field, normalize_balancing_config
+from .balancing_fields import (
+    _resolve_balancing_field,
+    normalize_balancing_config,
+    validate_branch_router_config,
+)
 
 
 @dataclass
@@ -87,6 +91,7 @@ def load_config(path: str) -> dict:
     with open(path) as f:
         cfg = yaml.safe_load(f)
     normalize_balancing_config(cfg)
+    validate_branch_router_config(cfg)
     return cfg
 
 

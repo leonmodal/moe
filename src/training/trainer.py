@@ -35,6 +35,7 @@ from .distributed import (
     barrier,
     cleanup_distributed,
     describe_wrapper,
+    dist_world_size,
     infer_dtype,
     is_distributed,
     is_main_process,
@@ -57,7 +58,7 @@ from .model_factory import build_model, configure_liger_kernels
 from .routing import (
     apply_branch_schedule_pre_forward,
     apply_router_exploration_rate,
-    collect_branch_attn_fraction,
+    collect_branch_attn_counts,
     collect_branch_explore_mask_fraction,
     collect_router_z_loss,
     exploration_rate_schedule,
@@ -482,22 +483,57 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
         # value never gets confused with how often the random override
         # was taken.
         branch_explore_rate = current_branch_explore_rate
-        branch_attn_fraction, branch_attn_per_depth = collect_branch_attn_fraction(model)
+        branch_counts = collect_branch_attn_counts(model)
         branch_explore_mask_fraction = collect_branch_explore_mask_fraction(model)
-        if is_log_step and distributed and branch_attn_fraction is not None:
-            cross_rank_bundle = {"_attn": branch_attn_fraction}
-            for idx, val in enumerate(branch_attn_per_depth or []):
-                cross_rank_bundle[f"_attn_d{idx}"] = val
-            if branch_explore_mask_fraction is not None:
-                cross_rank_bundle["_mask"] = branch_explore_mask_fraction
-            reduced_branch = reduce_scalar_dict(cross_rank_bundle, device=device)
-            branch_attn_fraction = reduced_branch["_attn"]
-            branch_attn_per_depth = [
-                reduced_branch[f"_attn_d{idx}"]
-                for idx in range(len(branch_attn_per_depth or []))
-            ] or branch_attn_per_depth
-            if branch_explore_mask_fraction is not None:
-                branch_explore_mask_fraction = reduced_branch["_mask"]
+        branch_attn_fraction = None
+        branch_attn_per_depth = None
+        if branch_counts is not None:
+            local_attn, local_total, local_depth_pairs = branch_counts
+            if is_log_step and distributed:
+                # Token-weighted reduction: SUM the (numerator,
+                # denominator) pairs across ranks, then divide. Avoids
+                # the bias that arises from averaging already-averaged
+                # fractions when ranks have different per-rank token
+                # counts.
+                bundle = {
+                    "_attn_num": float(local_attn),
+                    "_attn_den": float(local_total),
+                }
+                for idx, (n_attn, n_total) in enumerate(local_depth_pairs):
+                    bundle[f"_attn_num_d{idx}"] = float(n_attn)
+                    bundle[f"_attn_den_d{idx}"] = float(n_total)
+                if branch_explore_mask_fraction is not None:
+                    bundle["_mask"] = branch_explore_mask_fraction
+                reduced_branch = reduce_scalar_dict(
+                    bundle, reduction="sum", device=device,
+                )
+                summed_attn = reduced_branch["_attn_num"]
+                summed_total = reduced_branch["_attn_den"]
+                branch_attn_fraction = (
+                    summed_attn / summed_total if summed_total > 0 else 0.0
+                )
+                branch_attn_per_depth = []
+                for idx in range(len(local_depth_pairs)):
+                    n_attn = reduced_branch[f"_attn_num_d{idx}"]
+                    n_total = reduced_branch[f"_attn_den_d{idx}"]
+                    branch_attn_per_depth.append(
+                        n_attn / n_total if n_total > 0 else 0.0,
+                    )
+                if branch_explore_mask_fraction is not None:
+                    # Mask fraction reduction is mean-of-rank-means
+                    # (we don't track per-rank mask token counts);
+                    # convert SUM-reduce back to mean explicitly.
+                    branch_explore_mask_fraction = (
+                        reduced_branch["_mask"] / max(1, dist_world_size())
+                    )
+            else:
+                branch_attn_fraction = (
+                    local_attn / local_total if local_total > 0 else 0.0
+                )
+                branch_attn_per_depth = [
+                    n_attn / n_total if n_total > 0 else 0.0
+                    for n_attn, n_total in local_depth_pairs
+                ]
         log_training_step(
             wandb_run,
             step=global_step,

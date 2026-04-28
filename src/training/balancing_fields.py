@@ -122,6 +122,124 @@ _METHOD_ACTIVE_FIELDS: dict[str, frozenset[str]] = {
 }
 
 
+_BRANCH_ROUTER_KNOWN_KEYS = frozenset({
+    "balancing",
+    "exploration_rate",
+    "exploration_decay",
+    "exploration_min",
+    "exploration_warmup_steps",
+})
+
+_BRANCH_BALANCING_VALID = frozenset({"none", "exploration_only"})
+
+_BRANCH_DECAY_VALID = frozenset({"constant", "linear", "cosine"})
+
+
+def validate_branch_router_config(cfg: dict) -> None:
+    """Validate the `model.branch_router` nested block (and the
+    legacy flat-bridge fields) for unknown keys, illegal values, and
+    conflicting nested-vs-flat assignments. Raises `ValueError` on
+    the first issue found.
+
+    Validation rules:
+      * Unknown keys under `model.branch_router` are rejected with a
+        list of accepted keys, so a typo'd field name does not silently
+        revert to the constructor default.
+      * `balancing` must be one of `{"none", "exploration_only"}`.
+      * `exploration_decay` must be one of
+        `{"constant", "linear", "cosine"}`.
+      * `exploration_rate`, `exploration_min` must be in [0.0, 1.0].
+      * `exploration_warmup_steps` must be a non-negative int.
+      * If both nested and flat (`branch_<key>`) forms are present
+        with conflicting values for the same field, raise. Equal
+        values are accepted (the migrator can leave both during a
+        partial migration).
+
+    The validator is a pure check — it does not mutate `cfg`. The
+    flat-bridge form is not rewritten into nested form here; that
+    is the migrator's job.
+    """
+    mcfg = cfg.get("model")
+    if not isinstance(mcfg, dict):
+        return
+
+    nested = mcfg.get("branch_router")
+    if nested is not None:
+        if not isinstance(nested, dict):
+            raise ValueError(
+                f"model.branch_router must be a mapping; got "
+                f"{type(nested).__name__}"
+            )
+        unknown = set(nested.keys()) - _BRANCH_ROUTER_KNOWN_KEYS
+        if unknown:
+            raise ValueError(
+                f"model.branch_router has unknown keys: {sorted(unknown)}. "
+                f"Allowed keys: {sorted(_BRANCH_ROUTER_KNOWN_KEYS)}."
+            )
+
+    def _resolve(key: str, default):
+        if isinstance(nested, dict) and key in nested:
+            return nested[key], "branch_router"
+        flat_key = f"branch_{key}"
+        if flat_key in mcfg:
+            return mcfg[flat_key], flat_key
+        return default, None
+
+    balancing, src = _resolve("balancing", "none")
+    if balancing not in _BRANCH_BALANCING_VALID:
+        raise ValueError(
+            f"model.{src}.balancing={balancing!r} is invalid; "
+            f"must be one of {sorted(_BRANCH_BALANCING_VALID)}"
+        )
+    decay, src = _resolve("exploration_decay", "constant")
+    if decay not in _BRANCH_DECAY_VALID:
+        raise ValueError(
+            f"model.{src}.exploration_decay={decay!r} is invalid; "
+            f"must be one of {sorted(_BRANCH_DECAY_VALID)}"
+        )
+    rate, src = _resolve("exploration_rate", 0.0)
+    if not (0.0 <= rate <= 1.0):
+        raise ValueError(
+            f"model.{src}.exploration_rate={rate} must be in [0.0, 1.0]"
+        )
+    floor, src = _resolve("exploration_min", 0.0)
+    if not (0.0 <= floor <= 1.0):
+        raise ValueError(
+            f"model.{src}.exploration_min={floor} must be in [0.0, 1.0]"
+        )
+    if floor > rate:
+        raise ValueError(
+            f"model.branch_router.exploration_min ({floor}) exceeds "
+            f"exploration_rate ({rate}); the floor is reached at "
+            f"warmup_steps and so cannot exceed the initial rate."
+        )
+    warmup, src = _resolve("exploration_warmup_steps", 0)
+    if not isinstance(warmup, int) or warmup < 0:
+        raise ValueError(
+            f"model.{src}.exploration_warmup_steps={warmup} must be "
+            f"a non-negative int"
+        )
+
+    # Reject conflicting nested-vs-flat assignments on the SAME field.
+    if isinstance(nested, dict):
+        for key in _BRANCH_ROUTER_KNOWN_KEYS:
+            if key not in nested:
+                continue
+            flat_key = f"branch_{key}"
+            if flat_key not in mcfg:
+                continue
+            if nested[key] != mcfg[flat_key]:
+                raise ValueError(
+                    f"model.branch_router.{key}={nested[key]!r} "
+                    f"conflicts with model.{flat_key}={mcfg[flat_key]!r}. "
+                    f"Both forms are present with different values; the "
+                    f"nested form takes precedence at runtime, but a "
+                    f"production yaml should not carry conflicting "
+                    f"settings. Either drop the legacy flat field or "
+                    f"reconcile the values."
+                )
+
+
 def normalize_balancing_config(cfg: dict) -> dict:
     """Apply AUTO-ZERO + warn for legacy coefficients when
     `load_balancing_method` is set.

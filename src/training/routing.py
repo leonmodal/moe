@@ -401,51 +401,112 @@ def apply_branch_exploration_only_rate(model, rate: float) -> int:
     return updated
 
 
+def collect_branch_attn_counts(
+    model,
+) -> tuple[int, int, list[tuple[int, int]]] | None:
+    """Token-weighted ATTN-vs-total branch-selection counts on the
+    most recent forward. Returns
+    `(global_attn_count, global_total_count, per_depth_list)` where
+    `per_depth_list[i] == (attn_count_at_depth_i, total_count_at_depth_i)`.
+    Returns `None` when the model has no branch-decision cache (so the
+    trainer's logging path can skip the metric).
+
+    These raw counts are the right shape for cross-rank token-weighted
+    reduction: `dist.all_reduce(SUM)` the numerator/denominator pairs
+    across ranks, then divide. Averaging already-averaged fractions
+    across ranks is wrong when ranks have different per-rank token
+    counts (e.g. heterogeneous batch sizes).
+    """
+    raw_model = unwrap_model(model)
+    inner = getattr(raw_model, "model", raw_model)
+    cache = getattr(inner, "_all_branch_selected_experts", None)
+    if cache is None:
+        cache = getattr(raw_model, "_all_branch_selected_experts", None)
+    if not cache:
+        return None
+
+    per_depth: list[tuple[int, int]] = []
+    total_attn = 0
+    total_count = 0
+    for selected in cache:
+        if selected is None:
+            continue
+        attn_count = int((selected == 0).sum().item())
+        n = int(selected.numel())
+        per_depth.append((attn_count, n))
+        total_attn += attn_count
+        total_count += n
+
+    if not per_depth:
+        return None
+    return total_attn, total_count, per_depth
+
+
 def collect_branch_attn_fraction(
     model,
 ) -> tuple[float | None, list[float] | None]:
     """Per-step branch routing telemetry: the fraction of branch tokens
     that chose ATTN (selected_experts == 0) on the most recent forward.
 
-    Reads `BranchRouter.last_selected_experts` (a long tensor populated
-    on every forward, irrespective of routing mode). Walks every
-    `BranchRouter` instance on `model` and skips MLP / attention
-    routers that share the balancing-owner interface but route over
-    `num_experts > 2` pools (selected_experts == 0 there does not
-    mean ATTN, so including them in the average would silently pollute
-    the metric).
+    Reads the model's per-depth branch-selection cache populated by the
+    most recent forward. For `MoEverythingForCausalLM`, the inner
+    backbone (`model.model`) appends every depth's
+    `last_selected_experts` into `_all_branch_selected_experts` on each
+    `_depth_step`, so a shared branch router (the default
+    `per_layer_router=False` path) is observable across all depths
+    even though the module-level `last_selected_experts` is overwritten
+    on every depth call. Reading from the all-depths cache is the only
+    correct way to compute `% ATTN` over the full step's branch
+    decisions.
 
     Returns `(global_mean, per_depth)`:
 
-    * `global_mean` is the unweighted average of every router's ATTN
-      fraction. When no router has a populated tensor, returns
-      `(None, None)` so the trainer's logging path can treat that
-      situation as "do not emit the metric".
-    * `per_depth` is the list of per-router ATTN fractions, in
-      module-tree iteration order. For `per_layer_router=True` the list
+    * `global_mean` is TOKEN-WEIGHTED across all depths: the total
+      ATTN-token count divided by the total branch-token count. For a
+      step where one depth chose ATTN for every token and the next
+      chose MLP for every token, the global mean is 0.5 — not 0.0 (the
+      shared module's final-depth view) and not the average of two
+      already-averaged fractions (which is meaningless if depths have
+      different token counts).
+    * `per_depth` is the list of per-depth ATTN fractions, one entry
+      per populated cache slot. For `per_layer_router=True` the list
       has `num_hidden_layers` entries, one per depth; for the singular
-      `branch_router` path the list has length 1. The trainer logs
-      these under per-depth keys (`train/branch_attn_fraction/depth_<i>`)
-      so per-depth divergence is visible in W&B.
+      `branch_router` path the list also has `num_hidden_layers`
+      entries (one per depth call of the SAME shared router), so
+      per-depth divergence is visible regardless of routing mode.
+
+    Returns `(None, None)` when no branch decisions are present (e.g.
+    a non-moe_everything model, or a moe_everything model that has not
+    been run since construction). The trainer's logging path treats
+    `(None, None)` as "do not emit the metric this step", so models
+    without branch routers do not pay the wandb-payload cost.
 
     Mask-based exploration_only fraction is exposed by a separate
     `collect_branch_explore_mask_fraction(model)` helper for diagnostic
     runs that want to see how often the random override was taken.
     """
-    from src.models.routing.routers import BranchRouter
-
     raw_model = unwrap_model(model)
-    fractions: list[float] = []
-    for module in raw_model.modules():
-        if not isinstance(module, BranchRouter):
-            continue
-        selected = getattr(module, "last_selected_experts", None)
+    inner = getattr(raw_model, "model", raw_model)
+    cache = getattr(inner, "_all_branch_selected_experts", None)
+    if cache is None:
+        cache = getattr(raw_model, "_all_branch_selected_experts", None)
+    if not cache:
+        return None, None
+
+    per_depth: list[float] = []
+    total_attn = 0
+    total_count = 0
+    for selected in cache:
         if selected is None:
             continue
-        fractions.append(float((selected == 0).float().mean().item()))
-    if not fractions:
+        per_depth.append(float((selected == 0).float().mean().item()))
+        total_attn += int((selected == 0).sum().item())
+        total_count += int(selected.numel())
+
+    if not per_depth:
         return None, None
-    return sum(fractions) / len(fractions), fractions
+    global_mean = total_attn / total_count
+    return global_mean, per_depth
 
 
 def collect_branch_explore_mask_fraction(model) -> float | None:
