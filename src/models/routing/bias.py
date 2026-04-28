@@ -44,7 +44,7 @@ def update_bias_from_counts(
     zero_sum: bool = True,
 ) -> None:
     """Update expert bias in-place using the configured DeepSeek-V3-style
-    sign update. DEC-2 (RESOLVED → AC-6) selects between two reference
+    sign update. the bias-update mode selector selects between two reference
     formulations via the `zero_sum` flag.
 
     `zero_sum=True` (default, mirrors `nmoe.Router.update_bias`):

@@ -144,7 +144,7 @@ def collect_router_z_losses(routers: Iterable[nn.Module]) -> torch.Tensor | None
 _SCORE_FUNCTIONS = {"softmax", "sigmoid", "sqrtsoftplus"}
 _TOPK_ORDERINGS = {"post", "pre"}
 
-# DEC-17 (RESOLVED → AC-1 task38): the canonical name for the score-function
+# the softmax_position naming rule: the canonical name for the score-function
 # vs top-k ordering knob is `softmax_position` (matches Megatron-LM's naming),
 # with values `pre_topk` and `post_topk`. Old names map as:
 #     softmax_position = "pre_topk"  ⟷ legacy router_topk_ordering = "post"
@@ -166,7 +166,7 @@ def _resolve_softmax_position(config) -> str:
 
     Returns one of `_SOFTMAX_POSITIONS`. Raises `ValueError` for unknown
     values. When neither field is set, defaults to `pre_topk` (preserves
-    the pre-DEC-17 default behaviour: softmax applied to all experts
+    the pre-the softmax_position naming rule default behaviour: softmax applied to all experts
     before top-k).
     """
     canonical = getattr(config, "softmax_position", None)
@@ -177,7 +177,7 @@ def _resolve_softmax_position(config) -> str:
             if mapped != canonical:
                 # `legacy` is set AND maps to a different canonical value.
                 warnings.warn(
-                    f"DEC-17 conflict: config sets BOTH softmax_position={canonical!r} "
+                    f"softmax_position/router_topk_ordering conflict: config sets BOTH softmax_position={canonical!r} "
                     f"AND legacy router_topk_ordering={legacy!r}; using softmax_position. "
                     f"Remove the legacy field to silence this warning.",
                     DeprecationWarning, stacklevel=3,
@@ -196,7 +196,7 @@ def _resolve_softmax_position(config) -> str:
             )
         canonical = _LEGACY_TOPK_ORDERING_TO_SOFTMAX_POSITION[legacy]
         warnings.warn(
-            f"DEC-17: config field `router_topk_ordering={legacy!r}` is "
+            f"softmax_position migration: config field `router_topk_ordering={legacy!r}` is "
             f"deprecated; rename it to `softmax_position={canonical!r}`. "
             f"The legacy field is supported for one release.",
             DeprecationWarning, stacklevel=3,
@@ -206,7 +206,7 @@ def _resolve_softmax_position(config) -> str:
 
 
 def _validate_softmax_position_top1_guard(softmax_position: str, top_k: int) -> None:
-    """DEC-17 top-1 guard validator: `softmax_position=post_topk` with
+    """top-1 routing-weight guard validator: `softmax_position=post_topk` with
     `top_k=1` produces a constant `1.0` weight (softmax of a single
     selected logit), which kills the gradient signal that would route
     through the routing weight back to the gate. Reject this combination
@@ -215,7 +215,7 @@ def _validate_softmax_position_top1_guard(softmax_position: str, top_k: int) -> 
     """
     if softmax_position == "post_topk" and top_k == 1:
         raise ValueError(
-            "DEC-17 top-1 guard: softmax_position='post_topk' with top_k=1 "
+            "top-1 routing-weight guard: softmax_position='post_topk' with top_k=1 "
             "kills routing-weight gradients (softmax of one logit ≡ 1.0). "
             "Either pick softmax_position='pre_topk' (default; computes "
             "softmax over all experts before top-k so the selected weight "
@@ -271,7 +271,7 @@ class ExplorationTopKRouter(Qwen3MoeTopKRouter):
                 f"router_score_function must be one of {sorted(_SCORE_FUNCTIONS)}, "
                 f"got {self.score_function!r}"
             )
-        # DEC-17 (RESOLVED → AC-1 task38): canonical name is
+        # the softmax_position naming rule: canonical name is
         # `softmax_position` ∈ {pre_topk, post_topk}; legacy
         # `router_topk_ordering` is accepted with a DeprecationWarning.
         # We keep `self.topk_ordering` populated with the legacy value
@@ -291,7 +291,7 @@ class ExplorationTopKRouter(Qwen3MoeTopKRouter):
         self._last_top_k_idx = None
         self._last_exploration_mask = None
         self._last_z_loss = None
-        # DEC-15 DETACH-ONLY: telemetry state populated on every forward.
+        # DETACH-ONLY: telemetry state populated on every forward.
         self._last_router_scores_detached = None
 
     def forward(self, hidden_states: torch.Tensor):
@@ -429,7 +429,7 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
             exploration_mask = None
             selection_scores = biased_scores
             if self.training and self.exploration_rate > 0.0:
-                # AC-9: rely on `torch.utils.checkpoint`'s default
+                # Recompute determinism: rely on `torch.utils.checkpoint`'s default
                 # `preserve_rng_state=True` for recompute determinism.
                 # PyTorch saves the RNG state on the real forward and
                 # restores it before the recompute, so `torch.rand_like`
@@ -484,7 +484,7 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
         else:
             self._last_top_k_idx = top_k_idx.detach()
 
-        # DEC-15 DETACH-ONLY: stash a detached snapshot of the per-expert
+        # DETACH-ONLY: stash a detached snapshot of the per-expert
         # scores so non-aux methods can keep telemetry (`f_i` plots, routing
         # heatmaps) without retaining the autograd graph.
         # `output_router_logits=False` skips the model-level model output but

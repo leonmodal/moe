@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 
-# Re-export the DEC-3b resolver so existing import sites
+# Re-export the canonical-block resolver so existing import sites
 # (`from .model_factory import _resolve_balancing_field`) keep working.
 from .balancing_fields import (  # noqa: F401
     _BALANCING_FIELDS_IN_TRAINING,
@@ -93,8 +93,8 @@ def _set_router_params(config, model_cfg: dict) -> None:
     """Plumb shared router knobs (softmax-family and DeepSeek both honour these)."""
     config.router_exploration_rate = model_cfg.get("router_exploration_rate", 0.0)
     # Scoring function and softmax position (softmax-family router only;
-    # DeepSeek forces sigmoid + its own selection path). DEC-17 (RESOLVED →
-    # AC-1 task38): `softmax_position` is the canonical field name;
+    # DeepSeek forces sigmoid + its own selection path). the softmax_position naming rule (RESOLVED →
+    # softmax_position): `softmax_position` is the canonical field name;
     # `router_topk_ordering` is accepted as a deprecated alias with a
     # DeprecationWarning emitted from `_resolve_softmax_position`.
     config.router_score_function = model_cfg.get("router_score_function", "softmax")
@@ -169,7 +169,7 @@ def build_model(cfg: dict):
         model = Qwen3ForCausalLM(config)
         return model, config
 
-    # DEC-15 / task14: resolve `output_router_logits` from the method.
+    # the DETACH-ONLY policy / : resolve `output_router_logits` from the method.
     # For aux methods, router scores need to be gradient-bearing in the
     # model output so the aux loss term can backprop through them. For
     # non-aux methods (deepseek_bias, quantile, none), we don't return
@@ -191,7 +191,7 @@ def build_model(cfg: dict):
         rope_theta=mcfg.get("rope_theta", 1_000_000.0),
         rms_norm_eps=mcfg.get("rms_norm_eps", 1e-6),
         tie_word_embeddings=mcfg.get("tie_word_embeddings", False),
-        # Per DEC-3b: aux coefficients live in `training:`. Fall back to
+        # Per the canonical-block resolver rule: aux coefficients live in `training:`. Fall back to
         # `model:` with a deprecation warning for unmigrated yamls.
         router_aux_loss_coef=_resolve_balancing_field(cfg, "router_aux_loss_coef", 0.001),
         seq_aux_loss_coef=_resolve_balancing_field(cfg, "seq_aux_loss_coef", 0.0),
@@ -255,7 +255,7 @@ def build_model(cfg: dict):
         )
         # Router-option knobs attached post-construction (the config __init__
         # does not currently enumerate them; _set_router_params is the single
-        # source of truth across all MoE families). DEC-17 → AC-1 task38:
+        # source of truth across all MoE families). the softmax_position naming rule → softmax_position:
         # `softmax_position` is the canonical field name; legacy
         # `router_topk_ordering` is accepted with a DeprecationWarning.
         config.router_score_function = mcfg.get("router_score_function", "softmax")
@@ -273,7 +273,7 @@ def build_model(cfg: dict):
         except Exception:
             model.set_experts_implementation("eager")
 
-    # AC-1 / DEC-3a: stamp the resolved `load_balancing_method` onto BOTH the
+    # the load-balancing-method gating rule / the canonical-block coefficient normalizer: stamp the resolved `load_balancing_method` onto BOTH the
     # model and its config so every caller (the trainer, ad-hoc test fixtures,
     # the post-step `update_expert_biases` walker) sees the same authoritative
     # value without needing to re-resolve from `cfg`. `normalize_balancing_config`

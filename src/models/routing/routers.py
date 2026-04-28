@@ -70,7 +70,7 @@ class BranchRouter(nn.Module):
         # cache → 0 saved tensors). The count-buffer guard in
         # `forward` plus PyTorch's RNG preservation are sufficient.
         if use_deepseek_style:
-            # Canonical balancing-owner buffer interface (DEC-18 / DEC-19): every
+            # Canonical balancing-owner buffer interface (the balancing-owner buffer interface): every
             # owner — standalone DeepSeekRouter, BranchRouter, or shared expert
             # bank — exposes the same `expert_bias` (persistent fp32) and
             # `local_tokens_per_expert` (non-persistent fp32) attributes so the
@@ -109,7 +109,7 @@ class BranchRouter(nn.Module):
                 scores = torch.sigmoid(logits)
                 biased = scores + self.expert_bias.to(scores.dtype)
                 if self.training and self.use_sampling:
-                    # AC-9: rely on `torch.utils.checkpoint`'s default
+                    # Recompute determinism: rely on `torch.utils.checkpoint`'s default
                     # `preserve_rng_state=True` so `torch.multinomial`
                     # produces identical draws on real forward and recompute.
                     flat = scores.view(-1, 2)
@@ -120,13 +120,13 @@ class BranchRouter(nn.Module):
             else:
                 probs = F.softmax(logits, dim=-1)
                 if self.training and self.use_sampling:
-                    # AC-9: same RNG-preservation rationale as above.
+                    # Recompute determinism: same RNG-preservation rationale as above.
                     flat = probs.view(-1, 2)
                     choice = torch.multinomial(flat, 1).view(probs.shape[:-1])
                 else:
                     choice_scores = probs.float()
                     if self.training and self.exploration_rate > 0.0:
-                        # AC-9: rely on `torch.utils.checkpoint`'s default
+                        # Recompute determinism: rely on `torch.utils.checkpoint`'s default
                         # `preserve_rng_state=True` for recompute determinism.
                         # Both `torch.rand` for the binary mask and
                         # `torch.rand_like` for the override values produce
@@ -152,7 +152,7 @@ class BranchRouter(nn.Module):
                 probs = probs.unsqueeze(1).expand(B, T, 2)
 
         # Track counts for bias update (DeepSeek style). Skip on gradient-checkpoint
-        # recompute so backward replays do not double-count (AC-9 / DEC-18).
+        # recompute so backward replays do not double-count (the recompute-determinism rule / the unified balancing-owner buffer interface).
         if (
             self.use_deepseek_style
             and self.training

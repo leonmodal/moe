@@ -3,7 +3,7 @@ Fixed load-balancing loss for MoE training.
 
 Two variants:
   1. load_balancing_loss_func — batch-level Switch Transformer loss with global
-     aggregation under DDP (DEC-4): both `tokens_per_expert` and
+     aggregation under DDP : both `tokens_per_expert` and
      `router_prob_per_expert` are all-reduced (SUM, divided by world_size)
      across ranks before forming the per-expert product, matching Megatron-LM's
      `global_tokens_per_expert` / `aggregated_probs_per_expert` contract. The
@@ -18,7 +18,7 @@ Fixes vs the HuggingFace transformers implementation:
   1. No double softmax — router already returns softmax probabilities,
      the HF loss applies softmax again which flattens the distribution
      and makes the loss blind to imbalance.
-  2. (DEC-4 superseded) `f_i` was previously rank-local; the global-aggregate
+  2. ((superseded)) `f_i` was previously rank-local; the global-aggregate
      path is the canonical Megatron-aligned semantics now.
 """
 import torch
@@ -30,7 +30,7 @@ def _maybe_all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
     """Sum `tensor` across DDP ranks, in-place. No-op when distributed is not
     initialized.
 
-    Used for global-aggregate Switch aux (DEC-4): we sum per-rank numerators
+    Used for global-aggregate Switch aux : we sum per-rank numerators
     and denominators separately and divide globally, which is exact even when
     per-rank active-token counts disagree (the token-mask path).
     """

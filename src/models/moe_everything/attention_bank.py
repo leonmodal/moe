@@ -740,14 +740,14 @@ class AttentionExpertBank(nn.Module):
             # Expand mask to match per-head flattened probs: (N,) -> (N*H,)
             if num_head_repeats > 1:
                 flat_mask = flat_mask.repeat(num_head_repeats)
-            # AC-8: build the dense `router_logits` via the FUNCTIONAL
+            # Gradient-preservation rule: build the dense `router_logits` via the FUNCTIONAL
             # `index_copy` (out-of-place) so autograd records a
             # `IndexCopyBackward` and gradient flows from `dense_probs` back to
             # `router_probs` and onward to the attention router weight. The
             # legacy `dense[mask] = src` indexed-assignment pattern is
             # autograd-opaque when `dense` is a leaf with `requires_grad=False`
             # (which `new_zeros(...)` produces), and was the root cause of the
-            # AC-8 regression.
+            # the gradient-preservation regression.
             mask_idx = flat_mask.nonzero(as_tuple=False).squeeze(-1)
             dense_probs = torch.zeros(
                 flat_mask.numel(),
@@ -776,7 +776,7 @@ class AttentionExpertBank(nn.Module):
             }
             return
 
-        # AC-8: same gradient-preserving rule for the non-token-masked path.
+        # Gradient-preservation rule: same gradient-preserving rule for the non-token-masked path.
         self.last_router_info[name] = {
             "router_logits": router_probs,
             "router_logits_detached": router_probs.detach(),

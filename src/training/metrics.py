@@ -75,7 +75,7 @@ def get_output_router_token_masks(output, model=None) -> tuple[torch.Tensor | No
     masks = getattr(output, "router_token_masks", None)
     if masks:
         return tuple(masks)
-    # DEC-15 fallback: when the model's forward skipped writing router_token_masks
+    # the DETACH-ONLY policy fallback: when the model's forward skipped writing router_token_masks
     # to the output (non-aux methods), the moe_everything inner model still
     # accumulates per-depth token masks under `_all_mlp_token_masks`. Use them
     # so non-aux MoE-Everything metrics weight expert load by active tokens
@@ -89,7 +89,7 @@ def get_output_router_token_masks(output, model=None) -> tuple[torch.Tensor | No
 
 
 def _collect_detached_router_scores(model) -> tuple[torch.Tensor, ...] | None:
-    """DEC-15 DETACH-ONLY telemetry consumer (MLP-only).
+    """DETACH-ONLY telemetry consumer (MLP-only).
 
     When the model's `forward` skips returning gradient-bearing
     `router_logits` (non-aux methods), telemetry consumers can still
@@ -172,7 +172,7 @@ def compute_output_metrics(
 
     aux = getattr(output, "aux_loss", None)
     aux_normalized = None
-    # DEC-15 DETACH-ONLY: when the model output's `router_logits` is None
+    # DETACH-ONLY: when the model output's `router_logits` is None
     # (non-aux method that skips the gradient-bearing path), fall back to
     # the per-router `_last_router_scores_detached` snapshot. Telemetry
     # remains available without retaining the autograd graph.
@@ -190,7 +190,7 @@ def compute_output_metrics(
     ce_tensor = getattr(output, "ce_loss", None)
     seq_aux = getattr(output, "seq_aux_loss", None)
     if seq_aux is None and seq_aux_loss_coef > 0 and router_logits_for_metrics is not None:
-        # DEC-15: same detached fallback for seq aux telemetry.
+        # the DETACH-ONLY policy: same detached fallback for seq aux telemetry.
         seq_aux = seq_load_balancing_loss_func(
             router_logits_for_metrics,
             model_cfg.num_experts,

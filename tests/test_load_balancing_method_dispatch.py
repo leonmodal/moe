@@ -253,7 +253,7 @@ def test_method_in_legacy_model_block_warns_then_normalizes():
     ]
     # Two warnings expected: one for legacy `model:` placement of
     # `load_balancing_method`, one for the AUTO-ZERO of `bias_update_rate`.
-    assert any("DEC-3b" in m for m in deprecation_msgs)
+    assert any("deprecated" in m and "model:" in m for m in deprecation_msgs)
     assert any("AUTO-ZERO" in m for m in deprecation_msgs)
 
 

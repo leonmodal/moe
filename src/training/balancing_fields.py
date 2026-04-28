@@ -20,14 +20,14 @@ import warnings
 from typing import Any
 
 
-# Fields that MUST live under `cfg["training"]` per DEC-3b.
+# Fields that MUST live under `cfg["training"]` per the canonical-block resolver rule.
 _BALANCING_FIELDS_IN_TRAINING: tuple[str, ...] = (
     "router_aux_loss_coef",
     "seq_aux_loss_coef",
     "bias_update_rate",
     "bias_warmup_start",
     "bias_warmup_steps",
-    "bias_update_zero_sum",  # DEC-2 mode selector — see TrainingConfig comment.
+    "bias_update_zero_sum",  # mode selector — see TrainingConfig comment.
     "load_balancing_method",
     "bias_rate_q",
     "bias_rate_k",
@@ -56,14 +56,14 @@ def _resolve_balancing_field(cfg: dict, name: str, default: Any) -> Any:
         if name in mcfg:
             warnings.warn(
                 f"Config field {name!r} appears in BOTH `training:` and `model:`; "
-                f"using the `training:` value (canonical per DEC-3b). Remove the "
+                f"using the `training:` value (canonical per the canonical-block resolver rule). Remove the "
                 f"`model:` copy to silence this warning.",
                 DeprecationWarning, stacklevel=3,
             )
         return tcfg[name]
     if name in mcfg:
         warnings.warn(
-            f"Config field {name!r} found under `model:` — DEC-3b moved it to "
+            f"Config field {name!r} found under `model:` — the canonical-block resolver rule moved it to "
             f"`training:`. The `model:` placement is deprecated; run "
             f"`python scripts/migrate_balancing_fields_to_training.py` to migrate.",
             DeprecationWarning, stacklevel=3,
@@ -72,7 +72,7 @@ def _resolve_balancing_field(cfg: dict, name: str, default: Any) -> Any:
     return default
 
 
-# AC-1 / DEC-3a: which legacy coefficients are kept active under each
+# the load-balancing-method gating rule / the canonical-block coefficient normalizer: which legacy coefficients are kept active under each
 # `load_balancing_method`. Anything outside the per-method "active" set is
 # AUTO-ZEROED with a deprecation warning so the trainer's coefficient-driven
 # code paths produce behavior consistent with the resolved method.
@@ -83,7 +83,7 @@ _VALID_LOAD_BALANCING_METHODS: tuple[str, ...] = (
     "quantile",
     "none",
 )
-# DEC-15 (RESOLVED 2026-04-27 → AC-1 task14): methods whose loss term needs
+# the DETACH-ONLY policy: methods whose loss term needs
 # `router_logits` exposed as a gradient-bearing model output. For other
 # methods, the model's `forward` should NOT request loss-bearing router
 # logits — non-aux methods drive routing through the router-internal
@@ -95,9 +95,9 @@ _AUX_BEARING_METHODS: frozenset = frozenset({"aux_loss", "seq_aux_loss"})
 def output_router_logits_for_method(method: str | None) -> bool:
     """Resolve the `output_router_logits` flag from `load_balancing_method`.
 
-    Per DEC-15:
+    Per the DETACH-ONLY policy:
       - `None` (no method set; legacy back-compat): return True (preserve
-        the pre-DEC-15 default; any caller that opts out can pass `None`
+        the pre-the DETACH-ONLY policy default; any caller that opts out can pass `None`
         explicitly to bypass).
       - `aux_loss` / `seq_aux_loss`: return True (router scores are
         gradient-bearing inputs to the aux loss term).
@@ -123,7 +123,7 @@ _METHOD_ACTIVE_FIELDS: dict[str, frozenset[str]] = {
 
 
 def normalize_balancing_config(cfg: dict) -> dict:
-    """Apply DEC-3a AUTO-ZERO + warn for legacy coefficients when
+    """Apply AUTO-ZERO + warn for legacy coefficients when
     `load_balancing_method` is set.
 
     Mutates `cfg` in place AND returns it for fluent chaining. Reads
@@ -133,10 +133,10 @@ def normalize_balancing_config(cfg: dict) -> dict:
     coefficient-driven runtime sees its original values). When the method is
     EXPLICITLY set — including `none` — every legacy coefficient outside the
     method's active set is auto-zeroed with a deprecation warning. `none`'s
-    active set is empty, so it zeroes everything (AC-16: `balancing: none`
+    active set is empty, so it zeroes everything (Per the `none` method contract: `balancing: none`
     disables all balancing).
 
-    Per DEC-3a (RESOLVED 2026-04-27 → AC-1): repository configs are stricter
+    the load-balancing-method coefficient normalizer: repository configs are stricter
     (rejection, via the future config validator); external/legacy configs go
     through AUTO-ZERO at runtime.
     """
@@ -178,7 +178,7 @@ def normalize_balancing_config(cfg: dict) -> dict:
                 src_block[field] = 0.0 if isinstance(value, float) else 0
     if conflicts:
         msg_lines = [
-            f"DEC-3a AUTO-ZERO: load_balancing_method={method!r} is incompatible with "
+            f"AUTO-ZERO: load_balancing_method={method!r} is incompatible with "
             f"the following non-zero coefficients (zeroed at runtime; please remove "
             f"them from the yaml to silence this warning):"
         ]

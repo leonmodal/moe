@@ -176,9 +176,9 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
     def get_all_balancing_owners(self):
         """Yield (owner_module, label) for every load-balancing owner.
 
-        Pre-DEC-19 implementation: each per-layer `GlobalSparseMoeBlock.gate`
+        Pre-the bank-level balancing-state rule implementation: each per-layer `GlobalSparseMoeBlock.gate`
         owns its own `expert_bias` / `local_tokens_per_expert` buffers, so the
-        walker visits all per-layer routers. The DEC-19 refactor (Milestone C)
+        walker visits all per-layer routers. The the planned bank-level state refactor
         will collapse these to a single bank-level owner on `self.model`.
         """
         for layer in self.model.layers:
@@ -192,7 +192,7 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
         if selected_experts is not None:
             output.selected_experts = selected_experts
 
-        # AC-1: gate aux / seq-aux additions by the resolved
+        # Method gating: gate aux / seq-aux additions by the resolved
         # `load_balancing_method`. See the matching `StandardMoEModel.forward`
         # comment for the rationale. `None` preserves legacy back-compat
         # coefficient-driven behavior.
@@ -202,7 +202,7 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
 
         # Recompute aux loss. See `StandardMoEModel.forward` for the rationale
         # behind the aux_active gate plus the detached old_aux subtraction
-        # for non-aux methods (DEC-15 DETACH-ONLY).
+        # for non-aux methods (DETACH-ONLY).
         if output.router_logits is not None and output.aux_loss is not None:
             old_aux = output.aux_loss
             if aux_active:
@@ -247,7 +247,7 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
             )
             output.loss = output.loss + seq_coef * seq_aux
 
-        # DEC-15 DETACH-ONLY: for non-aux methods, detach the model output's
+        # DETACH-ONLY: for non-aux methods, detach the model output's
         # `router_logits` even if the caller forced `output_router_logits=True`.
         # See `StandardMoEModel.forward` for the rationale.
         if not (aux_active or seq_aux_active) and output.router_logits is not None:

@@ -500,11 +500,11 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
     def get_all_balancing_owners(self):
         """Yield (owner_module, label) for every load-balancing owner.
 
-        Pre-DEC-19 implementation: routers across the MLP bank, the four
+        Pre-the bank-level balancing-state rule implementation: routers across the MLP bank, the four
         attention router classes, and the branch router(s) each own their own
         `expert_bias` / `local_tokens_per_expert` buffers. Labels match the
         per-projection bias-rate keys consumed by the trainer
-        (`bias_rate_q/k/v/o/mlp/branch`). The DEC-19 refactor (Milestone C)
+        (`bias_rate_q/k/v/o/mlp/branch`). The the planned bank-level state refactor
         will collapse the MLP and attention routers to bank-level owners.
         """
         inner = self.model
@@ -538,7 +538,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                     # one router serves all heads); fall back to "q" so the
                     # default per_proj_rates dict still resolves to a numeric
                     # rate. Specialized split-rate users can extend the map
-                    # once DEC-19 lands a cleaner naming.
+                    # once the bank-level balancing-state rule lands a cleaner naming.
                     label = "q"
                 yield m, label
 
@@ -585,7 +585,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
             ce_loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
             loss = ce_loss
 
-            # AC-1: gate aux / seq-aux additions by the resolved
+            # Method gating: gate aux / seq-aux additions by the resolved
             # `load_balancing_method`. `None` keeps the legacy coefficient-
             # driven behavior; explicit methods restrict to the method's
             # active loss term. `normalize_balancing_config` already
@@ -622,7 +622,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                     loss = loss + seq_aux_coef * seq_aux
 
             # Attention expert router losses.
-            # AC-1: only run when method allows aux or seq_aux contributions.
+            # Method gating: only run when method allows aux or seq_aux contributions.
             # Skip auxiliary terms in sanity mode because routing is deterministic there.
             if (
                 (aux_active or seq_aux_active)
@@ -698,7 +698,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
             branch_probs_out = tuple(t.detach() for t in branch_prob_tensors) if branch_prob_tensors is not None else None
             attention_router_info_out = None
             if attention_router_info is not None:
-                # DEC-15 DETACH-ONLY: for non-aux methods, expose the
+                # DETACH-ONLY: for non-aux methods, expose the
                 # `router_logits_detached` side channel that
                 # `attention_bank._store_router_info` always populates. The
                 # gradient-bearing `router_logits` view is reserved for aux

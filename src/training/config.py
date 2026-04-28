@@ -53,7 +53,7 @@ class TrainingConfig:
     bias_update_rate: float = 0.0
     bias_warmup_start: float = 0.0
     bias_warmup_steps: int = 0
-    # DEC-2 (RESOLVED → AC-6): selects between the nmoe / DeepSeek-V3 zero-sum
+    # the bias-update mode selector: selects between the nmoe / DeepSeek-V3 zero-sum
     # update (default, True) and the Megatron-LM plain-sign update (False).
     #   True  → bias -= (sign(load - 1/E) - mean(sign(load - 1/E))) * rate
     #           Reference: nmoe/nmoe/model.py:Router.update_bias
@@ -63,7 +63,7 @@ class TrainingConfig:
     # signal; the zero-sum version pins the cumulative bias mean at zero so
     # `expert_bias` does not drift unboundedly under asymmetric loads.
     bias_update_zero_sum: bool = True
-    # Router-exploration warmup (AC-10, from docs/research/external_moe_techniques.md).
+    # Router-exploration warmup (from docs/research/external_moe_techniques.md).
     # The "target" rate is the model-side `router_exploration_rate`. When
     # `router_exploration_warmup_steps > 0` the trainer lineartly schedules the
     # effective rate from `router_exploration_warmup_start` at step 0 to the
@@ -74,7 +74,7 @@ class TrainingConfig:
 
 
 def load_config(path: str) -> dict:
-    """Load a YAML configuration file and apply DEC-3a method normalization.
+    """Load a YAML configuration file and apply the canonical-block coefficient normalizer method normalization.
 
     Calling `normalize_balancing_config` here (instead of only in
     `scripts/train.py`) ensures every caller — `build_training_config`,

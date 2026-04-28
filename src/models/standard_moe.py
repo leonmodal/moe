@@ -44,7 +44,7 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
         """Yield (owner_module, label) for every load-balancing owner.
 
         Standard MoE has per-layer expert pools, so each layer's `gate` owns its
-        own `expert_bias` / `local_tokens_per_expert` buffers (DEC-19 rule:
+        own `expert_bias` / `local_tokens_per_expert` buffers (the bank-level balancing-state rule:
         per-layer pools keep per-router state).
         """
         for layer in self.model.layers:
@@ -58,7 +58,7 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
         if selected_experts is not None:
             output.selected_experts = selected_experts
 
-        # AC-1: gate aux / seq-aux additions by the resolved
+        # Method gating: gate aux / seq-aux additions by the resolved
         # `load_balancing_method`. `None` (no method set) keeps legacy
         # coefficient-driven behavior; explicit methods restrict to the
         # method's active loss term. `normalize_balancing_config` already
@@ -75,7 +75,7 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
         # the base class's broken double-softmax aux contribution. For aux
         # methods we then add `coef * new_aux` (graph-bearing) so the
         # corrected aux loss term can backprop through router_logits. For
-        # non-aux methods (DEC-15 DETACH-ONLY) we:
+        # non-aux methods (DETACH-ONLY) we:
         #   - subtract `coef * old_aux.detach()` (no gradient flow through
         #     the base class's old_aux), and
         #   - compute `new_aux` under `torch.no_grad()` purely as detached
@@ -125,7 +125,7 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
             )
             output.loss = output.loss + seq_coef * seq_aux
 
-        # DEC-15 DETACH-ONLY: for non-aux methods, the model output's
+        # DETACH-ONLY: for non-aux methods, the model output's
         # `router_logits` must be detached even if the caller forced
         # `output_router_logits=True`. Telemetry is preserved (the values are
         # available) but the autograd graph is not retained — so a downstream

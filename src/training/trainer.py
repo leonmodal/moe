@@ -140,7 +140,7 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
                 print("Gradient checkpointing enabled.", flush=True)
 
     model.to(device)
-    # Per DEC-3b: seq_aux_loss_coef lives under `training:` (canonical). The
+    # Per the canonical-block resolver rule: seq_aux_loss_coef lives under `training:` (canonical). The
     # resolver falls back to `model:` with a deprecation warning for any
     # unmigrated yamls.
     from .balancing_fields import _resolve_balancing_field

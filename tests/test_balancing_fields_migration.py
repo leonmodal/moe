@@ -98,9 +98,10 @@ def test_resolver_warns_when_field_still_under_model_block():
     assert rate == 0.002
     assert any(
         issubclass(w.category, DeprecationWarning)
-        and "DEC-3b" in str(w.message)
+        and "deprecated" in str(w.message)
+        and "model:" in str(w.message)
         for w in caught
-    ), f"Expected DEC-3b deprecation warning, got: {[str(w.message) for w in caught]}"
+    ), f"Expected canonical-block deprecation warning, got: {[str(w.message) for w in caught]}"
 
 
 def test_resolver_prefers_training_block_when_field_in_both():
@@ -204,9 +205,9 @@ def test_build_training_config_resolves_legacy_model_block():
     deprecation_msgs = [
         str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)
     ]
-    assert any("DEC-3b" in m for m in deprecation_msgs), (
-        f"Expected at least one DEC-3b deprecation warning from build_training_config, "
-        f"got: {deprecation_msgs}"
+    assert any("deprecated" in m and "model:" in m for m in deprecation_msgs), (
+        f"Expected at least one canonical-block deprecation warning from "
+        f"build_training_config, got: {deprecation_msgs}"
     )
 
 
@@ -300,7 +301,7 @@ def test_build_training_config_bias_update_zero_sum_legacy_model_block_warns():
         str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)
     ]
     assert any("bias_update_zero_sum" in m for m in deprecation_msgs), (
-        f"Expected a DEC-3b DeprecationWarning for legacy "
+        f"Expected a canonical-block DeprecationWarning for legacy "
         f"`model.bias_update_zero_sum`; got: {deprecation_msgs}"
     )
 

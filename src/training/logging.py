@@ -150,7 +150,7 @@ def save_routing_plots(
                 "O": raw_model._global_o_bias.detach().cpu().numpy(),
                 "MLP": raw_model._global_mlp_bias.detach().cpu().numpy(),
             }
-        # Branch-router biases (DEC-18: buffer name unified to `expert_bias`).
+        # Branch-router biases (the unified balancing-owner buffer interface: buffer name unified to `expert_bias`).
         # Singular and plural attribute names both exist depending on
         # `per_layer_router`; iterate both.
         attn_b, mlp_b = [], []

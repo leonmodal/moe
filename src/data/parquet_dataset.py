@@ -48,8 +48,8 @@ class DataConfig:
     # Dataset-level read-ahead of parquet files. 1 = read one file ahead in a
     # background thread while the main process tokenizes; 0 disables prefetch.
     # Prefetch is keyed strictly by file order so resume stays exact. The trainer
-    # forces DataLoader num_workers=0 for AC-12 correctness, so this is the
-    # correct layer to add parallelism for AC-8 throughput.
+    # forces DataLoader num_workers=0 for deterministic resume correctness, so this is the
+    # correct layer to add parallelism for throughput.
     prefetch_files: int = 1
 
 

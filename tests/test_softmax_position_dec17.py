@@ -123,7 +123,7 @@ def test_resolve_canonical_overrides_inconsistent_legacy_with_warning():
     assert result == "post_topk"
     deprecation_warnings = [w for w in caught if issubclass(w.category, DeprecationWarning)]
     assert len(deprecation_warnings) == 1
-    assert "DEC-17 conflict" in str(deprecation_warnings[0].message)
+    assert "softmax_position/router_topk_ordering conflict" in str(deprecation_warnings[0].message)
 
 
 @pytest.mark.parametrize(
@@ -149,7 +149,7 @@ def test_top1_guard_rejects_post_topk_with_topk_1():
     """The top-1 guard must reject `post_topk` + `top_k=1` because
     softmax of a single selected logit yields a constant `1.0` weight,
     destroying the gradient signal."""
-    with pytest.raises(ValueError, match="DEC-17 top-1 guard"):
+    with pytest.raises(ValueError, match="top-1 routing-weight guard"):
         _validate_softmax_position_top1_guard("post_topk", top_k=1)
 
 
@@ -202,7 +202,7 @@ def test_exploration_topk_router_legacy_field_still_works_with_warning():
 def test_exploration_topk_router_top1_guard_in_constructor():
     """Constructor rejects `softmax_position=post_topk` + `top_k=1`."""
     cfg = _make_config(top_k=1, softmax_position="post_topk")
-    with pytest.raises(ValueError, match="DEC-17 top-1 guard"):
+    with pytest.raises(ValueError, match="top-1 routing-weight guard"):
         ExplorationTopKRouter(cfg)
 
 
@@ -211,7 +211,7 @@ def test_exploration_topk_router_top1_guard_via_legacy_alias():
     the legacy alias `router_topk_ordering=pre` (which maps to
     `softmax_position=post_topk`) with `top_k=1`."""
     cfg = _make_config(top_k=1, router_topk_ordering="pre")
-    with pytest.raises(ValueError, match="DEC-17 top-1 guard"):
+    with pytest.raises(ValueError, match="top-1 routing-weight guard"):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             ExplorationTopKRouter(cfg)
