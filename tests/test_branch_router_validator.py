@@ -277,49 +277,37 @@ def test_validator_rejects_mlp_router_invalid_decay():
         _validator()(cfg)
 
 
-def test_validator_branch_router_accepts_aux_loss():
-    """The branch router can opt into the regular aux-loss method.
-    Earlier validator versions only accepted `none` and
-    `exploration_only`; the broader contract accepts all five
-    balancing methods plus `exploration_only`.
+def test_validator_branch_router_rejects_aux_loss_until_runtime_lands():
+    """The branch router currently implements only `none` and
+    `exploration_only` in `BranchRouter.__init__`. The validator
+    rejects every other method on branch_router so the failure
+    surfaces at config-load time rather than inside the
+    `build_model` -> BranchRouter constructor. The broader set
+    (aux_loss, seq_aux_loss, deepseek_bias, quantile) requires
+    runtime work in BranchRouter and is gated on a separate
+    workstream.
     """
     cfg = {"model": {"branch_router": {"balancing": "aux_loss"}}}
-    _validator()(cfg)
+    with pytest.raises(ValueError, match="branch_router.balancing="):
+        _validator()(cfg)
 
 
-def test_validator_branch_router_accepts_seq_aux_loss():
+def test_validator_branch_router_rejects_seq_aux_loss():
     cfg = {"model": {"branch_router": {"balancing": "seq_aux_loss"}}}
-    _validator()(cfg)
+    with pytest.raises(ValueError, match="branch_router.balancing="):
+        _validator()(cfg)
 
 
-def test_validator_branch_router_accepts_deepseek_bias():
+def test_validator_branch_router_rejects_deepseek_bias():
     cfg = {"model": {"branch_router": {"balancing": "deepseek_bias"}}}
-    _validator()(cfg)
+    with pytest.raises(ValueError, match="branch_router.balancing="):
+        _validator()(cfg)
 
 
-def test_validator_branch_router_accepts_quantile():
+def test_validator_branch_router_rejects_quantile():
     cfg = {"model": {"branch_router": {"balancing": "quantile"}}}
-    _validator()(cfg)
-
-
-def test_validator_branch_router_accepts_quantile_with_knobs():
-    """Quantile balancing requires the quantile-method knobs
-    (quantile_eta, quantile_target_q, quantile_global_state). The
-    schema must accept them on every router group so configs can be
-    authored against the nested schema before the quantile runtime
-    lands.
-    """
-    cfg = {
-        "model": {
-            "branch_router": {
-                "balancing": "quantile",
-                "quantile_eta": 0.01,
-                "quantile_target_q": 0.5,
-                "quantile_global_state": True,
-            }
-        }
-    }
-    _validator()(cfg)
+    with pytest.raises(ValueError, match="branch_router.balancing="):
+        _validator()(cfg)
 
 
 def test_validator_mlp_router_accepts_quantile_with_knobs():
@@ -350,18 +338,14 @@ def test_validator_attn_router_accepts_quantile_with_knobs():
     _validator()(cfg)
 
 
-def test_validator_router_groups_accept_deepseek_bias_knobs():
-    """All three router groups accept the DeepSeek-bias update knobs
-    so nested schemas can drive per-class bias updates."""
+def test_validator_mlp_attn_router_groups_accept_deepseek_bias_knobs():
+    """The mlp_router and attn_router groups accept the DeepSeek-bias
+    update knobs (per-class). branch_router is restricted to {none,
+    exploration_only} until the BranchRouter runtime supports the
+    broader method set, so the deepseek_bias method on branch_router
+    is rejected separately."""
     cfg = {
         "model": {
-            "branch_router": {
-                "balancing": "deepseek_bias",
-                "bias_update_rate": 0.001,
-                "bias_update_zero_sum": True,
-                "bias_warmup_start": 0.0,
-                "bias_warmup_steps": 1000,
-            },
             "mlp_router": {
                 "balancing": "deepseek_bias",
                 "bias_update_rate": 0.001,

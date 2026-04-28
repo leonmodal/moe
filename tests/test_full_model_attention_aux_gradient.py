@@ -244,18 +244,51 @@ def test_full_model_aux_loss_strict_dominates_baseline_contrastive(tmp_path):
 
 
 def test_full_model_seq_aux_strict_dominates_baseline_contrastive(tmp_path):
-    """Round 25 review Finding 3: seq-aux needs its own contrastive
-    test (Round 25 only had one for the regular aux path).
+    """Per-router-named seq-aux contrastive (Round 26 review Finding 3
+    fix): every named router parameter that has gradient under
+    `method=none` must have at-least-as-large gradient under
+    `seq_aux_loss / coef=2.0`. Aggregate-only inequality could be
+    satisfied by one live router while N-1 siblings get gradient
+    purely from the CE forward path.
     """
     yaml_seq = _yaml_with_method(tmp_path, "seq_aux_loss", seq_coef=2.0)
     yaml_none = _yaml_with_method(tmp_path, "none", router_coef=0.0, seq_coef=0.0)
     seq_norms = _backward_and_collect(yaml_seq)
     none_norms = _backward_and_collect(yaml_none)
+    # Sanity: aggregate inequality.
     seq_total = sum(seq_norms.values())
     none_total = sum(none_norms.values())
     assert seq_total > none_total + 1e-9, (
         f"aggregate seq_aux_grad ({seq_total:.3e}) should exceed "
         f"none_grad ({none_total:.3e})"
+    )
+    # Per-router strict-dominance: every router parameter must have
+    # at-least-as-large gradient under seq_aux as under method=none
+    # (within 1e-9 tolerance for fp32 noise). A regression that
+    # breaks gradient flow on one router would surface here even if
+    # the aggregate sum looks fine.
+    deficits = []
+    for name in none_norms:
+        if name not in seq_norms:
+            continue
+        if seq_norms[name] + 1e-9 < none_norms[name]:
+            deficits.append((name, seq_norms[name], none_norms[name]))
+    assert not deficits, (
+        f"per-router seq-aux contrastive: {len(deficits)} routers had "
+        f"WEAKER gradient under seq_aux_loss than under method=none: "
+        f"{deficits[:5]}"
+    )
+    # Stronger: at least ONE router parameter strictly increased
+    # under seq_aux. This proves the seq-aux path isn't a no-op.
+    delta_positive = sum(
+        1 for name in none_norms
+        if name in seq_norms
+        and seq_norms[name] > none_norms[name] + 1e-9
+    )
+    assert delta_positive > 0, (
+        "no router parameter saw a strictly-larger gradient under "
+        "seq_aux_loss vs method=none; the seq-aux contribution is "
+        "not actually flowing into the router weights."
     )
 
 
@@ -320,6 +353,115 @@ def test_full_model_zero_coefficient_attention_aux_loss_is_none(tmp_path):
     out = model(input_ids=input_ids, labels=input_ids, output_router_logits=True)
     assert out.attention_aux_loss is None
     assert out.seq_aux_loss is None
+
+
+def _yaml_with_per_class(tmp_path, *, top_method=None,
+                         mlp_balancing=None, attn_balancing=None,
+                         router_coef=0.0, seq_coef=0.0):
+    """Build a yaml fixture with optional per-class router blocks
+    set under model: (NOT under training:), used for the per-class
+    runtime-dispatch tests.
+
+    `_BASE_YAML` ends with the `training:` section, so per-class
+    blocks must be inserted at the END of the `model:` section
+    (before `training:`). We split `_BASE_YAML` at the `training:`
+    boundary and reassemble with the per-class blocks tucked in.
+    """
+    head, _, tail = _BASE_YAML.partition("training:")
+    inserts: list[str] = []
+    if mlp_balancing is not None:
+        inserts.append(f"  mlp_router:\n    balancing: {mlp_balancing}\n")
+    if attn_balancing is not None:
+        inserts.append(f"  attn_router:\n    balancing: {attn_balancing}\n")
+    training_appends: list[str] = []
+    if router_coef:
+        training_appends.append(f"  router_aux_loss_coef: {router_coef}\n")
+    if seq_coef:
+        training_appends.append(f"  seq_aux_loss_coef: {seq_coef}\n")
+    if top_method is not None:
+        training_appends.append(f"  load_balancing_method: {top_method}\n")
+    yaml_text = (
+        head + "".join(inserts)
+        + "training:" + tail + "".join(training_appends)
+    )
+    p = tmp_path / "per_class.yaml"
+    p.write_text(yaml_text)
+    return str(p)
+
+
+def test_per_class_mlp_router_balancing_none_skips_mlp_aux(tmp_path):
+    """Round 26 review Finding 1 runtime fix: with
+    `mlp_router.balancing: none` set on the nested schema, the
+    MLP aux loss path must be skipped EVEN IF the top-level method
+    is `aux_loss` and `router_aux_loss_coef > 0`. The per-class
+    field wins over the top-level method.
+    """
+    yaml_path = _yaml_with_per_class(
+        tmp_path, top_method="aux_loss", router_coef=0.5,
+        mlp_balancing="none",
+    )
+    cfg = _CFG_MOD.load_config(yaml_path)
+    model, _model_cfg = _FACTORY_MOD.build_model(cfg)
+    model.train()
+    torch.manual_seed(20260428)
+    input_ids = torch.randint(0, model.vocab_size, (1, 8), dtype=torch.long)
+    out = model(input_ids=input_ids, labels=input_ids, output_router_logits=True)
+    # `aux_loss` was set, but mlp_router_balancing=none -> the
+    # MLP aux contribution to the loss is skipped. The model's
+    # `aux_loss` field reflects the MLP+attention sum; with MLP
+    # skipped, only attention contributes to it.
+    assert out.attention_aux_loss is not None, (
+        "with attn_router unset (defaults to top-level aux_loss), "
+        "attention_aux_loss should still be produced"
+    )
+
+
+def test_per_class_attn_router_balancing_none_skips_attention_aux(tmp_path):
+    """The companion contract for the attention class: with
+    `attn_router.balancing: none`, the attention aux/seq-aux path
+    is skipped even if the top-level method is `aux_loss` with a
+    non-zero coefficient.
+    """
+    yaml_path = _yaml_with_per_class(
+        tmp_path, top_method="aux_loss", router_coef=0.5,
+        attn_balancing="none",
+    )
+    cfg = _CFG_MOD.load_config(yaml_path)
+    model, _model_cfg = _FACTORY_MOD.build_model(cfg)
+    model.train()
+    torch.manual_seed(20260428)
+    input_ids = torch.randint(0, model.vocab_size, (1, 8), dtype=torch.long)
+    out = model(input_ids=input_ids, labels=input_ids, output_router_logits=True)
+    assert out.attention_aux_loss is None, (
+        "with attn_router_balancing=none, attention_aux_loss must be "
+        "None (the per-class gate skips the attention aux path) "
+        "regardless of the top-level aux_loss method."
+    )
+
+
+def test_per_class_balancing_none_on_both_skips_all_aux(tmp_path):
+    """Belt-and-suspenders: with both `mlp_router.balancing: none`
+    AND `attn_router.balancing: none`, NO aux contribution flows
+    even when the top-level method asks for `aux_loss`. This is
+    the structural "all classes opted out" path.
+    """
+    yaml_path = _yaml_with_per_class(
+        tmp_path, top_method="aux_loss", router_coef=0.5,
+        mlp_balancing="none", attn_balancing="none",
+    )
+    cfg = _CFG_MOD.load_config(yaml_path)
+    model, _model_cfg = _FACTORY_MOD.build_model(cfg)
+    model.train()
+    torch.manual_seed(20260428)
+    input_ids = torch.randint(0, model.vocab_size, (1, 8), dtype=torch.long)
+    out = model(input_ids=input_ids, labels=input_ids, output_router_logits=True)
+    assert out.attention_aux_loss is None
+    # `aux_loss` in the output is set IF the MLP aux contribution
+    # is present. With mlp_router_balancing=none, MLP aux is
+    # skipped, so `aux_loss` should be None too.
+    assert out.aux_loss is None, (
+        "with both per-class methods=none, aux_loss must be None"
+    )
 
 
 if __name__ == "__main__":

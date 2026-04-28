@@ -152,14 +152,23 @@ _COMMON_ROUTER_KNOBS = frozenset({
     "exploration_warmup_steps",
 })
 
-# Branch-router accepts every method + the branch-only
-# `exploration_only` rate-driven mode. The `exploration_only` value
-# is unique to the branch router; the other four methods (aux_loss,
-# seq_aux_loss, deepseek_bias, quantile) and `none` are shared with
-# MLP/attention routers.
+# Branch-router currently accepts only `none` and `exploration_only`
+# at the BranchRouter constructor. The validator deliberately tracks
+# the runtime here: a yaml that asks for
+# `branch_router.balancing: aux_loss` should fail at config-load
+# time (clear error, points the author at the broader plan workstream)
+# rather than at `build_model` time inside the BranchRouter
+# constructor. The full set of balancing methods (aux_loss,
+# seq_aux_loss, deepseek_bias, quantile) for the branch router
+# requires runtime work — uniform branch aux/seq-aux contribution
+# through the loss path, branch DeepSeek bias via the unified bias
+# owner, and branch quantile via the quantile owner. The MLP and
+# attention router groups DO accept the broader value set since
+# their forward dispatch can gate on the per-class method without
+# new router-class code.
 _BRANCH_ROUTER_KNOWN_KEYS = frozenset(_COMMON_ROUTER_KNOBS)
 
-_BRANCH_BALANCING_VALID = frozenset(_VALID_LOAD_BALANCING_METHODS) | frozenset({"exploration_only"})
+_BRANCH_BALANCING_VALID = frozenset({"none", "exploration_only"})
 
 _BRANCH_DECAY_VALID = frozenset({"constant", "linear", "cosine"})
 

@@ -608,10 +608,37 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
             # auto-zeros conflicting coefficients, but the explicit gate
             # here is belt-and-suspenders against future regressions.
             method = getattr(self, "_load_balancing_method", None)
-            aux_active = method is None or method == "aux_loss"
-            seq_aux_active = method is None or method == "seq_aux_loss"
+            top_aux_active = method is None or method == "aux_loss"
+            top_seq_aux_active = method is None or method == "seq_aux_loss"
 
-            if aux_active and mlp_router_logits is not None:
+            # Per-class method gating: when the nested-schema yaml sets
+            # `model.mlp_router.balancing` or `model.attn_router.balancing`,
+            # the per-class value WINS over the top-level method. This is
+            # the runtime side of the nested-schema contract: a yaml that
+            # opts MLP into aux_loss and attention into seq_aux_loss can
+            # express that without the legacy top-level method having to
+            # be both at once. When a per-class field is unset, fall back
+            # to the top-level decision so legacy yamls keep working.
+            mlp_class_method = getattr(self.config, "mlp_router_balancing", None)
+            attn_class_method = getattr(self.config, "attn_router_balancing", None)
+            mlp_aux_active = (
+                top_aux_active if mlp_class_method is None
+                else mlp_class_method == "aux_loss"
+            )
+            mlp_seq_aux_active = (
+                top_seq_aux_active if mlp_class_method is None
+                else mlp_class_method == "seq_aux_loss"
+            )
+            attn_aux_active = (
+                top_aux_active if attn_class_method is None
+                else attn_class_method == "aux_loss"
+            )
+            attn_seq_aux_active = (
+                top_seq_aux_active if attn_class_method is None
+                else attn_class_method == "seq_aux_loss"
+            )
+
+            if mlp_aux_active and mlp_router_logits is not None:
                 mlp_aux = load_balancing_loss_func(
                     mlp_router_logits,
                     self.num_experts,
@@ -624,7 +651,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                     loss = loss + self.router_aux_loss_coef * mlp_aux
 
             seq_aux_coef = getattr(self, "_seq_aux_loss_coef", 0.0)
-            if seq_aux_active and seq_aux_coef > 0 and mlp_router_logits is not None:
+            if mlp_seq_aux_active and seq_aux_coef > 0 and mlp_router_logits is not None:
                 seq_aux = seq_load_balancing_loss_func(
                     mlp_router_logits,
                     self.num_experts,
@@ -641,7 +668,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
             # Method gating: only run when method allows aux or seq_aux contributions.
             # Skip auxiliary terms in sanity mode because routing is deterministic there.
             if (
-                (aux_active or seq_aux_active)
+                (attn_aux_active or attn_seq_aux_active)
                 and attention_router_info is not None
                 and getattr(self.config, "sanity_check_mode", None) != "alternating_global_moe"
             ):
@@ -665,7 +692,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                     else:
                         n_experts = num_attn_experts
                         n_per_tok = 1  # per-head top-1 routing
-                    if aux_active:
+                    if attn_aux_active:
                         attn_aux = load_balancing_loss_func(
                             r_logits,
                             n_experts,
@@ -675,7 +702,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                         )
                         if isinstance(attn_aux, torch.Tensor):
                             attention_aux_loss = attn_aux if attention_aux_loss is None else attention_aux_loss + attn_aux
-                    if seq_aux_active and seq_aux_coef > 0:
+                    if attn_seq_aux_active and seq_aux_coef > 0:
                         attn_seq_aux = seq_load_balancing_loss_func(
                             r_logits, n_experts, n_per_tok,
                             batch_size=input_ids.shape[0],
@@ -685,7 +712,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                         if isinstance(attn_seq_aux, torch.Tensor):
                             loss = loss + seq_aux_coef * attn_seq_aux
 
-            if aux_active and isinstance(attention_aux_loss, torch.Tensor):
+            if attn_aux_active and isinstance(attention_aux_loss, torch.Tensor):
                 aux_loss = attention_aux_loss if aux_loss is None else aux_loss + attention_aux_loss
                 loss = loss + self.router_aux_loss_coef * attention_aux_loss
 

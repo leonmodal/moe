@@ -386,6 +386,118 @@ def test_bench_step_rejects_chunked_ce_until_runtime_implemented(tiny_config_yam
     )
 
 
+def test_summarize_max_row_picks_largest_stable_batch_not_fastest_tps():
+    """`_summarize_max_row` must pick the LARGEST stable global
+    batch first, then fastest tokens/sec at that batch — not just
+    the fastest tokens/sec across all rows. Codex Round 26 review
+    found that a smaller batch with marginally higher tokens/sec
+    was preferred over a larger stable batch. Synthesize two
+    stable rows: (b=1, ga=1, tps=1000) and (b=8, ga=4, tps=900).
+    The correct answer is global_batch=32 (b=8, ga=4), not 1.
+    """
+    repo = REPO
+    cmd = [
+        sys.executable, "-c",
+        """
+import importlib.util, json
+spec = importlib.util.spec_from_file_location("bench_step", "scripts/bench_step.py")
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+import argparse
+args = argparse.Namespace(config="probe.yaml", memory_headroom_gb=0.0)
+records = [
+    {
+        "batch_size": 1, "gradient_accumulation": 1,
+        "gradient_checkpointing": False, "chunked_ce": False,
+        "tokens_per_second_median": 1000.0, "wall_seconds_median": 0.001,
+        "peak_gpu_memory_bytes": None, "headroom_bytes": None,
+        "oom": False,
+    },
+    {
+        "batch_size": 8, "gradient_accumulation": 4,
+        "gradient_checkpointing": False, "chunked_ce": False,
+        "tokens_per_second_median": 900.0, "wall_seconds_median": 0.0011,
+        "peak_gpu_memory_bytes": None, "headroom_bytes": None,
+        "oom": False,
+    },
+]
+out = mod._summarize_max_row(records, args=args, seq_len=2048, device="cpu")
+print(json.dumps(out))
+"""
+    ]
+    env = {"PYTHONPATH": str(repo), **os.environ}
+    result = subprocess.run(cmd, cwd=str(repo), env=env,
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+    assert out["max_per_rank_batch"] == 8, (
+        f"max_per_rank_batch should be 8 (largest stable per-rank batch), "
+        f"got {out['max_per_rank_batch']}"
+    )
+    assert out["max_global_batch"] == 32, (
+        f"max_global_batch should be 8*4=32, got {out['max_global_batch']}"
+    )
+    assert out["grad_accum_at_max"] == 4
+    assert out["tokens_per_sec_at_max"] == 900.0
+
+
+def test_summarize_max_row_tie_breaks_fastest_at_max_batch():
+    """When two rows tie at the max global batch, the row with the
+    higher tokens/sec wins. Synthesize three rows: (b=1,ga=1,tps=500),
+    (b=8,ga=4,tps=900,grad_ckpt=False), (b=4,ga=8,tps=1100,grad_ckpt=True).
+    Both later rows have global=32 (the max); the tie-break picks
+    the faster one (tps=1100, grad_ckpt=True).
+    """
+    repo = REPO
+    cmd = [
+        sys.executable, "-c",
+        """
+import importlib.util, json
+spec = importlib.util.spec_from_file_location("bench_step", "scripts/bench_step.py")
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+import argparse
+args = argparse.Namespace(config="probe.yaml", memory_headroom_gb=0.0)
+records = [
+    {
+        "batch_size": 1, "gradient_accumulation": 1,
+        "gradient_checkpointing": False, "chunked_ce": False,
+        "tokens_per_second_median": 500.0, "wall_seconds_median": 0.002,
+        "peak_gpu_memory_bytes": None, "headroom_bytes": None,
+        "oom": False,
+    },
+    {
+        "batch_size": 8, "gradient_accumulation": 4,
+        "gradient_checkpointing": False, "chunked_ce": False,
+        "tokens_per_second_median": 900.0, "wall_seconds_median": 0.0011,
+        "peak_gpu_memory_bytes": None, "headroom_bytes": None,
+        "oom": False,
+    },
+    {
+        "batch_size": 4, "gradient_accumulation": 8,
+        "gradient_checkpointing": True, "chunked_ce": False,
+        "tokens_per_second_median": 1100.0, "wall_seconds_median": 0.0009,
+        "peak_gpu_memory_bytes": None, "headroom_bytes": None,
+        "oom": False,
+    },
+]
+out = mod._summarize_max_row(records, args=args, seq_len=2048, device="cpu")
+print(json.dumps(out))
+"""
+    ]
+    env = {"PYTHONPATH": str(repo), **os.environ}
+    result = subprocess.run(cmd, cwd=str(repo), env=env,
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+    assert out["max_global_batch"] == 32
+    assert out["max_per_rank_batch"] == 4, (
+        f"tie-break at global_batch=32 should pick (b=4, ga=8) for tps=1100, "
+        f"got max_per_rank_batch={out['max_per_rank_batch']}"
+    )
+    assert out["grad_accum_at_max"] == 8
+    assert out["grad_ckpt_at_max"] is True
+    assert out["tokens_per_sec_at_max"] == 1100.0
+
+
 def test_bench_step_disables_wandb_eval_heatmap_paths():
     """The bench is required by AC-19/DEC-8 to disable W&B,
     checkpoint, eval, and heatmap paths. The

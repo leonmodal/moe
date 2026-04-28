@@ -263,8 +263,8 @@ def _maybe_enable_chunked_ce(model, chunked_ce: bool) -> None:
         "chunked_ce=true was requested but the model does not expose "
         "a `set_chunked_ce(...)` runtime hook. The chunked-CE / "
         "fused-linear-CE path needs to be implemented in the model "
-        "code before it can be a bench search axis. See the AC-25 "
-        "speed-borrowing track for the implementation."
+        "code before it can be a bench search axis. Add the runtime "
+        "hook (the throughput-optimization workstream) and re-run."
     )
 
 
@@ -480,12 +480,24 @@ def _summarize_max_row(
         grad_ckpt_at_max, chunked_ce_at_max, median_step_s_at_max,
         tokens_per_sec_at_max, peak_mem_gb_at_max.
 
-    "Max" means the FASTEST stable point: among all non-OOM rows
-    that respect the `--memory-headroom-gb` gate, pick the row with
-    the highest `tokens_per_second_median`. The `max_global_batch`
-    is `batch_size * gradient_accumulation` (DDP world-size is
-    factored in by the caller — single-rank runs treat it as
-    world_size=1).
+    Selection algorithm:
+
+      1. Filter to rows that completed without OOM AND respect the
+         `--memory-headroom-gb` gate.
+      2. Among the eligible rows, find the LARGEST stable global
+         batch (`batch_size * gradient_accumulation`). The "max
+         global batch" is the primary axis: a smaller batch with
+         higher tokens/sec is NOT preferred over a larger stable
+         batch — the latter unlocks more gradient signal per step.
+      3. Tie-break the largest-batch group by FASTEST timing
+         (highest `tokens_per_second_median`). Among the tied
+         rows, the fastest setting is the recommended max
+         configuration.
+
+    `max_per_rank_batch` is the per-rank batch at the chosen row;
+    `max_global_batch = max_per_rank_batch * grad_accum_at_max`. DDP
+    world-size is factored in by the caller (single-rank runs treat
+    `world_size=1`).
     """
     headroom_bytes_gate = int(args.memory_headroom_gb * (1 << 30))
     eligible = [
@@ -514,22 +526,31 @@ def _summarize_max_row(
             "n_grid_points": len(records),
             "n_eligible": 0,
         }
-    fastest = max(eligible, key=lambda r: r["tokens_per_second_median"])
+    # Step 1: find the largest stable global batch across eligible rows.
+    max_global = max(
+        r["batch_size"] * r["gradient_accumulation"] for r in eligible
+    )
+    # Step 2: among rows at that max global batch, pick the fastest.
+    at_max = [
+        r for r in eligible
+        if r["batch_size"] * r["gradient_accumulation"] == max_global
+    ]
+    chosen = max(at_max, key=lambda r: r["tokens_per_second_median"])
     return {
         "config": args.config,
         "device": str(device),
         "seq_len": seq_len,
         "summary": "max_row",
-        "max_per_rank_batch": fastest["batch_size"],
-        "max_global_batch": fastest["batch_size"] * fastest["gradient_accumulation"],
-        "grad_accum_at_max": fastest["gradient_accumulation"],
-        "grad_ckpt_at_max": fastest["gradient_checkpointing"],
-        "chunked_ce_at_max": fastest["chunked_ce"],
-        "median_step_s_at_max": fastest["wall_seconds_median"],
-        "tokens_per_sec_at_max": fastest["tokens_per_second_median"],
+        "max_per_rank_batch": chosen["batch_size"],
+        "max_global_batch": max_global,
+        "grad_accum_at_max": chosen["gradient_accumulation"],
+        "grad_ckpt_at_max": chosen["gradient_checkpointing"],
+        "chunked_ce_at_max": chosen["chunked_ce"],
+        "median_step_s_at_max": chosen["wall_seconds_median"],
+        "tokens_per_sec_at_max": chosen["tokens_per_second_median"],
         "peak_mem_gb_at_max": (
-            fastest["peak_gpu_memory_bytes"] / (1 << 30)
-            if fastest.get("peak_gpu_memory_bytes") is not None else None
+            chosen["peak_gpu_memory_bytes"] / (1 << 30)
+            if chosen.get("peak_gpu_memory_bytes") is not None else None
         ),
         "n_grid_points": len(records),
         "n_eligible": len(eligible),
