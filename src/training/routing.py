@@ -22,6 +22,7 @@ def update_expert_biases(
     bias_rate: float,
     distributed: bool = False,
     per_proj_rates: dict[str, float] | None = None,
+    zero_sum: bool = True,
 ) -> None:
     """Update expert biases using DeepSeek V3-style load balancing.
 
@@ -66,17 +67,45 @@ def update_expert_biases(
 
     for owner, label in get_owners():
         rate = rates.get(label, bias_rate)
-        _update_single_router_bias(owner, rate, use_dist)
+        _update_single_router_bias(owner, rate, use_dist, zero_sum=zero_sum)
 
 
-def _update_single_router_bias(router, bias_rate: float, distributed: bool) -> None:
+def _update_single_router_bias(
+    router,
+    bias_rate: float,
+    distributed: bool,
+    *,
+    zero_sum: bool = True,
+) -> None:
     """Update expert bias for a single load-balancing owner.
 
-    `counts.sum()` was being computed twice — once for the host-side
-    `> 0` check and again for the normaliser — each call a CPU↔GPU sync.
-    Compute it once and branch on a device-side mask so there's no host
-    barrier (the mask yields a zero update when no tokens were seen,
-    which is equivalent to the previous early-return behaviour).
+    Per DEC-2 (RESOLVED → AC-6) two reference modes are supported, selected
+    by the `zero_sum` flag plumbed from `TrainingConfig.bias_update_zero_sum`:
+
+      `zero_sum=True` (default, matches `nmoe.Router.update_bias` — see
+      `nmoe/nmoe/model.py:92-97`):
+          s     = sign(loads - 1/E)
+          delta = (s - s.mean()) * rate
+          bias -= delta             # cumulative bias mean is pinned at 0
+
+      `zero_sum=False` (matches Megatron-LM's
+      `get_updated_expert_bias` — see Megatron-LM/megatron/core/transformer/
+      moe/moe_utils.py):
+          delta = sign(avg_load - load) * rate
+          bias += delta             # cumulative mean drifts up to ±rate per step
+                                    # under asymmetric loads (still bounded by clamp)
+
+    Both modes target the same intuition: underloaded experts get a small
+    positive bias bump, overloaded experts get a small negative bump.
+    Both clamp the cumulative bias to ±16 after every update (DeepSeek-V3
+    scale guard).
+
+    Implementation note: `counts.sum()` was being computed twice — once
+    for the host-side `> 0` check and again for the normaliser — each
+    call a CPU↔GPU sync. Compute it once and branch on a device-side mask
+    so there's no host barrier (the mask yields a zero update when no
+    tokens were seen, which is equivalent to the previous early-return
+    behaviour).
     """
     with torch.no_grad():
         counts = router.local_tokens_per_expert
@@ -87,7 +116,13 @@ def _update_single_router_bias(router, bias_rate: float, distributed: bool) -> N
         expected = 1.0 / counts.shape[0]
         s = torch.sign(loads - expected)
         nonzero = (total > 0).to(s.dtype)
-        router.expert_bias -= (s - s.mean()) * bias_rate * nonzero
+        if zero_sum:
+            # nmoe / DeepSeek-V3 zero-sum (mean-subtracted) update.
+            router.expert_bias -= (s - s.mean()) * bias_rate * nonzero
+        else:
+            # Megatron-LM plain-sign update; equivalent to flipping the sign
+            # since `s = sign(load - 1/E)` and Megatron uses `sign(avg - load)`.
+            router.expert_bias -= s * bias_rate * nonzero
         router.expert_bias.clamp_(-16.0, 16.0)
         router.local_tokens_per_expert.zero_()
 

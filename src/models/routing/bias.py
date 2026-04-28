@@ -40,22 +40,39 @@ def update_bias_from_counts(
     rate: float,
     clamp_range: float = 16.0,
     distributed: bool = False,
+    *,
+    zero_sum: bool = True,
 ) -> None:
-    """Update expert bias in-place using zero-sum sign update.
+    """Update expert bias in-place using the configured DeepSeek-V3-style
+    sign update. DEC-2 (RESOLVED → AC-6) selects between two reference
+    formulations via the `zero_sum` flag.
 
-    The update rule from DeepSeek V3:
-      s = sign(load - expected)
-      bias -= (s - s.mean()) * rate
-      bias = clamp(bias, -clamp_range, clamp_range)
+    `zero_sum=True` (default, mirrors `nmoe.Router.update_bias`):
+        s     = sign(load - 1/E)
+        delta = (s - s.mean()) * rate
+        bias -= delta
+      The mean-subtraction pins the cumulative bias mean at zero so the
+      bias does not drift unboundedly under asymmetric loads.
 
-    The zero-sum property (s - s.mean()) ensures biases don't drift collectively.
+    `zero_sum=False` (mirrors Megatron-LM's plain-sign update):
+        delta = sign(avg_load - load) * rate
+        bias += delta
+      The mean is allowed to drift up to ±rate per step under asymmetric
+      loads — still bounded by `clamp_range` but otherwise unconstrained.
+
+    Both modes target the same intuition: underloaded experts get a
+    small positive bias bump, overloaded experts get a small negative
+    bump. Both clamp to ±`clamp_range` after the update.
 
     Args:
         bias: (num_experts,) expert bias buffer to update in-place.
         counts: (num_experts,) token counts per expert for this step.
         rate: Bias update rate.
-        clamp_range: Maximum absolute bias value.
+        clamp_range: Maximum absolute bias value (DeepSeek-V3 default 16).
         distributed: Whether to all-reduce counts across workers.
+        zero_sum: True for nmoe / DeepSeek-V3 zero-sum; False for the
+                  Megatron-LM plain-sign reference. Plumbed from
+                  `TrainingConfig.bias_update_zero_sum` (default True).
     """
     with torch.no_grad():
         if distributed:
@@ -65,7 +82,10 @@ def update_bias_from_counts(
             loads = counts / total
             expected = 1.0 / counts.shape[0]
             s = torch.sign(loads - expected)
-            bias -= (s - s.mean()) * rate
+            if zero_sum:
+                bias -= (s - s.mean()) * rate
+            else:
+                bias -= s * rate
             bias.clamp_(-clamp_range, clamp_range)
 
 

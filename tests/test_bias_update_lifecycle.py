@@ -150,26 +150,101 @@ def test_get_bias_rate_respects_model_override():
 # ──────────────────────────────────────────────────────────────────────
 
 def test_bias_update_delta_is_zero_sum():
-    """DEC-2 invariant: the bias delta has zero mean.
+    """DEC-2 invariant (zero_sum=True): the bias delta has zero mean.
 
-    After one update step, sum(new_bias - old_bias) ≈ 0 (within fp32
-    round-off). This keeps the cumulative bias from drifting and is the
-    crucial difference between our zero-sum formulation and the naive
-    Megatron `sign(avg - count) * rate` (which can have nonzero mean
-    when the load distribution is asymmetric)."""
+    After one update step in `zero_sum=True` mode, sum(new_bias -
+    old_bias) ≈ 0 (within fp32 round-off). This keeps the cumulative
+    bias from drifting and is the crucial difference between the
+    nmoe / DeepSeek-V3 zero-sum formulation and the naive Megatron
+    `sign(avg - count) * rate` (which can have nonzero mean when the
+    load distribution is asymmetric)."""
     routing = _load_routing_module()
 
     router = _make_router(num_experts=8)
-    # Asymmetric load (more in some experts than others)
     counts = torch.tensor([10.0, 5.0, 20.0, 3.0, 15.0, 8.0, 12.0, 7.0])
     router.local_tokens_per_expert = counts.clone()
     initial_bias = router.expert_bias.detach().clone()
 
-    routing._update_single_router_bias(router, bias_rate=0.001, distributed=False)
+    routing._update_single_router_bias(
+        router, bias_rate=0.001, distributed=False, zero_sum=True,
+    )
     delta = router.expert_bias - initial_bias
 
     assert delta.sum().abs() < 1e-7, (
-        f"Bias delta is not zero-sum: sum={delta.sum().item()}, delta={delta}"
+        f"zero_sum=True bias delta is not zero-sum: sum={delta.sum().item()}, delta={delta}"
+    )
+
+
+def test_bias_update_megatron_mode_can_drift_mean():
+    """DEC-2 contract for `zero_sum=False`: the Megatron-LM plain-sign
+    update does NOT subtract `s.mean()`, so for asymmetric loads (where
+    `sign(load - 1/E)` is not balanced between +1 and -1) the bias
+    mean drifts.
+
+    Concretely, with 1 overloaded expert and 7 underloaded experts:
+      `s = [+1, -1, -1, -1, -1, -1, -1, -1]`
+      zero-sum delta = (s - s.mean()) * rate = (s + 0.75) * rate; sum = 0.
+      Megatron delta = -s * rate                      ; sum = 6 * rate.
+    This test asserts the Megatron-mode delta has the expected non-zero
+    mean — a defining behavioral difference from the zero-sum mode.
+    """
+    routing = _load_routing_module()
+
+    router = _make_router(num_experts=8)
+    # 1 overloaded expert, 7 underloaded.
+    counts = torch.tensor([100.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    router.local_tokens_per_expert = counts.clone()
+    initial_bias = router.expert_bias.detach().clone()
+
+    rate = 0.001
+    routing._update_single_router_bias(
+        router, bias_rate=rate, distributed=False, zero_sum=False,
+    )
+    delta = router.expert_bias - initial_bias
+
+    # `delta = -sign(loads - 1/E) * rate` =
+    #   for the heavy expert: -1 * rate (negative)
+    #   for the seven light experts: +1 * rate (positive)
+    # Sum = -rate + 7 * rate = +6 * rate.
+    assert delta.sum().item() == pytest.approx(6 * rate, rel=1e-6), (
+        f"zero_sum=False (Megatron) delta sum = {delta.sum().item()}, expected {6*rate}"
+    )
+    # The heavy expert gets bias DECREASED, the light experts INCREASED —
+    # same routing-direction signal as zero-sum mode.
+    assert delta[0].item() < 0, "heavy expert bias must decrease"
+    assert (delta[1:] > 0).all(), "light experts' biases must all increase"
+
+
+@pytest.mark.parametrize("zero_sum", [True, False])
+def test_both_modes_drive_overloaded_bias_negative(zero_sum):
+    """Convergence-style test (DEC-2): under repeated steps with the
+    same overloaded-load pattern, the heavy expert's bias must drift
+    monotonically negative for BOTH modes — they target the same
+    routing-correction signal even though the per-step deltas differ.
+    """
+    routing = _load_routing_module()
+    router = _make_router(num_experts=4)
+    rate = 0.05
+
+    bias_history: list[float] = []
+    for _ in range(20):
+        # Same heavy/light pattern every step (simulates a stuck imbalance).
+        router.local_tokens_per_expert = torch.tensor([100.0, 1.0, 1.0, 1.0])
+        routing._update_single_router_bias(
+            router, bias_rate=rate, distributed=False, zero_sum=zero_sum,
+        )
+        bias_history.append(router.expert_bias[0].item())
+
+    # The heavy expert's bias should be monotonically non-increasing
+    # (allowing equal-step plateaus due to fp32 round-off near zero), and
+    # finish well below where it started.
+    diffs = [bias_history[i+1] - bias_history[i] for i in range(len(bias_history)-1)]
+    assert all(d <= 1e-6 for d in diffs), (
+        f"zero_sum={zero_sum} heavy-expert bias is not monotonically non-increasing: {bias_history}"
+    )
+    assert bias_history[-1] < bias_history[0] - rate, (
+        f"zero_sum={zero_sum} heavy-expert bias did not drift negative enough: "
+        f"started {bias_history[0]}, ended {bias_history[-1]}, rate={rate}"
     )
 
 
@@ -291,6 +366,101 @@ def test_local_tokens_zeroed_after_update():
     routing._update_single_router_bias(router, bias_rate=0.001, distributed=False)
     assert router.local_tokens_per_expert.sum().item() == 0.0, (
         "local_tokens_per_expert must be zeroed after update"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Real DDP all-reduce test (gloo backend, 2 spawned processes)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _ddp_worker(rank: int, world_size: int, port: int, output_path: str):
+    """Worker entry point for the 2-rank DDP all-reduce test.
+
+    Sets up a gloo process group on localhost, runs
+    `_update_single_router_bias(distributed=True)` with ASYMMETRIC
+    per-rank counts, and writes the post-update bias tensor to
+    `output_path` keyed by rank. The parent process then reads both
+    files back and asserts the per-rank biases are identical (the
+    contract: after an all_reduce(SUM) on `local_tokens_per_expert`,
+    every rank computes the same global delta).
+    """
+    import os
+    import torch as _torch
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    import torch.distributed as _dist
+    _dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+
+    routing = _load_routing_module()
+    router = _make_router(num_experts=4)
+
+    # Asymmetric per-rank counts:
+    # rank 0 saw [10, 0, 0, 0]; rank 1 saw [0, 0, 0, 10].
+    # After SUM all-reduce: [10, 0, 0, 10]. Both ranks compute the SAME
+    # bias delta from this aggregate, so post-update biases match.
+    if rank == 0:
+        router.local_tokens_per_expert = _torch.tensor([10.0, 0.0, 0.0, 0.0])
+    else:
+        router.local_tokens_per_expert = _torch.tensor([0.0, 0.0, 0.0, 10.0])
+
+    routing._update_single_router_bias(
+        router, bias_rate=0.01, distributed=True, zero_sum=True,
+    )
+
+    # Persist post-update bias to disk for the parent to compare.
+    _torch.save(router.expert_bias.cpu(), output_path.format(rank=rank))
+    _dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_available(),
+    reason="torch.distributed not available in this build",
+)
+def test_ddp_two_rank_all_reduce_produces_identical_biases(tmp_path):
+    """DEC-2 / AC-6 real-DDP correctness: with 2 spawned worker
+    processes (gloo backend, asymmetric per-rank counts), the
+    post-update `expert_bias` must be identical on both ranks. This
+    proves the `dist.all_reduce(counts, op=SUM)` path actually
+    aggregates counts before the bias update, not just that the call
+    was made (which the mocked test in
+    `test_distributed_path_calls_all_reduce_sum` already covers).
+
+    Uses `torch.multiprocessing.spawn` with the gloo backend so it runs
+    on CPU.
+    """
+    import socket
+    import torch.multiprocessing as mp
+
+    # Find a free port for the rendezvous.
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    output_template = str(tmp_path / "rank_{rank}_bias.pt")
+
+    mp.spawn(
+        _ddp_worker,
+        args=(2, port, output_template),
+        nprocs=2,
+        join=True,
+    )
+
+    rank0_bias = torch.load(output_template.format(rank=0))
+    rank1_bias = torch.load(output_template.format(rank=1))
+
+    torch.testing.assert_close(rank0_bias, rank1_bias, atol=1e-7, rtol=1e-7)
+
+    # Sanity: the expected aggregate is `[10, 0, 0, 10]`, so loads are
+    # `[0.5, 0, 0, 0.5]` and the zero-sum update produces a non-trivial
+    # symmetric delta. Bias should be non-zero somewhere.
+    assert rank0_bias.abs().sum().item() > 0, (
+        "post-update bias is all zeros — all-reduce probably did not run"
     )
 
 

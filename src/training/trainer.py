@@ -478,6 +478,7 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
             update_expert_biases(
                 model, bias_rate=rate, distributed=distributed,
                 per_proj_rates=per_proj_rates,
+                zero_sum=train_cfg.bias_update_zero_sum,
             )
 
         # Routing heatmaps

@@ -12,6 +12,7 @@ Replaces softmax routing with sigmoid + non-gradient expert bias:
 The bias is updated externally by update_expert_biases() in train.py,
 not through gradient descent — this prevents the router from gaming the loss.
 """
+import warnings
 from collections.abc import Iterable
 
 import torch
@@ -143,6 +144,84 @@ def collect_router_z_losses(routers: Iterable[nn.Module]) -> torch.Tensor | None
 _SCORE_FUNCTIONS = {"softmax", "sigmoid", "sqrtsoftplus"}
 _TOPK_ORDERINGS = {"post", "pre"}
 
+# DEC-17 (RESOLVED → AC-1 task38): the canonical name for the score-function
+# vs top-k ordering knob is `softmax_position` (matches Megatron-LM's naming),
+# with values `pre_topk` and `post_topk`. Old names map as:
+#     softmax_position = "pre_topk"  ⟷ legacy router_topk_ordering = "post"
+#         (score function applied to all experts → top-k → gather; softmax
+#         comes BEFORE the top-k selection.)
+#     softmax_position = "post_topk" ⟷ legacy router_topk_ordering = "pre"
+#         (top-k on raw logits → score function only on selected; softmax
+#         comes AFTER the top-k selection.)
+_SOFTMAX_POSITIONS = {"pre_topk", "post_topk"}
+_LEGACY_TOPK_ORDERING_TO_SOFTMAX_POSITION = {
+    "post": "pre_topk",
+    "pre": "post_topk",
+}
+
+
+def _resolve_softmax_position(config) -> str:
+    """Resolve `softmax_position` from config, accepting the deprecated
+    `router_topk_ordering` alias with a `DeprecationWarning`.
+
+    Returns one of `_SOFTMAX_POSITIONS`. Raises `ValueError` for unknown
+    values. When neither field is set, defaults to `pre_topk` (preserves
+    the pre-DEC-17 default behaviour: softmax applied to all experts
+    before top-k).
+    """
+    canonical = getattr(config, "softmax_position", None)
+    legacy = getattr(config, "router_topk_ordering", None)
+    if canonical is not None:
+        if legacy is not None:
+            mapped = _LEGACY_TOPK_ORDERING_TO_SOFTMAX_POSITION.get(legacy)
+            if mapped != canonical:
+                # `legacy` is set AND maps to a different canonical value.
+                warnings.warn(
+                    f"DEC-17 conflict: config sets BOTH softmax_position={canonical!r} "
+                    f"AND legacy router_topk_ordering={legacy!r}; using softmax_position. "
+                    f"Remove the legacy field to silence this warning.",
+                    DeprecationWarning, stacklevel=3,
+                )
+        if canonical not in _SOFTMAX_POSITIONS:
+            raise ValueError(
+                f"softmax_position must be one of {sorted(_SOFTMAX_POSITIONS)}, "
+                f"got {canonical!r}"
+            )
+        return canonical
+    if legacy is not None:
+        if legacy not in _LEGACY_TOPK_ORDERING_TO_SOFTMAX_POSITION:
+            raise ValueError(
+                f"router_topk_ordering must be one of "
+                f"{sorted(_LEGACY_TOPK_ORDERING_TO_SOFTMAX_POSITION)}, got {legacy!r}"
+            )
+        canonical = _LEGACY_TOPK_ORDERING_TO_SOFTMAX_POSITION[legacy]
+        warnings.warn(
+            f"DEC-17: config field `router_topk_ordering={legacy!r}` is "
+            f"deprecated; rename it to `softmax_position={canonical!r}`. "
+            f"The legacy field is supported for one release.",
+            DeprecationWarning, stacklevel=3,
+        )
+        return canonical
+    return "pre_topk"
+
+
+def _validate_softmax_position_top1_guard(softmax_position: str, top_k: int) -> None:
+    """DEC-17 top-1 guard validator: `softmax_position=post_topk` with
+    `top_k=1` produces a constant `1.0` weight (softmax of a single
+    selected logit), which kills the gradient signal that would route
+    through the routing weight back to the gate. Reject this combination
+    early with a clear ValueError rather than letting it silently
+    destabilize training.
+    """
+    if softmax_position == "post_topk" and top_k == 1:
+        raise ValueError(
+            "DEC-17 top-1 guard: softmax_position='post_topk' with top_k=1 "
+            "kills routing-weight gradients (softmax of one logit ≡ 1.0). "
+            "Either pick softmax_position='pre_topk' (default; computes "
+            "softmax over all experts before top-k so the selected weight "
+            "is non-constant) or raise top_k > 1."
+        )
+
 
 def _apply_score_function(logits: torch.Tensor, score_function: str) -> torch.Tensor:
     """Compute per-expert scores from raw router logits.
@@ -192,12 +271,20 @@ class ExplorationTopKRouter(Qwen3MoeTopKRouter):
                 f"router_score_function must be one of {sorted(_SCORE_FUNCTIONS)}, "
                 f"got {self.score_function!r}"
             )
-        self.topk_ordering = getattr(config, "router_topk_ordering", "post")
-        if self.topk_ordering not in _TOPK_ORDERINGS:
-            raise ValueError(
-                f"router_topk_ordering must be one of {sorted(_TOPK_ORDERINGS)}, "
-                f"got {self.topk_ordering!r}"
-            )
+        # DEC-17 (RESOLVED → AC-1 task38): canonical name is
+        # `softmax_position` ∈ {pre_topk, post_topk}; legacy
+        # `router_topk_ordering` is accepted with a DeprecationWarning.
+        # We keep `self.topk_ordering` populated with the legacy value
+        # so the forward-method `if self.topk_ordering == "pre"` checks
+        # below stay back-compat with any downstream code that still
+        # reads it. Future refactors can drop `self.topk_ordering` once
+        # the forward method is rewritten in terms of `softmax_position`.
+        self.softmax_position = _resolve_softmax_position(config)
+        _validate_softmax_position_top1_guard(self.softmax_position, self.top_k)
+        # Reverse-map for back-compat with the existing forward implementation.
+        self.topk_ordering = (
+            "pre" if self.softmax_position == "post_topk" else "post"
+        )
         self.num_groups = getattr(config, "num_groups", None)
         self.group_topk = getattr(config, "group_topk", None)
         self.z_loss_coef = float(getattr(config, "router_z_loss_coef", 0.0) or 0.0)

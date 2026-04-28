@@ -92,10 +92,16 @@ def configure_liger_kernels(cfg: dict) -> str:
 def _set_router_params(config, model_cfg: dict) -> None:
     """Plumb shared router knobs (softmax-family and DeepSeek both honour these)."""
     config.router_exploration_rate = model_cfg.get("router_exploration_rate", 0.0)
-    # Scoring function and top-k ordering (softmax-family router only; DeepSeek
-    # forces sigmoid + its own selection path).
+    # Scoring function and softmax position (softmax-family router only;
+    # DeepSeek forces sigmoid + its own selection path). DEC-17 (RESOLVED →
+    # AC-1 task38): `softmax_position` is the canonical field name;
+    # `router_topk_ordering` is accepted as a deprecated alias with a
+    # DeprecationWarning emitted from `_resolve_softmax_position`.
     config.router_score_function = model_cfg.get("router_score_function", "softmax")
-    config.router_topk_ordering = model_cfg.get("router_topk_ordering", "post")
+    if "softmax_position" in model_cfg:
+        config.softmax_position = model_cfg["softmax_position"]
+    if "router_topk_ordering" in model_cfg:
+        config.router_topk_ordering = model_cfg["router_topk_ordering"]
     # Group-limited top-k (applies to both router families when set).
     config.num_groups = model_cfg.get("num_groups", None)
     config.group_topk = model_cfg.get("group_topk", None)
@@ -249,9 +255,14 @@ def build_model(cfg: dict):
         )
         # Router-option knobs attached post-construction (the config __init__
         # does not currently enumerate them; _set_router_params is the single
-        # source of truth across all MoE families).
+        # source of truth across all MoE families). DEC-17 → AC-1 task38:
+        # `softmax_position` is the canonical field name; legacy
+        # `router_topk_ordering` is accepted with a DeprecationWarning.
         config.router_score_function = mcfg.get("router_score_function", "softmax")
-        config.router_topk_ordering = mcfg.get("router_topk_ordering", "post")
+        if "softmax_position" in mcfg:
+            config.softmax_position = mcfg["softmax_position"]
+        if "router_topk_ordering" in mcfg:
+            config.router_topk_ordering = mcfg["router_topk_ordering"]
         config.router_z_loss_coef = mcfg.get("router_z_loss_coef", 0.0)
         model = MoEverythingForCausalLM(config)
 

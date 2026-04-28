@@ -27,6 +27,7 @@ _BALANCING_FIELDS_IN_TRAINING: tuple[str, ...] = (
     "bias_update_rate",
     "bias_warmup_start",
     "bias_warmup_steps",
+    "bias_update_zero_sum",  # DEC-2 mode selector — see TrainingConfig comment.
     "load_balancing_method",
     "bias_rate_q",
     "bias_rate_k",
@@ -154,8 +155,15 @@ def normalize_balancing_config(cfg: dict) -> dict:
     tcfg = cfg.setdefault("training", {})
     mcfg = cfg.get("model", {}) or {}
     conflicts: list[tuple[str, str, float]] = []
+    # Mode-selector knobs are NOT coefficients; auto-zeroing them would
+    # silently flip a behavior switch (e.g. bias_update_zero_sum=True →
+    # False under load_balancing_method=aux_loss). They live in the
+    # canonical block so they survive yaml migration, but the auto-zero
+    # pass leaves them untouched — the runtime simply ignores them when
+    # the method doesn't use them.
+    _NON_COEFFICIENT_KNOBS = frozenset({"bias_update_zero_sum"})
     for field in _BALANCING_FIELDS_IN_TRAINING:
-        if field == "load_balancing_method" or field in active:
+        if field == "load_balancing_method" or field in active or field in _NON_COEFFICIENT_KNOBS:
             continue
         # Look in both blocks (the resolver returns the first non-default
         # value, but for the auto-zero we need to know where the value LIVES

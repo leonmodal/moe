@@ -257,9 +257,26 @@ router.expert_bias = torch.zeros(num_experts)  # persistent buffer
 After each training step:
 1. **Count**: How many tokens went to each expert (tracked during forward pass)
 2. **All-reduce**: Sum counts across all ranks
-3. **Update**: `bias[i] -= sign(count[i] - mean_count) * bias_rate`
+3. **Update**: applies the configured DEC-2 sign-update mode (default: nmoe / DeepSeek-V3 zero-sum); see "DEC-2 update modes" below.
+4. **Clamp**: bias clamped to ±16 (DeepSeek-V3 scale guard).
 
 Experts that received too many tokens get their bias decreased (making them less likely to be selected). Experts that received too few get their bias increased.
+
+### DEC-2 update modes
+
+`bias_update_zero_sum` (canonical block: `training:`, default `True`)
+selects between two reference formulations:
+
+| `bias_update_zero_sum` | Formula | Reference |
+|-----------------------|---------|-----------|
+| `True` (default) | `s = sign(load - 1/E)` ; `bias -= (s - s.mean()) * rate` | [`nmoe.Router.update_bias`](../nmoe/nmoe/model.py) (DeepSeek-V3-style). The mean-subtraction pins the cumulative bias mean at zero so `expert_bias` does not drift unboundedly under asymmetric loads. |
+| `False` | `bias += sign(avg_load - load) * rate` (equivalent: `bias -= sign(load - 1/E) * rate`) | Megatron-LM `get_updated_expert_bias`. The mean is allowed to drift up to ±`rate` per step under asymmetric loads — still bounded by the clamp but otherwise unconstrained. |
+
+Both modes target the same intuition (overloaded experts → bias down,
+underloaded experts → bias up); the difference is whether the
+cumulative bias mean is pinned at zero. Pick `True` (default) to match
+nmoe / DeepSeek-V3; pick `False` to reproduce Megatron-LM's published
+balancing recipe exactly.
 
 ### Per-layer vs Global bias updates
 
@@ -286,6 +303,7 @@ Late training (alpha~0.0): Global signal dominates, ensuring overall balance.
 | `bias_update_rate` | 0.0 (disabled) | Main bias learning rate |
 | `bias_warmup_start` | 0.0 | Initial rate (ramps to `bias_update_rate`) |
 | `bias_warmup_steps` | 0 | Steps to ramp bias rate |
+| `bias_update_zero_sum` | True | DEC-2 mode selector — see "DEC-2 update modes" above. |
 | `bias_interpolation` | False | Enable alpha interpolation (global MoE) |
 | `bias_interpolation_warmup_steps` | 5000 | Alpha schedule duration |
 

@@ -15,6 +15,7 @@ model:
   branch_router_aux_loss_coef: 0.0
   router_exploration_rate: 0.02
   bias_interpolation: false
+  # DeepSeek-V3 paper Section 3.2 default 2.5; matches nmoe.Router routed_scaling_factor
   topk_scaling_factor: 2.5
   num_groups: 8
   group_topk: 4

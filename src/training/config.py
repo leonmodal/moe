@@ -53,6 +53,16 @@ class TrainingConfig:
     bias_update_rate: float = 0.0
     bias_warmup_start: float = 0.0
     bias_warmup_steps: int = 0
+    # DEC-2 (RESOLVED → AC-6): selects between the nmoe / DeepSeek-V3 zero-sum
+    # update (default, True) and the Megatron-LM plain-sign update (False).
+    #   True  → bias -= (sign(load - 1/E) - mean(sign(load - 1/E))) * rate
+    #           Reference: nmoe/nmoe/model.py:Router.update_bias
+    #   False → bias += sign(avg_load - load) * rate
+    #           Reference: Megatron-LM moe_utils.py get_updated_expert_bias
+    # Both modes target the same "underloaded → up, overloaded → down"
+    # signal; the zero-sum version pins the cumulative bias mean at zero so
+    # `expert_bias` does not drift unboundedly under asymmetric loads.
+    bias_update_zero_sum: bool = True
     # Router-exploration warmup (AC-10, from docs/research/external_moe_techniques.md).
     # The "target" rate is the model-side `router_exploration_rate`. When
     # `router_exploration_warmup_steps > 0` the trainer lineartly schedules the
@@ -124,6 +134,7 @@ def build_training_config(cfg: dict) -> TrainingConfig:
         bias_update_rate=_resolve_balancing_field(cfg, "bias_update_rate", 0.0),
         bias_warmup_start=_resolve_balancing_field(cfg, "bias_warmup_start", 0.0),
         bias_warmup_steps=_resolve_balancing_field(cfg, "bias_warmup_steps", 0),
+        bias_update_zero_sum=_resolve_balancing_field(cfg, "bias_update_zero_sum", True),
         router_exploration_warmup_start=tcfg.get("router_exploration_warmup_start", 0.0),
         router_exploration_warmup_steps=tcfg.get("router_exploration_warmup_steps", 0),
     )
