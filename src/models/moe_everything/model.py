@@ -736,9 +736,47 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                 aux_loss = attention_aux_loss if aux_loss is None else aux_loss + attention_aux_loss
                 loss = loss + attn_aux_coef * attention_aux_loss
 
-            # Do not apply auxiliary balancing to the branch router. The
-            # branch split is part of the model behavior we want to observe,
-            # not something we want to regularize toward 50/50 usage.
+            # Branch-router aux/seq-aux contribution: when the
+            # nested-schema yaml sets `model.branch_router.balancing`
+            # to `aux_loss` or `seq_aux_loss`, the branch routing's
+            # per-token probability tensors flow into the same
+            # load-balancing loss helpers used for MLP / attention.
+            # The branch is binary (ATTN vs MLP) so num_experts == 2
+            # and num_experts_per_tok == 1 (each token picks one).
+            # When the per-class field is unset or `none` /
+            # `exploration_only`, no branch aux contribution is
+            # added (the prior contract).
+            branch_class_method = getattr(self.config, "branch_router_balancing", None)
+            if branch_class_method in ("aux_loss", "seq_aux_loss") and branch_prob_tensors is not None:
+                branch_selected = tuple(self.model._all_branch_selected_experts) or None
+                branch_aux_coef = float(getattr(
+                    self.config, "branch_router_router_aux_loss_coef",
+                    self.branch_router_aux_loss_coef,
+                ))
+                branch_seq_aux_coef = float(getattr(
+                    self.config, "branch_router_seq_aux_loss_coef",
+                    seq_aux_coef,
+                ))
+                if branch_class_method == "aux_loss" and branch_aux_coef > 0:
+                    branch_aux_term = load_balancing_loss_func(
+                        branch_prob_tensors,
+                        2,  # binary ATTN/MLP pool
+                        1,  # one branch per token
+                        selected_experts=branch_selected,
+                    )
+                    if isinstance(branch_aux_term, torch.Tensor):
+                        branch_aux_loss = branch_aux_term
+                        loss = loss + branch_aux_coef * branch_aux_term
+                if branch_class_method == "seq_aux_loss" and branch_seq_aux_coef > 0:
+                    branch_seq_aux_term = seq_load_balancing_loss_func(
+                        branch_prob_tensors,
+                        2, 1,
+                        batch_size=input_ids.shape[0],
+                        selected_experts=branch_selected,
+                    )
+                    if isinstance(branch_seq_aux_term, torch.Tensor):
+                        branch_aux_loss = branch_seq_aux_term
+                        loss = loss + branch_seq_aux_coef * branch_seq_aux_term
 
         if output_router_logits:
             # Aux methods need `router_logits` to be gradient-bearing

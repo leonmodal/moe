@@ -77,7 +77,21 @@ class BranchRouter(nn.Module):
         #                                exploration_only_rate=1.0
         #   `exploration_only_rate > 0` (without explicit balancing)
         #     auto-promotes balancing to "exploration_only".
-        _allowed_balancing = ("none", "exploration_only")
+        # `aux_loss` and `seq_aux_loss` are accepted: the model's
+        # forward path computes the loss term from `last_probs` /
+        # `last_selected_experts` (already tracked by every
+        # forward) and adds it to total loss via the same code
+        # path used for MLP and attention routers.
+        # `deepseek_bias` and `quantile` still need owner-state
+        # plumbing (per-router `expert_bias` + accumulator
+        # buffers) before they can route through the post-step
+        # walker; for now those values are rejected at construction
+        # time so a build crashes loudly rather than silently
+        # running on the wrong update path.
+        _allowed_balancing = (
+            "none", "exploration_only",
+            "aux_loss", "seq_aux_loss",
+        )
         if balancing not in _allowed_balancing:
             raise ValueError(
                 f"BranchRouter balancing must be one of {_allowed_balancing}, "

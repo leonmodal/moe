@@ -197,6 +197,35 @@ def validate_config(path: Path) -> list[str]:
                 f"the nested per-class blocks are authoritative."
             )
 
+        # Active per-class knob enforcement: each method-active
+        # block must explicitly carry the matrix's required active
+        # knob values. Implicit defaults are not acceptable on the
+        # active matrix because the per-class block is the source
+        # of truth.
+        required_active = {
+            "aux_loss": {"router_aux_loss_coef": 0.001},
+            "seq_aux_loss": {"seq_aux_loss_coef": 0.0001},
+            "deepseek_bias": {"bias_update_rate": 0.001},
+            "quantile": {
+                "quantile_eta": 0.005,
+                "quantile_target_q": 0.5,
+                "quantile_global_state": True,
+            },
+        }
+        for group in ("mlp_router", "attn_router", "branch_router"):
+            block = mcfg_local.get(group, {}) or {}
+            method = block.get("balancing")
+            if method not in required_active:
+                continue
+            for knob, expected in required_active[method].items():
+                actual = block.get(knob)
+                if actual != expected:
+                    issues.append(
+                        f"active matrix yaml: model.{group}.{knob}="
+                        f"{actual!r}, expected {expected!r} for "
+                        f"balancing={method!r}"
+                    )
+
     return issues
 
 

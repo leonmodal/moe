@@ -277,28 +277,29 @@ def test_validator_rejects_mlp_router_invalid_decay():
         _validator()(cfg)
 
 
-def test_validator_branch_router_rejects_aux_loss_until_runtime_lands():
-    """The branch router currently implements only `none` and
-    `exploration_only` in `BranchRouter.__init__`. The validator
-    rejects every other method on branch_router so the failure
-    surfaces at config-load time rather than inside the
-    `build_model` -> BranchRouter constructor. The broader set
-    (aux_loss, seq_aux_loss, deepseek_bias, quantile) requires
-    runtime work in BranchRouter and is gated on a separate
-    workstream.
+def test_validator_branch_router_accepts_aux_loss():
+    """Round 32 review Finding 4: BranchRouter now accepts
+    `aux_loss` and `seq_aux_loss`. The model's forward path
+    computes the aux contribution from branch probabilities /
+    selected indices via the same loss helpers used for MLP and
+    attention routers."""
+    cfg = {"model": {"branch_router": {"balancing": "aux_loss",
+                                       "router_aux_loss_coef": 0.001}}}
+    _validator()(cfg)
+
+
+def test_validator_branch_router_accepts_seq_aux_loss():
+    cfg = {"model": {"branch_router": {"balancing": "seq_aux_loss",
+                                       "seq_aux_loss_coef": 0.0001}}}
+    _validator()(cfg)
+
+
+def test_validator_branch_router_rejects_deepseek_bias_until_runtime_lands():
+    """deepseek_bias still requires owner-state plumbing
+    (per-router `expert_bias` + accumulator buffers + walker
+    dispatch); rejected at validator level so failures surface
+    at config-load time rather than inside the build_model path.
     """
-    cfg = {"model": {"branch_router": {"balancing": "aux_loss"}}}
-    with pytest.raises(ValueError, match="branch_router.balancing="):
-        _validator()(cfg)
-
-
-def test_validator_branch_router_rejects_seq_aux_loss():
-    cfg = {"model": {"branch_router": {"balancing": "seq_aux_loss"}}}
-    with pytest.raises(ValueError, match="branch_router.balancing="):
-        _validator()(cfg)
-
-
-def test_validator_branch_router_rejects_deepseek_bias():
     cfg = {"model": {"branch_router": {"balancing": "deepseek_bias"}}}
     with pytest.raises(ValueError, match="branch_router.balancing="):
         _validator()(cfg)

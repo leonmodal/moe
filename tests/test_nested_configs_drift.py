@@ -211,6 +211,101 @@ _REQUIRED_ACTIVE_KNOBS = {
 }
 
 
+# Branch-router contract for `per_head_precompute_kv` matrix rows.
+# Per the matrix spec, every yaml whose `attn_expert_mode` is
+# `per_head_precompute_kv` must enable branch exploration_only with
+# the documented decay schedule.
+_PRECOMPUTE_KV_BRANCH_SPEC = {
+    "balancing": "exploration_only",
+    "exploration_rate": 0.1,
+    "exploration_decay": "cosine",
+    "exploration_min": 0.01,
+    "exploration_warmup_steps": 1000,
+}
+
+
+def test_cli_validator_rejects_missing_active_knob_in_active_matrix(tmp_path):
+    """Round 32 review Finding 2: scripts/validate_configs.py
+    must fail on a matrix yaml that omits the active method's
+    required knob (e.g. `balancing: aux_loss` without
+    `router_aux_loss_coef: 0.001`). Build a temporary matrix-path
+    yaml with the missing knob and assert the CLI reports the issue.
+    """
+    import os
+    import subprocess
+    # Place the temporary yaml under a fake "active matrix" path
+    # so the strict-mode gate fires.
+    matrix_dir = tmp_path / "configs" / "4_layers"
+    matrix_dir.mkdir(parents=True)
+    bad_yaml = matrix_dir / "standard_moe_aux_loss.yaml"
+    bad_yaml.write_text(
+        """experiment_name: validator_negative_probe
+model:
+  type: standard_moe
+  vocab_size: 32
+  hidden_size: 16
+  num_hidden_layers: 1
+  num_experts: 4
+  num_experts_per_tok: 1
+  moe_intermediate_size: 32
+  mlp_router:
+    balancing: aux_loss
+training:
+  learning_rate: 1e-3
+  weight_decay: 0
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 0
+  max_steps: 1
+  batch_size: 1
+  gradient_accumulation: 1
+  mixed_precision: ""
+  output_dir: /tmp
+"""
+    )
+    cmd = [
+        sys.executable, "scripts/validate_configs.py",
+        str(bad_yaml),
+    ]
+    env = {"PYTHONPATH": str(REPO), **os.environ}
+    result = subprocess.run(
+        cmd, cwd=str(REPO), env=env,
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0, (
+        f"CLI did not detect missing aux active knob:\n"
+        f"STDOUT={result.stdout}\nSTDERR={result.stderr}"
+    )
+    assert "router_aux_loss_coef" in result.stdout, (
+        f"CLI output did not mention the missing knob:\n{result.stdout}"
+    )
+
+
+def test_precompute_kv_rows_set_dec6_branch_exploration():
+    """Every matrix row whose `attn_expert_mode == per_head_precompute_kv`
+    must set branch_router to the documented exploration_only spec
+    (rate=0.1, decay=cosine, min=0.01, warmup=1000). The KV
+    precompute path is the architectural variant that benefits most
+    from the random branch curriculum, so the matrix locks the
+    branch contract for those rows."""
+    deficits: list[tuple[str, str]] = []
+    for p in _nested_yamls():
+        with p.open() as f:
+            cfg = yaml.safe_load(f)
+        mcfg = cfg.get("model", {}) or {}
+        if mcfg.get("attn_expert_mode") != "per_head_precompute_kv":
+            continue
+        branch = mcfg.get("branch_router", {}) or {}
+        for key, expected in _PRECOMPUTE_KV_BRANCH_SPEC.items():
+            actual = branch.get(key)
+            if actual != expected:
+                deficits.append((str(p), f"branch_router.{key} = {actual!r} (expected {expected!r})"))
+    assert not deficits, (
+        f"precompute_kv matrix rows missing the branch exploration_only spec: "
+        f"{deficits}"
+    )
+
+
 def test_matrix_rows_carry_required_active_knobs_per_method():
     """Round 31 review Finding 1: every matrix row's per-class
     block must explicitly carry the active knobs for its method.

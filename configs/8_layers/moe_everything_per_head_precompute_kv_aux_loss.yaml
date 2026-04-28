@@ -41,7 +41,11 @@ model:
     balancing: aux_loss
     router_aux_loss_coef: 0.001
   branch_router:
-    balancing: none
+    balancing: exploration_only
+    exploration_rate: 0.1
+    exploration_decay: cosine
+    exploration_min: 0.01
+    exploration_warmup_steps: 1000
 training:
   learning_rate: 0.001
   weight_decay: 0.01

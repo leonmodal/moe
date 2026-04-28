@@ -152,23 +152,22 @@ _COMMON_ROUTER_KNOBS = frozenset({
     "exploration_warmup_steps",
 })
 
-# Branch-router currently accepts only `none` and `exploration_only`
-# at the BranchRouter constructor. The validator deliberately tracks
-# the runtime here: a yaml that asks for
-# `branch_router.balancing: aux_loss` should fail at config-load
-# time (clear error, points the author at the broader plan workstream)
-# rather than at `build_model` time inside the BranchRouter
-# constructor. The full set of balancing methods (aux_loss,
-# seq_aux_loss, deepseek_bias, quantile) for the branch router
-# requires runtime work — uniform branch aux/seq-aux contribution
-# through the loss path, branch DeepSeek bias via the unified bias
-# owner, and branch quantile via the quantile owner. The MLP and
-# attention router groups DO accept the broader value set since
-# their forward dispatch can gate on the per-class method without
-# new router-class code.
+# Branch-router accepts `none`, `exploration_only`, `aux_loss`, and
+# `seq_aux_loss`. Validator stays aligned with the BranchRouter
+# constructor's accepted set: aux/seq-aux flow through the same
+# loss path used for MLP and attention routers (using the
+# branch-specific `last_probs` / `last_selected_experts` tensors).
+# `deepseek_bias` and `quantile` still need owner-state plumbing
+# before they can route through the post-step walker; they remain
+# rejected at validator AND constructor level. The MLP and attention
+# router groups accept the broader value set because their forward
+# dispatch can gate on the per-class method without new router-class
+# code.
 _BRANCH_ROUTER_KNOWN_KEYS = frozenset(_COMMON_ROUTER_KNOBS)
 
-_BRANCH_BALANCING_VALID = frozenset({"none", "exploration_only"})
+_BRANCH_BALANCING_VALID = frozenset({
+    "none", "exploration_only", "aux_loss", "seq_aux_loss",
+})
 
 _BRANCH_DECAY_VALID = frozenset({"constant", "linear", "cosine"})
 
