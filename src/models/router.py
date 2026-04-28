@@ -298,6 +298,16 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
         self._last_top_k_idx = None
         self._last_exploration_mask = None
         self._last_z_loss = None
+        # AC-9: snapshot of `top_k_idx` written ONLY on the real forward.
+        # On gradient-checkpoint recompute, the router uses this snapshot
+        # to produce the same biased top-k selection without re-sampling
+        # `apply_router_exploration`'s `torch.rand_like`. This is a defensive
+        # safety net against checkpoint configurations where
+        # `preserve_rng_state=False` is set (PyTorch's default `True` already
+        # makes recompute deterministic, but this cache survives even when
+        # RNG preservation is disabled, e.g. by some custom checkpoint
+        # wrappers).
+        self._cached_top_k_idx_for_recompute: torch.Tensor | None = None
 
     def forward(self, hidden_states: torch.Tensor):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
@@ -323,10 +333,38 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
             exploration_mask = None
             selection_scores = biased_scores
             if self.training and self.exploration_rate > 0.0:
-                exploration_mask = sample_router_exploration_mask(biased_scores, self.exploration_rate)
+                # AC-9: under gradient-checkpoint recompute, reuse the cached
+                # exploration mask from the real forward so the recompute
+                # branch decision is identical and gradient consistency
+                # holds. Belt-and-suspenders on top of `torch.utils.checkpoint`'s
+                # default `preserve_rng_state=True`.
+                cached = getattr(self, "_last_exploration_mask", None)
+                if (
+                    is_checkpoint_recompute()
+                    and cached is not None
+                    and cached.shape == biased_scores.shape[:1]
+                    and cached.device == biased_scores.device
+                ):
+                    exploration_mask = cached
+                else:
+                    exploration_mask = sample_router_exploration_mask(biased_scores, self.exploration_rate)
                 selection_scores = apply_router_exploration(biased_scores, exploration_mask)
 
-            if self.num_groups is not None and self.group_topk is not None:
+            # AC-9: under gradient-checkpoint recompute, reuse the cached
+            # top_k_idx from the real forward. This bypasses the
+            # exploration + top-k computation entirely and guarantees the
+            # recompute's biased selection matches the real forward — even
+            # if `apply_router_exploration`'s internal `torch.rand_like`
+            # would otherwise produce different values.
+            cached_idx = getattr(self, "_cached_top_k_idx_for_recompute", None)
+            if (
+                is_checkpoint_recompute()
+                and cached_idx is not None
+                and cached_idx.shape[0] == selection_scores.shape[0]
+                and cached_idx.device == selection_scores.device
+            ):
+                top_k_idx = cached_idx
+            elif self.num_groups is not None and self.group_topk is not None:
                 # Group-limited top-k: select from top groups only
                 _, top_k_idx = group_limited_topk(
                     selection_scores,
@@ -364,6 +402,8 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
                 ).float()
                 self.local_tokens_per_expert += counts
                 self._last_top_k_idx = top_k_idx.detach()
+                # AC-9: stash the real-forward top_k_idx for recompute reuse.
+                self._cached_top_k_idx_for_recompute = top_k_idx.detach()
         else:
             self._last_top_k_idx = top_k_idx.detach()
 

@@ -100,18 +100,21 @@ def normalize_balancing_config(cfg: dict) -> dict:
     `load_balancing_method` is set.
 
     Mutates `cfg` in place AND returns it for fluent chaining. Reads
-    `load_balancing_method` via `_resolve_balancing_field`; if absent or
-    `none`, leaves coefficients alone (back-compat for yamls that pre-date
-    `load_balancing_method`). Otherwise, walks every coefficient field in
-    `_METHOD_ACTIVE_FIELDS` for OTHER methods and zeroes any that are
-    present-and-nonzero in either block, emitting a deprecation warning.
+    `load_balancing_method` via `_resolve_balancing_field`. When the method is
+    absent (no `load_balancing_method` in either block), the config is left
+    alone (back-compat for yamls that pre-date the dispatch knob — the
+    coefficient-driven runtime sees its original values). When the method is
+    EXPLICITLY set — including `none` — every legacy coefficient outside the
+    method's active set is auto-zeroed with a deprecation warning. `none`'s
+    active set is empty, so it zeroes everything (AC-16: `balancing: none`
+    disables all balancing).
 
     Per DEC-3a (RESOLVED 2026-04-27 → AC-1): repository configs are stricter
     (rejection, via the future config validator); external/legacy configs go
     through AUTO-ZERO at runtime.
     """
     method = _resolve_balancing_field(cfg, "load_balancing_method", None)
-    if method is None or method == "none":
+    if method is None:
         return cfg
     if method not in _VALID_LOAD_BALANCING_METHODS:
         raise ValueError(

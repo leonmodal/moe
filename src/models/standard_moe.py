@@ -56,7 +56,24 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
         if selected_experts is not None:
             output.selected_experts = selected_experts
 
-        # Recompute aux loss with our fixed loss function
+        # AC-1: gate aux / seq-aux additions by the resolved
+        # `load_balancing_method`. `None` (no method set) keeps legacy
+        # coefficient-driven behavior; explicit methods restrict to the
+        # method's active loss term. `normalize_balancing_config` already
+        # auto-zeros conflicting coefficients, but the explicit gate here
+        # is belt-and-suspenders against any future default that leaks a
+        # non-zero coefficient into a non-active method.
+        method = getattr(self, "_load_balancing_method", None)
+        aux_active = method is None or method == "aux_loss"
+        seq_aux_active = method is None or method == "seq_aux_loss"
+
+        # Recompute aux loss with our fixed loss function. The base class
+        # already added `self.router_aux_loss_coef * old_aux` to the loss; we
+        # subtract that and either re-add the corrected `new_aux` (when
+        # `aux_loss` is the active method, or no method is set) or leave the
+        # subtraction as-is (when another method is active and coefs were
+        # auto-zeroed — both terms collapse to zero and the subtraction is a
+        # no-op).
         if output.router_logits is not None and output.aux_loss is not None:
             old_aux = output.aux_loss
             new_aux = load_balancing_loss_func(
@@ -66,12 +83,19 @@ class StandardMoEModel(Qwen3MoeForCausalLM):
                 selected_experts=selected_experts,
             )
             if output.loss is not None:
-                output.loss = output.loss - self.router_aux_loss_coef * old_aux + self.router_aux_loss_coef * new_aux
+                output.loss = output.loss - self.router_aux_loss_coef * old_aux
+                if aux_active:
+                    output.loss = output.loss + self.router_aux_loss_coef * new_aux
             output.aux_loss = new_aux
 
-        # Sequence-level aux loss (DeepSeek V2/V3)
+        # Sequence-level aux loss (DeepSeek V2/V3) — gated by method.
         seq_coef = getattr(self, "_seq_aux_loss_coef", 0.0)
-        if seq_coef > 0 and output.router_logits is not None and output.loss is not None:
+        if (
+            seq_aux_active
+            and seq_coef > 0
+            and output.router_logits is not None
+            and output.loss is not None
+        ):
             input_ids = kwargs.get("input_ids")
             bsz = input_ids.shape[0] if input_ids is not None else 1
             seq_aux = seq_load_balancing_loss_func(

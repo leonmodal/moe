@@ -144,6 +144,155 @@ def test_uniform_routing_global_aggregate_matches_single_rank():
     )
 
 
+@contextmanager
+def _mock_distributed_with_call_order_queue(world_size: int, queue: list):
+    """Mock `dist.all_reduce` with a deterministic call-order queue.
+
+    Each call pops the next tensor from `queue` and adds it to the current
+    `tensor` argument. After the loss function's `world_size` divide, the
+    result equals the global aggregate. Injecting concrete rank-1 tensors
+    simulates a real 2-rank reduction without needing `mp.spawn`.
+    """
+    queue = list(queue)  # mutable copy
+    call_count = {"n": 0}
+
+    def call_order_all_reduce(tensor, op=None, **kwargs):
+        if not queue:
+            raise AssertionError(
+                f"Mock all_reduce queue exhausted on call #{call_count['n']}"
+            )
+        addend = queue.pop(0)
+        tensor.add_(addend.to(tensor.dtype).to(tensor.device))
+        call_count["n"] += 1
+
+    with patch("torch.distributed.is_initialized", return_value=True), \
+         patch("torch.distributed.is_available", return_value=True), \
+         patch("torch.distributed.get_world_size", return_value=world_size), \
+         patch("torch.distributed.all_reduce", side_effect=call_order_all_reduce):
+        yield call_count
+
+
+def test_asymmetric_two_rank_global_aggregate_differs_from_rank_local():
+    """Real asymmetric AC-4 test (Codex Round 3 asks for this).
+
+    Rank 0 routes every token to expert 0; rank 1 routes every token to
+    expert 1. Globally the routing is balanced 50/50 across experts 0 and 1.
+
+    Rank-local Switch aux on rank 0 sees max imbalance → loss == top_k *
+    num_experts (1 * 4 = 4 with top_k=1, num_experts=4 — every token's mass
+    concentrated on a single expert).
+
+    The DEC-4 global aggregate sees rank0+rank1 averaged → tokens_per_expert
+    = [0.5, 0.5, 0, 0], router_prob_per_expert = [0.5, 0.5, 0, 0]. Loss =
+    sum(0.5 * 0.5 + 0.5 * 0.5) * num_experts = 0.5 * 4 = 2.
+
+    The test injects rank 1's tensors via the call-order mock and asserts
+    the global loss is STRICTLY SMALLER than the rank-local loss.
+    """
+    num_experts = 4
+    top_k = 1
+    num_tokens = 8
+
+    # Rank 0: every token → expert 0.
+    selected_rank0 = torch.zeros(num_tokens, top_k, dtype=torch.long)
+    probs_rank0 = torch.zeros(num_tokens, num_experts)
+    probs_rank0[:, 0] = 1.0
+
+    # Rank 1: every token → expert 1. Compute its per-rank tokens_per_expert
+    # and router_prob_per_expert exactly as the loss function would
+    # internally.
+    selected_rank1 = torch.full((num_tokens, top_k), 1, dtype=torch.long)
+    probs_rank1 = torch.zeros(num_tokens, num_experts)
+    probs_rank1[:, 1] = 1.0
+
+    # Per-rank tensors that the loss function would compute for rank 1:
+    # `tokens_per_expert` is `mean(one_hot(selected), dim=0)` over (T, K).
+    # For rank 1 with selected = all-1 and K=1: tokens_per_expert = [0,1,0,0].
+    tpe_rank1 = torch.tensor([0.0, 1.0, 0.0, 0.0])
+    # `router_prob_per_expert` is `mean(probs, dim=0)` = [0,1,0,0].
+    rpe_rank1 = torch.tensor([0.0, 1.0, 0.0, 0.0])
+
+    # 1) Rank-local rank-0 loss (no DDP).
+    with patch("torch.distributed.is_initialized", return_value=False):
+        local_loss = load_balancing_loss_func(
+            (probs_rank0,), num_experts=num_experts, top_k=top_k,
+            selected_experts=(selected_rank0,),
+        ).item()
+    # Sanity: max imbalance → loss == top_k * num_experts (the "all to one
+    # expert" extreme of the Switch aux baseline).
+    assert local_loss == pytest.approx(num_experts * top_k, abs=1e-5), (
+        f"rank-local loss for max-imbalance routing should be num_experts * "
+        f"top_k = {num_experts * top_k}, got {local_loss}"
+    )
+
+    # 2) Asymmetric two-rank loss with the call-order mock injecting rank 1's
+    # tokens_per_expert into the FIRST all_reduce call and rank 1's
+    # router_prob_per_expert into the SECOND.
+    with _mock_distributed_with_call_order_queue(
+        world_size=2,
+        queue=[tpe_rank1, rpe_rank1],
+    ) as call_count:
+        global_loss = load_balancing_loss_func(
+            (probs_rank0,), num_experts=num_experts, top_k=top_k,
+            selected_experts=(selected_rank0,),
+        ).item()
+    assert call_count["n"] == 2, (
+        f"loss func should call all_reduce exactly twice (tokens_per_expert "
+        f"+ router_prob_per_expert), got {call_count['n']}"
+    )
+
+    # The DEC-4 global aggregate is strictly smaller than the rank-local loss
+    # under asymmetric per-rank routing.
+    assert global_loss < local_loss, (
+        f"DEC-4 global aggregate must be smaller than rank-local under "
+        f"asymmetric routing; got global={global_loss}, local={local_loss}"
+    )
+
+    # And the global-aggregate loss matches the closed-form expectation:
+    # tokens_per_expert = [0.5, 0.5, 0, 0], router_prob_per_expert = [0.5, 0.5, 0, 0]
+    # → loss = sum(0.5*0.5 + 0.5*0.5) * num_experts = 0.5 * num_experts.
+    expected_global = 0.5 * num_experts
+    assert global_loss == pytest.approx(expected_global, abs=1e-5), (
+        f"DEC-4 global-aggregate closed-form: {expected_global}, got {global_loss}"
+    )
+
+
+def test_token_mask_path_global_aggregate_under_ddp():
+    """The token-mask path (`attention_mask is not None`) must also flow
+    through the DDP all-reduce. We verify by counting all_reduce calls (the
+    function calls it once per averaged statistic regardless of which path)."""
+    num_experts = 4
+    top_k = 2
+    num_tokens = 8
+    batch_size = 1
+    seq_len = num_tokens // batch_size
+
+    gate_logits = torch.full((num_tokens, num_experts), 1.0 / num_experts)
+    selected = torch.zeros(num_tokens, top_k, dtype=torch.long)
+    for t in range(num_tokens):
+        for k in range(top_k):
+            selected[t, k] = (t * top_k + k) % num_experts
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+
+    # Identical-rank symmetric mock; we only care that all_reduce is called
+    # the expected number of times under the token-mask path.
+    other_rank_tpe = torch.zeros(top_k, num_experts)  # match shape from token-mask path
+    other_rank_rpe = torch.zeros(num_experts)
+    with _mock_distributed_with_call_order_queue(
+        world_size=2,
+        queue=[other_rank_tpe, other_rank_rpe],
+    ) as call_count:
+        loss = load_balancing_loss_func(
+            (gate_logits,), num_experts=num_experts, top_k=top_k,
+            attention_mask=attention_mask,
+            selected_experts=(selected,),
+        )
+    assert call_count["n"] == 2, (
+        f"token-mask path must also call all_reduce twice, got {call_count['n']}"
+    )
+    assert torch.isfinite(loss).all()
+
+
 def test_remove_all_reduce_diverges_under_skewed_per_rank_routing():
     """Negative AC-4: removing the all-reduce makes per-rank loss diverge from
     the global-aggregate loss when ranks see DIFFERENT routing.
@@ -255,6 +404,8 @@ def test_selected_experts_divergence_still_works_under_global_aggregate():
 if __name__ == "__main__":
     test_uninitialized_dist_no_collective_fires()
     test_uniform_routing_global_aggregate_matches_single_rank()
+    test_asymmetric_two_rank_global_aggregate_differs_from_rank_local()
+    test_token_mask_path_global_aggregate_under_ddp()
     test_remove_all_reduce_diverges_under_skewed_per_rank_routing()
     test_selected_experts_divergence_still_works_under_global_aggregate()
     print("ALL OK")

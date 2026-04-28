@@ -110,6 +110,12 @@ def test_method_seq_aux_loss_zeroes_switch_and_bias():
 
 
 def test_method_none_zeroes_everything():
+    """Per AC-16: `load_balancing_method: none` disables ALL balancing —
+    every legacy coefficient is AUTO-ZEROED with a warning. Round 3 had a
+    bug where this test locked the OPPOSITE behavior (none was treated as
+    a back-compat sentinel that left coefs alone); Round 4 corrects both
+    the runtime AND this test.
+    """
     cfg = {
         "model": {},
         "training": {
@@ -119,19 +125,46 @@ def test_method_none_zeroes_everything():
             "bias_update_rate": 0.001,
         },
     }
-    with warnings.catch_warnings(record=True):
+    with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         normalize_balancing_config(cfg)
     tcfg = cfg["training"]
-    # `none` is a sentinel that means "do nothing"; the normalizer leaves the
-    # coefficients alone (the back-compat path) so legacy yamls without an
-    # explicit method-dispatch wiring still produce their original behavior.
-    # That's deliberate: when `none` is set, the trainer's coefficient-driven
-    # dispatch already produces "no balancing" because forward paths skip
-    # zero-coefficient terms and `bias_update_rate=0` skips `update_expert_biases`.
+    # `none` zeros every legacy coefficient — AC-16 contract.
+    assert tcfg["router_aux_loss_coef"] == 0.0, "none must zero router_aux_loss_coef"
+    assert tcfg["seq_aux_loss_coef"] == 0.0, "none must zero seq_aux_loss_coef"
+    assert tcfg["bias_update_rate"] == 0.0, "none must zero bias_update_rate"
+    assert any(
+        issubclass(w.category, DeprecationWarning) and "AUTO-ZERO" in str(w.message)
+        for w in caught
+    ), f"Expected an AUTO-ZERO deprecation warning, got: {[str(w.message) for w in caught]}"
+
+
+def test_method_absent_leaves_coefs_alone_back_compat():
+    """When `load_balancing_method` is ABSENT (not even set to `none`), the
+    normalizer is a no-op: legacy coefficient-driven yamls retain their
+    original behavior. This is the back-compat path for yamls written
+    before `load_balancing_method` existed.
+    """
+    cfg = {
+        "model": {},
+        "training": {
+            # No load_balancing_method set — this is what an old yaml looks like.
+            "router_aux_loss_coef": 0.001,
+            "seq_aux_loss_coef": 0.0001,
+            "bias_update_rate": 0.001,
+        },
+    }
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        normalize_balancing_config(cfg)
+    tcfg = cfg["training"]
     assert tcfg["router_aux_loss_coef"] == 0.001
     assert tcfg["seq_aux_loss_coef"] == 0.0001
     assert tcfg["bias_update_rate"] == 0.001
+    assert not any(
+        issubclass(w.category, DeprecationWarning) and "AUTO-ZERO" in str(w.message)
+        for w in caught
+    )
 
 
 def test_method_quantile_zeroes_aux_and_bias_for_now():
@@ -236,6 +269,7 @@ if __name__ == "__main__":
     test_method_deepseek_bias_zeroes_aux_coefs()
     test_method_seq_aux_loss_zeroes_switch_and_bias()
     test_method_none_zeroes_everything()
+    test_method_absent_leaves_coefs_alone_back_compat()
     test_method_quantile_zeroes_aux_and_bias_for_now()
     test_no_method_set_leaves_coefs_alone()
     test_invalid_method_raises()

@@ -141,10 +141,20 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
     # Per DEC-3b: seq_aux_loss_coef lives under `training:` (canonical). The
     # resolver falls back to `model:` with a deprecation warning for any
     # unmigrated yamls.
-    from .model_factory import _resolve_balancing_field
+    from .balancing_fields import _resolve_balancing_field
     seq_aux_loss_coef = _resolve_balancing_field(cfg, "seq_aux_loss_coef", 0.0)
     if seq_aux_loss_coef:
         model._seq_aux_loss_coef = seq_aux_loss_coef
+
+    # AC-1 / DEC-3a: stamp the resolved `load_balancing_method` onto the model
+    # so each family's `forward` gates aux / seq-aux additions explicitly,
+    # not just by coefficient values. `normalize_balancing_config` (called
+    # from `load_config`) has already auto-zeroed conflicting coefficients,
+    # so this is belt-and-suspenders against future regressions where a
+    # non-zero default coefficient leaks into a non-active method.
+    load_balancing_method_resolved = _resolve_balancing_field(cfg, "load_balancing_method", None)
+    if load_balancing_method_resolved is not None:
+        model._load_balancing_method = load_balancing_method_resolved
 
     if train_cfg.torch_compile:
         compile_mode = train_cfg.torch_compile_mode
@@ -430,10 +440,21 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
         )
 
         # Expert bias updates. Per DEC-3b (AC-3) the per-projection rates
-        # also live under `training:` canonically; resolve via the same helper
+        # live under `training:` canonically; resolve via the same helper
         # so unmigrated yamls fall back with a deprecation warning instead of
         # silently using `rate` for every class.
-        if train_cfg.bias_update_rate > 0:
+        # AC-1: gate by the resolved `load_balancing_method`. Only
+        # `deepseek_bias` (and `quantile` once implemented in Milestone D)
+        # actually trigger the post-step bias update walker. For
+        # `aux_loss` / `seq_aux_loss` / `none`, even a non-zero
+        # `bias_update_rate` (e.g. left over from a config bug) is ignored.
+        method_for_bias_update = getattr(model, "_load_balancing_method", None)
+        bias_update_methods = {"deepseek_bias"}  # quantile lands in Milestone D
+        method_allows_bias_update = (
+            method_for_bias_update is None
+            or method_for_bias_update in bias_update_methods
+        )
+        if train_cfg.bias_update_rate > 0 and method_allows_bias_update:
             rate = get_bias_rate(
                 model, global_step, train_cfg.bias_update_rate,
                 train_cfg.bias_warmup_start, train_cfg.bias_warmup_steps,

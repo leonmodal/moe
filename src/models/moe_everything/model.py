@@ -585,7 +585,17 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
             ce_loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
             loss = ce_loss
 
-            if mlp_router_logits is not None:
+            # AC-1: gate aux / seq-aux additions by the resolved
+            # `load_balancing_method`. `None` keeps the legacy coefficient-
+            # driven behavior; explicit methods restrict to the method's
+            # active loss term. `normalize_balancing_config` already
+            # auto-zeros conflicting coefficients, but the explicit gate
+            # here is belt-and-suspenders against future regressions.
+            method = getattr(self, "_load_balancing_method", None)
+            aux_active = method is None or method == "aux_loss"
+            seq_aux_active = method is None or method == "seq_aux_loss"
+
+            if aux_active and mlp_router_logits is not None:
                 mlp_aux = load_balancing_loss_func(
                     mlp_router_logits,
                     self.num_experts,
@@ -598,7 +608,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                     loss = loss + self.router_aux_loss_coef * mlp_aux
 
             seq_aux_coef = getattr(self, "_seq_aux_loss_coef", 0.0)
-            if seq_aux_coef > 0 and mlp_router_logits is not None:
+            if seq_aux_active and seq_aux_coef > 0 and mlp_router_logits is not None:
                 seq_aux = seq_load_balancing_loss_func(
                     mlp_router_logits,
                     self.num_experts,
@@ -612,9 +622,11 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                     loss = loss + seq_aux_coef * seq_aux
 
             # Attention expert router losses.
+            # AC-1: only run when method allows aux or seq_aux contributions.
             # Skip auxiliary terms in sanity mode because routing is deterministic there.
             if (
-                attention_router_info is not None
+                (aux_active or seq_aux_active)
+                and attention_router_info is not None
                 and getattr(self.config, "sanity_check_mode", None) != "alternating_global_moe"
             ):
                 # Gather per-router logits and selected experts across depths
@@ -637,16 +649,17 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                     else:
                         n_experts = num_attn_experts
                         n_per_tok = 1  # per-head top-1 routing
-                    attn_aux = load_balancing_loss_func(
-                        r_logits,
-                        n_experts,
-                        n_per_tok,
-                        token_masks=r_masks,
-                        selected_experts=r_selected,
-                    )
-                    if isinstance(attn_aux, torch.Tensor):
-                        attention_aux_loss = attn_aux if attention_aux_loss is None else attention_aux_loss + attn_aux
-                    if seq_aux_coef > 0:
+                    if aux_active:
+                        attn_aux = load_balancing_loss_func(
+                            r_logits,
+                            n_experts,
+                            n_per_tok,
+                            token_masks=r_masks,
+                            selected_experts=r_selected,
+                        )
+                        if isinstance(attn_aux, torch.Tensor):
+                            attention_aux_loss = attn_aux if attention_aux_loss is None else attention_aux_loss + attn_aux
+                    if seq_aux_active and seq_aux_coef > 0:
                         attn_seq_aux = seq_load_balancing_loss_func(
                             r_logits, n_experts, n_per_tok,
                             batch_size=input_ids.shape[0],
@@ -656,7 +669,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                         if isinstance(attn_seq_aux, torch.Tensor):
                             loss = loss + seq_aux_coef * attn_seq_aux
 
-            if isinstance(attention_aux_loss, torch.Tensor):
+            if aux_active and isinstance(attention_aux_loss, torch.Tensor):
                 aux_loss = attention_aux_loss if aux_loss is None else aux_loss + attention_aux_loss
                 loss = loss + self.router_aux_loss_coef * attention_aux_loss
 

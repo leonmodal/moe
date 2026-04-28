@@ -214,6 +214,99 @@ def test_branch_router_under_torch_utils_checkpoint_matches_no_checkpoint():
     )
 
 
+def test_branch_router_use_sampling_choice_reused_under_recompute():
+    """AC-9 (Round 4 fill): when `use_sampling=True`, the multinomial draw on
+    the real forward must be CACHED and REUSED on recompute. Without the
+    cache, recompute would re-sample (potentially with a different RNG state
+    if `preserve_rng_state` is ever disabled), breaking gradient consistency.
+    """
+    from src.models.router import checkpoint_recompute_context
+
+    torch.manual_seed(2026)
+    router = BranchRouter(
+        hidden_size=8,
+        use_deepseek_style=True,
+        use_sampling=True,
+    ).train()
+    x = torch.randn(2, 4, 8)
+
+    # Real forward.
+    with torch.enable_grad():
+        with checkpoint_recompute_context(False):
+            router(x)
+    cached_choice = router._last_sampling_choice
+    assert cached_choice is not None, (
+        "real forward must populate `_last_sampling_choice` for recompute reuse"
+    )
+    snapshot = cached_choice.clone()
+    real_branch_decision = router.last_selected_experts.clone()
+
+    # Recompute pass — DELIBERATELY change torch's RNG state to prove the
+    # cache is what determines the recompute branch decision (not RNG).
+    torch.manual_seed(9999)
+    with torch.enable_grad():
+        with checkpoint_recompute_context(True):
+            router(x)
+
+    # Cache must be unchanged.
+    assert torch.equal(router._last_sampling_choice, snapshot), (
+        "recompute must NOT refresh `_last_sampling_choice`"
+    )
+    # Branch decision must match the real forward (cache-driven).
+    assert torch.equal(router.last_selected_experts, real_branch_decision), (
+        "recompute branch decision diverged from real forward — multinomial "
+        "cache is not being reused (AC-9 regression)."
+    )
+
+
+def test_deepseek_router_exploration_mask_reused_under_recompute():
+    """AC-9 (Round 4 fill): `DeepSeekRouter` (not just BranchRouter) caches its
+    exploration mask on real forward and reuses it on recompute. Round 3 only
+    covered BranchRouter; Codex's Round 3 review specifically asks for this.
+    """
+    from src.models.router import DeepSeekRouter, checkpoint_recompute_context
+
+    class _MiniCfg:
+        hidden_size = 8
+        num_experts = 4
+        num_experts_per_tok = 2
+        norm_topk_prob = True
+        topk_scaling_factor = None
+        num_groups = None
+        group_topk = None
+        router_exploration_rate = 0.5  # half the tokens trip exploration
+        router_z_loss_coef = 0.0
+
+    torch.manual_seed(2026)
+    cfg = _MiniCfg()
+    router = DeepSeekRouter(cfg).train()
+    x = torch.randn(8, 8)  # (T, hidden)
+
+    # Real forward.
+    with torch.enable_grad():
+        with checkpoint_recompute_context(False):
+            router(x)
+    cached_mask = router._last_exploration_mask
+    assert cached_mask is not None
+    assert cached_mask.any(), "exploration_rate=0.5 should produce some masked tokens"
+    snapshot = cached_mask.clone()
+    real_top_k_idx = router._last_top_k_idx.clone()
+
+    # Recompute pass — change RNG state to prove cache-driven.
+    torch.manual_seed(9999)
+    with torch.enable_grad():
+        with checkpoint_recompute_context(True):
+            router(x)
+
+    assert torch.equal(router._last_exploration_mask, snapshot), (
+        "recompute must NOT refresh `DeepSeekRouter._last_exploration_mask`"
+    )
+    assert torch.equal(router._last_top_k_idx, real_top_k_idx), (
+        "recompute top-k decision diverged from real forward — DeepSeekRouter "
+        "exploration cache is not being reused (AC-9 regression)."
+    )
+
+
 if __name__ == "__main__":
     test_branch_router_real_forward_increments_counts()
     test_branch_router_recompute_does_not_double_count()
@@ -221,4 +314,6 @@ if __name__ == "__main__":
     test_branch_router_buffer_names_are_canonical()
     test_branch_router_exploration_mask_reused_under_recompute()
     test_branch_router_under_torch_utils_checkpoint_matches_no_checkpoint()
+    test_branch_router_use_sampling_choice_reused_under_recompute()
+    test_deepseek_router_exploration_mask_reused_under_recompute()
     print("ALL OK")

@@ -191,6 +191,14 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
         if selected_experts is not None:
             output.selected_experts = selected_experts
 
+        # AC-1: gate aux / seq-aux additions by the resolved
+        # `load_balancing_method`. See the matching `StandardMoEModel.forward`
+        # comment for the rationale. `None` preserves legacy back-compat
+        # coefficient-driven behavior.
+        method = getattr(self, "_load_balancing_method", None)
+        aux_active = method is None or method == "aux_loss"
+        seq_aux_active = method is None or method == "seq_aux_loss"
+
         # Recompute aux loss with our fixed loss function
         if output.router_logits is not None and output.aux_loss is not None:
             old_aux = output.aux_loss
@@ -201,12 +209,19 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
                 selected_experts=selected_experts,
             )
             if output.loss is not None:
-                output.loss = output.loss - self.router_aux_loss_coef * old_aux + self.router_aux_loss_coef * new_aux
+                output.loss = output.loss - self.router_aux_loss_coef * old_aux
+                if aux_active:
+                    output.loss = output.loss + self.router_aux_loss_coef * new_aux
             output.aux_loss = new_aux
 
-        # Sequence-level aux loss (DeepSeek V2/V3)
+        # Sequence-level aux loss (DeepSeek V2/V3) — gated by method.
         seq_coef = getattr(self, "_seq_aux_loss_coef", 0.0)
-        if seq_coef > 0 and output.router_logits is not None and output.loss is not None:
+        if (
+            seq_aux_active
+            and seq_coef > 0
+            and output.router_logits is not None
+            and output.loss is not None
+        ):
             input_ids = kwargs.get("input_ids")
             bsz = input_ids.shape[0] if input_ids is not None else 1
             seq_aux = seq_load_balancing_loss_func(

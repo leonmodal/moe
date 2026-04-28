@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-from .balancing_fields import _resolve_balancing_field
+from .balancing_fields import _resolve_balancing_field, normalize_balancing_config
 
 
 @dataclass
@@ -64,9 +64,21 @@ class TrainingConfig:
 
 
 def load_config(path: str) -> dict:
-    """Load a YAML configuration file."""
+    """Load a YAML configuration file and apply DEC-3a method normalization.
+
+    Calling `normalize_balancing_config` here (instead of only in
+    `scripts/train.py`) ensures every caller — `build_training_config`,
+    `build_model`, ad-hoc test fixtures — sees a method-consistent view of
+    the balancing coefficients. Without this, a caller that loads a yaml
+    directly (e.g. for sanity testing) and skips the train script would
+    still observe the legacy coefficient-driven behavior the new
+    `load_balancing_method` knob is supposed to gate (Codex Round 3
+    blocker #2).
+    """
     with open(path) as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    normalize_balancing_config(cfg)
+    return cfg
 
 
 def build_training_config(cfg: dict) -> TrainingConfig:
