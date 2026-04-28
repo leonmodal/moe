@@ -88,6 +88,99 @@ def test_migrate_renames_router_topk_ordering_to_softmax_position():
     assert cfg["model"]["softmax_position"] == "post_softmax"
 
 
+def test_migrate_dec17_value_mapping_post_to_pre_topk():
+    """Round 27 review Finding 1 fix: the rename from
+    router_topk_ordering -> softmax_position also flips the
+    semantic axis. `router_topk_ordering: post` (top-k AFTER
+    softmax) maps to `softmax_position: pre_topk` (softmax BEFORE
+    top-k), and vice versa.
+    """
+    mc = _load_migrator()
+    cfg = {"model": {"router_topk_ordering": "post"}}
+    mc.migrate_config(cfg)
+    assert cfg["model"]["softmax_position"] == "pre_topk", (
+        f"DEC-17 value mapping post -> pre_topk not applied; got "
+        f"{cfg['model']['softmax_position']!r}"
+    )
+    cfg = {"model": {"router_topk_ordering": "pre"}}
+    mc.migrate_config(cfg)
+    assert cfg["model"]["softmax_position"] == "post_topk"
+
+
+def test_migrate_expand_top_level_aux_loss_into_per_class_blocks():
+    """Round 27 review Finding 1 fix: top-level
+    training.load_balancing_method should expand into per-class
+    model.{mlp,attn,branch}_router blocks. `aux_loss` propagates
+    to MLP/attention; branch stays `none` until BranchRouter
+    runtime supports the broader method set.
+    """
+    mc = _load_migrator()
+    cfg = {
+        "training": {
+            "load_balancing_method": "aux_loss",
+            "router_aux_loss_coef": 0.001,
+        },
+        "model": {"type": "moe_everything"},
+    }
+    changes = mc.migrate_config(cfg)
+    assert any("mlp_router" in c for c in changes)
+    assert cfg["model"]["mlp_router"]["balancing"] == "aux_loss"
+    assert cfg["model"]["mlp_router"]["router_aux_loss_coef"] == 0.001
+    assert cfg["model"]["attn_router"]["balancing"] == "aux_loss"
+    assert cfg["model"]["branch_router"]["balancing"] == "none"
+
+
+def test_migrate_expand_top_level_seq_aux_into_per_class():
+    mc = _load_migrator()
+    cfg = {
+        "training": {
+            "load_balancing_method": "seq_aux_loss",
+            "seq_aux_loss_coef": 0.0001,
+        },
+        "model": {"type": "moe_everything"},
+    }
+    mc.migrate_config(cfg)
+    assert cfg["model"]["mlp_router"]["balancing"] == "seq_aux_loss"
+    assert cfg["model"]["mlp_router"]["seq_aux_loss_coef"] == 0.0001
+    assert cfg["model"]["attn_router"]["balancing"] == "seq_aux_loss"
+
+
+def test_migrate_expand_top_level_deepseek_bias_into_per_class():
+    mc = _load_migrator()
+    cfg = {
+        "training": {
+            "load_balancing_method": "deepseek_bias",
+            "bias_update_rate": 0.001,
+        },
+        "model": {"type": "moe_everything"},
+    }
+    mc.migrate_config(cfg)
+    assert cfg["model"]["mlp_router"]["balancing"] == "deepseek_bias"
+    assert cfg["model"]["mlp_router"]["bias_update_rate"] == 0.001
+    assert cfg["model"]["attn_router"]["balancing"] == "deepseek_bias"
+    # Branch stays `none` until BranchRouter runtime supports deepseek.
+    assert cfg["model"]["branch_router"]["balancing"] == "none"
+
+
+def test_migrate_does_not_duplicate_per_class_when_already_present():
+    """When mlp_router or attn_router is already set, the
+    expansion step is a no-op — the operator's nested block is
+    authoritative."""
+    mc = _load_migrator()
+    cfg = {
+        "training": {"load_balancing_method": "aux_loss",
+                     "router_aux_loss_coef": 0.5},
+        "model": {
+            "type": "moe_everything",
+            "mlp_router": {"balancing": "deepseek_bias", "bias_update_rate": 0.001},
+        }
+    }
+    mc.migrate_config(cfg)
+    # Migration must NOT overwrite the operator's mlp_router.
+    assert cfg["model"]["mlp_router"]["balancing"] == "deepseek_bias"
+    assert "attn_router" not in cfg["model"]
+
+
 def test_migrate_warns_on_conflicting_nested_and_flat():
     """When the same field appears in both flat and nested form
     with DIFFERENT values, the migrator does NOT silently drop

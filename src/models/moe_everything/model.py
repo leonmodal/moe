@@ -638,6 +638,27 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                 else attn_class_method == "seq_aux_loss"
             )
 
+            # Per-class coefficients: when the nested-schema yaml sets
+            # `model.{mlp,attn}_router.router_aux_loss_coef` or
+            # `model.{mlp,attn}_router.seq_aux_loss_coef`, the per-class
+            # value WINS over the top-level training coefficient. Falls
+            # back to top-level when unset so legacy yamls still work.
+            seq_aux_coef = getattr(self, "_seq_aux_loss_coef", 0.0)
+            mlp_aux_coef = getattr(
+                self.config, "mlp_router_router_aux_loss_coef",
+                self.router_aux_loss_coef,
+            )
+            mlp_seq_aux_coef = getattr(
+                self.config, "mlp_router_seq_aux_loss_coef", seq_aux_coef,
+            )
+            attn_aux_coef = getattr(
+                self.config, "attn_router_router_aux_loss_coef",
+                self.router_aux_loss_coef,
+            )
+            attn_seq_aux_coef = getattr(
+                self.config, "attn_router_seq_aux_loss_coef", seq_aux_coef,
+            )
+
             if mlp_aux_active and mlp_router_logits is not None:
                 mlp_aux = load_balancing_loss_func(
                     mlp_router_logits,
@@ -648,10 +669,9 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                 )
                 if isinstance(mlp_aux, torch.Tensor):
                     aux_loss = mlp_aux
-                    loss = loss + self.router_aux_loss_coef * mlp_aux
+                    loss = loss + mlp_aux_coef * mlp_aux
 
-            seq_aux_coef = getattr(self, "_seq_aux_loss_coef", 0.0)
-            if mlp_seq_aux_active and seq_aux_coef > 0 and mlp_router_logits is not None:
+            if mlp_seq_aux_active and mlp_seq_aux_coef > 0 and mlp_router_logits is not None:
                 seq_aux = seq_load_balancing_loss_func(
                     mlp_router_logits,
                     self.num_experts,
@@ -662,7 +682,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                 )
                 if isinstance(seq_aux, torch.Tensor):
                     seq_aux_loss = seq_aux
-                    loss = loss + seq_aux_coef * seq_aux
+                    loss = loss + mlp_seq_aux_coef * seq_aux
 
             # Attention expert router losses.
             # Method gating: only run when method allows aux or seq_aux contributions.
@@ -702,7 +722,7 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                         )
                         if isinstance(attn_aux, torch.Tensor):
                             attention_aux_loss = attn_aux if attention_aux_loss is None else attention_aux_loss + attn_aux
-                    if attn_seq_aux_active and seq_aux_coef > 0:
+                    if attn_seq_aux_active and attn_seq_aux_coef > 0:
                         attn_seq_aux = seq_load_balancing_loss_func(
                             r_logits, n_experts, n_per_tok,
                             batch_size=input_ids.shape[0],
@@ -710,11 +730,11 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                             token_masks=r_masks,
                         )
                         if isinstance(attn_seq_aux, torch.Tensor):
-                            loss = loss + seq_aux_coef * attn_seq_aux
+                            loss = loss + attn_seq_aux_coef * attn_seq_aux
 
             if attn_aux_active and isinstance(attention_aux_loss, torch.Tensor):
                 aux_loss = attention_aux_loss if aux_loss is None else aux_loss + attention_aux_loss
-                loss = loss + self.router_aux_loss_coef * attention_aux_loss
+                loss = loss + attn_aux_coef * attention_aux_loss
 
             # Do not apply auxiliary balancing to the branch router. The
             # branch split is part of the model behavior we want to observe,

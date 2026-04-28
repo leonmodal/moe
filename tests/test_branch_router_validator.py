@@ -361,6 +361,104 @@ def test_validator_mlp_attn_router_groups_accept_deepseek_bias_knobs():
     _validator()(cfg)
 
 
+def test_validator_rejects_aux_loss_with_bias_update():
+    """AC-17: aux_loss method must not also set bias_update_rate."""
+    cfg = {"model": {"mlp_router": {
+        "balancing": "aux_loss",
+        "router_aux_loss_coef": 0.001,
+        "bias_update_rate": 0.001,
+    }}}
+    with pytest.raises(ValueError, match="aux_loss is incompatible with bias_update_rate"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_aux_loss_with_seq_aux_coef():
+    cfg = {"model": {"mlp_router": {
+        "balancing": "aux_loss",
+        "seq_aux_loss_coef": 0.0001,
+    }}}
+    with pytest.raises(ValueError, match="aux_loss is incompatible with seq_aux_loss_coef"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_aux_loss_with_quantile_knobs():
+    cfg = {"model": {"mlp_router": {
+        "balancing": "aux_loss",
+        "quantile_eta": 0.005,
+    }}}
+    with pytest.raises(ValueError, match="aux_loss is incompatible with quantile_eta"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_seq_aux_with_aux_coef():
+    cfg = {"model": {"mlp_router": {
+        "balancing": "seq_aux_loss",
+        "router_aux_loss_coef": 0.001,
+    }}}
+    with pytest.raises(ValueError, match="seq_aux_loss is incompatible with router_aux_loss_coef"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_deepseek_bias_with_aux_coef():
+    cfg = {"model": {"mlp_router": {
+        "balancing": "deepseek_bias",
+        "bias_update_rate": 0.001,
+        "router_aux_loss_coef": 0.001,
+    }}}
+    with pytest.raises(ValueError, match="deepseek_bias is incompatible with router_aux_loss_coef"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_deepseek_bias_with_quantile_knobs():
+    cfg = {"model": {"attn_router": {
+        "balancing": "deepseek_bias",
+        "quantile_eta": 0.005,
+    }}}
+    with pytest.raises(ValueError, match="deepseek_bias is incompatible with quantile_eta"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_quantile_with_aux_coef():
+    cfg = {"model": {"mlp_router": {
+        "balancing": "quantile",
+        "quantile_eta": 0.005,
+        "router_aux_loss_coef": 0.001,
+    }}}
+    with pytest.raises(ValueError, match="quantile is incompatible with router_aux_loss_coef"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_none_with_any_active_knob():
+    """`balancing: none` disables every balancing path; specifying
+    a coefficient or update knob is rejected."""
+    cfg = {"model": {"mlp_router": {
+        "balancing": "none",
+        "router_aux_loss_coef": 0.001,
+    }}}
+    with pytest.raises(ValueError, match="none is incompatible with router_aux_loss_coef"):
+        _validator()(cfg)
+    cfg = {"model": {"attn_router": {
+        "balancing": "none",
+        "bias_update_rate": 0.001,
+    }}}
+    with pytest.raises(ValueError, match="none is incompatible with bias_update_rate"):
+        _validator()(cfg)
+
+
+def test_validator_accepts_each_method_with_only_its_active_knobs():
+    """Sanity: every per-class method with ONLY its active knobs
+    is accepted. Mirror of the rejection-set tests above."""
+    for spec in [
+        {"balancing": "aux_loss", "router_aux_loss_coef": 0.001},
+        {"balancing": "seq_aux_loss", "seq_aux_loss_coef": 0.0001},
+        {"balancing": "deepseek_bias", "bias_update_rate": 0.001},
+        {"balancing": "quantile", "quantile_eta": 0.005,
+         "quantile_target_q": 0.5, "quantile_global_state": True},
+        {"balancing": "none"},
+    ]:
+        _validator()({"model": {"mlp_router": spec}})
+
+
 def test_validator_branch_router_rejects_truly_invalid_method():
     """Even with the broader value set, an unrecognized method must
     still be rejected.
@@ -466,7 +564,6 @@ model:
   mlp_router:
     balancing: aux_loss
     router_aux_loss_coef: 0.001
-    quantile_eta: 0.005
   attn_router:
     balancing: deepseek_bias
     bias_update_rate: 0.001
@@ -524,7 +621,7 @@ print(json.dumps({{
     stamped = _json.loads(result.stdout)
     assert stamped["mlp_balancing"] == "aux_loss"
     assert stamped["mlp_aux_coef"] == 0.001
-    assert stamped["mlp_quantile_eta"] == 0.005
+    assert stamped["mlp_quantile_eta"] is None  # not set in this fixture
     assert stamped["attn_balancing"] == "deepseek_bias"
     assert stamped["attn_bias_rate"] == 0.001
     assert stamped["attn_scale"] is True

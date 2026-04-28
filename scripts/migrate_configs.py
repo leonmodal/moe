@@ -62,6 +62,17 @@ _KEY_RENAMES = {
     "router_topk_ordering": "softmax_position",
 }
 
+# Value-level mapping for the `router_topk_ordering -> softmax_position`
+# rename: the canonical-field migration also flips the semantic axis.
+# The legacy `post` (top-k applied AFTER softmax) maps to
+# `pre_topk` (softmax computed BEFORE top-k selection), and vice versa.
+_KEY_RENAME_VALUE_MAPS = {
+    "router_topk_ordering": {
+        "post": "pre_topk",
+        "pre": "post_topk",
+    },
+}
+
 
 def _migrate_branch_router_block(model_cfg: dict) -> list[str]:
     """Move the flat `branch_*` fields into `model.branch_router.{...}`.
@@ -127,17 +138,27 @@ def _rewrite_balancing_method_tokens(cfg: dict) -> list[str]:
 
 def _rewrite_field_names(model_cfg: dict) -> list[str]:
     """Rewrite renamed keys (e.g. `router_topk_ordering ->
-    softmax_position`)."""
+    softmax_position`). Some renames also map values across a
+    semantic axis (the canonical flip: `post` becomes `pre_topk` because
+    the canonical field's axis is "softmax position relative to
+    top-k", not "top-k position relative to softmax")."""
     changes: list[str] = []
     for old_name, new_name in _KEY_RENAMES.items():
         if old_name not in model_cfg:
             continue
         old_val = model_cfg[old_name]
+        # Apply value mapping for renames that change semantic axes.
+        value_map = _KEY_RENAME_VALUE_MAPS.get(old_name)
+        if value_map is not None and old_val in value_map:
+            new_val = value_map[old_val]
+        else:
+            new_val = old_val
         if new_name in model_cfg:
-            if model_cfg[new_name] != old_val:
+            if model_cfg[new_name] != new_val:
                 changes.append(
-                    f"WARNING: model.{old_name}={old_val!r} conflicts with "
-                    f"model.{new_name}={model_cfg[new_name]!r}; NOT removing."
+                    f"WARNING: model.{old_name}={old_val!r} (would map to "
+                    f"{new_val!r}) conflicts with model.{new_name}="
+                    f"{model_cfg[new_name]!r}; NOT removing."
                 )
                 continue
             del model_cfg[old_name]
@@ -145,11 +166,92 @@ def _rewrite_field_names(model_cfg: dict) -> list[str]:
                 f"removed redundant model.{old_name} (matched model.{new_name})"
             )
         else:
-            model_cfg[new_name] = old_val
+            model_cfg[new_name] = new_val
             del model_cfg[old_name]
-            changes.append(
-                f"renamed model.{old_name} -> model.{new_name}"
-            )
+            if new_val != old_val:
+                changes.append(
+                    f"renamed model.{old_name}={old_val!r} -> "
+                    f"model.{new_name}={new_val!r} (value mapping)"
+                )
+            else:
+                changes.append(
+                    f"renamed model.{old_name} -> model.{new_name}"
+                )
+    return changes
+
+
+_BRANCH_ROUTER_NESTED_DEFAULT = {"balancing": "none"}
+
+
+def _expand_top_level_method_to_per_class(cfg: dict) -> list[str]:
+    """Expand top-level `training.load_balancing_method` (and
+    associated coefficients) into per-class
+    `model.{mlp,attn,branch}_router` blocks.
+
+    Migration semantics:
+      * `aux_loss` / `seq_aux_loss` -> mlp_router and attn_router
+        adopt the same balancing; branch_router stays `none`
+        (BranchRouter runtime accepts only none/exploration_only
+        until the broader runtime lands).
+      * `deepseek_bias` -> mlp_router and attn_router adopt
+        deepseek_bias; branch_router stays `none`.
+      * `none` / `quantile` -> mlp_router and attn_router adopt
+        the same value; branch_router stays `none`.
+      * Top-level `training.router_aux_loss_coef` and
+        `training.seq_aux_loss_coef` are propagated onto the
+        per-class blocks for the matching method only.
+
+    The migration only fires when the per-class blocks are
+    ABSENT (so a yaml already on the nested schema does not
+    duplicate entries). The flat `training.load_balancing_method`
+    is left in place — Round 28 keeps it as a runtime input until
+    the full nested-schema cutover lands; the runtime falls back
+    to it when per-class fields are absent.
+    """
+    changes: list[str] = []
+    if "model" not in cfg or not isinstance(cfg["model"], dict):
+        return changes
+    model_cfg = cfg["model"]
+    tcfg = cfg.get("training", {}) or {}
+    # Resolve method from training: first, then fall back to model:
+    # for legacy yamls that placed it under model:.
+    method = tcfg.get("load_balancing_method")
+    if method is None:
+        method = model_cfg.get("load_balancing_method")
+    if method is None:
+        return changes  # nothing to expand
+    aux_coef = tcfg.get("router_aux_loss_coef", model_cfg.get("router_aux_loss_coef", 0.0))
+    seq_coef = tcfg.get("seq_aux_loss_coef", model_cfg.get("seq_aux_loss_coef", 0.0))
+    bias_rate = tcfg.get("bias_update_rate", model_cfg.get("bias_update_rate", 0.0))
+
+    classes_already_set = any(
+        isinstance(model_cfg.get(name), dict) and model_cfg[name]
+        for name in ("mlp_router", "attn_router")
+    )
+    if classes_already_set:
+        return changes  # do not duplicate per-class entries
+
+    def _build_per_class(method: str, *, include_aux=True) -> dict:
+        block: dict = {"balancing": method}
+        if method == "aux_loss" and include_aux and aux_coef:
+            block["router_aux_loss_coef"] = aux_coef
+        elif method == "seq_aux_loss" and include_aux and seq_coef:
+            block["seq_aux_loss_coef"] = seq_coef
+        elif method == "deepseek_bias" and bias_rate:
+            block["bias_update_rate"] = bias_rate
+        return block
+
+    if method in ("aux_loss", "seq_aux_loss", "deepseek_bias", "quantile", "none"):
+        # MLP + attention adopt the method; branch stays `none`.
+        model_cfg["mlp_router"] = _build_per_class(method)
+        model_cfg["attn_router"] = _build_per_class(method)
+        if "branch_router" not in model_cfg:
+            model_cfg["branch_router"] = dict(_BRANCH_ROUTER_NESTED_DEFAULT)
+        changes.append(
+            f"expanded top-level load_balancing_method={method!r} into "
+            f"model.mlp_router / model.attn_router (branch_router stays "
+            f"`none` until runtime supports broader methods)"
+        )
     return changes
 
 
@@ -163,6 +265,7 @@ def migrate_config(cfg: dict) -> list[str]:
         changes.extend(_rewrite_field_names(model_cfg))
         changes.extend(_migrate_branch_router_block(model_cfg))
     changes.extend(_rewrite_balancing_method_tokens(cfg))
+    changes.extend(_expand_top_level_method_to_per_class(cfg))
     return changes
 
 

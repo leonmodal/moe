@@ -464,5 +464,70 @@ def test_per_class_balancing_none_on_both_skips_all_aux(tmp_path):
     )
 
 
+def test_per_class_attn_router_aux_coef_overrides_top_level(tmp_path):
+    """Round 27 review Finding 2 fix: when the nested-schema yaml
+    sets `model.attn_router.router_aux_loss_coef = 2.0` and the
+    top-level `training.router_aux_loss_coef = 0.0`, the
+    attention's aux contribution to total loss must use the
+    per-class 2.0 (NOT the zero top-level). Probe: with a
+    non-zero per-class coef, `loss - ce_loss > 0`.
+    """
+    head, _, tail = _BASE_YAML.partition("training:")
+    yaml_text = (
+        head
+        + "  attn_router:\n"
+        + "    balancing: aux_loss\n"
+        + "    router_aux_loss_coef: 2.0\n"
+        + "training:" + tail
+        + "  load_balancing_method: aux_loss\n"
+        + "  router_aux_loss_coef: 0.0\n"
+    )
+    p = tmp_path / "per_class_coef.yaml"
+    p.write_text(yaml_text)
+    cfg = _CFG_MOD.load_config(str(p))
+    model, _ = _FACTORY_MOD.build_model(cfg)
+    model.train()
+    torch.manual_seed(20260428)
+    input_ids = torch.randint(0, model.vocab_size, (1, 8), dtype=torch.long)
+    out = model(input_ids=input_ids, labels=input_ids, output_router_logits=True)
+    delta = float((out.loss - out.ce_loss).item())
+    assert delta > 1e-6, (
+        f"per-class attn_router_router_aux_loss_coef=2.0 must drive "
+        f"loss > ce_loss; got delta={delta:.3e} (top-level coef=0.0)"
+    )
+
+
+def test_per_class_mlp_router_aux_coef_overrides_top_level(tmp_path):
+    """The companion contract for MLP class: nested
+    `model.mlp_router.router_aux_loss_coef = 2.0` must drive the
+    aux contribution even when the top-level is 0.
+    """
+    head, _, tail = _BASE_YAML.partition("training:")
+    yaml_text = (
+        head
+        + "  mlp_router:\n"
+        + "    balancing: aux_loss\n"
+        + "    router_aux_loss_coef: 2.0\n"
+        + "  attn_router:\n"
+        + "    balancing: none\n"
+        + "training:" + tail
+        + "  load_balancing_method: aux_loss\n"
+        + "  router_aux_loss_coef: 0.0\n"
+    )
+    p = tmp_path / "per_class_mlp_coef.yaml"
+    p.write_text(yaml_text)
+    cfg = _CFG_MOD.load_config(str(p))
+    model, _ = _FACTORY_MOD.build_model(cfg)
+    model.train()
+    torch.manual_seed(20260428)
+    input_ids = torch.randint(0, model.vocab_size, (1, 8), dtype=torch.long)
+    out = model(input_ids=input_ids, labels=input_ids, output_router_logits=True)
+    delta = float((out.loss - out.ce_loss).item())
+    assert delta > 1e-6, (
+        f"per-class mlp_router_router_aux_loss_coef=2.0 must drive "
+        f"loss > ce_loss; got delta={delta:.3e}"
+    )
+
+
 if __name__ == "__main__":
     print("Run via pytest")
