@@ -95,50 +95,85 @@ def test_branch_router_buffer_names_are_canonical():
     assert not hasattr(router, "local_counts"), "legacy `local_counts` buffer must be removed"
 
 
-def test_branch_router_exploration_rng_preserved_under_real_checkpoint():
-    """AC-9 (Round 5): with `exploration_rate > 0` and the softmax branch
-    path, real `torch.utils.checkpoint(...)` produces identical branch
-    decisions on real forward and recompute, courtesy of PyTorch's default
-    `preserve_rng_state=True`. Round 3-4 cached the mask explicitly to defend
-    against a hypothetical `preserve_rng_state=False` setting; that cache
-    caused a saved-tensor count mismatch with real `torch.utils.checkpoint`
-    and was removed in Round 5. This test verifies the RNG-preservation path.
-    """
+def _checkpoint_ctx_fn():
+    """Mirrors `MoEverythingModel._checkpoint_context_fn`: real forward runs
+    with the recompute flag OFF, recompute runs with it ON. Used by every
+    AC-9 stochastic test below to wire `torch.utils.checkpoint` correctly."""
     from src.models.router import checkpoint_recompute_context
+    return checkpoint_recompute_context(False), checkpoint_recompute_context(True)
 
-    def _ctx_fn():
-        return checkpoint_recompute_context(False), checkpoint_recompute_context(True)
 
-    torch.manual_seed(2026)
+def _run_branch_router(
+    *,
+    seed: int,
+    use_deepseek_style: bool,
+    exploration_rate: float = 0.0,
+    use_sampling: bool = False,
+    use_checkpoint: bool,
+    preserve_rng_state: bool = True,
+):
+    """Build a fresh `BranchRouter`, run forward+backward, return
+    `(selected_experts, local_tokens_per_expert, input.grad, loss.item())`.
+
+    The same callable runs both checkpointed and non-checkpointed (when
+    `use_checkpoint=False`), so AC-9 equality assertions can compare the two.
+    """
+    torch.manual_seed(seed)
     router = BranchRouter(
         hidden_size=8,
-        use_deepseek_style=False,
-        exploration_rate=0.5,
+        use_deepseek_style=use_deepseek_style,
+        exploration_rate=exploration_rate,
+        use_sampling=use_sampling,
     ).train()
+    torch.manual_seed(seed)  # re-seed so the input tensor is identical regardless of router init RNG cost
     x = torch.randn(2, 4, 8, requires_grad=True)
 
     def fn(inp):
         w_attn, w_mlp, attn_mask, mlp_mask = router(inp)
         return w_attn.sum() + w_mlp.sum()
 
-    loss = torch.utils.checkpoint.checkpoint(
-        fn, x, use_reentrant=False, context_fn=_ctx_fn,
-    )
+    if use_checkpoint:
+        loss = torch.utils.checkpoint.checkpoint(
+            fn, x,
+            use_reentrant=False,
+            context_fn=_checkpoint_ctx_fn,
+            preserve_rng_state=preserve_rng_state,
+        )
+    else:
+        loss = fn(x)
     loss.backward()
-    # Branch decisions must be identical between the real forward and the
-    # checkpointed recompute. The recompute IS triggered by `loss.backward()`;
-    # any RNG drift would surface as a different `last_selected_experts`
-    # being recorded by the recompute call.
-    assert router.last_selected_experts is not None
-    # The real forward set `last_selected_experts`; recompute (under
-    # `is_checkpoint_recompute()`) overwrites it with the recompute's value.
-    # If the values are equal, RNG was preserved; if not, they'd diverge.
-    # We can't snapshot the real-forward value here (the wrapper hides it),
-    # but the structural assertion (loss.backward() succeeds without
-    # CheckpointError on tensor-count mismatch) confirms the recompute
-    # produced an identical autograd graph — which requires RNG preservation
-    # to be working.
-    assert x.grad is not None and torch.isfinite(x.grad).all()
+    return (
+        router.last_selected_experts.clone() if router.last_selected_experts is not None else None,
+        router.local_tokens_per_expert.clone()
+            if hasattr(router, "local_tokens_per_expert") and router.local_tokens_per_expert is not None
+            else None,
+        x.grad.clone(),
+        loss.item(),
+    )
+
+
+def test_branch_router_softmax_exploration_checkpoint_matches_no_checkpoint():
+    """AC-9 (Round 6): BranchRouter softmax exploration produces identical
+    selected experts AND identical input gradients under
+    `torch.utils.checkpoint(use_reentrant=False, preserve_rng_state=True)` as
+    without checkpointing. Locks the gradient-consistency contract Codex
+    Round 5 review specifically asked for."""
+    sel_no_ckpt, _, grad_no_ckpt, _ = _run_branch_router(
+        seed=2027, use_deepseek_style=False, exploration_rate=0.5,
+        use_checkpoint=False,
+    )
+    sel_ckpt, _, grad_ckpt, _ = _run_branch_router(
+        seed=2027, use_deepseek_style=False, exploration_rate=0.5,
+        use_checkpoint=True,
+    )
+    assert torch.equal(sel_no_ckpt, sel_ckpt), (
+        f"Selected experts diverged between checkpointed and non-checkpointed runs. "
+        f"AC-9 regression."
+    )
+    assert torch.allclose(grad_no_ckpt, grad_ckpt, atol=1e-6), (
+        f"Input gradients diverged: max diff = "
+        f"{(grad_no_ckpt - grad_ckpt).abs().max().item()}. AC-9 regression."
+    )
 
 
 def test_branch_router_under_torch_utils_checkpoint_matches_no_checkpoint():
@@ -197,32 +232,65 @@ def test_branch_router_under_torch_utils_checkpoint_matches_no_checkpoint():
     )
 
 
-def test_branch_router_use_sampling_under_real_checkpoint():
-    """AC-9 (Round 5): `use_sampling=True` (`torch.multinomial` path) survives
-    real `torch.utils.checkpoint(...).backward()` via `preserve_rng_state=True`.
-    """
-    from src.models.router import checkpoint_recompute_context
-
-    def _ctx_fn():
-        return checkpoint_recompute_context(False), checkpoint_recompute_context(True)
-
-    torch.manual_seed(2026)
-    router = BranchRouter(
-        hidden_size=8,
-        use_deepseek_style=True,
-        use_sampling=True,
-    ).train()
-    x = torch.randn(2, 4, 8, requires_grad=True)
-
-    def fn(inp):
-        w_attn, w_mlp, attn_mask, mlp_mask = router(inp)
-        return w_attn.sum() + w_mlp.sum()
-
-    loss = torch.utils.checkpoint.checkpoint(
-        fn, x, use_reentrant=False, context_fn=_ctx_fn,
+def test_branch_router_use_sampling_checkpoint_matches_no_checkpoint():
+    """AC-9 (Round 6): `use_sampling=True` (`torch.multinomial` path) produces
+    identical multinomial draws and identical gradients under checkpoint as
+    without, courtesy of `preserve_rng_state=True`. Compares selections,
+    count buffers, AND gradients to lock the full equivalence."""
+    sel_no_ckpt, counts_no_ckpt, grad_no_ckpt, _ = _run_branch_router(
+        seed=2028, use_deepseek_style=True, use_sampling=True,
+        use_checkpoint=False,
     )
-    loss.backward()
-    assert x.grad is not None and torch.isfinite(x.grad).all()
+    sel_ckpt, counts_ckpt, grad_ckpt, _ = _run_branch_router(
+        seed=2028, use_deepseek_style=True, use_sampling=True,
+        use_checkpoint=True,
+    )
+    assert torch.equal(sel_no_ckpt, sel_ckpt), (
+        f"use_sampling: selections diverged between checkpointed and non-"
+        f"checkpointed. AC-9 regression."
+    )
+    assert torch.equal(counts_no_ckpt, counts_ckpt), (
+        f"use_sampling: count buffers diverged: {counts_no_ckpt} vs {counts_ckpt}. "
+        f"AC-9 regression (count guard not preserving across checkpoint)."
+    )
+    assert torch.allclose(grad_no_ckpt, grad_ckpt, atol=1e-6), (
+        f"use_sampling: gradients diverged: max diff = "
+        f"{(grad_no_ckpt - grad_ckpt).abs().max().item()}. AC-9 regression."
+    )
+
+
+def test_branch_router_use_sampling_diverges_when_rng_state_not_preserved():
+    """AC-9 (Round 6) negative test: with `preserve_rng_state=False`, the
+    `use_sampling` path SHOULD produce different multinomial draws on real
+    forward and recompute (because RNG state isn't restored). This locks the
+    contract that the AC-9 stochastic-path determinism requires PyTorch's
+    default `preserve_rng_state=True`. Codex's Round 5 probe demonstrated
+    this divergence (`maxdiff = 0.123`) and asked for an explicit test that
+    captures it.
+
+    If a future change made `preserve_rng_state=False` deterministic somehow
+    (e.g. by re-introducing a cache layer that survives the saved-tensor
+    count check), this test would start failing — at which point the test
+    should be re-evaluated (the underlying configuration is unsupported by
+    AC-9 unless that hypothetical change explicitly demonstrates safety).
+    """
+    sel_no_ckpt, _, grad_no_ckpt, _ = _run_branch_router(
+        seed=2029, use_deepseek_style=True, use_sampling=True,
+        use_checkpoint=False,
+    )
+    sel_ckpt_no_rng, _, grad_ckpt_no_rng, _ = _run_branch_router(
+        seed=2029, use_deepseek_style=True, use_sampling=True,
+        use_checkpoint=True, preserve_rng_state=False,
+    )
+    selections_diverge = not torch.equal(sel_no_ckpt, sel_ckpt_no_rng)
+    grads_diverge = not torch.allclose(grad_no_ckpt, grad_ckpt_no_rng, atol=1e-6)
+    assert selections_diverge or grads_diverge, (
+        "Expected stochastic divergence with preserve_rng_state=False (the "
+        "recompute should re-sample multinomial with a different RNG state). "
+        "If this assertion fires it means PyTorch's checkpoint behavior "
+        "changed and the AC-9 documented assumption no longer holds — "
+        "re-evaluate the test before passing."
+    )
 
 
 def test_branch_router_real_checkpoint_stochastic_matches_no_checkpoint():
@@ -296,14 +364,10 @@ def test_branch_router_real_checkpoint_stochastic_matches_no_checkpoint():
     )
 
 
-def test_deepseek_router_exploration_under_real_checkpoint():
-    """AC-9 (Round 5): `DeepSeekRouter.forward` with `router_exploration_rate > 0`
-    survives real `torch.utils.checkpoint(...).backward()` via
-    `preserve_rng_state=True`. Replaces the Round 3-4 cache-driven test that
-    was incompatible with `torch.utils.checkpoint`'s strict tensor-count
-    checks.
-    """
-    from src.models.router import DeepSeekRouter, checkpoint_recompute_context
+def _run_deepseek_router(*, seed: int, use_checkpoint: bool):
+    """Same shape as `_run_branch_router` but for `DeepSeekRouter` with
+    `router_exploration_rate=0.5`."""
+    from src.models.router import DeepSeekRouter
 
     class _MiniCfg:
         hidden_size = 8
@@ -316,23 +380,54 @@ def test_deepseek_router_exploration_under_real_checkpoint():
         router_exploration_rate = 0.5
         router_z_loss_coef = 0.0
 
-    def _ctx_fn():
-        return checkpoint_recompute_context(False), checkpoint_recompute_context(True)
-
-    torch.manual_seed(2026)
-    cfg = _MiniCfg()
-    router = DeepSeekRouter(cfg).train()
+    torch.manual_seed(seed)
+    router = DeepSeekRouter(_MiniCfg()).train()
+    torch.manual_seed(seed)
     x = torch.randn(8, 8, requires_grad=True)
 
     def fn(inp):
         scores, weights, idx = router(inp)
         return scores.sum() + weights.sum()
 
-    loss = torch.utils.checkpoint.checkpoint(
-        fn, x, use_reentrant=False, context_fn=_ctx_fn,
-    )
+    if use_checkpoint:
+        loss = torch.utils.checkpoint.checkpoint(
+            fn, x, use_reentrant=False, context_fn=_checkpoint_ctx_fn,
+        )
+    else:
+        loss = fn(x)
     loss.backward()
-    assert x.grad is not None and torch.isfinite(x.grad).all()
+    return (
+        router._last_top_k_idx.clone() if router._last_top_k_idx is not None else None,
+        router.local_tokens_per_expert.clone(),
+        x.grad.clone(),
+    )
+
+
+def test_deepseek_router_exploration_checkpoint_matches_no_checkpoint():
+    """AC-9 (Round 6): `DeepSeekRouter.forward` with `router_exploration_rate=0.5`
+    produces identical `top_k_idx`, `local_tokens_per_expert`, and input
+    gradients under real checkpoint vs no-checkpoint, on the same seed.
+
+    Replaces the Round 5 finite-gradient test (insufficient per Codex
+    Round 5 review)."""
+    idx_no_ckpt, counts_no_ckpt, grad_no_ckpt = _run_deepseek_router(
+        seed=2030, use_checkpoint=False,
+    )
+    idx_ckpt, counts_ckpt, grad_ckpt = _run_deepseek_router(
+        seed=2030, use_checkpoint=True,
+    )
+    assert torch.equal(idx_no_ckpt, idx_ckpt), (
+        f"DeepSeekRouter top_k_idx diverged between checkpointed and non-"
+        f"checkpointed runs. AC-9 regression."
+    )
+    assert torch.equal(counts_no_ckpt, counts_ckpt), (
+        f"DeepSeekRouter local_tokens_per_expert diverged: {counts_no_ckpt} "
+        f"vs {counts_ckpt}. AC-9 count guard regression."
+    )
+    assert torch.allclose(grad_no_ckpt, grad_ckpt, atol=1e-6), (
+        f"DeepSeekRouter input gradients diverged: max diff = "
+        f"{(grad_no_ckpt - grad_ckpt).abs().max().item()}. AC-9 regression."
+    )
 
 
 if __name__ == "__main__":
@@ -340,9 +435,10 @@ if __name__ == "__main__":
     test_branch_router_recompute_does_not_double_count()
     test_branch_router_no_grad_does_not_count()
     test_branch_router_buffer_names_are_canonical()
-    test_branch_router_exploration_rng_preserved_under_real_checkpoint()
+    test_branch_router_softmax_exploration_checkpoint_matches_no_checkpoint()
     test_branch_router_under_torch_utils_checkpoint_matches_no_checkpoint()
-    test_branch_router_use_sampling_under_real_checkpoint()
+    test_branch_router_use_sampling_checkpoint_matches_no_checkpoint()
+    test_branch_router_use_sampling_diverges_when_rng_state_not_preserved()
     test_branch_router_real_checkpoint_stochastic_matches_no_checkpoint()
-    test_deepseek_router_exploration_under_real_checkpoint()
+    test_deepseek_router_exploration_checkpoint_matches_no_checkpoint()
     print("ALL OK")

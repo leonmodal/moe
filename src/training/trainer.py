@@ -156,6 +156,13 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
     if load_balancing_method_resolved is not None:
         model._load_balancing_method = load_balancing_method_resolved
 
+    # DEC-15 / task14: resolve `output_router_logits` once and reuse for
+    # every per-step forward. Aux methods need gradient-bearing router
+    # scores in the model output; non-aux methods don't (the routing-
+    # decision state lives in router-internal buffers).
+    from .balancing_fields import output_router_logits_for_method
+    output_router_logits = output_router_logits_for_method(load_balancing_method_resolved)
+
     if train_cfg.torch_compile:
         compile_mode = train_cfg.torch_compile_mode
         if compile_mode is True:
@@ -357,7 +364,7 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
                     output = model(
                         input_ids=input_ids,
                         labels=labels,
-                        **({} if is_dense else {"output_router_logits": True}),
+                        **({} if is_dense else {"output_router_logits": output_router_logits}),
                     )
                 # Router z-loss (if any router has `router_z_loss_coef > 0`)
                 # is accumulated per-router during forward and summed here so

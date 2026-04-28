@@ -298,16 +298,13 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
         self._last_top_k_idx = None
         self._last_exploration_mask = None
         self._last_z_loss = None
-        # AC-9: snapshot of `top_k_idx` written ONLY on the real forward.
-        # On gradient-checkpoint recompute, the router uses this snapshot
-        # to produce the same biased top-k selection without re-sampling
-        # `apply_router_exploration`'s `torch.rand_like`. This is a defensive
-        # safety net against checkpoint configurations where
-        # `preserve_rng_state=False` is set (PyTorch's default `True` already
-        # makes recompute deterministic, but this cache survives even when
-        # RNG preservation is disabled, e.g. by some custom checkpoint
-        # wrappers).
-        self._cached_top_k_idx_for_recompute: torch.Tensor | None = None
+        # AC-9 (Round 5): rely on `torch.utils.checkpoint`'s default
+        # `preserve_rng_state=True` for recompute determinism. An earlier
+        # design cached `top_k_idx` here to defend against
+        # `preserve_rng_state=False`, but the cache caused a saved-tensor
+        # count mismatch under `use_reentrant=False`. The count-buffer
+        # guard in `forward` is the only checkpoint-specific state we need.
+        # See bitlesson `BL-20260428-cache-vs-checkpoint-tensor-count`.
 
     def forward(self, hidden_states: torch.Tensor):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)

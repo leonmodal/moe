@@ -16,6 +16,7 @@ import os
 from .balancing_fields import (  # noqa: F401
     _BALANCING_FIELDS_IN_TRAINING,
     _resolve_balancing_field,
+    output_router_logits_for_method,
 )
 
 from src.models import (
@@ -162,6 +163,14 @@ def build_model(cfg: dict):
         model = Qwen3ForCausalLM(config)
         return model, config
 
+    # DEC-15 / task14: resolve `output_router_logits` from the method.
+    # For aux methods, router scores need to be gradient-bearing in the
+    # model output so the aux loss term can backprop through them. For
+    # non-aux methods (deepseek_bias, quantile, none), we don't return
+    # them — the routing-decision state lives in router-internal buffers.
+    method_for_orl = _resolve_balancing_field(cfg, "load_balancing_method", None)
+    output_router_logits = output_router_logits_for_method(method_for_orl)
+
     # Common MoE parameters
     common = dict(
         vocab_size=mcfg["vocab_size"],
@@ -182,7 +191,7 @@ def build_model(cfg: dict):
         seq_aux_loss_coef=_resolve_balancing_field(cfg, "seq_aux_loss_coef", 0.0),
         norm_topk_prob=mcfg.get("norm_topk_prob", True),
         num_experts_per_tok=mcfg["num_experts_per_tok"],
-        output_router_logits=True,
+        output_router_logits=output_router_logits,
         attn_implementation=attn_impl,
     )
 

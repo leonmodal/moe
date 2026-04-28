@@ -90,10 +90,16 @@ def run_validation(
             }
             input_ids = batch["input_ids"]
             labels = input_ids
+            # DEC-15: respect the method-aware `output_router_logits` policy
+            # the model was built with. `getattr` falls back to True for the
+            # legacy back-compat path (no method stamped → preserve pre-DEC-15
+            # behavior).
+            orl = getattr(raw_model, "config", None)
+            orl_value = getattr(orl, "output_router_logits", True) if orl is not None else True
             output = model(
                 input_ids=input_ids,
                 labels=labels,
-                **({} if is_dense else {"output_router_logits": True}),
+                **({} if is_dense else {"output_router_logits": orl_value}),
             )
             metrics, _, _ = compute_output_metrics(
                 output,

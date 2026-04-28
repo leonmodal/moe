@@ -82,6 +82,32 @@ _VALID_LOAD_BALANCING_METHODS: tuple[str, ...] = (
     "quantile",
     "none",
 )
+# DEC-15 (RESOLVED 2026-04-27 → AC-1 task14): methods whose loss term needs
+# `router_logits` exposed as a gradient-bearing model output. For other
+# methods, the model's `forward` should NOT request loss-bearing router
+# logits — non-aux methods drive routing through the router-internal
+# `_last_top_k_idx` / `local_tokens_per_expert` buffers and do not need the
+# autograd graph to retain `router_logits`.
+_AUX_BEARING_METHODS: frozenset = frozenset({"aux_loss", "seq_aux_loss"})
+
+
+def output_router_logits_for_method(method: str | None) -> bool:
+    """Resolve the `output_router_logits` flag from `load_balancing_method`.
+
+    Per DEC-15:
+      - `None` (no method set; legacy back-compat): return True (preserve
+        the pre-DEC-15 default; any caller that opts out can pass `None`
+        explicitly to bypass).
+      - `aux_loss` / `seq_aux_loss`: return True (router scores are
+        gradient-bearing inputs to the aux loss term).
+      - `deepseek_bias` / `quantile` / `none`: return False (no aux loss
+        term reads `router_logits`; the router-internal `_last_top_k_idx`
+        and `local_tokens_per_expert` carry the routing-decision state
+        that the bias-update path consumes).
+    """
+    if method is None:
+        return True
+    return method in _AUX_BEARING_METHODS
 _METHOD_ACTIVE_FIELDS: dict[str, frozenset[str]] = {
     "aux_loss": frozenset({"router_aux_loss_coef"}),
     "seq_aux_loss": frozenset({"seq_aux_loss_coef"}),
