@@ -412,4 +412,16 @@ def build_model(cfg: dict):
                 if key in mlp_block:
                     setattr(config, f"effective_{key}", mlp_block[key])
 
+    # Round 37: same effective_* mirror for the branch router. When
+    # branch_router.balancing == deepseek_bias, the trainer's bias-update
+    # walker needs `effective_bias_update_rate` (etc.) to be visible on
+    # `config` so it can fall back from a zeroed top-level
+    # `train_cfg.bias_update_rate` to the per-class branch value.
+    branch_block = mcfg.get("branch_router") if isinstance(mcfg.get("branch_router"), dict) else None
+    if branch_block is not None and branch_block.get("balancing") == "deepseek_bias":
+        for key in ("bias_update_rate", "bias_update_zero_sum",
+                    "bias_warmup_start", "bias_warmup_steps"):
+            if key in branch_block and not hasattr(config, f"effective_{key}"):
+                setattr(config, f"effective_{key}", branch_block[key])
+
     return model, config

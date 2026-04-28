@@ -459,15 +459,17 @@ def test_validator_branch_router_accepts_seq_aux_loss():
     _validator()(cfg)
 
 
-def test_validator_branch_router_rejects_deepseek_bias_until_runtime_lands():
-    """deepseek_bias still requires owner-state plumbing
-    (per-router `expert_bias` + accumulator buffers + walker
-    dispatch); rejected at validator level so failures surface
-    at config-load time rather than inside the build_model path.
+def test_validator_branch_router_accepts_deepseek_bias():
+    """BranchRouter already owns `expert_bias` and
+    `local_tokens_per_expert` via DEC-18, so the post-step bias
+    walker can dispatch on it directly. Round 37 lifted the
+    constructor / validator restriction.
     """
-    cfg = {"model": {"branch_router": {"balancing": "deepseek_bias"}}}
-    with pytest.raises(ValueError, match="branch_router.balancing="):
-        _validator()(cfg)
+    cfg = {"model": {"branch_router": {
+        "balancing": "deepseek_bias",
+        "bias_update_rate": 0.001,
+    }}}
+    _validator()(cfg)
 
 
 def test_validator_branch_router_rejects_quantile():

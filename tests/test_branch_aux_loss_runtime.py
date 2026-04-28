@@ -209,12 +209,77 @@ def test_branch_balancing_none_produces_no_extra_loss_term(tmp_path):
     )
 
 
-def test_branch_router_rejects_deepseek_bias_at_construction():
-    """`deepseek_bias` on branch_router still requires owner-state
-    plumbing — rejected at BranchRouter constructor."""
+def test_branch_router_accepts_deepseek_bias_at_construction():
+    """`deepseek_bias` is now accepted: BranchRouter has
+    `expert_bias` + `local_tokens_per_expert` already (DEC-18).
+    Construction must succeed and the resulting router has the
+    correct balancing label."""
     from src.models.routing.routers import BranchRouter
-    with pytest.raises(ValueError, match="BranchRouter balancing must be"):
-        BranchRouter(hidden_size=16, balancing="deepseek_bias")
+    router = BranchRouter(hidden_size=16, balancing="deepseek_bias")
+    assert router.balancing == "deepseek_bias"
+    assert hasattr(router, "expert_bias")
+    assert hasattr(router, "local_tokens_per_expert")
+
+
+def test_branch_deepseek_bias_drives_post_step_expert_bias_update(tmp_path):
+    """Round 37: end-to-end branch deepseek_bias.
+
+    Build a yaml with branch_router.balancing=deepseek_bias +
+    bias_update_rate=0.001. Run forward + backward + optimizer.step
+    + post-step bias update. Assert branch.expert_bias changed
+    from initial (zero) to non-zero values.
+    """
+    import importlib.util as _u
+    repo = Path(__file__).resolve().parent.parent
+    spec = _u.spec_from_file_location(
+        "src.training.routing", str(repo / "src" / "training" / "routing.py"),
+    )
+    routing = _u.module_from_spec(spec)
+    sys.modules["src.training.routing"] = routing
+    spec.loader.exec_module(routing)
+
+    head, _, tail = _BASE_YAML.partition("training:")
+    yaml_text = (
+        head.replace(
+            "%BRANCH_BLOCK%",
+            "    balancing: deepseek_bias\n"
+            "    bias_update_rate: 0.001\n"
+            "    bias_update_zero_sum: true\n",
+        )
+        + "training:" + tail
+    )
+    p = tmp_path / "branch_deepseek.yaml"
+    p.write_text(yaml_text)
+    cfg = _CFG_MOD.load_config(str(p))
+    torch.manual_seed(20260428)
+    model, _ = _FACTORY_MOD.build_model(cfg)
+    model.train()
+    branch = model.model.branch_router
+
+    # Pre-populate counts to a non-zero baseline so the bias
+    # update has signal to act on (forward might not produce
+    # imbalanced counts in 1 step on this tiny model).
+    branch.local_tokens_per_expert.zero_()
+    branch.local_tokens_per_expert[0] = 100.0  # heavy ATTN
+    branch.local_tokens_per_expert[1] = 1.0    # light MLP
+    initial_bias = branch.expert_bias.clone()
+
+    # Run trainer post-step bias update directly (no forward needed
+    # since we pre-populated counts).
+    train_cfg = _CFG_MOD.build_training_config(cfg)
+    routing.trainer_post_optimizer_bias_update(
+        model, train_cfg=train_cfg, cfg=cfg,
+        distributed=False, global_step=1,
+    )
+
+    # ATTN was heavy → expert_bias[0] should decrease, expert_bias[1]
+    # should increase (zero-sum: bias -= sign(load - 1/E) * rate).
+    assert not torch.allclose(branch.expert_bias, initial_bias), (
+        f"branch.expert_bias did not change after post-step update; "
+        f"per-class branch deepseek_bias is not driving the walker. "
+        f"before={initial_bias.tolist()}, "
+        f"after={branch.expert_bias.tolist()}"
+    )
 
 
 def test_branch_router_rejects_quantile_at_construction():

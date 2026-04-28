@@ -86,6 +86,20 @@ def trainer_post_optimizer_bias_update(
         method_for_bias_update is None
         or method_for_bias_update in _BIAS_UPDATE_METHODS
     )
+    # Per-class gating: even when the model-level method is NOT in
+    # `_BIAS_UPDATE_METHODS`, the trainer must still fire when ANY
+    # per-class router opts into deepseek_bias. The per-class block
+    # populates `config.<group>_router_balancing` (for mlp/attn) or
+    # `config.branch_balancing` (for branch). When any of those
+    # equals `deepseek_bias` we override the gate.
+    raw_config = getattr(raw_model, "config", None)
+    per_class_methods = (
+        getattr(raw_config, "mlp_router_balancing", None),
+        getattr(raw_config, "attn_router_balancing", None),
+        getattr(raw_config, "branch_balancing", None),
+    )
+    if any(m == "deepseek_bias" for m in per_class_methods):
+        method_allows_bias_update = True
     # Per-class effective rate: when the nested-schema yaml sets
     # `model.mlp_router.balancing == "deepseek_bias"` and a
     # per-class `bias_update_rate`, the trainer must run the bias
@@ -211,6 +225,24 @@ def update_expert_biases(
 
     use_dist = distributed and dist.is_available() and dist.is_initialized()
 
+    # Per-class method check: when a per-class block opts a class
+    # OUT of deepseek_bias (e.g. MLP=aux_loss + branch=deepseek_bias),
+    # the walker must skip the non-deepseek owners so it doesn't
+    # blindly nudge `expert_bias` on an owner whose runtime never
+    # consumes it. The per-class method lives on:
+    #   - `config.mlp_router_balancing` for MLP routers
+    #   - `config.attn_router_balancing` for attention routers
+    #   - `config.branch_balancing` for the branch router
+    config = getattr(raw_model, "config", None)
+    label_to_class_method = {
+        "mlp": getattr(config, "mlp_router_balancing", None),
+        "q":   getattr(config, "attn_router_balancing", None),
+        "k":   getattr(config, "attn_router_balancing", None),
+        "v":   getattr(config, "attn_router_balancing", None),
+        "o":   getattr(config, "attn_router_balancing", None),
+        "branch": getattr(config, "branch_balancing", None),
+    }
+
     for owner, label in get_owners():
         # Skip branch routers in exploration-only mode: the mode is
         # by construction independent of the bias-update signal, so
@@ -221,6 +253,15 @@ def update_expert_biases(
             label == "branch"
             and getattr(owner, "balancing", "none") == "exploration_only"
         ):
+            continue
+        # Per-class gate: skip owners whose per-class method is set
+        # to anything OTHER than `deepseek_bias` (e.g. MLP=aux_loss
+        # + branch=deepseek_bias means the walker fires only on
+        # branch). When the per-class field is unset/None, fall
+        # back to the legacy unconditional update so back-compat
+        # configs keep working.
+        class_method = label_to_class_method.get(label)
+        if class_method is not None and class_method != "deepseek_bias":
             continue
         rate = rates.get(label, bias_rate)
         _update_single_router_bias(owner, rate, use_dist, zero_sum=zero_sum)
