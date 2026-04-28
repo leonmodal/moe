@@ -461,6 +461,333 @@ training:
     )
 
 
+def test_branch_deepseek_bias_sampling_path_consumes_expert_bias():
+    """Round 38 review Finding 1: when `use_sampling=True`, the
+    branch router previously called `torch.multinomial(scores, 1)`
+    on the unbiased sigmoid scores — so even though the post-step
+    walker updated `expert_bias`, the sampling categorical was
+    unchanged.
+
+    Probe: with equal logits (50/50 sigmoid scores) and an extreme
+    bias of [-16, +16], the sampling categorical must be driven
+    overwhelmingly toward MLP. We use 2000 tokens and a fixed seed
+    and assert the MLP fraction is > 0.95 (a fair coin flip would
+    sit at 0.5).
+    """
+    from src.models.routing.routers import BranchRouter
+    torch.manual_seed(0)
+    router = BranchRouter(
+        hidden_size=4, balancing="deepseek_bias",
+        use_deepseek_style=False,  # legacy flag NOT set
+        use_sampling=True,
+    )
+    router.train()  # sampling path is gated on `self.training`
+    # Equal logits => sigmoid scores ≈ 0.5 for both classes.
+    with torch.no_grad():
+        router.gate.weight.zero_()
+        router.gate.bias.zero_() if router.gate.bias is not None else None
+        # Extreme bias toward MLP.
+        router.expert_bias[0] = -16.0
+        router.expert_bias[1] = +16.0
+    h = torch.zeros(1, 2000, 4)
+    torch.manual_seed(7)
+    _, _, attn_mask, mlp_mask = router(h)
+    mlp_fraction = mlp_mask.float().mean().item()
+    assert mlp_fraction > 0.95, (
+        f"sampling path is ignoring `expert_bias`; with extreme MLP-favouring "
+        f"bias the sampled MLP fraction should exceed 0.95, got "
+        f"{mlp_fraction:.3f}. Equal logits + biased multinomial should "
+        f"land overwhelmingly in MLP."
+    )
+
+
+def test_branch_deepseek_bias_per_layer_router_lifecycle(tmp_path):
+    """Round 38 review Finding 1: Codex specifically asked for the
+    plural / per-layer branch router lifecycle.
+
+    Build moe_everything with `per_layer_router=True`,
+    `branch_router.balancing=deepseek_bias`. Pre-populate imbalanced
+    counts on EVERY per-layer router. Run the post-step walker.
+    Assert every per-layer `branch_routers[i].expert_bias` mutated.
+    """
+    import importlib.util as _u
+    repo = Path(__file__).resolve().parent.parent
+    spec = _u.spec_from_file_location(
+        "src.training.routing", str(repo / "src" / "training" / "routing.py"),
+    )
+    routing = _u.module_from_spec(spec)
+    sys.modules["src.training.routing"] = routing
+    spec.loader.exec_module(routing)
+
+    yaml_text = """experiment_name: per_layer_branch_deepseek
+model:
+  type: moe_everything
+  vocab_size: 32
+  hidden_size: 16
+  num_hidden_layers: 3
+  head_dim: 8
+  num_attention_heads: 2
+  num_key_value_heads: 2
+  num_experts: 4
+  num_experts_per_tok: 2
+  moe_intermediate_size: 32
+  intermediate_size: 32
+  norm_topk_prob: true
+  router_exploration_rate: 0.0
+  num_attn_experts: 2
+  num_attn_experts_per_tok: 1
+  attn_expert_mode: per_head_fully_independent
+  scale_attn_by_routing_weight: true
+  scale_branch_by_routing_weight: true
+  per_head_compute_mode: dense
+  use_deepseek_routing: true
+  branch_deepseek: false
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-06
+  rope_theta: 10000.0
+  max_position_embeddings: 32
+  tie_word_embeddings: true
+  output_router_logits: true
+  attn_implementation: eager
+  per_layer_router: true
+  mlp_router:
+    balancing: none
+  attn_router:
+    balancing: none
+  branch_router:
+    balancing: deepseek_bias
+    bias_update_rate: 0.5
+    bias_update_zero_sum: true
+training:
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 0
+  max_steps: 1
+  batch_size: 1
+  gradient_accumulation: 1
+  mixed_precision: ""
+  output_dir: /tmp
+"""
+    p = tmp_path / "per_layer_branch.yaml"
+    p.write_text(yaml_text)
+    cfg = _CFG_MOD.load_config(str(p))
+    torch.manual_seed(20260428)
+    model, _ = _FACTORY_MOD.build_model(cfg)
+    model.train()
+
+    # Per-layer routers live on `model.model.branch_routers` (plural).
+    branch_routers = getattr(model.model, "branch_routers", None)
+    assert branch_routers is not None and len(branch_routers) == 3, (
+        f"expected per-layer branch_routers ModuleList of length 3; "
+        f"got {branch_routers!r}"
+    )
+
+    # Pre-populate identical imbalance on every per-layer router.
+    initial: list[torch.Tensor] = []
+    with torch.no_grad():
+        for r in branch_routers:
+            r.local_tokens_per_expert.zero_()
+            r.local_tokens_per_expert[0] = 100.0  # heavy ATTN
+            r.local_tokens_per_expert[1] = 1.0    # light MLP
+            initial.append(r.expert_bias.detach().clone())
+
+    train_cfg = _CFG_MOD.build_training_config(cfg)
+    routing.trainer_post_optimizer_bias_update(
+        model, train_cfg=train_cfg, cfg=cfg,
+        distributed=False, global_step=1,
+    )
+
+    # Every per-layer router's expert_bias must have moved.
+    for i, r in enumerate(branch_routers):
+        assert not torch.allclose(r.expert_bias, initial[i]), (
+            f"per-layer branch_routers[{i}].expert_bias did not change; "
+            f"the walker is not reaching every per-layer branch owner. "
+            f"before={initial[i].tolist()}, after={r.expert_bias.tolist()}"
+        )
+
+
+def test_walker_per_proj_zero_sum_dispatches_per_owner_mode():
+    """Round 38 review Finding 2: per-owner zero-sum dispatch.
+
+    Direct unit test of `update_expert_biases(per_proj_zero_sum=...)`.
+    For an owner with E=4 experts and asymmetric counts [100, 1, 1, 1],
+    the two modes produce measurably different cumulative bias trajectories:
+
+      - zero_sum=True: per-step delta is mean-subtracted, so cumulative
+        bias mean stays pinned at 0 (`bias -= (s - s.mean()) * rate`).
+      - zero_sum=False: per-step delta is the raw sign tensor, so
+        cumulative bias mean drifts under asymmetric loads
+        (`bias -= s * rate`).
+
+    Build two equally-shaped owners labeled "mlp" and "branch" with
+    IDENTICAL counts. Pass `per_proj_zero_sum={"mlp": True, "branch": False}`.
+    Assert MLP mean is ~0 (zero-sum mode) and branch mean drifts
+    (non-zero-sum mode). Without per-owner dispatch, the walker
+    would collapse both onto the legacy global flag and at least one
+    of these assertions would fail.
+
+    Note: the binary 2-class case has `s.mean() == 0` whenever the
+    counts are split 1-1, so the two modes only differ for E ≥ 3.
+    The mock owners in this test use E=4 to expose the difference.
+    """
+    import importlib.util as _u
+    import torch.nn as nn
+    repo = Path(__file__).resolve().parent.parent
+    spec = _u.spec_from_file_location(
+        "src.training.routing", str(repo / "src" / "training" / "routing.py"),
+    )
+    routing = _u.module_from_spec(spec)
+    sys.modules["src.training.routing"] = routing
+    spec.loader.exec_module(routing)
+
+    class _Owner(nn.Module):
+        def __init__(self, n=4):
+            super().__init__()
+            self.register_buffer("expert_bias", torch.zeros(n, dtype=torch.float32))
+            self.register_buffer(
+                "local_tokens_per_expert",
+                torch.zeros(n, dtype=torch.float32),
+                persistent=False,
+            )
+
+    class _MockConfig:
+        pass
+
+    class _MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.owner_mlp = _Owner(4)
+            self.owner_branch = _Owner(4)
+            self._load_balancing_method = "deepseek_bias"
+            self.config = _MockConfig()
+
+        def get_all_balancing_owners(self):
+            yield self.owner_mlp, "mlp"
+            yield self.owner_branch, "branch"
+
+    m = _MockModel()
+    counts = torch.tensor([100.0, 1.0, 1.0, 1.0])
+    m.owner_mlp.local_tokens_per_expert.copy_(counts)
+    m.owner_branch.local_tokens_per_expert.copy_(counts)
+
+    with torch.no_grad():
+        routing.update_expert_biases(
+            m, bias_rate=0.5, distributed=False,
+            per_proj_zero_sum={"mlp": True, "branch": False},
+        )
+
+    mlp_mean = float(m.owner_mlp.expert_bias.mean().item())
+    branch_mean = float(m.owner_branch.expert_bias.mean().item())
+    assert abs(mlp_mean) < 1e-4, (
+        f"owner labeled 'mlp' under zero_sum=True should have cumulative "
+        f"bias mean pinned at 0; got mean={mlp_mean:.6e}. The walker is "
+        f"NOT applying per-owner zero_sum=True for the mlp label."
+    )
+    assert abs(branch_mean) > 1e-4, (
+        f"owner labeled 'branch' under zero_sum=False should drift; got "
+        f"mean={branch_mean:.6e}. The walker is collapsing both owners "
+        f"onto zero_sum=True instead of honoring per_proj_zero_sum."
+    )
+
+
+def test_trainer_threads_per_owner_zero_sum_through_factory_stamping(tmp_path):
+    """Higher-level: prove the trainer pipes per-class
+    `effective_<owner>_bias_update_zero_sum` (set by `model_factory.py`
+    when `<owner>_router.balancing == "deepseek_bias"`) into the walker
+    via `per_proj_zero_sum`.
+
+    Build a tiny model and STAMP the per-owner flags directly onto
+    `config`, then call the trainer's post-step helper. Compare the
+    resulting MLP-bias trajectory to a flipped-flag run on a fresh
+    model with identical counts. Without my fix, the trainer reads
+    only the un-prefixed alias and the per-owner flag is ignored —
+    the trajectories would be identical.
+    """
+    import importlib.util as _u
+    import torch.nn as nn
+    repo = Path(__file__).resolve().parent.parent
+    spec = _u.spec_from_file_location(
+        "src.training.routing", str(repo / "src" / "training" / "routing.py"),
+    )
+    routing = _u.module_from_spec(spec)
+    sys.modules["src.training.routing"] = routing
+    spec.loader.exec_module(routing)
+
+    class _Owner(nn.Module):
+        def __init__(self, n=4):
+            super().__init__()
+            self.register_buffer("expert_bias", torch.zeros(n, dtype=torch.float32))
+            self.register_buffer(
+                "local_tokens_per_expert",
+                torch.zeros(n, dtype=torch.float32),
+                persistent=False,
+            )
+
+    class _MockConfig:
+        def __init__(self, mlp_zs):
+            # The trainer reads `effective_mlp_bias_update_zero_sum`.
+            # `effective_mlp_bias_update_rate` mirrors a per-class rate
+            # so the trainer's owner-rate gate fires for "mlp".
+            self.effective_mlp_bias_update_zero_sum = mlp_zs
+            self.effective_mlp_bias_update_rate = 0.5
+            self.mlp_router_balancing = "deepseek_bias"
+            # The unprefixed alias is the OPPOSITE of the per-owner
+            # value so a regression that ignores per-owner stamping
+            # would observe the wrong mode.
+            self.effective_bias_update_zero_sum = not mlp_zs
+            self.effective_bias_update_rate = 0.5
+
+    class _MockModel(nn.Module):
+        def __init__(self, mlp_zs):
+            super().__init__()
+            self.owner_mlp = _Owner(4)
+            self._load_balancing_method = "deepseek_bias"
+            self.config = _MockConfig(mlp_zs)
+
+        def get_all_balancing_owners(self):
+            yield self.owner_mlp, "mlp"
+
+    counts = torch.tensor([100.0, 1.0, 1.0, 1.0])
+
+    class _TrainCfg:
+        bias_update_rate = 0.0
+        bias_update_zero_sum = True  # would override if alias was read
+        bias_warmup_start = 0.0
+        bias_warmup_steps = 0
+
+    # MLP zero_sum=True stamped on per-owner field; alias is False.
+    m_true = _MockModel(mlp_zs=True)
+    m_true.owner_mlp.local_tokens_per_expert.copy_(counts)
+    routing.trainer_post_optimizer_bias_update(
+        m_true, train_cfg=_TrainCfg(), cfg={"training": {}},
+        distributed=False, global_step=1,
+    )
+
+    # MLP zero_sum=False stamped on per-owner field; alias is True.
+    m_false = _MockModel(mlp_zs=False)
+    m_false.owner_mlp.local_tokens_per_expert.copy_(counts)
+    routing.trainer_post_optimizer_bias_update(
+        m_false, train_cfg=_TrainCfg(), cfg={"training": {}},
+        distributed=False, global_step=1,
+    )
+
+    mean_true = float(m_true.owner_mlp.expert_bias.mean().item())
+    mean_false = float(m_false.owner_mlp.expert_bias.mean().item())
+    assert abs(mean_true) < 1e-4, (
+        f"per-owner mlp_zs=True should pin mean at 0; got {mean_true:.6e}. "
+        f"The trainer read the un-prefixed alias instead of "
+        f"effective_mlp_bias_update_zero_sum."
+    )
+    assert abs(mean_false) > 1e-4, (
+        f"per-owner mlp_zs=False should drift mean; got {mean_false:.6e}. "
+        f"The trainer read the un-prefixed alias instead of "
+        f"effective_mlp_bias_update_zero_sum."
+    )
+
+
 def test_branch_deepseek_bias_post_step_bias_changes_subsequent_branch_choice(tmp_path):
     """Full lifecycle: load_config -> build -> pre-populate counts ->
     trainer_post_optimizer_bias_update -> forward.

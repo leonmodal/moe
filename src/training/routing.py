@@ -175,13 +175,34 @@ def trainer_post_optimizer_bias_update(
         "branch": _resolve_balancing_field(cfg, "bias_rate_branch", branch_rate),
     }
 
-    # Per-class `bias_update_zero_sum` mirror — falls back to
-    # top-level when unset.
-    effective_zero_sum = getattr(
+    # Per-owner `bias_update_zero_sum` resolution. The factory stamps
+    # `effective_<owner>_bias_update_zero_sum` for every nested
+    # per-class block whose `balancing == "deepseek_bias"`. Owners
+    # that didn't opt in fall back to the global flag (un-prefixed
+    # `effective_bias_update_zero_sum` or `train_cfg.bias_update_zero_sum`).
+    global_zero_sum = getattr(
         raw_config, "effective_bias_update_zero_sum", None,
     )
-    if effective_zero_sum is None:
-        effective_zero_sum = train_cfg.bias_update_zero_sum
+    if global_zero_sum is None:
+        global_zero_sum = train_cfg.bias_update_zero_sum
+
+    def _per_owner_zero_sum(owner: str) -> bool:
+        per_owner = getattr(
+            raw_config, f"effective_{owner}_bias_update_zero_sum", None,
+        )
+        if per_owner is None:
+            return bool(global_zero_sum)
+        return bool(per_owner)
+
+    mlp_zs = _per_owner_zero_sum("mlp")
+    attn_zs = _per_owner_zero_sum("attn")
+    branch_zs = _per_owner_zero_sum("branch")
+    per_proj_zero_sum = {
+        "mlp": mlp_zs,
+        "q": attn_zs, "k": attn_zs, "v": attn_zs, "o": attn_zs,
+        "branch": branch_zs,
+    }
+
     # The fallback `bias_rate` for the walker is the maximum among
     # per-owner rates so labels not covered by `per_proj_rates` (or
     # absent owners) keep using a sane positive value rather than 0.
@@ -190,7 +211,8 @@ def trainer_post_optimizer_bias_update(
         update_expert_biases(
             model, bias_rate=fallback_rate, distributed=distributed,
             per_proj_rates=per_proj_rates,
-            zero_sum=bool(effective_zero_sum),
+            zero_sum=bool(global_zero_sum),
+            per_proj_zero_sum=per_proj_zero_sum,
         )
 
 
@@ -201,6 +223,7 @@ def update_expert_biases(
     distributed: bool = False,
     per_proj_rates: dict[str, float] | None = None,
     zero_sum: bool = True,
+    per_proj_zero_sum: dict[str, bool] | None = None,
 ) -> None:
     """Update expert biases using DeepSeek V3-style load balancing.
 
@@ -303,7 +326,11 @@ def update_expert_biases(
         if class_method is not None and class_method != "deepseek_bias":
             continue
         rate = rates.get(label, bias_rate)
-        _update_single_router_bias(owner, rate, use_dist, zero_sum=zero_sum)
+        owner_zero_sum = (
+            per_proj_zero_sum.get(label, zero_sum)
+            if per_proj_zero_sum is not None else zero_sum
+        )
+        _update_single_router_bias(owner, rate, use_dist, zero_sum=owner_zero_sum)
 
 
 def _update_single_router_bias(

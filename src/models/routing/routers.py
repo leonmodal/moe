@@ -236,10 +236,22 @@ class BranchRouter(nn.Module):
                 scores = torch.sigmoid(logits)
                 biased = scores + self.expert_bias.to(scores.dtype)
                 if self.training and self.use_sampling:
-                    # Recompute determinism: rely on `torch.utils.checkpoint`'s default
+                    # Sample from a bias-aware distribution so the
+                    # learned `expert_bias` actually shifts the
+                    # sampling categorical — otherwise the post-step
+                    # walker mutates a buffer that the sampling path
+                    # ignores, and a heavily-loaded expert never
+                    # gets routed away from.
+                    # Renormalize via softmax over `biased` (in fp32
+                    # to keep negative-bias clamps stable) to produce
+                    # a valid `multinomial` distribution.
+                    # Recompute determinism: rely on
+                    # `torch.utils.checkpoint`'s default
                     # `preserve_rng_state=True` so `torch.multinomial`
-                    # produces identical draws on real forward and recompute.
-                    flat = scores.view(-1, 2)
+                    # produces identical draws on real forward and
+                    # recompute.
+                    sample_dist = F.softmax(biased.float(), dim=-1)
+                    flat = sample_dist.view(-1, 2)
                     choice = torch.multinomial(flat, 1).view(scores.shape[:-1])
                 else:
                     choice = biased.argmax(dim=-1)
