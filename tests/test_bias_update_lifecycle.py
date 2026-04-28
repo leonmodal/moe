@@ -1186,21 +1186,20 @@ def test_update_expert_biases_rejects_grad_enabled_call():
 
 
 @pytest.mark.parametrize(
-    "method", ["aux_loss", "seq_aux_loss", "quantile", "none"]
+    "method", ["aux_loss", "seq_aux_loss", "none"]
 )
 def test_update_expert_biases_no_op_for_non_bias_methods(method):
     """AC-1/AC-6 (Codex Round 14 Finding 1): non-bias methods must
     no-op cleanly under the default grad-enabled context — the
     method-dispatch gate runs BEFORE the no_grad misuse guard, so
     direct callers (tests, downstream tools) calling
-    `update_expert_biases` for `aux_loss`/`seq_aux_loss`/`quantile`/
-    `none` get the documented no-op semantics rather than a
-    `RuntimeError`.
+    `update_expert_biases` for `aux_loss`/`seq_aux_loss`/`none`
+    get the documented no-op semantics rather than a `RuntimeError`.
 
-    The misuse guard exists to catch accidental misuse on
-    `deepseek_bias` (the only currently-active bias method); it
-    should NEVER fire for other methods because they don't
-    walk owners or mutate buffers.
+    The misuse guard exists to catch accidental misuse on bias-
+    update methods (currently `deepseek_bias` and `quantile`); it
+    should NEVER fire for non-bias methods because they don't walk
+    owners or mutate buffers.
     """
     routing = _load_routing_module()
     router = _make_router(num_experts=4)

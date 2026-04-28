@@ -288,6 +288,190 @@ def test_branch_router_rejects_quantile_at_construction():
         BranchRouter(hidden_size=16, balancing="quantile")
 
 
+def test_walker_dispatches_quantile_owner_through_quantile_helper():
+    """Round 41 AC-10: per-owner quantile dispatch.
+
+    When an owner's per-class method is `quantile` AND
+    `_BIAS_UPDATE_METHODS` includes `quantile`, the walker must call
+    `_update_single_router_quantile_bias` (which drains the
+    accumulator and updates `expert_bias` + `quantile_ema`) — not the
+    DeepSeek `sign(load - 1/E)` path.
+
+    Direct unit test: build a mock owner with a populated
+    `local_quantile_scores` list and `quantile_ema` buffer. Call the
+    walker with model-level method = `quantile`. Assert:
+      - `quantile_ema` updates from zeros (EMA absorbed the scores).
+      - `expert_bias` is set (quantile bias-from-EMA pulls toward
+        global EMA median).
+      - `local_quantile_scores` is drained to an empty list.
+      - `local_tokens_per_expert` is NOT zeroed (the deepseek path
+        wasn't run).
+    """
+    import importlib.util as _u
+    import torch.nn as nn
+    repo = Path(__file__).resolve().parent.parent
+    spec = _u.spec_from_file_location(
+        "src.training.routing", str(repo / "src" / "training" / "routing.py"),
+    )
+    routing = _u.module_from_spec(spec)
+    sys.modules["src.training.routing"] = routing
+    spec.loader.exec_module(routing)
+
+    class _Owner(nn.Module):
+        def __init__(self, n=4):
+            super().__init__()
+            self.register_buffer("expert_bias", torch.zeros(n, dtype=torch.float32))
+            self.register_buffer(
+                "local_tokens_per_expert",
+                torch.zeros(n, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer("quantile_ema", torch.zeros(n, dtype=torch.float32))
+            self.local_quantile_scores: list[torch.Tensor] = []
+
+    class _MockConfig:
+        mlp_router_balancing = "quantile"
+
+    class _MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.owner = _Owner(4)
+            self._load_balancing_method = "quantile"
+            self.config = _MockConfig()
+
+        def get_all_balancing_owners(self):
+            yield self.owner, "mlp"
+
+    m = _MockModel()
+    # Populate accumulator with imbalanced per-expert scores:
+    # expert 0 strongly preferred (high scores); other experts low.
+    raw = torch.tensor([
+        [0.9, 0.1, 0.1, 0.1],
+        [0.8, 0.2, 0.1, 0.1],
+        [0.95, 0.05, 0.05, 0.05],
+    ], dtype=torch.float32)
+    m.owner.local_quantile_scores.append(raw)
+    # Inject a counts state too so we can confirm the deepseek path
+    # does NOT run.
+    m.owner.local_tokens_per_expert[:] = torch.tensor([7.0, 1.0, 1.0, 1.0])
+    counts_initial = m.owner.local_tokens_per_expert.detach().clone()
+
+    with torch.no_grad():
+        routing.update_expert_biases(
+            m, bias_rate=0.0, distributed=False,
+        )
+
+    # quantile_ema absorbed the scores (eta default 0.05; first call
+    # pulls EMA from 0 toward the per-expert median).
+    assert (m.owner.quantile_ema != 0).any(), (
+        f"quantile_ema unchanged; the walker did not call the quantile helper. "
+        f"ema={m.owner.quantile_ema.tolist()}"
+    )
+    # expert_bias is set by quantile-from-EMA: expert 0 (loaded) gets
+    # negative bias; other experts get positive. Assert at minimum
+    # that the bias is no longer zero.
+    assert (m.owner.expert_bias != 0).any(), (
+        f"expert_bias unchanged; quantile-from-EMA helper did not write bias. "
+        f"bias={m.owner.expert_bias.tolist()}"
+    )
+    # Accumulator drained.
+    assert len(m.owner.local_quantile_scores) == 0, (
+        f"quantile_scores accumulator was not drained: "
+        f"len={len(m.owner.local_quantile_scores)}"
+    )
+    # Counts NOT zeroed (the deepseek path would have zeroed them).
+    torch.testing.assert_close(m.owner.local_tokens_per_expert, counts_initial)
+
+
+def test_walker_quantile_dispatch_no_op_on_empty_accumulator():
+    """Round 41 AC-10: empty-accumulator no-op.
+
+    When a quantile-method owner has no accumulated scores (e.g. a
+    branch-masked path with zero active tokens, or simply no forward
+    has run since the last update), the walker MUST be a clean no-op
+    on that owner — neither `quantile_ema` nor `expert_bias` moves.
+    """
+    import importlib.util as _u
+    import torch.nn as nn
+    repo = Path(__file__).resolve().parent.parent
+    spec = _u.spec_from_file_location(
+        "src.training.routing", str(repo / "src" / "training" / "routing.py"),
+    )
+    routing = _u.module_from_spec(spec)
+    sys.modules["src.training.routing"] = routing
+    spec.loader.exec_module(routing)
+
+    class _Owner(nn.Module):
+        def __init__(self, n=4):
+            super().__init__()
+            self.register_buffer("expert_bias", torch.zeros(n, dtype=torch.float32))
+            self.register_buffer(
+                "local_tokens_per_expert",
+                torch.zeros(n, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer("quantile_ema", torch.zeros(n, dtype=torch.float32))
+            self.local_quantile_scores: list[torch.Tensor] = []
+
+    class _MockConfig:
+        mlp_router_balancing = "quantile"
+
+    class _MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.owner = _Owner(4)
+            self._load_balancing_method = "quantile"
+            self.config = _MockConfig()
+
+        def get_all_balancing_owners(self):
+            yield self.owner, "mlp"
+
+    m = _MockModel()
+    initial_bias = m.owner.expert_bias.detach().clone()
+    initial_ema = m.owner.quantile_ema.detach().clone()
+
+    with torch.no_grad():
+        routing.update_expert_biases(
+            m, bias_rate=0.0, distributed=False,
+        )
+
+    torch.testing.assert_close(m.owner.expert_bias, initial_bias)
+    torch.testing.assert_close(m.owner.quantile_ema, initial_ema)
+
+
+def test_deepseek_router_registers_quantile_state_unconditionally():
+    """Round 41 AC-10: quantile state lives on every DeepSeekRouter
+    so the walker can dispatch quantile-method owners without a
+    per-class flag at construction time. Verifies presence of
+    `quantile_ema` (persistent fp32 buffer) and `local_quantile_scores`
+    (Python list).
+    """
+    from src.models.router import DeepSeekRouter
+
+    class _Cfg:
+        hidden_size = 16
+        num_experts = 4
+        num_experts_per_tok = 2
+        norm_topk_prob = True
+        topk_scaling_factor = 2.5
+        router_exploration_rate = 0.0
+        router_z_loss_coef = 0.0
+
+    r = DeepSeekRouter(_Cfg())
+    assert hasattr(r, "quantile_ema")
+    assert isinstance(r.quantile_ema, torch.Tensor)
+    assert r.quantile_ema.shape == (4,)
+    assert r.quantile_ema.dtype == torch.float32
+    # quantile_ema must be a persistent buffer (saved in state_dict).
+    state_keys = set(r.state_dict().keys())
+    assert "quantile_ema" in state_keys, (
+        f"quantile_ema must be a persistent buffer; state_dict keys={state_keys}"
+    )
+    assert hasattr(r, "local_quantile_scores")
+    assert isinstance(r.local_quantile_scores, list)
+    assert r.local_quantile_scores == []
+
+
 def test_branch_deepseek_bias_forces_biased_scoring_path_consumes_expert_bias():
     """Contrastive proof that `balancing="deepseek_bias"` actually
     consumes `expert_bias` during routing — independent of the legacy
@@ -608,42 +792,188 @@ training:
             f"before={initial[i].tolist()}, after={r.expert_bias.tolist()}"
         )
 
-    # Round 39 review Finding 2: mutation alone is insufficient — a
-    # subsequent forward through each per-layer router must OBSERVE
-    # the changed bias. Hand-set ATTN-favouring logits on every per-
-    # layer router, run a forward at zero bias (sanity: ATTN), then
-    # write an extreme MLP-favouring `expert_bias` and run again
-    # (must flip to MLP). This proves each per-layer router consumes
-    # its own `expert_bias` during routing.
-    model.eval()  # sampling/training-only branches off
+    # Round 40 review Finding 1: the prior round called each per-
+    # layer router directly (`r(h)`); the test never exercised
+    # `MoEverythingModel`'s depth loop. Round 41 strengthens the
+    # coverage to a real `model(input_ids=...)` forward and asserts
+    # each `branch_routers[i].last_selected_experts` is set by the
+    # full model path AND reflects the bias.
+    model.eval()
+    # With zeroed gate weights and zero bias, every depth's branch
+    # router sees logits = 0 (or a constant from the gate's bias if
+    # any) and argmax breaks the tie at index 0 = ATTN.
     for r in branch_routers:
         with torch.no_grad():
             r.gate.weight.zero_()
-            r.gate.weight[0, 0] = 4.0
-            r.gate.weight[1, 0] = -4.0
+            if r.gate.bias is not None:
+                r.gate.bias.zero_()
             r.expert_bias.zero_()
 
-    h = torch.zeros(1, 1, branch_routers[0].gate.in_features)
-    h[0, 0, 0] = 1.0
+    fixed_input_ids = torch.randint(
+        0, model.vocab_size, (1, 8), dtype=torch.long,
+    )
+    out = model(
+        input_ids=fixed_input_ids,
+        labels=fixed_input_ids,
+        output_router_logits=True,
+    )
+    assert out is not None  # full forward returned
+
     for i, r in enumerate(branch_routers):
-        _, _, attn_mask, mlp_mask = r(h)
-        assert attn_mask[0, 0, 0].item() and not mlp_mask[0, 0, 0].item(), (
-            f"per-layer branch_routers[{i}] zero-bias forward should pick "
-            f"ATTN; got attn={attn_mask[0,0,0].item()}, mlp={mlp_mask[0,0,0].item()}"
+        sel = r.last_selected_experts
+        assert sel is not None, (
+            f"per-layer branch_routers[{i}] did not record last_selected_experts; "
+            f"the full model forward never reached this depth's branch router."
+        )
+        assert torch.all(sel == 0), (
+            f"per-layer branch_routers[{i}] zero-bias model forward should "
+            f"pick ATTN at every token; got selected={sel.unique().tolist()}"
         )
 
+    # Now write extreme MLP-favouring `expert_bias` on every per-layer
+    # router and re-run the full model forward.
     for r in branch_routers:
         with torch.no_grad():
             r.expert_bias[0] = -16.0
             r.expert_bias[1] = +16.0
+    out2 = model(
+        input_ids=fixed_input_ids,
+        labels=fixed_input_ids,
+        output_router_logits=True,
+    )
+    assert out2 is not None
+
     for i, r in enumerate(branch_routers):
-        _, _, attn_mask, mlp_mask = r(h)
-        assert mlp_mask[0, 0, 0].item() and not attn_mask[0, 0, 0].item(), (
-            f"per-layer branch_routers[{i}] post-bias forward did not flip "
-            f"to MLP; the per-layer router is not consuming its own "
-            f"expert_bias. attn={attn_mask[0,0,0].item()}, "
-            f"mlp={mlp_mask[0,0,0].item()}, expert_bias={r.expert_bias.tolist()}"
+        sel = r.last_selected_experts
+        assert sel is not None
+        assert torch.all(sel == 1), (
+            f"per-layer branch_routers[{i}] post-bias model forward did NOT "
+            f"flip to MLP at every token; got selected={sel.unique().tolist()}; "
+            f"expert_bias={r.expert_bias.tolist()}. The full-model depth loop "
+            f"is not consuming each per-layer router's expert_bias."
         )
+
+
+@pytest.mark.parametrize("mlp_method", ["aux_loss", "none"])
+def test_mixed_per_class_branch_deepseek_with_various_mlp_methods(tmp_path, mlp_method):
+    """Round 40 review Finding 1: parameterized non-bias MLP variants.
+
+    The mixed-method gate fix in Round 40 must hold for ANY non-bias
+    MLP method, not just `aux_loss`. Run the same regression for
+    `mlp_router.balancing in {"aux_loss", "none"}`. Quantile is
+    excluded until quantile runtime lands; the validator currently
+    accepts it for MLP but the trainer dispatch on quantile is
+    being added incrementally.
+    """
+    import importlib.util as _u
+    repo = Path(__file__).resolve().parent.parent
+    spec = _u.spec_from_file_location(
+        "src.training.routing", str(repo / "src" / "training" / "routing.py"),
+    )
+    routing = _u.module_from_spec(spec)
+    sys.modules["src.training.routing"] = routing
+    spec.loader.exec_module(routing)
+
+    if mlp_method == "aux_loss":
+        mlp_block = (
+            "    balancing: aux_loss\n"
+            "    router_aux_loss_coef: 0.001\n"
+        )
+    elif mlp_method == "none":
+        mlp_block = "    balancing: none\n"
+    else:
+        raise ValueError(f"unhandled mlp_method={mlp_method}")
+
+    yaml_text = f"""experiment_name: mixed_mlp_{mlp_method}_branch_deepseek
+model:
+  type: moe_everything
+  vocab_size: 32
+  hidden_size: 16
+  num_hidden_layers: 1
+  head_dim: 8
+  num_attention_heads: 2
+  num_key_value_heads: 2
+  num_experts: 4
+  num_experts_per_tok: 2
+  moe_intermediate_size: 32
+  intermediate_size: 32
+  norm_topk_prob: true
+  router_exploration_rate: 0.0
+  num_attn_experts: 2
+  num_attn_experts_per_tok: 1
+  attn_expert_mode: per_head_fully_independent
+  scale_attn_by_routing_weight: true
+  scale_branch_by_routing_weight: true
+  per_head_compute_mode: dense
+  use_deepseek_routing: true
+  branch_deepseek: false
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-06
+  rope_theta: 10000.0
+  max_position_embeddings: 32
+  tie_word_embeddings: true
+  output_router_logits: true
+  attn_implementation: eager
+  mlp_router:
+{mlp_block}  attn_router:
+    balancing: none
+  branch_router:
+    balancing: deepseek_bias
+    bias_update_rate: 0.5
+    bias_update_zero_sum: true
+training:
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 0
+  max_steps: 1
+  batch_size: 1
+  gradient_accumulation: 1
+  mixed_precision: ""
+  output_dir: /tmp
+"""
+    p = tmp_path / f"mixed_mlp_{mlp_method}.yaml"
+    p.write_text(yaml_text)
+    cfg = _CFG_MOD.load_config(str(p))
+    torch.manual_seed(20260428)
+    model, _ = _FACTORY_MOD.build_model(cfg)
+    model.train()
+    branch = model.model.branch_router
+    mlp_owner = next(
+        owner for owner, label in model.get_all_balancing_owners()
+        if label == "mlp"
+    )
+
+    with torch.no_grad():
+        branch.local_tokens_per_expert.zero_()
+        branch.local_tokens_per_expert[0] = 100.0
+        branch.local_tokens_per_expert[1] = 1.0
+        mlp_owner.local_tokens_per_expert.zero_()
+        mlp_owner.local_tokens_per_expert[0] = 100.0
+        mlp_owner.local_tokens_per_expert[1:] = 1.0
+        branch_initial = branch.expert_bias.detach().clone()
+        mlp_initial = mlp_owner.expert_bias.detach().clone()
+
+    train_cfg = _CFG_MOD.build_training_config(cfg)
+    routing.trainer_post_optimizer_bias_update(
+        model, train_cfg=train_cfg, cfg=cfg,
+        distributed=False, global_step=1,
+    )
+
+    branch_delta = (branch.expert_bias - branch_initial).abs().max().item()
+    mlp_delta = (mlp_owner.expert_bias - mlp_initial).abs().max().item()
+    assert branch_delta > 1e-4, (
+        f"mlp_method={mlp_method!r}: branch deepseek_bias did not fire "
+        f"(branch_delta={branch_delta:.6e}). The walker is preempted by "
+        f"the model-level method gate."
+    )
+    assert mlp_delta == 0.0, (
+        f"mlp_method={mlp_method!r}: MLP class is non-deepseek but the "
+        f"walker mutated mlp.expert_bias (mlp_delta={mlp_delta:.6e}). "
+        f"The per-owner skip table is not catching the MLP owner."
+    )
 
 
 def test_mixed_per_class_branch_deepseek_bias_with_mlp_aux_loss(tmp_path):

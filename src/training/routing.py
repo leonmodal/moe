@@ -9,12 +9,14 @@ from .distributed import is_distributed, unwrap_model
 
 
 _DEFAULT_BIAS_LABELS = ("q", "k", "v", "o", "mlp", "branch")
-# Methods that trigger the post-step bias-update walker. The
-# DeepSeek-V3-style sigmoid+bias router is the only active method
-# today; quantile-based balancing will be added later. Calling the
-# update path for any other method is a no-op so the wrong update
-# rule never runs by accident.
-_BIAS_UPDATE_METHODS = frozenset({"deepseek_bias"})
+# Methods that trigger the post-step bias-update walker. Both
+# `deepseek_bias` (sigmoid + sign-driven bias update) and `quantile`
+# (per-expert quantile EMA driving bias toward the global median)
+# fire the walker; the per-owner dispatch below routes each owner
+# through the correct single-owner update helper based on the
+# per-class method. Calling the walker for any other method is a
+# no-op so the wrong update rule never runs by accident.
+_BIAS_UPDATE_METHODS = frozenset({"deepseek_bias", "quantile"})
 
 
 def trainer_optimizer_step_and_bias_update(
@@ -335,14 +337,29 @@ def update_expert_biases(
             and getattr(owner, "balancing", "none") == "exploration_only"
         ):
             continue
-        # Per-class gate: skip owners whose per-class method is set
-        # to anything OTHER than `deepseek_bias` (e.g. MLP=aux_loss
-        # + branch=deepseek_bias means the walker fires only on
-        # branch). When the per-class field is unset/None, fall
-        # back to the legacy unconditional update so back-compat
-        # configs keep working.
+        # Per-class gate: route each owner through the matching
+        # single-owner helper based on its per-class method (or
+        # the model-level fallback when the per-class field is
+        # unset). When set to `deepseek_bias` or `quantile`, we
+        # dispatch to the corresponding helper. Explicit non-bias
+        # per-class methods (e.g. `aux_loss`, `seq_aux_loss`,
+        # `none`) skip the owner.
         class_method = label_to_class_method.get(label)
-        if class_method is not None and class_method != "deepseek_bias":
+        if class_method in _BIAS_UPDATE_METHODS:
+            owner_method = class_method
+        elif class_method is not None:
+            # explicit non-bias per-class method => skip this owner.
+            continue
+        elif method in _BIAS_UPDATE_METHODS:
+            # No per-class field; fall back to the model-level method.
+            owner_method = method
+        else:
+            # Legacy back-compat: caller didn't stamp a model-level
+            # method either, so default to deepseek_bias to preserve
+            # the original unconditional update.
+            owner_method = "deepseek_bias"
+        if owner_method == "quantile":
+            _update_single_router_quantile_bias(owner, distributed=use_dist)
             continue
         rate = rates.get(label, bias_rate)
         owner_zero_sum = (
@@ -412,6 +429,51 @@ def _update_single_router_bias(
             router.expert_bias -= s * bias_rate * nonzero
         router.expert_bias.clamp_(-16.0, 16.0)
         router.local_tokens_per_expert.zero_()
+
+
+def _update_single_router_quantile_bias(
+    router,
+    *,
+    distributed: bool,
+) -> None:
+    """Quantile-EMA bias update for a single load-balancing owner.
+
+    Drains the owner's per-step score accumulator
+    (`router.local_quantile_scores`, a list of `(T_i, E)` fp32
+    tensors), concatenates them along the token axis, and runs the
+    canonical fp32 quantile helper from `models.routing.bias`. The
+    helper updates `router.quantile_ema` (persistent) and overwrites
+    `router.expert_bias` to pull each expert toward the global EMA
+    median.
+
+    Empty-accumulator case: when no scores have been recorded since
+    the last update (e.g. a branch-masked path with zero active
+    tokens), the helper is a no-op — neither the EMA nor the bias
+    moves. After draining, the accumulator is reset to an empty list.
+
+    Quantile-method tuning knobs read from the owner module (or
+    fallback defaults):
+      * `quantile_target_q` (default 0.5 = median)
+      * `quantile_eta`      (default 0.05)
+    """
+    from src.models.routing.bias import update_bias_from_quantile
+
+    target_q = float(getattr(router, "quantile_target_q", 0.5))
+    eta = float(getattr(router, "quantile_eta", 0.05))
+    scores_list = getattr(router, "local_quantile_scores", None)
+    if not scores_list:
+        # No accumulated scores; no-op (preserves bias / EMA unchanged).
+        return
+    scores = torch.cat(scores_list, dim=0).float()
+    update_bias_from_quantile(
+        router.expert_bias,
+        router.quantile_ema,
+        scores,
+        target_q=target_q,
+        eta=eta,
+        distributed=distributed,
+    )
+    router.local_quantile_scores = []
 
 
 def get_bias_rate(

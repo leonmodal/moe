@@ -390,6 +390,28 @@ class DeepSeekRouter(Qwen3MoeTopKRouter):
             torch.zeros(self.num_experts, dtype=torch.float32),
             persistent=False,
         )
+        # Quantile-method state. `quantile_ema` is persistent fp32 — it
+        # is the per-expert EMA of the target quantile across windows
+        # and must survive checkpoint resume to preserve the bias
+        # trajectory. `local_quantile_scores` is a Python list of
+        # detached fp32 score tensors accumulated over the current
+        # step's forward(s); the post-step walker concatenates and
+        # drains it. Both fields are present unconditionally so the
+        # walker can dispatch quantile-method owners without
+        # special-casing a per-class flag at construction time.
+        self.register_buffer(
+            "quantile_ema",
+            torch.zeros(self.num_experts, dtype=torch.float32),
+        )
+        self.local_quantile_scores: list[torch.Tensor] = []
+        # Optional per-class quantile knobs (target_q / eta) — when
+        # the per-class block sets `quantile_target_q` / `quantile_eta`,
+        # the factory copies them onto the router as plain attributes
+        # so the trainer's quantile helper picks them up.
+        if hasattr(config, "quantile_target_q"):
+            self.quantile_target_q = float(getattr(config, "quantile_target_q") or 0.5)
+        if hasattr(config, "quantile_eta"):
+            self.quantile_eta = float(getattr(config, "quantile_eta") or 0.05)
         # Last forward's selected experts (T, K). Used by seq aux loss
         # so f_i matches actual biased routing assignments.
         self._last_top_k_idx = None
