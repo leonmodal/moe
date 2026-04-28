@@ -127,7 +127,7 @@ def _get_branch_router_field(model_cfg: dict, key: str, default):
             exploration_min: 0.0
             exploration_warmup_steps: 1000
 
-    Flat fallback (pre-AC-13 yamls): `branch_balancing`,
+    Flat fallback (legacy yamls): `branch_balancing`,
     `branch_exploration_rate`, etc. live directly on the `model:` block.
     The nested form wins when both are present.
     """

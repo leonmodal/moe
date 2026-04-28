@@ -64,6 +64,58 @@ Used when `router_type: deepseek`:
 | `per_layer_router` | bool | false | Per-layer vs shared router |
 | `branch_router_aux_loss_coef` | float | 0.0 | Branch aux loss (0 = no branch balancing) |
 
+#### Branch-router exploration_only (preferred nested form)
+
+When using exploration_only branch routing, the preferred config form
+is the nested `branch_router` block:
+
+```yaml
+model:
+  type: moe_everything
+  branch_router:
+    balancing: exploration_only        # "none" | "exploration_only"
+    exploration_rate: 1.0              # initial p_explore at step 0
+    exploration_decay: cosine          # "constant" | "linear" | "cosine"
+    exploration_min: 0.01              # floor reached at warmup_steps
+    exploration_warmup_steps: 1000     # decay length in steps
+```
+
+| Field (under `model.branch_router`) | Type | Default | Description |
+|-------------------------------------|------|---------|-------------|
+| `balancing` | string | `none` | `none` keeps the regular argmax routing; `exploration_only` flips every BranchRouter on the model into rate-driven uniform Bernoulli random routing for masked tokens. Branch aux loss and DeepSeek branch bias state are inert under `exploration_only`. |
+| `exploration_rate` | float | 0.0 | Initial `p_explore` at step 0. Default 0.0 so a `balancing="none"` build never accidentally enables exploration_only via the BranchRouter's auto-promote rule. Set this explicitly when opting into `exploration_only`. |
+| `exploration_decay` | string | `constant` | Decay shape applied by the trainer's per-step pre-forward schedule helper. `constant` ignores `exploration_warmup_steps` and `exploration_min`; `linear` and `cosine` decay from `exploration_rate` to `exploration_min` over `exploration_warmup_steps` steps. |
+| `exploration_min` | float | 0.0 | Floor `p_explore` reached at `step >= exploration_warmup_steps`. Returned for every step thereafter. |
+| `exploration_warmup_steps` | int | 0 | Decay length in steps. 0 with a non-constant schedule returns `exploration_min` immediately. |
+
+##### Flat-bridge fields (legacy yamls)
+
+The flat fields below are accepted on the `model:` block as a bridge
+for legacy yamls until the nested-schema migration lands. The nested
+form wins when both are present.
+
+| Flat field | Maps to | Notes |
+|------------|---------|-------|
+| `branch_balancing` | `branch_router.balancing` | |
+| `branch_exploration_rate` | `branch_router.exploration_rate` | |
+| `branch_exploration_decay` | `branch_router.exploration_decay` | |
+| `branch_exploration_min` | `branch_router.exploration_min` | |
+| `branch_exploration_warmup_steps` | `branch_router.exploration_warmup_steps` | |
+
+##### Trainer telemetry keys
+
+When `branch_router.balancing == "exploration_only"` is active on
+the model, the trainer's `log_training_step` writes the following
+keys to console + W&B (omitted on inactive models so they incur no
+extra payload cost):
+
+| Key | Meaning |
+|-----|---------|
+| `train/branch_explore_rate` | `p_explore(global_step)` applied before this step's forward. |
+| `train/branch_attn_fraction` | Global-mean fraction of branch tokens that chose ATTN (`selected_experts == 0`) on this step's forward. |
+| `train/branch_attn_fraction/depth_<i>` | Per-router ATTN fraction for `per_layer_router=True` builds. Emitted only when there are >= 2 routers. |
+| `train/branch_explore_mask_fraction` | Diagnostic-only fraction of branch tokens routed via the random override mask. NOT the same as `% ATTN`. |
+
 ## Training Section
 
 | Field | Type | Default | Description |

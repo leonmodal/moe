@@ -49,15 +49,6 @@ def trainer_optimizer_step_and_bias_update(
         model, train_cfg, cfg,
         distributed=distributed, global_step=global_step,
     )
-    # AC-14: per-step exploration_only rate update. Resolved against
-    # the model's config (so per-config schedule shapes / floors live in
-    # the same place as the rest of the branch_router knobs) and pushed
-    # onto every BranchRouter whose `balancing == "exploration_only"`.
-    # When the feature is inactive on this model, both helpers return
-    # quickly and the rate is left at whatever the constructor seeded.
-    rate = compute_branch_exploration_only_rate(model, global_step)
-    if rate is not None:
-        apply_branch_exploration_only_rate(model, rate)
 
 
 def trainer_post_optimizer_bias_update(
@@ -360,6 +351,26 @@ def exploration_decay_schedule(
     return final_rate + 0.5 * (initial_rate - final_rate) * (1.0 + math.cos(math.pi * frac))
 
 
+def apply_branch_schedule_pre_forward(model, global_step: int) -> float | None:
+    """Apply the branch exploration_only schedule for `global_step`
+    BEFORE the forward pass for that step. Returns the rate that was
+    applied, or `None` if the feature is inactive on this model.
+
+    This is the canonical pre-forward hook the trainer calls once per
+    training step (and once after model construction / checkpoint
+    load) to keep the BranchRouter's `exploration_only_rate` aligned
+    with `p_explore(global_step)`. The rate the helper returns is
+    what the trainer's logging path should report for this step:
+    forward + backward + optimizer all run with exactly this rate
+    active.
+    """
+    rate = compute_branch_exploration_only_rate(model, global_step)
+    if rate is None:
+        return None
+    apply_branch_exploration_only_rate(model, rate)
+    return rate
+
+
 def apply_branch_exploration_only_rate(model, rate: float) -> int:
     """Push `rate` into every BranchRouter on `model` whose
     `balancing == "exploration_only"`.
@@ -390,19 +401,63 @@ def apply_branch_exploration_only_rate(model, rate: float) -> int:
     return updated
 
 
-def collect_branch_explore_fraction(model) -> float | None:
-    """Mean fraction of branch tokens routed via the exploration_only
-    path on the most recent forward, across every BranchRouter on
-    `model` whose `balancing == "exploration_only"`.
+def collect_branch_attn_fraction(
+    model,
+) -> tuple[float | None, list[float] | None]:
+    """Per-step branch routing telemetry: the fraction of branch tokens
+    that chose ATTN (selected_experts == 0) on the most recent forward.
 
-    Reads `BranchRouter.last_exploration_only_mask` (a bool tensor of
-    shape `(B, T)` populated on every forward when the rate is > 0 and
-    the router is in training mode; otherwise `None`). Returns `None`
-    when no router has a populated mask (e.g. eval-mode forward, rate
-    == 0, or feature inactive on this model). The trainer's logging
-    path treats `None` as "do not emit the metric this step", so a
-    model without exploration_only does not pay the wandb-payload
-    cost.
+    Reads `BranchRouter.last_selected_experts` (a long tensor populated
+    on every forward, irrespective of routing mode). Walks every
+    `BranchRouter` instance on `model` and skips MLP / attention
+    routers that share the balancing-owner interface but route over
+    `num_experts > 2` pools (selected_experts == 0 there does not
+    mean ATTN, so including them in the average would silently pollute
+    the metric).
+
+    Returns `(global_mean, per_depth)`:
+
+    * `global_mean` is the unweighted average of every router's ATTN
+      fraction. When no router has a populated tensor, returns
+      `(None, None)` so the trainer's logging path can treat that
+      situation as "do not emit the metric".
+    * `per_depth` is the list of per-router ATTN fractions, in
+      module-tree iteration order. For `per_layer_router=True` the list
+      has `num_hidden_layers` entries, one per depth; for the singular
+      `branch_router` path the list has length 1. The trainer logs
+      these under per-depth keys (`train/branch_attn_fraction/depth_<i>`)
+      so per-depth divergence is visible in W&B.
+
+    Mask-based exploration_only fraction is exposed by a separate
+    `collect_branch_explore_mask_fraction(model)` helper for diagnostic
+    runs that want to see how often the random override was taken.
+    """
+    from src.models.routing.routers import BranchRouter
+
+    raw_model = unwrap_model(model)
+    fractions: list[float] = []
+    for module in raw_model.modules():
+        if not isinstance(module, BranchRouter):
+            continue
+        selected = getattr(module, "last_selected_experts", None)
+        if selected is None:
+            continue
+        fractions.append(float((selected == 0).float().mean().item()))
+    if not fractions:
+        return None, None
+    return sum(fractions) / len(fractions), fractions
+
+
+def collect_branch_explore_mask_fraction(model) -> float | None:
+    """Diagnostic-only fraction of branch tokens routed via the
+    exploration_only mask on the most recent forward. This is NOT
+    the trainer's `% ATTN` telemetry — it is the per-step mean of
+    `last_exploration_only_mask` across every active exploration_only
+    router. Useful when verifying the schedule actually applied a
+    nonzero rate, but unsuitable as the branch-fraction proxy.
+
+    Returns `None` when no router has a populated mask (eval-mode
+    forward, rate == 0, or feature inactive on this model).
     """
     raw_model = unwrap_model(model)
     fractions: list[float] = []

@@ -85,22 +85,102 @@ The hard decision makes this non-differentiable at the selection point, but the 
 
 #### Exploration-only branch routing
 
-When `BranchRouter(exploration_only=True)` is set, the routing
-decision is drawn from a uniform Bernoulli — every token picks
-ATTN (0) or MLP (1) with 50% probability each, regardless of the
-gate's score, expert_bias, or input. The gate's projection still
-runs (so the routing-weight tensors stay gradient-bearing for the
-rest of the model's loss), but the SELECTION itself is detached.
+The user-facing surface for exploration-only branch routing is the
+`branch_router.balancing` config field on `moe_everything` model
+yamls (with the flat-bridge fields `branch_balancing` /
+`branch_exploration_*` for legacy yamls until the nested-schema
+migration lands). Setting `branch_router.balancing: exploration_only`
+makes every BranchRouter on the model draw its decision from a
+per-token uniform Bernoulli with probability `p_explore` — every
+masked token picks ATTN (0) or MLP (1) with 50% probability each,
+regardless of the gate's score, `expert_bias`, or input. Unmasked
+tokens fall through to the gate's deterministic argmax path, so a
+schedule that decays `p_explore` from 1.0 → 0.0 produces a smooth
+"random at first, deterministic at the end" routing curriculum.
 
-This mode is only active during `training()`; under `eval()`, the
-router falls back to the deterministic argmax path so evaluation
-runs are reproducible.
+The gate's projection still runs unconditionally (so the
+routing-weight tensors stay gradient-bearing for the rest of the
+model's loss), but the SELECTION itself is detached for masked
+tokens. This mode is only active during `training()`; under
+`eval()`, the router falls back to the deterministic argmax path so
+evaluation runs are reproducible.
 
-Use `exploration_only=True` for diagnostic runs that need a
-fully randomized branch distribution while keeping the rest of
-the model trainable. Pair it with one of the
-`exploration_decay_schedule(...)` shapes below if you want to
-gradually anneal the exploration rate over training.
+When `balancing: exploration_only` is active, both the branch
+auxiliary loss path and the DeepSeek-style branch bias path are
+inert by construction:
+* The model's forward never accumulates branch aux loss into the
+  total.
+* The walker that runs `update_expert_biases(...)` after the
+  optimizer step skips owners with `label == "branch"` AND
+  `balancing == "exploration_only"`, leaving `expert_bias` and
+  `local_tokens_per_expert` unchanged across the entire run.
+
+This means a yaml that sets `branch_router_aux_loss_coef > 0` and
+`branch_deepseek: true` together with `balancing: exploration_only`
+still produces a valid run; the exploration-only mode wins and the
+branch aux/bias settings are no-ops for the duration of the run.
+
+Yaml form (preferred nested form):
+
+```yaml
+model:
+  type: moe_everything
+  branch_router:
+    balancing: exploration_only
+    exploration_rate: 1.0          # initial p_explore at step 0
+    exploration_decay: cosine      # constant | linear | cosine
+    exploration_min: 0.01          # floor reached at warmup_steps
+    exploration_warmup_steps: 1000 # decay length
+```
+
+Flat-bridge form (legacy yamls; the nested form wins when both are
+present):
+
+```yaml
+model:
+  type: moe_everything
+  branch_balancing: exploration_only
+  branch_exploration_rate: 1.0
+  branch_exploration_decay: cosine
+  branch_exploration_min: 0.01
+  branch_exploration_warmup_steps: 1000
+```
+
+Trainer hook + telemetry:
+* The trainer applies `p_explore(global_step)` BEFORE every step's
+  forward pass via `apply_branch_schedule_pre_forward(model, step)`,
+  so the first forward of a fresh run AND the first forward after
+  a checkpoint resume at `global_step=N` see exactly `p_explore(N)`.
+* The trainer's `log_training_step` writes the following keys to
+  console + W&B (only when the feature is active on the model):
+  * `train/branch_explore_rate` — the `p_explore(step)` rate
+    applied before this step's forward.
+  * `train/branch_attn_fraction` — global-mean fraction of branch
+    tokens that chose ATTN, computed from
+    `BranchRouter.last_selected_experts`.
+  * `train/branch_attn_fraction/depth_<i>` — per-router ATTN
+    fraction for `per_layer_router=True` builds.
+  * `train/branch_explore_mask_fraction` — diagnostic-only fraction
+    of branch tokens routed via the random-override mask. NOT the
+    same as `% ATTN` and exposed under a separate key so the two
+    cannot be confused.
+
+Programmatic surface (mostly for tests):
+
+```python
+from src.models.routing.routers import BranchRouter
+
+router = BranchRouter(
+    hidden_size=H,
+    balancing="exploration_only",
+    exploration_only_rate=0.7,
+)
+```
+
+The `exploration_only=True` legacy bool kwarg is still accepted for
+back-compat but maps to `balancing="exploration_only"` +
+`exploration_only_rate=1.0`. New callers should set
+`balancing` and `exploration_only_rate` directly.
 
 #### Exploration rate schedules
 

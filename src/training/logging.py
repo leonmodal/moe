@@ -47,26 +47,39 @@ def log_training_step(
     elapsed: float,
     log_every: int,
     branch_explore_rate: float | None = None,
-    branch_explore_fraction: float | None = None,
+    branch_attn_fraction: float | None = None,
+    branch_attn_per_depth: list[float] | None = None,
+    branch_explore_mask_fraction: float | None = None,
 ) -> None:
     """Log training step to console and WandB.
 
-    `branch_explore_rate` / `branch_explore_fraction` are optional and
-    only added to the console / wandb payload when the model has an
-    active `balancing == "exploration_only"` branch router. The rate is
-    the per-step `p_explore(step)` resolved from the schedule shape;
-    the fraction is the per-step measured fraction of branch tokens
-    that landed in the exploration_only path (telemetry that the
-    BranchRouter populates on every forward).
+    Branch routing telemetry (only emitted when active on this model):
+      * `branch_explore_rate`: the `p_explore(step)` rate applied
+        BEFORE this step's forward. This is the rate every microbatch
+        in the step actually saw, not the post-step or
+        pre-next-step rate.
+      * `branch_attn_fraction`: the global-mean fraction of branch
+        tokens that chose ATTN (selected_experts == 0) across all
+        active branch routers on this step's forward.
+      * `branch_attn_per_depth`: per-router ATTN fractions for
+        `per_layer_router=True` builds; logged under
+        `train/branch_attn_fraction/depth_<i>` so per-depth
+        divergence is visible in W&B.
+      * `branch_explore_mask_fraction`: diagnostic-only fraction of
+        branch tokens routed via the random-override mask (NOT the
+        same as `% ATTN`). Logged under a separate key so the two
+        cannot be confused.
     """
     if step % log_every != 0 or not is_main_process():
         return
 
     extra = ""
     if branch_explore_rate is not None:
-        extra += f"  br_explore_rate={branch_explore_rate:.4f}"
-    if branch_explore_fraction is not None:
-        extra += f"  br_explore_frac={branch_explore_fraction:.4f}"
+        extra += f"  br_p_explore={branch_explore_rate:.4f}"
+    if branch_attn_fraction is not None:
+        extra += f"  br_attn={branch_attn_fraction:.4f}"
+    if branch_explore_mask_fraction is not None:
+        extra += f"  br_explore_mask={branch_explore_mask_fraction:.4f}"
     print(
         f"step {step:6d}  "
         f"loss={metrics['loss']:.4f}  "
@@ -100,8 +113,13 @@ def log_training_step(
         }
         if branch_explore_rate is not None:
             payload["train/branch_explore_rate"] = branch_explore_rate
-        if branch_explore_fraction is not None:
-            payload["train/branch_explore_fraction"] = branch_explore_fraction
+        if branch_attn_fraction is not None:
+            payload["train/branch_attn_fraction"] = branch_attn_fraction
+        if branch_attn_per_depth is not None and len(branch_attn_per_depth) > 1:
+            for idx, value in enumerate(branch_attn_per_depth):
+                payload[f"train/branch_attn_fraction/depth_{idx}"] = value
+        if branch_explore_mask_fraction is not None:
+            payload["train/branch_explore_mask_fraction"] = branch_explore_mask_fraction
         wandb_run.log(payload, step=step)
 
 

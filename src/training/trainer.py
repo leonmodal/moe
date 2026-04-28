@@ -55,10 +55,11 @@ from .logging import (
 from .metrics import compute_output_metrics
 from .model_factory import build_model, configure_liger_kernels
 from .routing import (
+    apply_branch_schedule_pre_forward,
     apply_router_exploration_rate,
-    collect_branch_explore_fraction,
+    collect_branch_attn_fraction,
+    collect_branch_explore_mask_fraction,
     collect_router_z_loss,
-    compute_branch_exploration_only_rate,
     exploration_rate_schedule,
     get_bias_rate,
     trainer_optimizer_step_and_bias_update,
@@ -313,6 +314,15 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
     last_applied_exploration_rate: float | None = None
     exploration_plateau_applied = False
 
+    # Seed branch exploration_only schedule once before the main loop so
+    # step-0 forwards (and the first forward after a checkpoint resume at
+    # step=N) see p_explore(global_step) rather than the constructor-seeded
+    # initial rate. The intra-loop call below applies p_explore on every
+    # subsequent step.
+    current_branch_explore_rate = apply_branch_schedule_pre_forward(
+        model, global_step
+    )
+
     while global_step < train_cfg.max_steps:
         step_start = time.perf_counter()
         if router_exploration_enabled and not exploration_plateau_applied:
@@ -336,6 +346,17 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
                 # Rate is now constant for the rest of training; no further
                 # schedule evaluation or module-tree walks are needed.
                 exploration_plateau_applied = True
+
+        # Apply the branch exploration_only schedule for the CURRENT step
+        # before the forward pass runs, so the rate p_explore(global_step)
+        # is what every microbatch in this step actually sees. The returned
+        # rate is the source of truth for this step's logging and is passed
+        # verbatim to log_training_step, so console / wandb never lag the
+        # active rate by one step.
+        current_branch_explore_rate = apply_branch_schedule_pre_forward(
+            model, global_step
+        )
+
         optimizer.zero_grad(set_to_none=True)
         window_metrics = {
             "loss": 0.0, "ce_loss": 0.0, "aux_loss": 0.0,
@@ -449,13 +470,34 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
             }
             reduced_grad = grad_norm
 
-        # AC-14 telemetry: per-step `p_explore(step)` and the measured
-        # branch fraction routed via the exploration_only path. Both
-        # return `None` when the feature is inactive on this model, so
-        # only models with `branch_balancing == "exploration_only"` pay
-        # the extra logging cost.
-        branch_explore_rate = compute_branch_exploration_only_rate(model, global_step)
-        branch_explore_fraction = collect_branch_explore_fraction(model)
+        # Branch routing telemetry: per-step `p_explore` (the rate
+        # applied before this step's forward) and the measured fraction
+        # of branch tokens that chose ATTN on this step's forward. Both
+        # are `None` when the feature is inactive on this model, in
+        # which case the logging path skips emitting the extra fields.
+        # On distributed runs, the global mean is reduced across ranks
+        # so rank-0 logs see the cluster-wide branch behavior. The mask
+        # fraction is exposed under a separate diagnostic key
+        # (`branch_explore_mask_fraction`) so the trainer's `% ATTN`
+        # value never gets confused with how often the random override
+        # was taken.
+        branch_explore_rate = current_branch_explore_rate
+        branch_attn_fraction, branch_attn_per_depth = collect_branch_attn_fraction(model)
+        branch_explore_mask_fraction = collect_branch_explore_mask_fraction(model)
+        if is_log_step and distributed and branch_attn_fraction is not None:
+            cross_rank_bundle = {"_attn": branch_attn_fraction}
+            for idx, val in enumerate(branch_attn_per_depth or []):
+                cross_rank_bundle[f"_attn_d{idx}"] = val
+            if branch_explore_mask_fraction is not None:
+                cross_rank_bundle["_mask"] = branch_explore_mask_fraction
+            reduced_branch = reduce_scalar_dict(cross_rank_bundle, device=device)
+            branch_attn_fraction = reduced_branch["_attn"]
+            branch_attn_per_depth = [
+                reduced_branch[f"_attn_d{idx}"]
+                for idx in range(len(branch_attn_per_depth or []))
+            ] or branch_attn_per_depth
+            if branch_explore_mask_fraction is not None:
+                branch_explore_mask_fraction = reduced_branch["_mask"]
         log_training_step(
             wandb_run,
             step=global_step,
@@ -467,7 +509,9 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
             elapsed=elapsed,
             log_every=train_cfg.log_every,
             branch_explore_rate=branch_explore_rate,
-            branch_explore_fraction=branch_explore_fraction,
+            branch_attn_fraction=branch_attn_fraction,
+            branch_attn_per_depth=branch_attn_per_depth,
+            branch_explore_mask_fraction=branch_explore_mask_fraction,
         )
 
         # Routing heatmaps
