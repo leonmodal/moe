@@ -139,6 +139,19 @@ def _stamp_per_class_router_fields(config, model_cfg: dict) -> None:
         prefix = f"{group}_"
         for key, value in nested.items():
             setattr(config, prefix + key, value)
+    # Branch-router: the runtime reads `config.branch_balancing`
+    # (set via the dedicated flat-bridge plumbing earlier in
+    # `build_model`). For per-class branch coefficients
+    # (`router_aux_loss_coef`, `seq_aux_loss_coef`) we expose the
+    # full nested branch_router dict on `config._mcfg_branch_router`
+    # so the runtime can read knobs without parsing through the
+    # legacy flat-bridge. Empty / absent block is set to {} so
+    # downstream `getattr` defaults work without explicit None
+    # checks.
+    branch_nested = model_cfg.get("branch_router")
+    config._mcfg_branch_router = (
+        dict(branch_nested) if isinstance(branch_nested, dict) else {}
+    )
 
 
 def _get_branch_router_field(model_cfg: dict, key: str, default):

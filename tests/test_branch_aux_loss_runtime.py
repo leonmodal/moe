@@ -105,39 +105,85 @@ def _build_with_branch_method(method: str, tmp_path):
     return model
 
 
-def test_branch_aux_loss_drives_branch_gate_gradient(tmp_path):
-    """Build a moe_everything with branch_router.balancing=aux_loss
-    and a non-zero per-class coef. After backward, the branch
-    router's gate weight MUST receive non-zero gradient that
-    came from the aux contribution (branch logits flow into
-    load_balancing_loss_func via _all_branch_probs / _all_branch_selected_experts).
+def test_branch_aux_loss_actually_fires_and_adds_loss_term(tmp_path):
+    """Round 33 review Finding 1: prove the branch aux contribution
+    actually FIRES — `out.branch_aux_loss` must be a Tensor and
+    `out.loss - out.ce_loss` must equal `coef * branch_aux_loss`
+    within fp32 tolerance. Earlier round only checked that the
+    branch gate's gradient was non-zero, which is satisfied by CE
+    alone and doesn't prove the aux path runs.
     """
     model = _build_with_branch_method("aux_loss", tmp_path)
     model.train()
     torch.manual_seed(11111)
     input_ids = torch.randint(0, model.vocab_size, (1, 8), dtype=torch.long)
     out = model(input_ids=input_ids, labels=input_ids, output_router_logits=True)
-    out.loss.backward()
-    branch = model.model.branch_router
-    assert branch.gate.weight.grad is not None
-    grad_norm = float(branch.gate.weight.grad.norm().item())
-    assert grad_norm > 1e-12, (
-        f"branch gate gradient is too small under aux_loss method: "
-        f"{grad_norm:.3e}; expected > 1e-12"
+    assert out.branch_aux_loss is not None, (
+        "branch_router.balancing=aux_loss did not produce a "
+        "branch_aux_loss tensor on the model output"
+    )
+    assert isinstance(out.branch_aux_loss, torch.Tensor)
+    coef = 0.5  # the per-class coef we set in `_BASE_YAML`
+    expected_delta = coef * float(out.branch_aux_loss.detach().item())
+    actual_delta = float((out.loss - out.ce_loss).detach().item())
+    assert abs(actual_delta - expected_delta) < 1e-4, (
+        f"loss - ce_loss = {actual_delta:.6e} but expected "
+        f"coef*branch_aux_loss = {expected_delta:.6e}; the branch "
+        f"aux term is not being added to total loss correctly"
     )
 
 
-def test_branch_seq_aux_loss_drives_branch_gate_gradient(tmp_path):
-    """Same contract under seq_aux_loss."""
+def test_branch_seq_aux_loss_actually_fires_and_adds_loss_term(tmp_path):
+    """Same contract for seq_aux_loss — the runtime must produce
+    a non-None branch_aux_loss and the loss-ce delta must equal
+    coef * value."""
     model = _build_with_branch_method("seq_aux_loss", tmp_path)
     model.train()
     torch.manual_seed(11111)
     input_ids = torch.randint(0, model.vocab_size, (1, 8), dtype=torch.long)
     out = model(input_ids=input_ids, labels=input_ids, output_router_logits=True)
-    out.loss.backward()
-    branch = model.model.branch_router
-    assert branch.gate.weight.grad is not None
-    assert float(branch.gate.weight.grad.norm().item()) > 1e-12
+    assert out.branch_aux_loss is not None
+    coef = 0.5
+    expected_delta = coef * float(out.branch_aux_loss.detach().item())
+    actual_delta = float((out.loss - out.ce_loss).detach().item())
+    assert abs(actual_delta - expected_delta) < 1e-4
+
+
+def test_branch_aux_loss_contrastive_vs_none_baseline(tmp_path):
+    """Round 33 review Finding 1: contrastive proof that the loss
+    delta under aux_loss / seq_aux_loss is STRICTLY GREATER than
+    under method=none (with identical seed/init/input). Earlier
+    rounds were satisfied by gradient existing — this proves the
+    branch aux path adds non-zero signal.
+    """
+    model_aux = _build_with_branch_method("aux_loss", tmp_path)
+    model_aux.train()
+    torch.manual_seed(11111)
+    input_ids = torch.randint(0, model_aux.vocab_size, (1, 8), dtype=torch.long)
+    out_aux = model_aux(input_ids=input_ids, labels=input_ids, output_router_logits=True)
+    delta_aux = float((out_aux.loss - out_aux.ce_loss).detach().item())
+
+    # Build the none baseline with the SAME seed so initialization
+    # matches.
+    yaml_text = _BASE_YAML.replace("%BAL%", "none").replace(
+        "    router_aux_loss_coef: 0.5\n    seq_aux_loss_coef: 0.5\n", "",
+    )
+    p = tmp_path / "branch_none_for_contrast.yaml"
+    p.write_text(yaml_text)
+    cfg_none = _CFG_MOD.load_config(str(p))
+    torch.manual_seed(20260428)
+    model_none, _ = _FACTORY_MOD.build_model(cfg_none)
+    model_none.train()
+    torch.manual_seed(11111)
+    input_ids = torch.randint(0, model_none.vocab_size, (1, 8), dtype=torch.long)
+    out_none = model_none(input_ids=input_ids, labels=input_ids, output_router_logits=True)
+    delta_none = float((out_none.loss - out_none.ce_loss).detach().item())
+
+    assert delta_aux > delta_none + 1e-6, (
+        f"branch aux_loss should add a positive delta over none "
+        f"baseline; got delta_aux={delta_aux:.3e}, "
+        f"delta_none={delta_none:.3e}"
+    )
 
 
 def test_branch_balancing_none_produces_no_extra_loss_term(tmp_path):

@@ -167,12 +167,24 @@ def validate_config(path: Path) -> list[str]:
     # top-level coefficient is off-axis pollution that violates
     # the matrix method-axis contract. Yamls under `configs/extras/`
     # are exempt as legacy / non-matrix fixtures.
-    path_str = str(path)
-    in_active_matrix = (
-        "/configs/4_layers/" in path_str
-        or "/configs/8_layers/" in path_str
-        or "/configs/16_layers/" in path_str
-    )
+    #
+    # Path classification: resolve to absolute, then check whether
+    # the path's components include `configs/<depth>_layers/`. Was
+    # previously substring-matched on `/configs/<depth>_layers/`,
+    # which silently skipped relative paths like
+    # `configs/4_layers/foo.yaml` (no leading slash) — the default
+    # CLI scan returns relative paths.
+    in_active_matrix = False
+    try:
+        resolved = Path(path).resolve()
+        parts = resolved.parts
+        for i, part in enumerate(parts):
+            if part == "configs" and i + 1 < len(parts):
+                if parts[i + 1] in {"4_layers", "8_layers", "16_layers"}:
+                    in_active_matrix = True
+                    break
+    except (OSError, ValueError):
+        in_active_matrix = False
     if in_active_matrix:
         forbidden = (
             "router_aux_loss_coef", "seq_aux_loss_coef",
@@ -224,6 +236,29 @@ def validate_config(path: Path) -> list[str]:
                         f"active matrix yaml: model.{group}.{knob}="
                         f"{actual!r}, expected {expected!r} for "
                         f"balancing={method!r}"
+                    )
+
+        # DEC-6 contract: every active matrix yaml whose
+        # `attn_expert_mode == per_head_precompute_kv` must set
+        # `branch_router` to the documented exploration_only
+        # schedule. Drift here would silently change branch
+        # routing behavior in the precompute_kv variant.
+        precompute_kv_branch_spec = {
+            "balancing": "exploration_only",
+            "exploration_rate": 0.1,
+            "exploration_decay": "cosine",
+            "exploration_min": 0.01,
+            "exploration_warmup_steps": 1000,
+        }
+        if mcfg_local.get("attn_expert_mode") == "per_head_precompute_kv":
+            branch_block = mcfg_local.get("branch_router", {}) or {}
+            for knob, expected in precompute_kv_branch_spec.items():
+                actual = branch_block.get(knob)
+                if actual != expected:
+                    issues.append(
+                        f"active matrix yaml: precompute_kv row "
+                        f"requires branch_router.{knob}={expected!r}; "
+                        f"got {actual!r}"
                     )
 
     return issues

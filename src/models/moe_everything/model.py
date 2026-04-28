@@ -746,20 +746,46 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
             # When the per-class field is unset or `none` /
             # `exploration_only`, no branch aux contribution is
             # added (the prior contract).
-            branch_class_method = getattr(self.config, "branch_router_balancing", None)
+            #
+            # Config field: `MoEverythingConfig.branch_balancing`
+            # (set from yaml `model.branch_router.balancing` by the
+            # factory) — NOT `branch_router_balancing` (which is
+            # never set). The factory's flat-bridge plumbing keeps
+            # this name, so the runtime reads it directly.
+            branch_class_method = getattr(self.config, "branch_balancing", None)
             if branch_class_method in ("aux_loss", "seq_aux_loss") and branch_prob_tensors is not None:
-                branch_selected = tuple(self.model._all_branch_selected_experts) or None
-                branch_aux_coef = float(getattr(
-                    self.config, "branch_router_router_aux_loss_coef",
-                    self.branch_router_aux_loss_coef,
-                ))
-                branch_seq_aux_coef = float(getattr(
-                    self.config, "branch_router_seq_aux_loss_coef",
-                    seq_aux_coef,
-                ))
+                # Branch probs are (B, T, 2); the load-balancing
+                # helpers expect (B*T, E). Reshape per layer before
+                # passing through.
+                B = input_ids.shape[0]
+                branch_prob_2d = tuple(
+                    t.reshape(-1, 2) for t in branch_prob_tensors
+                )
+                branch_selected_raw = self.model._all_branch_selected_experts
+                # Selected experts per layer: shape (B, T, 1) -> (B*T, 1)
+                branch_selected = tuple(
+                    t.reshape(-1, 1) for t in branch_selected_raw
+                ) if branch_selected_raw else None
+                # Per-class branch coefficients are stamped into the
+                # branch_router config block by `model_factory.py`'s
+                # `_get_branch_router_field` helper. The flat bridge
+                # exposes them as `branch_router_aux_loss_coef` /
+                # `branch_router_seq_aux_loss_coef` (NOT
+                # `branch_router_router_aux_loss_coef`).
+                _mcfg = getattr(self.config, "_mcfg_branch_router", {}) or {}
+                branch_aux_coef = float(
+                    _mcfg.get("router_aux_loss_coef")
+                    if "router_aux_loss_coef" in _mcfg
+                    else self.branch_router_aux_loss_coef
+                )
+                branch_seq_aux_coef = float(
+                    _mcfg.get("seq_aux_loss_coef")
+                    if "seq_aux_loss_coef" in _mcfg
+                    else seq_aux_coef
+                )
                 if branch_class_method == "aux_loss" and branch_aux_coef > 0:
                     branch_aux_term = load_balancing_loss_func(
-                        branch_prob_tensors,
+                        branch_prob_2d,
                         2,  # binary ATTN/MLP pool
                         1,  # one branch per token
                         selected_experts=branch_selected,
@@ -769,9 +795,9 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
                         loss = loss + branch_aux_coef * branch_aux_term
                 if branch_class_method == "seq_aux_loss" and branch_seq_aux_coef > 0:
                     branch_seq_aux_term = seq_load_balancing_loss_func(
-                        branch_prob_tensors,
+                        branch_prob_2d,
                         2, 1,
-                        batch_size=input_ids.shape[0],
+                        batch_size=B,
                         selected_experts=branch_selected,
                     )
                     if isinstance(branch_seq_aux_term, torch.Tensor):

@@ -224,22 +224,7 @@ _PRECOMPUTE_KV_BRANCH_SPEC = {
 }
 
 
-def test_cli_validator_rejects_missing_active_knob_in_active_matrix(tmp_path):
-    """Round 32 review Finding 2: scripts/validate_configs.py
-    must fail on a matrix yaml that omits the active method's
-    required knob (e.g. `balancing: aux_loss` without
-    `router_aux_loss_coef: 0.001`). Build a temporary matrix-path
-    yaml with the missing knob and assert the CLI reports the issue.
-    """
-    import os
-    import subprocess
-    # Place the temporary yaml under a fake "active matrix" path
-    # so the strict-mode gate fires.
-    matrix_dir = tmp_path / "configs" / "4_layers"
-    matrix_dir.mkdir(parents=True)
-    bad_yaml = matrix_dir / "standard_moe_aux_loss.yaml"
-    bad_yaml.write_text(
-        """experiment_name: validator_negative_probe
+_BAD_AUX_YAML_TEXT = """experiment_name: validator_negative_probe
 model:
   type: standard_moe
   vocab_size: 32
@@ -262,23 +247,108 @@ training:
   mixed_precision: ""
   output_dir: /tmp
 """
-    )
-    cmd = [
-        sys.executable, "scripts/validate_configs.py",
-        str(bad_yaml),
-    ]
+
+
+def test_cli_validator_rejects_missing_active_knob_absolute_path(tmp_path):
+    """scripts/validate_configs.py must fail on a matrix yaml
+    that omits the active method's required knob, given an
+    absolute path. Was the only case Round 32 covered."""
+    import os
+    import subprocess
+    matrix_dir = tmp_path / "configs" / "4_layers"
+    matrix_dir.mkdir(parents=True)
+    bad_yaml = matrix_dir / "standard_moe_aux_loss.yaml"
+    bad_yaml.write_text(_BAD_AUX_YAML_TEXT)
+    cmd = [sys.executable, "scripts/validate_configs.py", str(bad_yaml)]
     env = {"PYTHONPATH": str(REPO), **os.environ}
     result = subprocess.run(
-        cmd, cwd=str(REPO), env=env,
-        capture_output=True, text=True,
+        cmd, cwd=str(REPO), env=env, capture_output=True, text=True,
     )
     assert result.returncode != 0, (
         f"CLI did not detect missing aux active knob:\n"
         f"STDOUT={result.stdout}\nSTDERR={result.stderr}"
     )
-    assert "router_aux_loss_coef" in result.stdout, (
-        f"CLI output did not mention the missing knob:\n{result.stdout}"
-    )
+    assert "router_aux_loss_coef" in result.stdout
+
+
+def test_cli_validator_rejects_missing_active_knob_relative_path(tmp_path):
+    """Round 33 review Finding 2: the CLI's strict mode must fire
+    for relative paths too. Drop a bad yaml into a real
+    `configs/4_layers/` location, run the CLI from the repo root
+    with a RELATIVE path, and assert it fails. This was the
+    silent-skip path Round 33's substring matcher missed.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    # Drop the bad yaml into the actual configs/4_layers dir so
+    # `relative_to(repo / "configs")` works correctly. We restore
+    # the dir afterwards so the matrix isn't permanently dirty.
+    tmp_name = "_TMP_validator_relative_probe.yaml"
+    target = REPO / "configs" / "4_layers" / tmp_name
+    target.write_text(_BAD_AUX_YAML_TEXT)
+    try:
+        cmd = [
+            sys.executable, "scripts/validate_configs.py",
+            f"configs/4_layers/{tmp_name}",  # RELATIVE path
+        ]
+        env = {"PYTHONPATH": str(REPO), **os.environ}
+        result = subprocess.run(
+            cmd, cwd=str(REPO), env=env,
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0, (
+            f"CLI did not detect missing aux active knob "
+            f"(relative path):\n"
+            f"STDOUT={result.stdout}\nSTDERR={result.stderr}"
+        )
+        assert "router_aux_loss_coef" in result.stdout
+    finally:
+        if target.exists():
+            target.unlink()
+
+
+def test_cli_validator_rejects_dec6_branch_drift_relative(tmp_path):
+    """Round 33 review Finding 2: CLI must enforce DEC-6 branch
+    contract on precompute_kv rows. Mutate a real precompute_kv
+    yaml so its branch_router becomes 'none', run CLI, expect
+    failure. Restore the yaml afterwards so the matrix stays
+    clean."""
+    import os
+    import subprocess
+
+    target = REPO / "configs" / "4_layers" / "moe_everything_per_head_precompute_kv_aux_loss.yaml"
+    original = target.read_text()
+    try:
+        bad_text = original.replace(
+            (
+                "  branch_router:\n"
+                "    balancing: exploration_only\n"
+                "    exploration_rate: 0.1\n"
+                "    exploration_decay: cosine\n"
+                "    exploration_min: 0.01\n"
+                "    exploration_warmup_steps: 1000\n"
+            ),
+            "  branch_router:\n    balancing: none\n",
+        )
+        target.write_text(bad_text)
+        cmd = [
+            sys.executable, "scripts/validate_configs.py",
+            "configs/4_layers/moe_everything_per_head_precompute_kv_aux_loss.yaml",
+        ]
+        env = {"PYTHONPATH": str(REPO), **os.environ}
+        result = subprocess.run(
+            cmd, cwd=str(REPO), env=env,
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0, (
+            f"CLI did not detect DEC-6 branch drift:\n"
+            f"STDOUT={result.stdout}\nSTDERR={result.stderr}"
+        )
+        assert "precompute_kv" in result.stdout
+    finally:
+        target.write_text(original)
 
 
 def test_precompute_kv_rows_set_dec6_branch_exploration():
