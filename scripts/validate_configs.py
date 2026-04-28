@@ -160,6 +160,43 @@ def validate_config(path: Path) -> list[str]:
     except Exception as exc:
         issues.append(f"nested-schema validator unavailable: {exc}")
 
+    # Strict mode for the active matrix: yamls under
+    # `configs/{4,8,16}_layers/` must not carry top-level
+    # balancing fields. The per-class blocks
+    # (`model.{mlp,attn,branch}_router`) are authoritative; a
+    # top-level coefficient is off-axis pollution that violates
+    # the AC-18 method-axis contract. Yamls under `configs/extras/`
+    # are exempt as legacy / non-matrix fixtures.
+    path_str = str(path)
+    in_active_matrix = (
+        "/configs/4_layers/" in path_str
+        or "/configs/8_layers/" in path_str
+        or "/configs/16_layers/" in path_str
+    )
+    if in_active_matrix:
+        forbidden = (
+            "router_aux_loss_coef", "seq_aux_loss_coef",
+            "bias_update_rate", "bias_update_zero_sum",
+            "bias_warmup_start", "bias_warmup_steps",
+            "load_balancing_method",
+        )
+        tcfg = cfg.get("training", {}) or {}
+        for key in forbidden:
+            if key in tcfg:
+                issues.append(
+                    f"active matrix yaml carries top-level "
+                    f"training.{key}={tcfg[key]!r}; per-class "
+                    f"`model.{{mlp,attn,branch}}_router` blocks "
+                    f"are authoritative."
+                )
+        mcfg_local = cfg.get("model", {}) or {}
+        if "load_balancing_method" in mcfg_local:
+            issues.append(
+                f"active matrix yaml carries top-level "
+                f"model.load_balancing_method={mcfg_local['load_balancing_method']!r}; "
+                f"the nested per-class blocks are authoritative."
+            )
+
     return issues
 
 

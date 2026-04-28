@@ -227,7 +227,7 @@ def build_model(cfg: dict):
     # Resolution order:
     #   1. Top-level `training.load_balancing_method` (or `model:`
     #      back-compat).
-    #   2. Nested `model.mlp_router.balancing` (the AC-13 nested-only
+    #   2. Nested `model.mlp_router.balancing` (the nested-only
     #      runtime — when the migrator has stripped the top-level
     #      method, this is the authoritative source). Standard /
     #      Global MoE have only an MLP router class, so the MLP

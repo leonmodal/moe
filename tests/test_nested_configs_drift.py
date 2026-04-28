@@ -131,6 +131,71 @@ def test_matrix_covers_every_required_cell():
     )
 
 
+_TOP_LEVEL_BALANCING_FIELDS = (
+    "router_aux_loss_coef",
+    "seq_aux_loss_coef",
+    "bias_update_rate",
+    "bias_update_zero_sum",
+    "bias_warmup_start",
+    "bias_warmup_steps",
+    "load_balancing_method",
+)
+
+
+def test_matrix_has_no_top_level_balancing_fields():
+    """Round 30 review Finding 1: every active matrix yaml must
+    have ZERO top-level balancing coefficients/methods. The
+    per-class blocks (`model.{mlp,attn,branch}_router`) are
+    authoritative; top-level fields are off-axis pollution that
+    can keep the matrix in a mixed nested-plus-flat state.
+    """
+    leaks: list[tuple[str, str, object]] = []
+    for p in _nested_yamls():
+        with p.open() as f:
+            cfg = yaml.safe_load(f)
+        tcfg = cfg.get("training", {}) or {}
+        for key in _TOP_LEVEL_BALANCING_FIELDS:
+            if key in tcfg:
+                leaks.append((str(p), f"training.{key}", tcfg[key]))
+        mcfg = cfg.get("model", {}) or {}
+        if "load_balancing_method" in mcfg:
+            leaks.append((str(p), "model.load_balancing_method", mcfg["load_balancing_method"]))
+    assert not leaks, (
+        f"matrix yamls still carry top-level balancing fields "
+        f"(off-axis pollution): {leaks}"
+    )
+
+
+def test_matrix_aux_loss_rows_have_only_aux_coef_in_per_class():
+    """Per-method axis rule for aux_loss rows: the per-class
+    `mlp_router` block has `balancing: aux_loss` and may carry
+    `router_aux_loss_coef`. It must NOT carry seq_aux_loss_coef,
+    bias_update_*, or quantile_* knobs (those would silently mix
+    methods)."""
+    incompatible_for_aux = (
+        "seq_aux_loss_coef",
+        "bias_update_rate", "bias_update_zero_sum",
+        "bias_warmup_start", "bias_warmup_steps",
+        "quantile_eta", "quantile_target_q", "quantile_global_state",
+    )
+    leaks = []
+    for p in _nested_yamls():
+        if not str(p).endswith("_aux_loss.yaml"):
+            continue
+        with p.open() as f:
+            cfg = yaml.safe_load(f)
+        for group in ("mlp_router", "attn_router", "branch_router"):
+            block = cfg.get("model", {}).get(group, {}) or {}
+            if block.get("balancing") != "aux_loss":
+                continue
+            for key in incompatible_for_aux:
+                if key in block and block[key]:
+                    leaks.append((str(p), f"{group}.{key}", block[key]))
+    assert not leaks, (
+        f"aux_loss matrix rows carry off-axis per-class knobs: {leaks}"
+    )
+
+
 def test_matrix_has_quantile_rows():
     """Codex Round 29 review explicitly flagged the absence of
     quantile rows. Pin this contract: every depth must have

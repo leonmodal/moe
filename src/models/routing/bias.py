@@ -95,6 +95,84 @@ def update_bias_from_counts(
             bias.clamp_(-clamp_range, clamp_range)
 
 
+def update_bias_from_quantile(
+    bias: torch.Tensor,
+    ema: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    target_q: float,
+    eta: float,
+    clamp_range: float = 16.0,
+    distributed: bool = False,
+) -> None:
+    """Pure fp32 quantile-balancing update. Updates `bias` and `ema`
+    in place from the per-expert raw scores accumulated over the
+    last training window.
+
+    The contract is:
+      * Each expert's per-batch top score becomes the input
+        observation. We summarize the score distribution by the
+        target quantile (default 0.5 = median) per expert.
+      * The EMA tracks the per-expert quantile across windows:
+            ema = (1 - eta) * ema + eta * q_e
+      * The bias derivation pulls each expert toward the GLOBAL
+        median of those EMA values:
+            bias[e] = clamp(ema.median() - ema[e], -clamp_range, +clamp_range)
+        Underloaded experts (low scores -> low ema) get a positive
+        bias; overloaded experts get a negative one. The clamp
+        bounds match the DeepSeek-V3 ±16 envelope.
+
+    Args:
+      bias: (num_experts,) — bias buffer to update in place.
+      ema:  (num_experts,) — persistent EMA of per-expert quantile.
+      scores: (n_active_tokens, num_experts) — concatenated detached
+              fp32 raw scores from the active-token forward(s).
+              Empty `n_active_tokens` is a no-op (returns without
+              touching `bias` or `ema`).
+      target_q: Quantile to track per expert, in [0, 1].
+                Defaults to 0.5 (median).
+      eta: EMA learning rate, in (0, 1].
+      clamp_range: Absolute bias clamp.
+      distributed: When True AND `dist` is initialized, the global
+                   quantile estimate is computed by `all_gather`-ing
+                   raw scores across ranks before quantile reduction.
+                   When `dist` is not initialized, falls back to the
+                   local-rank concatenation.
+
+    The function is a pure update — it does NOT touch model state
+    or autograd graphs. The caller is responsible for clearing the
+    score accumulator after this update fires.
+    """
+    with torch.no_grad():
+        if scores.numel() == 0:
+            return
+        if not (0.0 <= target_q <= 1.0):
+            raise ValueError(
+                f"quantile target_q must be in [0, 1]; got {target_q}"
+            )
+        if not (0.0 < eta <= 1.0):
+            raise ValueError(
+                f"quantile eta must be in (0, 1]; got {eta}"
+            )
+        if distributed and dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+            gathered = [torch.zeros_like(scores) for _ in range(world_size)]
+            dist.all_gather(gathered, scores)
+            scores = torch.cat(gathered, dim=0)
+        # Per-expert target quantile across all observed tokens.
+        # `quantile` operates on dim=0 (the n_active_tokens axis) and
+        # returns a (num_experts,) tensor.
+        q_per_expert = torch.quantile(
+            scores.float(), q=float(target_q), dim=0,
+        )
+        # EMA in-place update.
+        ema.mul_(1.0 - eta).add_(eta * q_per_expert)
+        # Bias = pull each expert toward the global median of EMAs.
+        target = ema.median()
+        new_bias = (target - ema).clamp_(-clamp_range, clamp_range)
+        bias.copy_(new_bias)
+
+
 def broadcast_bias_to_routers(
     global_bias: torch.Tensor,
     routers: list,
