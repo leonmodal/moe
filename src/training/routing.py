@@ -179,6 +179,16 @@ def update_expert_biases(
     use_dist = distributed and dist.is_available() and dist.is_initialized()
 
     for owner, label in get_owners():
+        # Skip branch routers in exploration-only mode: the mode is
+        # by construction independent of the bias-update signal, so
+        # nudging `expert_bias` here would do nothing routing-wise
+        # AND could accumulate spurious nonzero values that surprise
+        # checkpoint-resume / state-dict diff readers.
+        if (
+            label == "branch"
+            and getattr(owner, "balancing", "none") == "exploration_only"
+        ):
+            continue
         rate = rates.get(label, bias_rate)
         _update_single_router_bias(owner, rate, use_dist, zero_sum=zero_sum)
 

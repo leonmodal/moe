@@ -72,7 +72,7 @@ def _resolve_balancing_field(cfg: dict, name: str, default: Any) -> Any:
     return default
 
 
-# method gating / the coefficient normalizer: which legacy coefficients are kept active under each
+# Coefficient gating per method: which legacy coefficients are kept active under each
 # `load_balancing_method`. Anything outside the per-method "active" set is
 # AUTO-ZEROED with a deprecation warning so the trainer's coefficient-driven
 # code paths produce behavior consistent with the resolved method.
@@ -83,7 +83,7 @@ _VALID_LOAD_BALANCING_METHODS: tuple[str, ...] = (
     "quantile",
     "none",
 )
-# the detach-only policy: methods whose loss term needs
+# Detach-only telemetry: methods whose loss term needs
 # `router_logits` exposed as a gradient-bearing model output. For other
 # methods, the model's `forward` should NOT request loss-bearing router
 # logits — non-aux methods drive routing through the router-internal

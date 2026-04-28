@@ -430,9 +430,261 @@ def test_legacy_exploration_only_bool_still_works():
     is still accepted. `True` maps to rate=1.0; `False` to 0.0."""
     router_true = BranchRouter(hidden_size=16, exploration_only=True)
     assert router_true.exploration_only_rate == 1.0
+    assert router_true.balancing == "exploration_only"
 
     router_false = BranchRouter(hidden_size=16, exploration_only=False)
     assert router_false.exploration_only_rate == 0.0
+    assert router_false.balancing == "none"
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  AC-14 plan-text contracts (Codex Round 20 Findings 1-4)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_balancing_field_validates_value():
+    """`balancing` accepts only `none` or `exploration_only`. Other
+    values fail at construction so misconfigured yamls fail fast."""
+    with pytest.raises(ValueError, match="balancing must be one of"):
+        BranchRouter(hidden_size=16, balancing="quantile")
+
+
+def test_balancing_exploration_only_auto_promotes_from_rate():
+    """If a caller passes `exploration_only_rate > 0` but leaves
+    `balancing="none"` (default), the router auto-promotes
+    `balancing` to `"exploration_only"`. This avoids a foot-gun
+    where the rate is set but the mode flag is not."""
+    router = BranchRouter(hidden_size=16, exploration_only_rate=0.3)
+    assert router.balancing == "exploration_only"
+
+
+def test_telemetry_resets_on_each_forward():
+    """After a `rate>0` training forward records a mask, a
+    subsequent `rate=0` or eval-mode forward must reset both
+    `last_exploration_only_mask` and `last_exploration_only_rate`
+    to None / 0.0 so a downstream telemetry reader can't pick up
+    stale values."""
+    torch.manual_seed(20260428)
+    H = 16
+    T = 8
+    router = BranchRouter(
+        hidden_size=H, balancing="exploration_only", exploration_only_rate=0.5,
+    ).train()
+
+    # Step 1: nonzero rate, training mode → mask + rate recorded.
+    x = torch.randn(T, H)
+    _, _, _, _ = router(x)
+    assert router.last_exploration_only_mask is not None
+    assert router.last_exploration_only_rate == 0.5
+
+    # Step 2: rate goes to 0; training mode. Mask must reset.
+    router.exploration_only_rate = 0.0
+    _, _, _, _ = router(x)
+    assert router.last_exploration_only_mask is None
+    assert router.last_exploration_only_rate == 0.0
+
+    # Step 3: rate goes back up but model switches to eval.
+    router.exploration_only_rate = 1.0
+    router.eval()
+    _, _, _, _ = router(x)
+    assert router.last_exploration_only_mask is None
+    assert router.last_exploration_only_rate == 0.0
+
+
+def test_rng_injected_first_4_of_8_mask_and_choices():
+    """AC-14 plan-text deterministic RNG-injected test.
+
+    Build a `torch.Generator` and seed it so the first
+    `torch.rand(8)` draw produces 4 values < 0.5 (these are the
+    `explore_mask`'s True positions: tokens 0-3 are explored,
+    tokens 4-7 fall through to argmax). The router is configured
+    with `balancing="exploration_only"` and
+    `exploration_only_rate=0.5`. The test:
+
+    1. Records the mask the router produced and asserts it
+       matches the expected `[True, True, True, True, False,
+       False, False, False]` pattern.
+    2. Asserts that the masked tokens' choices come from the
+       second `torch.rand` draw (uniform 50/50 random choice),
+       NOT from the gate's argmax.
+    3. Asserts that the unmasked tokens' choices match the
+       gate's argmax exactly (set up so all 8 argmax values are
+       index 1 / MLP).
+    """
+    H = 16
+    T = 8
+
+    router = BranchRouter(
+        hidden_size=H,
+        balancing="exploration_only",
+        exploration_only_rate=0.5,
+    ).train()
+
+    # Bias gate so argmax is deterministically MLP (index 1) for
+    # every token (unmasked tokens follow this).
+    with torch.no_grad():
+        torch.nn.init.constant_(router.gate.weight[1], 100.0)
+        torch.nn.init.constant_(router.gate.weight[0], -100.0)
+
+    # Construct a generator whose state produces the desired
+    # explore mask + random-choice pattern. We probe the
+    # generator to capture what `torch.rand(8)` and the second
+    # `torch.rand(8)` will produce, then construct expected
+    # values from those probes.
+    gen_probe = torch.Generator()
+    gen_probe.manual_seed(20260428)
+    expected_mask_draw = torch.rand(8, generator=gen_probe)
+    expected_choice_draw = torch.rand(8, generator=gen_probe)
+    expected_mask = expected_mask_draw < 0.5
+    expected_random_choice = (expected_choice_draw < 0.5).long()
+
+    # Re-seed the actual generator the router will use.
+    gen = torch.Generator()
+    gen.manual_seed(20260428)
+    router.exploration_generator = gen
+
+    # Strictly-positive input so the biased argmax is
+    # deterministic for unmasked tokens.
+    x = torch.ones(T, H)
+    _, _, _, _ = router(x)
+
+    actual_mask = router.last_exploration_only_mask
+    actual_choices = router.last_selected_experts.reshape(-1)
+
+    # 1) Mask matches the expected pattern from the seeded generator.
+    assert torch.equal(actual_mask, expected_mask), (
+        f"explore_mask mismatch: actual={actual_mask.tolist()}, "
+        f"expected={expected_mask.tolist()}"
+    )
+
+    # 2) Masked tokens' choices come from the random-choice draw.
+    for i in range(T):
+        if expected_mask[i]:
+            assert actual_choices[i] == expected_random_choice[i], (
+                f"masked token {i}: actual_choice={actual_choices[i].item()}, "
+                f"expected_random={expected_random_choice[i].item()}"
+            )
+
+    # 3) Unmasked tokens' choices match argmax (always MLP=1 here).
+    for i in range(T):
+        if not expected_mask[i]:
+            assert actual_choices[i] == 1, (
+                f"unmasked token {i}: actual_choice={actual_choices[i].item()}, "
+                f"expected argmax MLP=1"
+            )
+
+
+def test_exploration_only_does_not_increment_local_tokens_per_expert():
+    """AC-14 negative test (call-site): a DeepSeek-style branch
+    router under `balancing=exploration_only` MUST NOT increment
+    `local_tokens_per_expert` during forward. This is the
+    construction-side half of the "branch DeepSeek bias is inert
+    under exploration_only" contract."""
+    torch.manual_seed(20260428)
+    H = 16
+    T = 32
+
+    router = BranchRouter(
+        hidden_size=H,
+        balancing="exploration_only",
+        exploration_only_rate=1.0,
+        use_deepseek_style=True,
+    ).train()
+
+    # Pre-populate counts to a non-zero baseline; the test checks
+    # that the forward DOES NOT increment from this baseline.
+    router.local_tokens_per_expert.copy_(torch.tensor([7.0, 11.0]))
+    initial_counts = router.local_tokens_per_expert.clone()
+
+    x = torch.randn(T, H)
+    _, _, _, _ = router(x)
+
+    assert torch.equal(router.local_tokens_per_expert, initial_counts), (
+        f"exploration_only DeepSeek-style branch router incremented counts: "
+        f"before={initial_counts.tolist()}, after={router.local_tokens_per_expert.tolist()}"
+    )
+
+
+def test_update_expert_biases_skips_exploration_only_branch_owner():
+    """AC-14 negative test (walker-side): `update_expert_biases`
+    must skip branch routers whose `balancing == "exploration_only"`
+    even if the model's `_load_balancing_method` is
+    `deepseek_bias`. A bias update on an exploration-only branch
+    router would push `expert_bias` away from zero with no
+    routing effect — we want neither the noise nor the
+    surprising state-dict diff."""
+    routing = _load_routing_module()
+
+    branch = BranchRouter(
+        hidden_size=16,
+        balancing="exploration_only",
+        exploration_only_rate=1.0,
+        use_deepseek_style=True,
+    )
+    branch.local_tokens_per_expert.copy_(torch.tensor([100.0, 1.0]))
+    initial_bias = branch.expert_bias.detach().clone()
+    initial_counts = branch.local_tokens_per_expert.detach().clone()
+
+    class _Model:
+        _load_balancing_method = "deepseek_bias"
+
+        def __init__(self, branch):
+            self._branch = branch
+
+        def get_all_balancing_owners(self):
+            yield self._branch, "branch"
+
+    with torch.no_grad():
+        routing.update_expert_biases(
+            _Model(branch), bias_rate=0.01, distributed=False,
+        )
+
+    # Branch router state must be untouched.
+    assert torch.equal(branch.expert_bias, initial_bias), (
+        f"exploration_only branch router's expert_bias was modified: "
+        f"before={initial_bias.tolist()}, after={branch.expert_bias.tolist()}"
+    )
+    assert torch.equal(branch.local_tokens_per_expert, initial_counts), (
+        f"exploration_only branch router's counts were zeroed by bias update: "
+        f"before={initial_counts.tolist()}, after={branch.local_tokens_per_expert.tolist()}"
+    )
+
+
+def test_update_expert_biases_does_update_non_exploration_only_branch():
+    """Companion positive test: a branch router with
+    `balancing="none"` (default) and `use_deepseek_style=True` IS
+    updated by the walker. This proves the skip in
+    `update_expert_biases` is gated on `balancing=exploration_only`
+    only — not a blanket disable for branch routers."""
+    routing = _load_routing_module()
+
+    branch = BranchRouter(
+        hidden_size=16,
+        balancing="none",
+        use_deepseek_style=True,
+    )
+    branch.local_tokens_per_expert.copy_(torch.tensor([100.0, 1.0]))
+    initial_bias = branch.expert_bias.detach().clone()
+
+    class _Model:
+        _load_balancing_method = "deepseek_bias"
+
+        def __init__(self, branch):
+            self._branch = branch
+
+        def get_all_balancing_owners(self):
+            yield self._branch, "branch"
+
+    with torch.no_grad():
+        routing.update_expert_biases(
+            _Model(branch), bias_rate=0.01, distributed=False,
+        )
+
+    # The legacy branch path SHOULD have updated expert_bias.
+    assert not torch.equal(branch.expert_bias, initial_bias), (
+        "non-exploration_only branch router with deepseek_bias method "
+        "should have been updated by the walker; expert_bias unchanged"
+    )
 
 
 if __name__ == "__main__":

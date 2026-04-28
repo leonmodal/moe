@@ -144,7 +144,7 @@ def collect_router_z_losses(routers: Iterable[nn.Module]) -> torch.Tensor | None
 _SCORE_FUNCTIONS = {"softmax", "sigmoid", "sqrtsoftplus"}
 _TOPK_ORDERINGS = {"post", "pre"}
 
-# the softmax_position contract: the canonical name for the score-function
+# Softmax-position handling: the canonical name for the score-function
 # vs top-k ordering knob is `softmax_position` (matches Megatron-LM's naming),
 # with values `pre_topk` and `post_topk`. Old names map as:
 #     softmax_position = "pre_topk"  ⟷ legacy router_topk_ordering = "post"
@@ -271,7 +271,7 @@ class ExplorationTopKRouter(Qwen3MoeTopKRouter):
                 f"router_score_function must be one of {sorted(_SCORE_FUNCTIONS)}, "
                 f"got {self.score_function!r}"
             )
-        # the softmax_position contract: canonical name is
+        # Softmax-position handling: canonical name is
         # `softmax_position` ∈ {pre_topk, post_topk}; legacy
         # `router_topk_ordering` is accepted with a DeprecationWarning.
         # We keep `self.topk_ordering` populated with the legacy value

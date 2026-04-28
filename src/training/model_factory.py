@@ -93,7 +93,7 @@ def _set_router_params(config, model_cfg: dict) -> None:
     """Plumb shared router knobs (softmax-family and DeepSeek both honour these)."""
     config.router_exploration_rate = model_cfg.get("router_exploration_rate", 0.0)
     # Scoring function and softmax position (softmax-family router only;
-    # DeepSeek forces sigmoid + its own selection path). the softmax_position contract (RESOLVED →
+    # DeepSeek forces sigmoid + its own selection path). Softmax-position migration (
     # softmax_position): `softmax_position` is the canonical field name;
     # `router_topk_ordering` is accepted as a deprecated alias with a
     # DeprecationWarning emitted from `_resolve_softmax_position`.
@@ -169,7 +169,7 @@ def build_model(cfg: dict):
         model = Qwen3ForCausalLM(config)
         return model, config
 
-    # the detach-only policy / : resolve `output_router_logits` from the method.
+    # Detach-only policy: resolve `output_router_logits` from the method.
     # For aux methods, router scores need to be gradient-bearing in the
     # model output so the aux loss term can backprop through them. For
     # non-aux methods (deepseek_bias, quantile, none), we don't return
@@ -255,7 +255,7 @@ def build_model(cfg: dict):
         )
         # Router-option knobs attached post-construction (the config __init__
         # does not currently enumerate them; _set_router_params is the single
-        # source of truth across all MoE families). the softmax_position contract → softmax_position:
+        # source of truth across all MoE families). softmax_position migration:
         # `softmax_position` is the canonical field name; legacy
         # `router_topk_ordering` is accepted with a DeprecationWarning.
         config.router_score_function = mcfg.get("router_score_function", "softmax")
@@ -273,7 +273,7 @@ def build_model(cfg: dict):
         except Exception:
             model.set_experts_implementation("eager")
 
-    # method gating / the coefficient normalizer: stamp the resolved `load_balancing_method` onto BOTH the
+    # Coefficient gating per method: stamp the resolved `load_balancing_method` onto BOTH the
     # model and its config so every caller (the trainer, ad-hoc test fixtures,
     # the post-step `update_expert_biases` walker) sees the same authoritative
     # value without needing to re-resolve from `cfg`. `normalize_balancing_config`

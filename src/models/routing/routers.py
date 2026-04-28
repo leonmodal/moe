@@ -52,7 +52,8 @@ class BranchRouter(nn.Module):
                  use_sampling: bool = False, use_seq_level: bool = False,
                  use_deepseek_style: bool = False,
                  exploration_only_rate: float = 0.0,
-                 exploration_only: bool | None = None):
+                 exploration_only: bool | None = None,
+                 balancing: str = "none"):
         super().__init__()
         self.gate = nn.Linear(hidden_size, 2, bias=False)
         self.exploration_rate = exploration_rate
@@ -60,37 +61,58 @@ class BranchRouter(nn.Module):
         self.use_sampling = use_sampling
         self.use_seq_level = use_seq_level
         self.use_deepseek_style = use_deepseek_style
-        # `exploration_only_rate`: per-step probability `p_explore` of
-        # routing each token (or sequence under `use_seq_level`) by a
-        # uniform Bernoulli draw rather than the gate's argmax.
-        #   `0.0`  → no exploration override (default; argmax routing).
-        #   `1.0`  → every routing decision is uniformly random.
-        #   `0<p<1` → per-token Bernoulli mask: with probability `p`,
-        #             the token's selection is replaced by a uniform
-        #             50/50 draw; otherwise it follows the regular
-        #             argmax path.
-        # The gate's projection still runs on every token so the
-        # routing-weight tensors stay gradient-bearing for the rest of
-        # the model. Recompute determinism is preserved via
-        # `torch.utils.checkpoint`'s default `preserve_rng_state=True`.
-        # Backwards-compat: the legacy `exploration_only: bool` kwarg is
-        # accepted; True → `exploration_only_rate=1.0`, False → 0.0.
-        if exploration_only is True and exploration_only_rate == 0.0:
-            exploration_only_rate = 1.0
+        # `balancing`: branch-router balancing mode. Allowed values:
+        #   "none"             - default; no exploration override.
+        #   "exploration_only" - every step draws a per-token explore
+        #                        mask at probability
+        #                        `exploration_only_rate` (the
+        #                        scheduled `p_explore(step)` rate).
+        #                        For masked tokens, the routing
+        #                        decision is replaced by a uniform
+        #                        Bernoulli draw. Branch aux/bias
+        #                        paths are disabled by construction
+        #                        in this mode.
+        # Backwards-compat aliases:
+        #   `exploration_only=True`  -> balancing="exploration_only",
+        #                                exploration_only_rate=1.0
+        #   `exploration_only_rate > 0` (without explicit balancing)
+        #     auto-promotes balancing to "exploration_only".
+        _allowed_balancing = ("none", "exploration_only")
+        if balancing not in _allowed_balancing:
+            raise ValueError(
+                f"BranchRouter balancing must be one of {_allowed_balancing}, "
+                f"got {balancing!r}"
+            )
+        if exploration_only is True:
+            balancing = "exploration_only"
+            if exploration_only_rate == 0.0:
+                exploration_only_rate = 1.0
         elif exploration_only is False:
+            balancing = "none"
             exploration_only_rate = 0.0
+        # Auto-promote: a positive rate without explicit balancing
+        # implies the user wants exploration-only mode.
+        if balancing == "none" and exploration_only_rate > 0.0:
+            balancing = "exploration_only"
         if not (0.0 <= exploration_only_rate <= 1.0):
             raise ValueError(
                 f"exploration_only_rate must be in [0, 1], got {exploration_only_rate}"
             )
+        self.balancing = balancing
         self.exploration_only_rate = exploration_only_rate
+        # Optional `torch.Generator` for deterministic exploration-only
+        # draws. Tests inject a seeded generator to assert the
+        # exact mask + branch-choice pattern. Production leaves it
+        # `None` and relies on the global RNG state (which
+        # `torch.utils.checkpoint`'s `preserve_rng_state=True`
+        # restores correctly on recompute).
+        self.exploration_generator: torch.Generator | None = None
         self.last_probs = None
         self.last_selected_experts = None
         # Last-step exploration-only mask (per-token bool) and the
-        # rate that produced it. Populated only when
-        # `exploration_only_rate > 0` and the router is in `training()`
-        # mode; tests use these for RNG-injected deterministic
-        # assertions.
+        # rate that produced it. Reset to None / 0.0 at the start of
+        # every forward; populated only when exploration-only is
+        # actually active.
         self.last_exploration_only_mask = None
         self.last_exploration_only_rate = 0.0
         # Rely on `torch.utils.checkpoint`'s default
@@ -120,6 +142,11 @@ class BranchRouter(nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor):
+        # Reset exploration-only telemetry on every forward so a later
+        # rate=0 / eval-mode call cannot read a stale mask/rate left
+        # over from a prior nonzero-rate forward.
+        self.last_exploration_only_mask = None
+        self.last_exploration_only_rate = 0.0
         device_type = hidden_states.device.type
         with torch.autocast(device_type=device_type, enabled=False):
             # Route in the gate's weight dtype. Under standard DDP/fp32 training
@@ -138,7 +165,11 @@ class BranchRouter(nn.Module):
             else:
                 logits = self.gate(hidden_states.to(gate_dtype))
 
-            if self.exploration_only_rate > 0.0 and self.training:
+            if (
+                self.balancing == "exploration_only"
+                and self.exploration_only_rate > 0.0
+                and self.training
+            ):
                 # Exploration-only routing: with probability
                 # `exploration_only_rate` per token (the explore mask),
                 # the token's selection is replaced by a uniform
@@ -150,19 +181,19 @@ class BranchRouter(nn.Module):
                     probs = torch.sigmoid(logits)
                 else:
                     probs = F.softmax(logits, dim=-1)
-                # Argmax fallback for non-explored tokens.
                 argmax_choice = probs.argmax(dim=-1)
-                # Per-token explore mask + uniform Bernoulli for masked
-                # tokens. Both `torch.rand` calls inherit the
-                # checkpoint-restored RNG state on recompute.
-                rand_mask = torch.rand(probs.shape[:-1], device=probs.device)
+                gen = self.exploration_generator
+                rand_kwargs = {"device": probs.device}
+                if gen is not None:
+                    rand_kwargs["generator"] = gen
+                rand_mask = torch.rand(probs.shape[:-1], **rand_kwargs)
                 explore_mask = rand_mask < self.exploration_only_rate
                 random_choice = (
-                    torch.rand(probs.shape[:-1], device=probs.device) < 0.5
+                    torch.rand(probs.shape[:-1], **rand_kwargs) < 0.5
                 ).long()
                 choice = torch.where(explore_mask, random_choice, argmax_choice)
-                # Record for tests / telemetry. `.detach()` on the mask
-                # so storing it doesn't retain gradient history.
+                # Record for tests / telemetry. `.detach()` on the
+                # mask so storing it doesn't retain gradient history.
                 self.last_exploration_only_mask = explore_mask.detach()
                 self.last_exploration_only_rate = float(self.exploration_only_rate)
             elif self.use_deepseek_style:
@@ -211,10 +242,16 @@ class BranchRouter(nn.Module):
                 choice = choice.unsqueeze(1).expand(B, T)
                 probs = probs.unsqueeze(1).expand(B, T, 2)
 
-        # Track counts for bias update (DeepSeek style). Skip on gradient-checkpoint
-        # recompute so backward replays do not double-count (recompute determinism / the shared `expert_bias`/`local_tokens_per_expert` buffer interface).
+        # Track counts for bias update (DeepSeek style). Skip on
+        # gradient-checkpoint recompute so backward replays do not
+        # double-count. Also skip when balancing is "exploration_only":
+        # the mode is by definition not driven by the bias-update
+        # signal, so counting random branch picks would inject noise
+        # into a buffer the trainer is asked to never read for this
+        # mode.
         if (
             self.use_deepseek_style
+            and self.balancing != "exploration_only"
             and self.training
             and torch.is_grad_enabled()
             and not is_checkpoint_recompute()
