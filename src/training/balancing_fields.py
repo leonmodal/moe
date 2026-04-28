@@ -447,6 +447,45 @@ def validate_branch_router_config(cfg: dict) -> None:
                         f"`balancing`."
                     )
 
+    # Apply the same branch method×knob rejection to flat-bridge
+    # form (`branch_<key>`). Some external configs and pre-migration
+    # yamls still use the flat form; the validator must catch the
+    # same incompatibilities there. Resolves the active method via
+    # `_resolve(...)` (which already prefers nested but falls back
+    # to flat) so a yaml carrying ONLY flat fields is still checked.
+    bal_resolved, _ = _resolve("balancing", "none")
+    if bal_resolved in {"aux_loss", "seq_aux_loss", "exploration_only", "none"}:
+        flat_branch_method_to_allowed = {
+            "aux_loss": {"router_aux_loss_coef"},
+            "seq_aux_loss": {"seq_aux_loss_coef"},
+            "exploration_only": {
+                "exploration_rate", "exploration_decay",
+                "exploration_min", "exploration_warmup_steps",
+            },
+            "none": {
+                "exploration_rate", "exploration_decay",
+                "exploration_min", "exploration_warmup_steps",
+            },
+        }
+        flat_all_active = {
+            "router_aux_loss_coef", "seq_aux_loss_coef",
+            "bias_update_rate", "bias_update_zero_sum",
+            "bias_warmup_start", "bias_warmup_steps",
+            "quantile_eta", "quantile_target_q",
+            "quantile_global_state",
+        }
+        flat_allowed = flat_branch_method_to_allowed[bal_resolved]
+        for field in sorted(flat_all_active - flat_allowed):
+            flat_field_name = f"branch_{field}"
+            if flat_field_name in mcfg and mcfg[flat_field_name]:
+                raise ValueError(
+                    f"branch_router.balancing={bal_resolved!r} is "
+                    f"incompatible with model.{flat_field_name}="
+                    f"{mcfg[flat_field_name]!r}; the runtime ignores "
+                    f"this knob under {bal_resolved}. Drop the "
+                    f"conflicting field or change `balancing`."
+                )
+
     # Reject conflicting nested-vs-flat assignments on the SAME field.
     if isinstance(nested, dict):
         for key in _BRANCH_ROUTER_KNOWN_KEYS:

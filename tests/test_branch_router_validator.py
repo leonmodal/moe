@@ -321,6 +321,127 @@ def test_validator_branch_router_rejects_none_with_active_knobs():
         _validator()(cfg)
 
 
+def test_validator_flat_branch_aux_loss_rejects_seq_aux_coef():
+    """Round 35 review Finding 1: flat-bridge branch fields must
+    apply the same method×knob rejection. `branch_balancing:
+    aux_loss + branch_seq_aux_loss_coef: 0.5` is the same
+    silent-mix bug whether expressed via nested or flat form.
+    """
+    cfg = {"model": {
+        "branch_balancing": "aux_loss",
+        "branch_router_aux_loss_coef": 0.001,
+        "branch_seq_aux_loss_coef": 0.5,
+    }}
+    with pytest.raises(ValueError, match="branch_router.balancing='aux_loss'.*model.branch_seq_aux_loss_coef"):
+        _validator()(cfg)
+
+
+def test_validator_flat_branch_seq_aux_loss_rejects_aux_coef():
+    cfg = {"model": {
+        "branch_balancing": "seq_aux_loss",
+        "branch_seq_aux_loss_coef": 0.0001,
+        "branch_router_aux_loss_coef": 0.5,
+    }}
+    with pytest.raises(ValueError, match="branch_router.balancing='seq_aux_loss'.*branch_router_aux_loss_coef"):
+        _validator()(cfg)
+
+
+def test_validator_flat_branch_none_rejects_active_knobs():
+    cfg = {"model": {
+        "branch_balancing": "none",
+        "branch_router_aux_loss_coef": 0.001,
+    }}
+    with pytest.raises(ValueError, match="branch_router.balancing='none'.*branch_router_aux_loss_coef"):
+        _validator()(cfg)
+
+
+def test_validator_flat_branch_exploration_only_rejects_aux_coef():
+    cfg = {"model": {
+        "branch_balancing": "exploration_only",
+        "branch_exploration_rate": 1.0,
+        "branch_router_aux_loss_coef": 0.001,
+    }}
+    with pytest.raises(ValueError, match="branch_router.balancing='exploration_only'.*branch_router_aux_loss_coef"):
+        _validator()(cfg)
+
+
+def test_cli_validator_rejects_flat_branch_field_in_active_matrix(tmp_path):
+    """The CLI strict mode rejects flat `branch_*` bridge fields
+    on active matrix yamls — the nested `branch_router` block is
+    authoritative. Drop a yaml with flat `branch_router_aux_loss_coef`
+    into a real matrix dir and assert the CLI fails."""
+    import os
+    import subprocess
+    repo = Path(__file__).resolve().parent.parent
+    target = repo / "configs" / "4_layers" / "_TMP_flat_branch_in_matrix.yaml"
+    target.write_text(
+        """experiment_name: flat_branch_probe
+model:
+  type: moe_everything
+  vocab_size: 32
+  hidden_size: 16
+  num_hidden_layers: 1
+  head_dim: 8
+  num_attention_heads: 2
+  num_key_value_heads: 2
+  num_experts: 4
+  num_experts_per_tok: 2
+  moe_intermediate_size: 32
+  intermediate_size: 32
+  branch_router_aux_loss_coef: 0.001
+  num_attn_experts: 2
+  num_attn_experts_per_tok: 1
+  attn_expert_mode: per_head_fully_independent
+  use_deepseek_routing: true
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-06
+  rope_theta: 10000.0
+  max_position_embeddings: 32
+  tie_word_embeddings: true
+  output_router_logits: true
+  attn_implementation: eager
+  mlp_router:
+    balancing: aux_loss
+    router_aux_loss_coef: 0.001
+  attn_router:
+    balancing: aux_loss
+    router_aux_loss_coef: 0.001
+  branch_router:
+    balancing: none
+training:
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 0
+  max_steps: 1
+  batch_size: 1
+  gradient_accumulation: 1
+  mixed_precision: ""
+  output_dir: /tmp
+"""
+    )
+    try:
+        cmd = [
+            sys.executable, "scripts/validate_configs.py",
+            "configs/4_layers/_TMP_flat_branch_in_matrix.yaml",
+        ]
+        env = {"PYTHONPATH": str(repo), **os.environ}
+        result = subprocess.run(
+            cmd, cwd=str(repo), env=env,
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0, (
+            f"CLI did not detect flat branch_router_aux_loss_coef in "
+            f"matrix:\nSTDOUT={result.stdout}\nSTDERR={result.stderr}"
+        )
+        assert "branch_router_aux_loss_coef" in result.stdout
+    finally:
+        if target.exists():
+            target.unlink()
+
+
 def test_validator_branch_router_accepts_aux_loss():
     """Round 32 review Finding 4: BranchRouter now accepts
     `aux_loss` and `seq_aux_loss`. The model's forward path

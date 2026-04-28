@@ -26,7 +26,6 @@ model:
     exploration_decay: cosine
     exploration_min: 0.01
     exploration_warmup_steps: 1000
-  branch_router_aux_loss_coef: 0.0
   global_router_update: true
   group_topk: 4
   head_dim: 128

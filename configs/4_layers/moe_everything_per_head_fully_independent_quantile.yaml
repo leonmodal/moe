@@ -22,7 +22,6 @@ model:
   bias_interpolation: false
   branch_router:
     balancing: none
-  branch_router_aux_loss_coef: 0.0
   global_router_update: true
   group_topk: 4
   head_dim: 128

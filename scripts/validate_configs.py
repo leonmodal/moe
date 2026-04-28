@@ -209,6 +209,35 @@ def validate_config(path: Path) -> list[str]:
                 f"the nested per-class blocks are authoritative."
             )
 
+        # Active matrix also forbids the flat `branch_*` bridge
+        # fields. The nested `model.branch_router` block is the
+        # only source of truth on the active matrix; flat fields
+        # are reserved for legacy / external configs handled
+        # outside the matrix.
+        flat_branch_keys = (
+            "branch_balancing",
+            "branch_router_aux_loss_coef",
+            "branch_seq_aux_loss_coef",
+            "branch_bias_update_rate",
+            "branch_bias_update_zero_sum",
+            "branch_bias_warmup_start",
+            "branch_bias_warmup_steps",
+            "branch_quantile_eta",
+            "branch_quantile_target_q",
+            "branch_quantile_global_state",
+            "branch_exploration_rate",
+            "branch_exploration_decay",
+            "branch_exploration_min",
+            "branch_exploration_warmup_steps",
+        )
+        for key in flat_branch_keys:
+            if key in mcfg_local:
+                issues.append(
+                    f"active matrix yaml carries flat-bridge "
+                    f"model.{key}={mcfg_local[key]!r}; the nested "
+                    f"`model.branch_router` block is authoritative."
+                )
+
         # Active per-class knob enforcement: each method-active
         # block must explicitly carry the matrix's required active
         # knob values. Implicit defaults are not acceptable on the
