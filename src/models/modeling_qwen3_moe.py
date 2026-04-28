@@ -27,7 +27,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from src.models.fp32_routing import fp32_index_add, fp32_index_select
-from src.models.triton_grouped_gemm import triton_grouped_gemm_output_input
+try:
+    from src.models.triton_grouped_gemm import triton_grouped_gemm_output_input
+except ModuleNotFoundError:  # triton is CUDA-only; fall back when unavailable.
+    triton_grouped_gemm_output_input = None
 
 from transformers import initialization as init
 from transformers.activations import ACT2FN

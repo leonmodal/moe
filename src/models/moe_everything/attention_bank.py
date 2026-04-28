@@ -10,7 +10,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.fp32_routing import fp32_index_add, fp32_index_put, fp32_index_select
-from src.models.triton_grouped_gemm import triton_grouped_gemm
+try:
+    from src.models.triton_grouped_gemm import triton_grouped_gemm
+except ModuleNotFoundError:  # triton is CUDA-only; fall back when unavailable.
+    triton_grouped_gemm = None
 from src.models.modeling_qwen3_moe import (
     Qwen3MoeRMSNorm,
     apply_rotary_pos_emb,

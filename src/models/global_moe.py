@@ -172,6 +172,19 @@ class GlobalMoEForCausalLM(Qwen3MoeForCausalLM):
         ]
         return collect_router_topk_indices(router for router in routers if router is not None)
 
+    def get_all_balancing_owners(self):
+        """Yield (owner_module, label) for every load-balancing owner.
+
+        Pre-DEC-19 implementation: each per-layer `GlobalSparseMoeBlock.gate`
+        owns its own `expert_bias` / `local_tokens_per_expert` buffers, so the
+        walker visits all per-layer routers. The DEC-19 refactor (Milestone C)
+        will collapse these to a single bank-level owner on `self.model`.
+        """
+        for layer in self.model.layers:
+            gate = getattr(getattr(layer, "mlp", None), "gate", None)
+            if gate is not None and hasattr(gate, "expert_bias") and hasattr(gate, "local_tokens_per_expert"):
+                yield gate, "mlp"
+
     def forward(self, **kwargs):
         output = super().forward(**kwargs)
         selected_experts = self._collect_selected_experts()

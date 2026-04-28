@@ -8,6 +8,9 @@ import torch.distributed as dist
 from .distributed import is_distributed, unwrap_model
 
 
+_DEFAULT_BIAS_LABELS = ("q", "k", "v", "o", "mlp", "branch")
+
+
 def update_expert_biases(
     model,
     *,
@@ -17,41 +20,36 @@ def update_expert_biases(
 ) -> None:
     """Update expert biases using DeepSeek V3-style load balancing.
 
-    For models with global load balancing (SpeedrunMoEGPT-style), delegates
-    to model.update_global_bias(). For standard models with per-router biases,
-    updates each DeepSeekRouter directly.
+    Walks every load-balancing owner exposed by `raw_model.get_all_balancing_owners()`
+    and runs the unified `_update_single_router_bias` on each. Owners expose the
+    canonical interface — `expert_bias` (persistent fp32) and
+    `local_tokens_per_expert` (non-persistent fp32) — so MLP routers, attention
+    routers, and branch routers all share the same code path (DEC-18). The
+    label yielded alongside each owner (`mlp`/`q`/`k`/`v`/`o`/`branch`) selects
+    a per-projection bias rate from `per_proj_rates`.
+
+    The legacy `update_global_bias` early-return path was dead code (no model
+    in this repo defined either `update_global_bias` or `global_load_balancing`)
+    and has been removed.
     """
     raw_model = unwrap_model(model)
-
-    # Global bias update path (MoE-Everything with global load balancing)
-    if hasattr(raw_model, 'update_global_bias') and getattr(raw_model, 'global_load_balancing', False):
-        if per_proj_rates is None:
-            per_proj_rates = {}
-        defaults = {
-            "q": bias_rate, "k": bias_rate, "v": bias_rate,
-            "o": bias_rate, "mlp": bias_rate, "branch": bias_rate,
-        }
-        defaults.update(per_proj_rates)
-        raw_model.update_global_bias(bias_rate, bias_rates=defaults)
+    get_owners = getattr(raw_model, "get_all_balancing_owners", None)
+    if get_owners is None:
         return
 
-    # Per-router bias update path
-    from src.models.router import DeepSeekRouter
+    rates = {label: bias_rate for label in _DEFAULT_BIAS_LABELS}
+    if per_proj_rates:
+        rates.update(per_proj_rates)
 
-    if hasattr(raw_model, 'get_all_routers'):
-        for router in raw_model.get_all_routers():
-            if isinstance(router, DeepSeekRouter):
-                _update_single_router_bias(router, bias_rate, distributed)
+    use_dist = distributed and dist.is_available() and dist.is_initialized()
 
-    # Branch router biases
-    if hasattr(raw_model, 'branch_routers'):
-        for br in raw_model.branch_routers:
-            if hasattr(br, 'branch_bias') and hasattr(br, 'local_counts'):
-                _update_branch_router_bias(br, bias_rate, distributed)
+    for owner, label in get_owners():
+        rate = rates.get(label, bias_rate)
+        _update_single_router_bias(owner, rate, use_dist)
 
 
 def _update_single_router_bias(router, bias_rate: float, distributed: bool) -> None:
-    """Update expert bias for a single DeepSeek router.
+    """Update expert bias for a single load-balancing owner.
 
     `counts.sum()` was being computed twice — once for the host-side
     `> 0` check and again for the normaliser — each call a CPU↔GPU sync.
@@ -71,24 +69,6 @@ def _update_single_router_bias(router, bias_rate: float, distributed: bool) -> N
         router.expert_bias -= (s - s.mean()) * bias_rate * nonzero
         router.expert_bias.clamp_(-16.0, 16.0)
         router.local_tokens_per_expert.zero_()
-
-
-def _update_branch_router_bias(br, bias_rate: float, distributed: bool) -> None:
-    """Update bias for a branch router. Same single-`sum` contract as
-    `_update_single_router_bias` — zero counts produce a zero update via
-    a device-side mask, avoiding the host-side `> 0` sync.
-    """
-    with torch.no_grad():
-        if distributed:
-            dist.all_reduce(br.local_counts, op=dist.ReduceOp.SUM)
-        total = br.local_counts.sum()
-        loads = br.local_counts / total.clamp_min(1.0)
-        expected = 1.0 / br.local_counts.shape[0]
-        s = torch.sign(loads - expected)
-        nonzero = (total > 0).to(s.dtype)
-        br.branch_bias -= (s - s.mean()) * bias_rate * nonzero
-        br.branch_bias.clamp_(-16.0, 16.0)
-        br.local_counts.zero_()
 
 
 def get_bias_rate(

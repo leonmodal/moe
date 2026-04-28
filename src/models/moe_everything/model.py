@@ -497,6 +497,66 @@ class MoEverythingForCausalLM(Qwen3MoePreTrainedModel):
     def gradient_checkpointing_disable(self):
         self.model.gradient_checkpointing_disable()
 
+    def get_all_balancing_owners(self):
+        """Yield (owner_module, label) for every load-balancing owner.
+
+        Pre-DEC-19 implementation: routers across the MLP bank, the four
+        attention router classes, and the branch router(s) each own their own
+        `expert_bias` / `local_tokens_per_expert` buffers. Labels match the
+        per-projection bias-rate keys consumed by the trainer
+        (`bias_rate_q/k/v/o/mlp/branch`). The DEC-19 refactor (Milestone C)
+        will collapse the MLP and attention routers to bank-level owners.
+        """
+        inner = self.model
+
+        # MLP bank: walk every submodule that exposes the balancing-owner
+        # interface; name path is unused (label is always "mlp").
+        mlp_bank = getattr(inner, "mlp_bank", None)
+        if mlp_bank is not None:
+            for _name, m in mlp_bank.named_modules():
+                if hasattr(m, "expert_bias") and hasattr(m, "local_tokens_per_expert"):
+                    yield m, "mlp"
+
+        # Attention bank: derive q/k/v/o label from the attribute path so the
+        # trainer's per-projection bias rates land on the right routers.
+        attn_bank = getattr(inner, "attn_bank", None)
+        if attn_bank is not None:
+            for name, m in attn_bank.named_modules():
+                if not (hasattr(m, "expert_bias") and hasattr(m, "local_tokens_per_expert")):
+                    continue
+                head = name.split(".", 1)[0] if name else ""
+                if head.startswith("q_"):
+                    label = "q"
+                elif head.startswith("k_"):
+                    label = "k"
+                elif head.startswith("v_"):
+                    label = "v"
+                elif head.startswith("o_"):
+                    label = "o"
+                else:
+                    # Single non-q/k/v/o-split set (e.g. attn_expert_mode where
+                    # one router serves all heads); fall back to "q" so the
+                    # default per_proj_rates dict still resolves to a numeric
+                    # rate. Specialized split-rate users can extend the map
+                    # once DEC-19 lands a cleaner naming.
+                    label = "q"
+                yield m, label
+
+        # Branch router(s): singular when per_layer_router=False, plural list
+        # when per_layer_router=True. Both attribute names exist depending on
+        # config; check both.
+        branch_router = getattr(inner, "branch_router", None)
+        if branch_router is not None and hasattr(branch_router, "expert_bias") \
+                and hasattr(branch_router, "local_tokens_per_expert"):
+            yield branch_router, "branch"
+
+        branch_routers = getattr(inner, "branch_routers", None)
+        if branch_routers is not None:
+            for br in branch_routers:
+                if br is not None and hasattr(br, "expert_bias") \
+                        and hasattr(br, "local_tokens_per_expert"):
+                    yield br, "branch"
+
     def forward(
         self,
         input_ids: torch.LongTensor,

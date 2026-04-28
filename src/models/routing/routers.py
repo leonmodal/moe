@@ -61,8 +61,21 @@ class BranchRouter(nn.Module):
         self.last_probs = None
         self.last_selected_experts = None
         if use_deepseek_style:
-            self.register_buffer("branch_bias", torch.zeros(2))
-            self.register_buffer("local_counts", torch.zeros(2), persistent=False)
+            # Canonical balancing-owner buffer interface (DEC-18 / DEC-19): every
+            # owner — standalone DeepSeekRouter, BranchRouter, or shared expert
+            # bank — exposes the same `expert_bias` (persistent fp32) and
+            # `local_tokens_per_expert` (non-persistent fp32) attributes so the
+            # unified `update_expert_biases` walker can update them without
+            # special-casing the branch path.
+            self.register_buffer(
+                "expert_bias",
+                torch.zeros(2, dtype=torch.float32),
+            )
+            self.register_buffer(
+                "local_tokens_per_expert",
+                torch.zeros(2, dtype=torch.float32),
+                persistent=False,
+            )
 
     def forward(self, hidden_states: torch.Tensor):
         device_type = hidden_states.device.type
@@ -85,7 +98,7 @@ class BranchRouter(nn.Module):
 
             if self.use_deepseek_style:
                 scores = torch.sigmoid(logits)
-                biased = scores + self.branch_bias
+                biased = scores + self.expert_bias.to(scores.dtype)
                 if self.training and self.use_sampling:
                     flat = scores.view(-1, 2)
                     choice = torch.multinomial(flat, 1).view(scores.shape[:-1])
@@ -111,12 +124,18 @@ class BranchRouter(nn.Module):
                 choice = choice.unsqueeze(1).expand(B, T)
                 probs = probs.unsqueeze(1).expand(B, T, 2)
 
-        # Track counts for bias update (DeepSeek style)
-        if self.use_deepseek_style and self.training:
+        # Track counts for bias update (DeepSeek style). Skip on gradient-checkpoint
+        # recompute so backward replays do not double-count (AC-9 / DEC-18).
+        if (
+            self.use_deepseek_style
+            and self.training
+            and torch.is_grad_enabled()
+            and not is_checkpoint_recompute()
+        ):
             with torch.no_grad():
                 flat_choice = choice.reshape(-1)
                 counts = torch.bincount(flat_choice, minlength=2).float()
-                self.local_counts += counts
+                self.local_tokens_per_expert += counts
 
         probs = probs.to(hidden_states.dtype)
         self.last_probs = probs

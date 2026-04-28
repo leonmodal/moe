@@ -51,15 +51,17 @@ Following TDD philosophy, each criterion includes positive tests (expected to PA
   - Negative Tests:
     - A yaml with `bias_update_rate: 0.001` placed only under the *wrong* block produces a validator error or warning (not a silent zero, which is today's behavior).
 
-- AC-4: Switch aux loss documented uniform-routing baseline matches its implementation, `f_i` stays rank-local (no all-reduce, per draft §1), and call sites pass *actual* `selected_experts` (not recomputed top-k).
+- AC-4: Switch aux loss documented uniform-routing baseline matches its implementation (uniform → `top_k` per DEC-1, e.g. `4.0` for `top_k=4`); under DDP the loss uses **global aggregates** via `all_reduce(SUM)` of `tokens_per_expert` and `router_prob_per_expert` (per DEC-4), guarded by `dist.is_initialized()`; and call sites pass *actual* `selected_experts` (not recomputed top-k). Note: this AC was reconciled with DEC-4 in Round 1 — earlier "rank-local, no-collective" wording is superseded.
   - Positive Tests:
-    - `tests/test_aux_loss_fix.py::test_uniform_routing` passes with the documented baseline (DEC-1: either `top_k` or `1.0`); a skewed input produces a strictly larger value.
-    - A no-collective assertion test wraps `load_balancing_loss_func` and asserts no `dist.all_reduce`/`all_gather`/`reduce_scatter` is invoked during its body (uses a stubbed `dist` module that fails on any collective).
-    - A divergence test injects `selected_experts` that deliberately differ from `torch.topk(scores, k)` (e.g. exploration-perturbed) and asserts `load_balancing_loss_func(..., selected_experts=...)` produces a numerically different result than the internal-topk-recompute path — locking the "actual hard assignment" call-site contract.
+    - `tests/test_aux_loss_fix.py::test_uniform_routing` passes with the `top_k` baseline (per DEC-1, e.g. `4.0` for top-4); a skewed input produces a strictly larger value.
+    - **DDP global-aggregate test (2 ranks)**: configure each rank with deliberately-skewed routing such that the per-rank f_i distributions disagree but the global f_i is uniform; `load_balancing_loss_func` under DDP returns the global-uniform baseline (`top_k`) on every rank — proving the implementation reduces over `tokens_per_expert` and `router_prob_per_expert` before computing the loss. Mismatched per-rank inputs that are NOT globally uniform still produce per-rank-identical loss (since both ranks see the same global aggregate).
+    - **`dist.is_initialized()` guard test**: with `world_size==1` (DDP not initialized), `load_balancing_loss_func` must NOT call any `dist.*` collective; asserted via a stubbed `dist` module whose collective methods raise.
+    - **selected_experts divergence test**: inject `selected_experts` that deliberately differ from `torch.topk(scores, k)` (e.g. exploration-perturbed) and assert `load_balancing_loss_func(..., selected_experts=...)` produces a numerically different result than the internal-topk-recompute path — locking the "actual hard assignment" call-site contract.
     - Token-mask path produces the same per-active-token loss as a dense sequence with the same active tokens.
   - Negative Tests:
     - A test mocking double-softmax (applying softmax twice on already-softmaxed scores) must produce a smaller-than-correct loss for the same skewed input — locking the existing "no double softmax" fix in place.
     - Replacing the call-site `selected_experts=self._collect_selected_experts()` with `selected_experts=None` (forcing internal recompute) and running with non-trivial `router_exploration_rate` must change the asserted loss value, demonstrating the actual-vs-recomputed gap the §1 bullet warns about.
+    - **Removing the DDP all-reduce** (rank-local fallback path on the 2-rank test) makes per-rank loss values diverge under non-globally-uniform per-rank routing — locks the "must all-reduce before computing the loss" invariant (matches Megatron's `global_tokens_per_expert` contract per DEC-4).
 
 - AC-5: Sequence-level aux loss reproduces DeepSeek V3 Eqs. 17–20 with uniform routing → `1.0`, runs per-sequence then averaged over batch and active MoE layers, and respects `token_masks` by dividing by effective T per sequence.
   - Positive Tests:

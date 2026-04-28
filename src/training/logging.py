@@ -150,13 +150,22 @@ def save_routing_plots(
                 "O": raw_model._global_o_bias.detach().cpu().numpy(),
                 "MLP": raw_model._global_mlp_bias.detach().cpu().numpy(),
             }
-        if hasattr(raw_model, 'branch_routers'):
-            attn_b, mlp_b = [], []
-            for br in raw_model.branch_routers:
-                if hasattr(br, 'branch_bias'):
-                    b = br.branch_bias.detach().cpu().numpy()
-                    attn_b.append(float(b[0]))
-                    mlp_b.append(float(b[1]))
-            if attn_b:
-                bias_data["branch_bias"] = {"attn": attn_b, "mlp": mlp_b}
+        # Branch-router biases (DEC-18: buffer name unified to `expert_bias`).
+        # Singular and plural attribute names both exist depending on
+        # `per_layer_router`; iterate both.
+        attn_b, mlp_b = [], []
+        for br in (
+            list(getattr(raw_model, "branch_routers", []) or [])
+            + ([getattr(raw_model, "branch_router", None)]
+               if getattr(raw_model, "branch_router", None) is not None else [])
+        ):
+            bias = getattr(br, "expert_bias", None)
+            if bias is not None and bias.numel() == 2:
+                b = bias.detach().cpu().numpy()
+                attn_b.append(float(b[0]))
+                mlp_b.append(float(b[1]))
+        if attn_b:
+            # Payload key kept as `branch_bias` so the plotting consumer
+            # (`src/utils/routing_plots.py`) doesn't need to change.
+            bias_data["branch_bias"] = {"attn": attn_b, "mlp": mlp_b}
         plot_routing_snapshot(snapshot, heatmap_dir, step, bias_data=bias_data)
