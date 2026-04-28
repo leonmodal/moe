@@ -339,3 +339,23 @@ Pulls the `RoutingStats` object off the model (`model._routing_stats_obj`), conv
 - Routing heatmaps (expert utilization across layers)
 - Expert bias charts (bias value distribution over training; reads from `src/models/routing/bias.py` buffers)
 - Per-head attention routing curves (MoE-Everything)
+
+## 5. Future Work / Outstanding Open Questions
+
+### 5.1 Quantile-balancing implementation (planned, not yet shipped)
+
+The `quantile` load-balancing method (`load_balancing_method: quantile`, with `quantile_eta` and `quantile_target_q` knobs) is specified in `docs/plan.md` (DEC-4, DEC-5, DEC-11, DEC-13, DEC-19) but **not yet implemented**. When task15-task19 in the plan land, this section MUST be expanded with:
+
+- The `update_bias_from_quantile` algorithm (cross-microbatch accumulation, fp32 boundaries, `all_gather`-based exact global quantile per DEC-4, post-update buffer clearing).
+- The bank-level state ownership (DEC-19) for `global_moe` and `moe_everything` — the `expert_bias`, `local_quantile_scores` accumulator, and `quantile_ema` buffers live on the bank; per-layer routers are stateless consumers.
+- The default values: `quantile_eta = 0.05`, `quantile_target_q = 1 - effective_top_k / effective_num_experts` per router class (plain top-k, group-limited, per-head top-1 each documented).
+
+### 5.2 Open question — per-family tuning of `quantile_eta` / `quantile_target_q`
+
+**Status: deferred (`TODO.md` "Per-family tuning of `quantile_eta` / `quantile_target_q`").**
+
+The defaults above come from the original draft (`quantile_eta=0.05`) and from the analytic balanced-routing target (`target_q=1-effective_top_k/effective_num_experts`). They are reasonable starting points but have NOT been tuned per family (`standard_moe`, `global_moe`, `moe_everything`). Whether these defaults remain optimal across all three families is an open question that requires training-to-convergence comparisons to answer reliably.
+
+The deferred work — sweep `quantile_eta ∈ {0.01, 0.02, 0.05, 0.1, 0.2}` × 3 families × multiple seeds, then sweep `quantile_target_q` deviations from the analytic default — is captured in `TODO.md` and will be authored as a follow-up plan once the §8 comparison sweep (`docs/plan.md` DEC-9) is run.
+
+If you find yourself reaching for `quantile_eta` to tune a particular run, **first check whether the AC-10 sanity test ("skewed input → uniform load within K steps where K ≤ ½ deepseek_bias") still holds at your chosen value**. If it does, the default is probably fine and any remaining gap is in another part of the pipeline. If it doesn't, document the failure and add the case to `TODO.md` so the eventual tuning sweep covers it.
