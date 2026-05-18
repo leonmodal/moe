@@ -132,7 +132,7 @@ def _stamp_per_class_router_fields(config, model_cfg: dict) -> None:
     `load_balancing_method` and the legacy coefficient defaults,
     preserving behavior for unmigrated configs.
     """
-    for group in ("mlp_router", "attn_router"):
+    for group in ("mlp_router", "attn_router", "branch_router"):
         nested = model_cfg.get(group)
         if not isinstance(nested, dict):
             continue

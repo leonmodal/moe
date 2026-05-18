@@ -885,3 +885,124 @@ def apply_router_exploration_rate(model, rate: float) -> int:
             module.exploration_rate = float(rate)
             count += 1
     return count
+
+
+def apply_per_class_exploration_schedules(model, step: int) -> dict[str, float]:
+    """Apply INDEPENDENT exploration-rate schedules per router class.
+
+    For each per-class block (`model.mlp_router`, `model.attn_router`,
+    `model.branch_router`) that defines a `exploration_rate` knob via
+    the nested schema, compute the current rate from the per-class
+    `(exploration_rate, exploration_decay, exploration_min,
+    exploration_warmup_steps)` triple and push it onto every router
+    of that class. MLP routers get the MLP rate; attention routers
+    get the attention rate; branch routers get the branch rate.
+
+    Returns a `{class: rate}` map (with `mlp` / `attn` / `branch`
+    keys present only when their per-class block opts in) so the
+    trainer / telemetry can log what was applied.
+
+    Falls back to a no-op on classes whose per-class
+    `<class>_router_exploration_rate` config attribute is unset.
+    The legacy single-scalar `apply_router_exploration_rate(model,
+    rate)` continues to work as a fallback for unmigrated configs.
+    """
+    try:
+        from src.models.routing.routers import BranchRouter
+    except Exception:  # pragma: no cover
+        BranchRouter = None  # type: ignore[assignment]
+    try:
+        from src.models.router import DeepSeekRouter
+    except Exception:  # pragma: no cover
+        DeepSeekRouter = None  # type: ignore[assignment]
+
+    raw_model = unwrap_model(model)
+    cfg = getattr(raw_model, "config", None)
+    if cfg is None:
+        return {}
+
+    # Read per-class exploration knobs from the yaml-source dict
+    # `_mcfg_<group>_router` rather than flat config attributes.
+    # The flat `<group>_router_exploration_rate` attribute can also
+    # be set by `MoEverythingConfig.__init__` as a default fallback
+    # to the model-wide rate, which would make per-class detection
+    # falsely positive for unmigrated configs. The `_mcfg_*` dict
+    # contains exactly what the yaml said — nothing more.
+    def _yaml_nested(group: str) -> dict:
+        # MLP / attn are stamped onto config attrs only when present;
+        # branch is the legacy outlier that has both a flat-bridge
+        # init param AND a nested block, so we always go through the
+        # `_mcfg_branch_router` dict for branch. For MLP / attn, the
+        # nested dict isn't preserved on config — read from the
+        # stamped flat attrs (only present when yaml set them).
+        if group == "branch_router":
+            return getattr(cfg, "_mcfg_branch_router", {}) or {}
+        # Fallback: detect by presence of stamped balancing attr;
+        # if any per-class attr exists, the yaml had a nested block.
+        balancing = getattr(cfg, f"{group}_balancing", None)
+        if balancing is None:
+            return {}
+        # Construct an effective dict from the stamped attrs.
+        out: dict = {}
+        for key in (
+            "exploration_rate", "exploration_decay",
+            "exploration_min", "exploration_warmup_steps",
+        ):
+            val = getattr(cfg, f"{group}_{key}", None)
+            if val is not None:
+                out[key] = val
+        return out
+
+    def _per_class_rate(group: str) -> float | None:
+        block = _yaml_nested(group)
+        if "exploration_rate" not in block:
+            return None
+        target = float(block["exploration_rate"])
+        decay = block.get("exploration_decay", "constant")
+        floor = float(block.get("exploration_min", 0.0) or 0.0)
+        warmup_steps = int(block.get("exploration_warmup_steps", 0) or 0)
+        if warmup_steps <= 0:
+            return target
+        return exploration_decay_schedule(
+            step, schedule=decay, initial_rate=target,
+            decay_steps=warmup_steps, final_rate=floor,
+        )
+
+    mlp_rate = _per_class_rate("mlp_router")
+    attn_rate = _per_class_rate("attn_router")
+    branch_rate = _per_class_rate("branch_router")
+
+    applied: dict[str, float] = {}
+    if mlp_rate is None and attn_rate is None and branch_rate is None:
+        return applied
+
+    # Discover MLP vs attention DeepSeekRouter instances by their
+    # parent module name (moe_everything's attn_bank vs mlp_bank,
+    # standard_moe's per-layer mlp router). For simple families
+    # (standard_moe / global_moe) every DeepSeekRouter is MLP.
+    bank_owner_map: dict[int, str] = {}
+    inner = getattr(raw_model, "model", raw_model)
+    for parent_name in ("mlp_bank", "attn_bank"):
+        parent = getattr(inner, parent_name, None)
+        if parent is None:
+            continue
+        bank_label = "mlp" if parent_name == "mlp_bank" else "attn"
+        for _name, sub in parent.named_modules():
+            if hasattr(sub, "exploration_rate"):
+                bank_owner_map[id(sub)] = bank_label
+
+    for module in raw_model.modules():
+        if BranchRouter is not None and isinstance(module, BranchRouter):
+            if branch_rate is not None:
+                module.exploration_rate = float(branch_rate)
+                applied["branch"] = float(branch_rate)
+            continue
+        if DeepSeekRouter is not None and isinstance(module, DeepSeekRouter):
+            label = bank_owner_map.get(id(module), "mlp")
+            if label == "attn" and attn_rate is not None:
+                module.exploration_rate = float(attn_rate)
+                applied["attn"] = float(attn_rate)
+            elif label == "mlp" and mlp_rate is not None:
+                module.exploration_rate = float(mlp_rate)
+                applied["mlp"] = float(mlp_rate)
+    return applied

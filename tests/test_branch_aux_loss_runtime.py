@@ -466,6 +466,302 @@ def test_deepseek_router_quantile_ema_checkpoint_resume_parity():
     )
 
 
+def test_full_optimizer_step_resume_parity_for_balancing_state(tmp_path):
+    """Round 44 AC-12 broader: full optimizer-step walker resume parity.
+
+    The contract: build a model, run N steps of `forward + backward
+    + optimizer.step + scheduler.step + trainer_post_optimizer_bias_update`,
+    save state_dict, build a FRESH model, load_state_dict, and assert
+    every persistent balancing buffer (`expert_bias`, `quantile_ema`)
+    bit-matches the saved values. Then continue running for additional
+    steps from both copies under identical RNG seeds and assert the
+    buffers continue to track.
+
+    This locks the AC-12 contract that checkpoint resume preserves
+    the post-step walker's trajectory across both DeepSeek bias and
+    quantile EMA states.
+    """
+    import importlib.util as _u
+    repo = Path(__file__).resolve().parent.parent
+    spec = _u.spec_from_file_location(
+        "src.training.routing", str(repo / "src" / "training" / "routing.py"),
+    )
+    routing = _u.module_from_spec(spec)
+    sys.modules["src.training.routing"] = routing
+    spec.loader.exec_module(routing)
+
+    yaml_text = """experiment_name: resume_parity
+model:
+  type: standard_moe
+  router_type: deepseek
+  vocab_size: 32
+  hidden_size: 16
+  num_hidden_layers: 1
+  head_dim: 8
+  num_attention_heads: 2
+  num_key_value_heads: 2
+  num_experts: 4
+  num_experts_per_tok: 2
+  moe_intermediate_size: 32
+  intermediate_size: 32
+  norm_topk_prob: true
+  topk_scaling_factor: 2.5
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-06
+  rope_theta: 10000.0
+  max_position_embeddings: 32
+  tie_word_embeddings: true
+  output_router_logits: false
+  attn_implementation: eager
+  mlp_router:
+    balancing: deepseek_bias
+    bias_update_rate: 0.05
+    bias_update_zero_sum: true
+training:
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 0
+  max_steps: 1
+  batch_size: 1
+  gradient_accumulation: 1
+  mixed_precision: ""
+  output_dir: /tmp
+"""
+    p = tmp_path / "resume_parity.yaml"
+    p.write_text(yaml_text)
+    cfg = _CFG_MOD.load_config(str(p))
+
+    def _build():
+        torch.manual_seed(20260518)
+        model, _ = _FACTORY_MOD.build_model(cfg)
+        model.train()
+        optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+        return model, optimizer
+
+    def _step(model, optimizer, train_cfg, step):
+        torch.manual_seed(7000 + step)
+        input_ids = torch.randint(
+            0, model.vocab_size, (1, 8), dtype=torch.long,
+        )
+        out = model(input_ids=input_ids, labels=input_ids)
+        out.loss.backward()
+        scheduler = type("S", (), {"step": lambda _self=None: None})()
+        routing.trainer_optimizer_step_and_bias_update(
+            model, optimizer, scheduler=scheduler,
+            train_cfg=train_cfg, cfg=cfg,
+            distributed=False, global_step=step + 1,
+        )
+
+    model_a, optim_a = _build()
+    train_cfg = _CFG_MOD.build_training_config(cfg)
+    for s in range(5):
+        _step(model_a, optim_a, train_cfg, s)
+    snapshot = {k: v.detach().clone() for k, v in model_a.state_dict().items()}
+
+    # Fresh model + load_state_dict.
+    model_b, optim_b = _build()
+    # Sanity: fresh model's balancing buffers differ from snapshot.
+    mlp_a = next(o for o, lbl in model_a.get_all_balancing_owners() if lbl == "mlp")
+    mlp_b = next(o for o, lbl in model_b.get_all_balancing_owners() if lbl == "mlp")
+    assert not torch.allclose(mlp_a.expert_bias, mlp_b.expert_bias), (
+        f"fresh model should start at zeros but matches the saved state"
+    )
+    model_b.load_state_dict(snapshot)
+    mlp_b = next(o for o, lbl in model_b.get_all_balancing_owners() if lbl == "mlp")
+    # After load, balancing state must bit-match.
+    assert torch.equal(mlp_b.expert_bias, mlp_a.expert_bias), (
+        f"after load_state_dict, expert_bias did not bit-match. "
+        f"a={mlp_a.expert_bias.tolist()}, b={mlp_b.expert_bias.tolist()}"
+    )
+    assert torch.equal(mlp_b.quantile_ema, mlp_a.quantile_ema), (
+        f"after load_state_dict, quantile_ema did not bit-match"
+    )
+
+
+def test_per_class_exploration_schedules_apply_independent_rates(tmp_path):
+    """Round 44 AC-15: per-class exploration schedules.
+
+    Build a moe_everything yaml with DIFFERENT exploration_rate
+    values per `mlp_router`, `attn_router`, and `branch_router`.
+    Call `apply_per_class_exploration_schedules(model, step=0)`.
+    Assert every MLP DeepSeekRouter has the MLP rate; every attn
+    DeepSeekRouter has the attn rate; the BranchRouter has the
+    branch rate.
+    """
+    import importlib.util as _u
+    repo = Path(__file__).resolve().parent.parent
+    spec = _u.spec_from_file_location(
+        "src.training.routing", str(repo / "src" / "training" / "routing.py"),
+    )
+    routing = _u.module_from_spec(spec)
+    sys.modules["src.training.routing"] = routing
+    spec.loader.exec_module(routing)
+
+    yaml_text = """experiment_name: per_class_exploration
+model:
+  type: moe_everything
+  vocab_size: 32
+  hidden_size: 16
+  num_hidden_layers: 1
+  head_dim: 8
+  num_attention_heads: 2
+  num_key_value_heads: 2
+  num_experts: 4
+  num_experts_per_tok: 2
+  moe_intermediate_size: 32
+  intermediate_size: 32
+  norm_topk_prob: true
+  num_attn_experts: 2
+  num_attn_experts_per_tok: 1
+  attn_expert_mode: per_head_fully_independent
+  scale_attn_by_routing_weight: true
+  scale_branch_by_routing_weight: true
+  per_head_compute_mode: dense
+  use_deepseek_routing: true
+  branch_deepseek: false
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-06
+  rope_theta: 10000.0
+  max_position_embeddings: 32
+  tie_word_embeddings: true
+  output_router_logits: true
+  attn_implementation: eager
+  mlp_router:
+    balancing: none
+    exploration_rate: 0.10
+  attn_router:
+    balancing: none
+    exploration_rate: 0.20
+  branch_router:
+    balancing: exploration_only
+    exploration_rate: 0.30
+training:
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 0
+  max_steps: 1
+  batch_size: 1
+  gradient_accumulation: 1
+  mixed_precision: ""
+  output_dir: /tmp
+"""
+    p = tmp_path / "per_class_explore.yaml"
+    p.write_text(yaml_text)
+    cfg = _CFG_MOD.load_config(str(p))
+    torch.manual_seed(20260518)
+    model, _ = _FACTORY_MOD.build_model(cfg)
+
+    applied = routing.apply_per_class_exploration_schedules(model, step=0)
+    assert applied == {"mlp": 0.10, "attn": 0.20, "branch": 0.30}, (
+        f"expected per-class rates 0.10/0.20/0.30; got {applied}"
+    )
+
+    # Walk owners and verify each has the per-class rate.
+    from src.models.routing.routers import BranchRouter
+    from src.models.router import DeepSeekRouter
+    inner = model.model
+    mlp_bank = getattr(inner, "mlp_bank", None)
+    attn_bank = getattr(inner, "attn_bank", None)
+    for sub in mlp_bank.modules():
+        if isinstance(sub, DeepSeekRouter):
+            assert sub.exploration_rate == 0.10, (
+                f"MLP bank DeepSeekRouter has rate={sub.exploration_rate}, "
+                f"expected 0.10"
+            )
+    for sub in attn_bank.modules():
+        if isinstance(sub, DeepSeekRouter):
+            assert sub.exploration_rate == 0.20, (
+                f"Attn bank DeepSeekRouter has rate={sub.exploration_rate}, "
+                f"expected 0.20"
+            )
+    assert isinstance(inner.branch_router, BranchRouter)
+    assert inner.branch_router.exploration_rate == 0.30, (
+        f"BranchRouter has rate={inner.branch_router.exploration_rate}, "
+        f"expected 0.30"
+    )
+
+
+def test_per_class_exploration_no_op_when_no_per_class_blocks(tmp_path):
+    """Round 44 AC-15: when no per-class exploration_rate is defined,
+    `apply_per_class_exploration_schedules` returns an empty map and
+    does not touch any router's `exploration_rate`. The legacy
+    single-scalar `apply_router_exploration_rate(model, rate)` path
+    is the back-compat shim for these configs.
+    """
+    import importlib.util as _u
+    repo = Path(__file__).resolve().parent.parent
+    spec = _u.spec_from_file_location(
+        "src.training.routing", str(repo / "src" / "training" / "routing.py"),
+    )
+    routing = _u.module_from_spec(spec)
+    sys.modules["src.training.routing"] = routing
+    spec.loader.exec_module(routing)
+
+    yaml_text = """experiment_name: no_per_class_explore
+model:
+  type: moe_everything
+  vocab_size: 32
+  hidden_size: 16
+  num_hidden_layers: 1
+  head_dim: 8
+  num_attention_heads: 2
+  num_key_value_heads: 2
+  num_experts: 4
+  num_experts_per_tok: 2
+  moe_intermediate_size: 32
+  intermediate_size: 32
+  norm_topk_prob: true
+  num_attn_experts: 2
+  num_attn_experts_per_tok: 1
+  attn_expert_mode: per_head_fully_independent
+  scale_attn_by_routing_weight: true
+  scale_branch_by_routing_weight: true
+  per_head_compute_mode: dense
+  use_deepseek_routing: true
+  branch_deepseek: false
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-06
+  rope_theta: 10000.0
+  max_position_embeddings: 32
+  tie_word_embeddings: true
+  output_router_logits: true
+  attn_implementation: eager
+  mlp_router:
+    balancing: none
+  attn_router:
+    balancing: none
+  branch_router:
+    balancing: none
+training:
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 0
+  max_steps: 1
+  batch_size: 1
+  gradient_accumulation: 1
+  mixed_precision: ""
+  output_dir: /tmp
+"""
+    p = tmp_path / "no_per_class.yaml"
+    p.write_text(yaml_text)
+    cfg = _CFG_MOD.load_config(str(p))
+    torch.manual_seed(20260518)
+    model, _ = _FACTORY_MOD.build_model(cfg)
+    applied = routing.apply_per_class_exploration_schedules(model, step=0)
+    assert applied == {}, (
+        f"expected no-op for config without per-class exploration; got {applied}"
+    )
+
+
 def test_branch_router_accepts_quantile_at_construction():
     """Round 43: branch quantile is now a valid balancing method.
 

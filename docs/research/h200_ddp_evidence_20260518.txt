@@ -1,0 +1,53 @@
+$ python -m pytest -v -s --no-header tests/test_bias_update_lifecycle.py::test_ddp_two_rank_all_reduce_produces_identical_biases tests/test_sanity_equivalence_precompute_kv.py::test_sanity_equivalence_ddp_per_rank_bias
+--- stdout ---
+============================= test session starts ==============================
+collecting ... [ERROR] `cache_position` is part of Qwen3Model.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3ForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3MoeModel.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+[ERROR] `cache_position` is part of Qwen3MoeForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+collected 2 items
+
+tests/test_bias_update_lifecycle.py::test_ddp_two_rank_all_reduce_produces_identical_biases [ERROR] `cache_position` is part of Qwen3Model.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3ForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3MoeModel.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+[ERROR] `cache_position` is part of Qwen3MoeForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+[ERROR] `cache_position` is part of Qwen3Model.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3ForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3MoeModel.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+[ERROR] `cache_position` is part of Qwen3MoeForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+[ERROR] `cache_position` is part of Qwen3Model.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3ForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3MoeModel.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+[ERROR] `cache_position` is part of Qwen3MoeForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+[ERROR] `cache_position` is part of Qwen3Model.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3ForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3MoeModel.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+[ERROR] `cache_position` is part of Qwen3MoeForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+PASSED
+tests/test_sanity_equivalence_precompute_kv.py::test_sanity_equivalence_ddp_per_rank_bias [ERROR] `cache_position` is part of Qwen3Model.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3ForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3MoeModel.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+[ERROR] `cache_position` is part of Qwen3MoeForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+[ERROR] `cache_position` is part of Qwen3Model.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3ForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3MoeModel.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+[ERROR] `cache_position` is part of Qwen3MoeForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+[ERROR] `cache_position` is part of Qwen3Model.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3ForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3MoeModel.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+[ERROR] `cache_position` is part of Qwen3MoeForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+[ERROR] `cache_position` is part of Qwen3Model.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3ForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3.py.
+[ERROR] `cache_position` is part of Qwen3MoeModel.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+[ERROR] `cache_position` is part of Qwen3MoeForCausalLM.forward's signature, but not documented. Make sure to add it to the docstring of the function in /root/moe/src/models/modeling_qwen3_moe.py.
+PASSED
+
+========================= 2 passed in 63.16s (0:01:03) =========================
+
+--- stderr ---
+/usr/local/lib/python3.11/site-packages/torch/autograd/graph.py:882: UserWarning: c10d::allreduce_: an autograd kernel was not registered to the Autograd key(s) but we are trying to backprop through it. This may lead to silently incorrect behavior. This behavior is deprecated and will be removed in a future version of PyTorch. If your operator is differentiable, please ensure you have registered an autograd kernel to the correct Autograd key (e.g. DispatchKey::Autograd, DispatchKey::CompositeImplicitAutograd). If your operator is not differentiable, or to squash this warning and use the previous behavior, please register torch::CppFunction::makeFallthrough() to DispatchKey::Autograd. (Triggered internally at /pytorch/torch/csrc/autograd/autograd_not_implemented_fallback.cpp:76.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+/usr/local/lib/python3.11/site-packages/torch/autograd/graph.py:882: UserWarning: c10d::allreduce_: an autograd kernel was not registered to the Autograd key(s) but we are trying to backprop through it. This may lead to silently incorrect behavior. This behavior is deprecated and will be removed in a future version of PyTorch. If your operator is differentiable, please ensure you have registered an autograd kernel to the correct Autograd key (e.g. DispatchKey::Autograd, DispatchKey::CompositeImplicitAutograd). If your operator is not differentiable, or to squash this warning and use the previous behavior, please register torch::CppFunction::makeFallthrough() to DispatchKey::Autograd. (Triggered internally at /pytorch/torch/csrc/autograd/autograd_not_implemented_fallback.cpp:76.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+
+returncode: 0
