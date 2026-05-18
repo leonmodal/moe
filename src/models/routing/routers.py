@@ -53,7 +53,9 @@ class BranchRouter(nn.Module):
                  use_deepseek_style: bool = False,
                  exploration_only_rate: float = 0.0,
                  exploration_only: bool | None = None,
-                 balancing: str = "none"):
+                 balancing: str = "none",
+                 quantile_target_q: float | None = None,
+                 quantile_eta: float | None = None):
         super().__init__()
         self.gate = nn.Linear(hidden_size, 2, bias=False)
         self.exploration_rate = exploration_rate
@@ -79,19 +81,21 @@ class BranchRouter(nn.Module):
         # `aux_loss` / `seq_aux_loss`: the model's forward computes
         # the loss term from `last_probs` / `last_selected_experts`
         # via the same helpers used for MLP and attention routers.
-        # `deepseek_bias`: BranchRouter already owns `expert_bias`
-        # and `local_tokens_per_expert` for the binary ATTN/MLP
-        # pool via the canonical balancing-owner interface. The
-        # post-step walker dispatches per-owner so this update
-        # fires regardless of what method MLP / attention pick.
-        # `quantile` still needs owner-state plumbing (persistent
-        # `quantile_ema` + accumulator) before it can route
-        # through the post-step walker; rejected at construction
-        # time until that lands.
+        # `deepseek_bias`: BranchRouter owns `expert_bias` and
+        # `local_tokens_per_expert` for the binary ATTN/MLP pool via
+        # the canonical balancing-owner interface. The post-step
+        # walker dispatches per-owner so this update fires regardless
+        # of what method MLP / attention pick.
+        # `quantile`: the branch router accumulates per-step sigmoid
+        # scores into `local_quantile_scores` (mirroring the
+        # DeepSeekRouter owner pattern). The post-step walker calls
+        # `_update_single_router_quantile_bias` which drives a
+        # per-class quantile EMA on the binary [ATTN, MLP] pool and
+        # derives `expert_bias` from the EMA's global median.
         _allowed_balancing = (
             "none", "exploration_only",
             "aux_loss", "seq_aux_loss",
-            "deepseek_bias",
+            "deepseek_bias", "quantile",
         )
         if balancing not in _allowed_balancing:
             raise ValueError(
@@ -149,10 +153,16 @@ class BranchRouter(nn.Module):
         # `forward` plus PyTorch's RNG preservation are sufficient.
         # The canonical balancing-owner buffers (`expert_bias` and
         # `local_tokens_per_expert`) are needed whenever the runtime
-        # uses biased argmax — `self.use_deepseek_style` already
-        # subsumes both the explicit flag and the per-class
-        # `balancing == "deepseek_bias"` upgrade above.
-        if self.use_deepseek_style:
+        # uses biased argmax (deepseek-style) OR when the post-step
+        # walker drives a quantile-EMA update on the branch pool.
+        # `self.use_deepseek_style` already subsumes both the explicit
+        # flag and the per-class `balancing == "deepseek_bias"`
+        # upgrade above; `balancing == "quantile"` adds the same
+        # buffer requirement.
+        needs_owner_buffers = (
+            self.use_deepseek_style or balancing == "quantile"
+        )
+        if needs_owner_buffers:
             # Every load-balancing owner — standalone DeepSeekRouter,
             # BranchRouter, or shared expert bank — exposes the same
             # `expert_bias` (persistent fp32) and
@@ -168,6 +178,20 @@ class BranchRouter(nn.Module):
                 torch.zeros(2, dtype=torch.float32),
                 persistent=False,
             )
+            # Quantile-method state: `quantile_ema` is persistent fp32
+            # (length-2 for the binary branch pool) so checkpoint resume
+            # preserves the bias trajectory. `local_quantile_scores` is
+            # a Python list of detached fp32 score tensors accumulated
+            # over the current step's forward(s); the walker drains it.
+            self.register_buffer(
+                "quantile_ema",
+                torch.zeros(2, dtype=torch.float32),
+            )
+            self.local_quantile_scores: list[torch.Tensor] = []
+            if quantile_target_q is not None:
+                self.quantile_target_q = float(quantile_target_q)
+            if quantile_eta is not None:
+                self.quantile_eta = float(quantile_eta)
 
     def forward(self, hidden_states: torch.Tensor):
         # Reset exploration-only telemetry on every forward so a later
@@ -308,6 +332,25 @@ class BranchRouter(nn.Module):
                 flat_choice = choice.reshape(-1)
                 counts = torch.bincount(flat_choice, minlength=2).float()
                 self.local_tokens_per_expert += counts
+
+        # Quantile-method accumulator: when `balancing == "quantile"`,
+        # the post-step walker reads `local_quantile_scores` and
+        # drives the per-class quantile EMA. Mirrors the
+        # `local_tokens_per_expert` recompute guard so backward
+        # replays do not double-append. Sigmoid scores in the
+        # deepseek-style path are already the right summary; for the
+        # softmax path, `probs` is the per-class probability of each
+        # choice, which is the correct per-expert quantile target.
+        if (
+            self.balancing == "quantile"
+            and self.training
+            and torch.is_grad_enabled()
+            and not is_checkpoint_recompute()
+        ):
+            with torch.no_grad():
+                flat_scores = probs.detach().float().reshape(-1, 2)
+                if flat_scores.numel() > 0:
+                    self.local_quantile_scores.append(flat_scores)
 
         # Rely on `torch.utils.checkpoint`'s default
         # `preserve_rng_state=True` for recompute determinism: an

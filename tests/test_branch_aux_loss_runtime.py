@@ -282,10 +282,213 @@ def test_branch_deepseek_bias_drives_post_step_expert_bias_update(tmp_path):
     )
 
 
-def test_branch_router_rejects_quantile_at_construction():
+def test_branch_quantile_production_path_drives_walker(tmp_path):
+    """Round 43 AC-13/AC-16: branch quantile end-to-end.
+
+    Build a moe_everything yaml with `branch_router.balancing: quantile`.
+    Run a real training-mode forward (which accumulates per-step
+    scores into `branch.local_quantile_scores`). Call
+    `trainer_post_optimizer_bias_update`. Assert:
+      - `branch.quantile_ema` updated from zeros.
+      - `branch.expert_bias` updated (quantile-from-EMA).
+      - `branch.local_quantile_scores` drained.
+    """
+    import importlib.util as _u
+    repo = Path(__file__).resolve().parent.parent
+    spec = _u.spec_from_file_location(
+        "src.training.routing", str(repo / "src" / "training" / "routing.py"),
+    )
+    routing = _u.module_from_spec(spec)
+    sys.modules["src.training.routing"] = routing
+    spec.loader.exec_module(routing)
+
+    yaml_text = """experiment_name: branch_quantile_e2e
+model:
+  type: moe_everything
+  vocab_size: 32
+  hidden_size: 16
+  num_hidden_layers: 1
+  head_dim: 8
+  num_attention_heads: 2
+  num_key_value_heads: 2
+  num_experts: 4
+  num_experts_per_tok: 2
+  moe_intermediate_size: 32
+  intermediate_size: 32
+  norm_topk_prob: true
+  router_exploration_rate: 0.0
+  num_attn_experts: 2
+  num_attn_experts_per_tok: 1
+  attn_expert_mode: per_head_fully_independent
+  scale_attn_by_routing_weight: true
+  scale_branch_by_routing_weight: true
+  per_head_compute_mode: dense
+  use_deepseek_routing: true
+  branch_deepseek: false
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-06
+  rope_theta: 10000.0
+  max_position_embeddings: 32
+  tie_word_embeddings: true
+  output_router_logits: true
+  attn_implementation: eager
+  mlp_router:
+    balancing: none
+  attn_router:
+    balancing: none
+  branch_router:
+    balancing: quantile
+    quantile_target_q: 0.5
+    quantile_eta: 0.05
+training:
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 0
+  max_steps: 1
+  batch_size: 1
+  gradient_accumulation: 1
+  mixed_precision: ""
+  output_dir: /tmp
+"""
+    p = tmp_path / "branch_quantile.yaml"
+    p.write_text(yaml_text)
+    cfg = _CFG_MOD.load_config(str(p))
+    torch.manual_seed(20260518)
+    model, _ = _FACTORY_MOD.build_model(cfg)
+    model.train()
+    branch = model.model.branch_router
+    assert branch.balancing == "quantile", (
+        f"branch.balancing should be quantile; got {branch.balancing!r}"
+    )
+
+    # Real forward populates branch.local_quantile_scores via the
+    # router's training-mode accumulator gate.
+    input_ids = torch.randint(0, model.vocab_size, (1, 8), dtype=torch.long)
+    out = model(input_ids=input_ids, labels=input_ids, output_router_logits=True)
+    out.loss.backward()
+    assert len(branch.local_quantile_scores) >= 1, (
+        f"branch forward did not append scores; len="
+        f"{len(branch.local_quantile_scores)}"
+    )
+    initial_bias = branch.expert_bias.detach().clone()
+    initial_ema = branch.quantile_ema.detach().clone()
+
+    train_cfg = _CFG_MOD.build_training_config(cfg)
+    routing.trainer_post_optimizer_bias_update(
+        model, train_cfg=train_cfg, cfg=cfg,
+        distributed=False, global_step=1,
+    )
+
+    assert (branch.quantile_ema != initial_ema).any(), (
+        f"branch.quantile_ema unchanged after walker. "
+        f"before={initial_ema.tolist()}, after={branch.quantile_ema.tolist()}"
+    )
+    assert (branch.expert_bias != initial_bias).any(), (
+        f"branch.expert_bias unchanged after walker. "
+        f"before={initial_bias.tolist()}, after={branch.expert_bias.tolist()}"
+    )
+    assert branch.local_quantile_scores == [], (
+        f"branch accumulator not drained: len="
+        f"{len(branch.local_quantile_scores)}"
+    )
+
+
+def test_branch_quantile_checkpoint_resume_parity_for_quantile_ema(tmp_path):
+    """Round 43 AC-12: quantile_ema persists across save/load.
+
+    Drive the branch's quantile_ema to a non-zero state via several
+    walker iterations, save state_dict, reset in memory, load
+    state_dict, and assert the loaded quantile_ema bit-matches the
+    saved one. Locks AC-12 EMA persistence contract for the branch
+    router (the MLP/attn quantile_ema is already a persistent buffer
+    by the same construction).
+    """
     from src.models.routing.routers import BranchRouter
-    with pytest.raises(ValueError, match="BranchRouter balancing must be"):
-        BranchRouter(hidden_size=16, balancing="quantile")
+
+    r = BranchRouter(hidden_size=16, balancing="quantile")
+    # Synthesize non-zero EMA + bias by hand-driving the helper.
+    with torch.no_grad():
+        r.quantile_ema[:] = torch.tensor([0.37, 0.91])
+        r.expert_bias[:] = torch.tensor([0.27, -0.27])
+
+    saved = {k: v.clone() for k, v in r.state_dict().items()}
+    # Clobber in memory.
+    with torch.no_grad():
+        r.quantile_ema.zero_()
+        r.expert_bias.zero_()
+    assert (r.quantile_ema == 0).all() and (r.expert_bias == 0).all()
+
+    # Round-trip via state_dict.
+    r.load_state_dict(saved)
+    assert torch.equal(r.quantile_ema, saved["quantile_ema"]), (
+        f"quantile_ema did not survive state_dict round-trip; "
+        f"got {r.quantile_ema.tolist()}, expected {saved['quantile_ema'].tolist()}"
+    )
+    assert torch.equal(r.expert_bias, saved["expert_bias"]), (
+        f"expert_bias did not survive state_dict round-trip; "
+        f"got {r.expert_bias.tolist()}, expected {saved['expert_bias'].tolist()}"
+    )
+
+
+def test_deepseek_router_quantile_ema_checkpoint_resume_parity():
+    """Round 43 AC-12: quantile_ema persistent buffer parity for
+    DeepSeekRouter (used by standard_moe / global_moe / moe_everything's
+    per-head attention banks). Same contract as the branch variant."""
+    from src.models.router import DeepSeekRouter
+
+    class _Cfg:
+        hidden_size = 16
+        num_experts = 4
+        num_experts_per_tok = 2
+        norm_topk_prob = True
+        topk_scaling_factor = 2.5
+        router_exploration_rate = 0.0
+        router_z_loss_coef = 0.0
+
+    r = DeepSeekRouter(_Cfg())
+    with torch.no_grad():
+        r.quantile_ema[:] = torch.tensor([0.1, 0.3, 0.5, 0.9])
+        r.expert_bias[:] = torch.tensor([0.4, 0.2, -0.2, -0.4])
+
+    saved = {k: v.clone() for k, v in r.state_dict().items()}
+    # Construct a fresh router and load.
+    r2 = DeepSeekRouter(_Cfg())
+    assert (r2.quantile_ema == 0).all() and (r2.expert_bias == 0).all()
+    r2.load_state_dict(saved)
+    assert torch.equal(r2.quantile_ema, saved["quantile_ema"]), (
+        f"DeepSeekRouter quantile_ema did not survive state_dict round-trip"
+    )
+    assert torch.equal(r2.expert_bias, saved["expert_bias"]), (
+        f"DeepSeekRouter expert_bias did not survive state_dict round-trip"
+    )
+
+
+def test_branch_router_accepts_quantile_at_construction():
+    """Round 43: branch quantile is now a valid balancing method.
+
+    BranchRouter(balancing="quantile") must construct successfully
+    and register `quantile_ema` + `local_quantile_scores` alongside
+    the canonical `expert_bias` + `local_tokens_per_expert` buffers.
+    """
+    from src.models.routing.routers import BranchRouter
+    r = BranchRouter(hidden_size=16, balancing="quantile")
+    assert r.balancing == "quantile"
+    assert hasattr(r, "expert_bias")
+    assert hasattr(r, "local_tokens_per_expert")
+    assert hasattr(r, "quantile_ema")
+    assert isinstance(r.quantile_ema, torch.Tensor)
+    assert r.quantile_ema.shape == (2,)
+    assert r.quantile_ema.dtype == torch.float32
+    state_keys = set(r.state_dict().keys())
+    assert "quantile_ema" in state_keys, (
+        f"quantile_ema must be a persistent buffer; state_dict keys={state_keys}"
+    )
+    assert hasattr(r, "local_quantile_scores")
+    assert isinstance(r.local_quantile_scores, list)
+    assert r.local_quantile_scores == []
 
 
 def test_walker_dispatches_quantile_owner_through_quantile_helper():

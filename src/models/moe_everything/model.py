@@ -79,6 +79,11 @@ class MoEverythingModel(nn.Module):
         # before the trainer hook fires) see the configured initial rate.
         branch_balancing = getattr(config, "branch_balancing", "none")
         branch_exploration_only_rate = getattr(config, "branch_exploration_rate", 0.0)
+        # Branch quantile knobs (only consumed when balancing == "quantile").
+        # The factory copies these from `model.branch_router.{quantile_target_q,
+        # quantile_eta}` onto the top-level config.
+        branch_q_target = getattr(config, "branch_quantile_target_q", None)
+        branch_q_eta = getattr(config, "branch_quantile_eta", None)
         if self.sanity_check_mode == "alternating_global_moe":
             if self.per_layer_router:
                 self.branch_routers = nn.ModuleList([BranchRouterRecorder() for _ in range(self.num_depths)])
@@ -91,7 +96,9 @@ class MoEverythingModel(nn.Module):
                              use_sampling=use_sampling, use_seq_level=use_seq_level,
                              use_deepseek_style=use_deepseek_style,
                              exploration_only_rate=branch_exploration_only_rate,
-                             balancing=branch_balancing)
+                             balancing=branch_balancing,
+                             quantile_target_q=branch_q_target,
+                             quantile_eta=branch_q_eta)
                 for _ in range(self.num_depths)
             ])
         else:
@@ -100,7 +107,9 @@ class MoEverythingModel(nn.Module):
                                               use_sampling=use_sampling, use_seq_level=use_seq_level,
                                               use_deepseek_style=use_deepseek_style,
                                               exploration_only_rate=branch_exploration_only_rate,
-                                              balancing=branch_balancing)
+                                              balancing=branch_balancing,
+                                              quantile_target_q=branch_q_target,
+                                              quantile_eta=branch_q_eta)
 
         self.attn_bank = AttentionExpertBank(config)
         self.mlp_bank = MlpExpertBank(config)

@@ -351,6 +351,14 @@ def build_model(cfg: dict):
             ),
             **common,
         )
+        # Branch quantile knobs — only used when branch_balancing=="quantile",
+        # but the model constructor reads them unconditionally from config.
+        bq_target = _get_branch_router_field(mcfg, "quantile_target_q", None)
+        bq_eta = _get_branch_router_field(mcfg, "quantile_eta", None)
+        if bq_target is not None:
+            config.branch_quantile_target_q = float(bq_target)
+        if bq_eta is not None:
+            config.branch_quantile_eta = float(bq_eta)
         # Router-option knobs attached post-construction (the config __init__
         # does not currently enumerate them; _set_router_params is the single
         # source of truth across all MoE families). softmax_position migration:

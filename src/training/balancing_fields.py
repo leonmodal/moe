@@ -167,7 +167,7 @@ _BRANCH_ROUTER_KNOWN_KEYS = frozenset(_COMMON_ROUTER_KNOBS)
 
 _BRANCH_BALANCING_VALID = frozenset({
     "none", "exploration_only", "aux_loss", "seq_aux_loss",
-    "deepseek_bias",
+    "deepseek_bias", "quantile",
 })
 
 _BRANCH_DECAY_VALID = frozenset({"constant", "linear", "cosine"})
@@ -417,6 +417,10 @@ def validate_branch_router_config(cfg: dict) -> None:
                 "bias_update_rate", "bias_update_zero_sum",
                 "bias_warmup_start", "bias_warmup_steps",
             },
+            "quantile": {
+                "quantile_eta", "quantile_target_q",
+                "quantile_global_state",
+            },
             # exploration_only consumes the exploration schedule
             # knobs; aux/seq coefs are not active here.
             "exploration_only": {
@@ -459,13 +463,17 @@ def validate_branch_router_config(cfg: dict) -> None:
     # `_resolve(...)` (which already prefers nested but falls back
     # to flat) so a yaml carrying ONLY flat fields is still checked.
     bal_resolved, _ = _resolve("balancing", "none")
-    if bal_resolved in {"aux_loss", "seq_aux_loss", "deepseek_bias", "exploration_only", "none"}:
+    if bal_resolved in {"aux_loss", "seq_aux_loss", "deepseek_bias", "quantile", "exploration_only", "none"}:
         flat_branch_method_to_allowed = {
             "aux_loss": {"router_aux_loss_coef"},
             "seq_aux_loss": {"seq_aux_loss_coef"},
             "deepseek_bias": {
                 "bias_update_rate", "bias_update_zero_sum",
                 "bias_warmup_start", "bias_warmup_steps",
+            },
+            "quantile": {
+                "quantile_eta", "quantile_target_q",
+                "quantile_global_state",
             },
             "exploration_only": {
                 "exploration_rate", "exploration_decay",

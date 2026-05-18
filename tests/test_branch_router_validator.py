@@ -472,9 +472,36 @@ def test_validator_branch_router_accepts_deepseek_bias():
     _validator()(cfg)
 
 
-def test_validator_branch_router_rejects_quantile():
-    cfg = {"model": {"branch_router": {"balancing": "quantile"}}}
-    with pytest.raises(ValueError, match="branch_router.balancing="):
+def test_validator_branch_router_accepts_quantile_with_knobs():
+    """Round 43: branch quantile is now a valid balancing method.
+
+    Validator accepts `branch_router.balancing: quantile` with the
+    same `quantile_*` knobs allowed for MLP/attention quantile.
+    """
+    cfg = {
+        "model": {
+            "branch_router": {
+                "balancing": "quantile",
+                "quantile_eta": 0.05,
+                "quantile_target_q": 0.5,
+            }
+        }
+    }
+    _validator()(cfg)
+
+
+def test_validator_branch_router_rejects_aux_knob_under_quantile():
+    """The method-knob rejection table must catch `router_aux_loss_coef`
+    on a quantile branch — quantile owns its own knob set."""
+    cfg = {
+        "model": {
+            "branch_router": {
+                "balancing": "quantile",
+                "router_aux_loss_coef": 0.01,
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="incompatible with"):
         _validator()(cfg)
 
 

@@ -443,10 +443,12 @@ def test_legacy_exploration_only_bool_still_works():
 
 
 def test_balancing_field_validates_value():
-    """`balancing` accepts only `none` or `exploration_only`. Other
-    values fail at construction so misconfigured yamls fail fast."""
+    """`balancing` accepts only the documented values. Quantile is
+    now a valid method (added in Round 43); junk values still fail
+    fast at construction so misconfigured yamls don't silently
+    behave as `none`."""
     with pytest.raises(ValueError, match="balancing must be one of"):
-        BranchRouter(hidden_size=16, balancing="quantile")
+        BranchRouter(hidden_size=16, balancing="not_a_real_method")
 
 
 def test_balancing_exploration_only_auto_promotes_from_rate():
