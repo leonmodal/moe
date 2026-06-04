@@ -453,7 +453,7 @@ def test_build_model_moe_everything_plumbs_router_options():
             "num_experts_per_tok": 2,
             "num_attn_experts": 4,
             "num_attn_experts_per_tok": 1,
-            "attn_expert_mode": "per_head_fully_independent",
+            "attn_expert_mode": "per_head_no_recompute",
             "max_position_embeddings": 128,
             "router_type": "softmax",
             "router_score_function": "sqrtsoftplus",

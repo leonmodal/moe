@@ -15,9 +15,9 @@ Two variants:
      no-TP / no-CP case.
 
 Fixes vs the HuggingFace transformers implementation:
-  1. No double softmax — router already returns softmax probabilities,
-     the HF loss applies softmax again which flattens the distribution
-     and makes the loss blind to imbalance.
+  1. No double softmax — routers pass already-scored probabilities or
+     scores, and the HF loss applies softmax again which flattens the
+     distribution and makes the loss blind to imbalance.
   2. Global-aggregate `f_i` across DDP ranks (matches Megatron-LM's
      `global_tokens_per_expert` contract). The earlier rank-local
      formulation has been replaced.
@@ -72,8 +72,9 @@ def load_balancing_loss_func(
     Computes auxiliary load balancing loss (Switch Transformer).
 
     Args:
-        gate_logits: Tuple of [T, E] softmax-probability tensors, one per layer.
-                     These are ALREADY softmax probabilities from the router.
+        gate_logits: Tuple of [T, E] already-scored router tensors, one per layer.
+                     Softmax routers pass probabilities; DeepSeek-style routers
+                     pass sigmoid scores.
         num_experts: Total number of experts.
         top_k: Number of experts selected per token.
         attention_mask: Optional [batch_size, seq_len] mask.
@@ -119,7 +120,7 @@ def load_balancing_loss_func(
 
     concatenated_gate_logits = torch.cat(filtered_logits, dim=0)
 
-    # gate_logits are already softmax probabilities from the router — use directly.
+    # The router has already applied its scoring function; use scores directly.
     routing_weights = concatenated_gate_logits
 
     selected_experts_tensor = torch.cat(filtered_selected, dim=0)

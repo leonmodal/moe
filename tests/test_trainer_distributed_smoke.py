@@ -59,6 +59,7 @@ _COMMON_TRAINING_YAML = textwrap.dedent("""\
       optimizer: adamw
       max_checkpoints: 0
       disable_liger: true
+      gradient_checkpointing: {gradient_checkpointing}
     data:
       data_dir: {data_dir}
       text_column: text
@@ -134,30 +135,46 @@ _MODEL_YAMLS: dict[str, str] = {
         "  router_type: deepseek\n"
     ) + _BASE_MODEL_FIELDS + "\n" + _MOE_COMMON + "\n" + _DEEPSEEK_EXTRA + "\n",
     # moe_everything: branch routing + per-head attention expert banks.
-    "moe_everything_fully_independent": (
-        "experiment_name: dist_smoke_moe_everything_fully_independent\n"
+    "moe_everything_no_recompute": (
+        "experiment_name: dist_smoke_moe_everything_no_recompute\n"
         "model:\n"
         "  type: moe_everything\n"
         "  router_type: softmax\n"
         "  num_attn_experts: 4\n"
         "  num_attn_experts_per_tok: 1\n"
-        "  attn_expert_mode: per_head_fully_independent\n"
+        "  attn_expert_mode: per_head_no_recompute\n"
+        "  attn_routing_bundle: q_k_v_o\n"
     ) + _BASE_MODEL_FIELDS + "\n" + _MOE_COMMON + "\n",
-    "moe_everything_precompute_kv": (
-        "experiment_name: dist_smoke_moe_everything_precompute_kv\n"
+    "moe_everything_recompute_k": (
+        "experiment_name: dist_smoke_moe_everything_recompute_k\n"
         "model:\n"
         "  type: moe_everything\n"
         "  router_type: softmax\n"
         "  num_attn_experts: 4\n"
         "  num_attn_experts_per_tok: 1\n"
-        "  attn_expert_mode: per_head_precompute_kv\n"
+        "  attn_expert_mode: per_head_recompute_k\n"
+        "  attn_routing_bundle: qkvo\n"
+    ) + _BASE_MODEL_FIELDS + "\n" + _MOE_COMMON + "\n",
+    "moe_everything_recompute_kv": (
+        "experiment_name: dist_smoke_moe_everything_recompute_kv\n"
+        "model:\n"
+        "  type: moe_everything\n"
+        "  router_type: softmax\n"
+        "  num_attn_experts: 4\n"
+        "  num_attn_experts_per_tok: 1\n"
+        "  attn_expert_mode: per_head_recompute_kv\n"
+        "  attn_routing_bundle: qkvo\n"
     ) + _BASE_MODEL_FIELDS + "\n" + _MOE_COMMON + "\n",
 }
 
 
 def _write_config(path: Path, *, model_variant: str, output_dir: Path, data_dir: Path) -> None:
     model_block = _MODEL_YAMLS[model_variant]
-    training_block = _COMMON_TRAINING_YAML.format(output_dir=output_dir, data_dir=data_dir)
+    training_block = _COMMON_TRAINING_YAML.format(
+        output_dir=output_dir,
+        data_dir=data_dir,
+        gradient_checkpointing="true" if model_variant.startswith("moe_everything") else "false",
+    )
     path.write_text(model_block + training_block)
 
 
@@ -181,6 +198,7 @@ def _run_trainer_subprocess(
     *,
     model_variant: str,
     dist_strategy: str,
+    fsdp_sharding_strategy: str | None = None,
     timeout: int = 600,
 ) -> tuple[subprocess.CompletedProcess, Path]:
     data_dir = tmp_path / "data"
@@ -208,6 +226,8 @@ def _run_trainer_subprocess(
         "--data_dir", str(data_dir),
         "--output_dir", str(output_dir),
     ]
+    if fsdp_sharding_strategy is not None:
+        cmd += ["--fsdp-sharding-strategy", fsdp_sharding_strategy]
     t0 = time.perf_counter()
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, cwd=str(_REPO_ROOT))
     elapsed = time.perf_counter() - t0
@@ -226,8 +246,9 @@ _SUPPORTED_VARIANTS = [
     "standard_moe_deepseek",
     "global_moe_softmax",
     "global_moe_deepseek",
-    "moe_everything_fully_independent",
-    "moe_everything_precompute_kv",
+    "moe_everything_no_recompute",
+    "moe_everything_recompute_k",
+    "moe_everything_recompute_kv",
 ]
 
 
@@ -276,6 +297,7 @@ def test_unified_trainer_subprocess_smoke(tmp_path, model_variant, dist_strategy
                 "so sparse-gradient sub-modules stay in their own FSDP units. "
                 f"Got banner line from:\n{combined}"
             )
+            assert "Gradient checkpointing enabled." in combined
         else:
             assert "FULL_SHARD" in combined, (
                 f"{model_variant}/fsdp must use FULL_SHARD sharding. Got:\n{combined}"
@@ -284,6 +306,8 @@ def test_unified_trainer_subprocess_smoke(tmp_path, model_variant, dist_strategy
         assert "Wrapper   : DDP" in combined, (
             f"{model_variant}/ddp must use a DDP wrapper. Got:\n{combined}"
         )
+        if model_variant.startswith("moe_everything"):
+            assert "Gradient checkpointing enabled." in combined
 
     ckpt = _find_checkpoint(output_dir)
     assert ckpt is not None, (
@@ -294,3 +318,19 @@ def test_unified_trainer_subprocess_smoke(tmp_path, model_variant, dist_strategy
         assert req.exists(), (
             f"Expected {req} after {model_variant}/{dist_strategy} smoke; not found"
         )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="requires at least 2 CUDA devices",
+)
+def test_fsdp_no_shard_override_smoke(tmp_path):
+    """Pin the FSDP NO_SHARD override used by the Modal launcher."""
+    result, _output_dir = _run_trainer_subprocess(
+        tmp_path,
+        model_variant="standard_moe_softmax",
+        dist_strategy="fsdp",
+        fsdp_sharding_strategy="no_shard",
+    )
+    combined = result.stdout + result.stderr
+    assert "Wrapper   : FSDP(NO_SHARD" in combined

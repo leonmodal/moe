@@ -43,6 +43,10 @@ def main() -> None:
     parser.add_argument("--data_dir", default=None, help="Override data directory")
     parser.add_argument("--output_dir", default=None, help="Override output directory")
     parser.add_argument("--max-steps", type=int, default=None, help="Override max training steps")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override per-rank batch size")
+    parser.add_argument("--gradient-accumulation", type=int, default=None, help="Override gradient accumulation")
+    parser.add_argument("--save-every", type=int, default=None, help="Override checkpoint save interval")
+    parser.add_argument("--disable-wandb", action="store_true", help="Disable W&B logging for this run")
     parser.add_argument("--max_checkpoints", type=int, default=0, help="Max checkpoints to keep (0=unlimited)")
     parser.add_argument("--auto_resume", action="store_true", help="Auto-resume from latest checkpoint")
     parser.add_argument(
@@ -50,6 +54,16 @@ def main() -> None:
         choices=("none", "ddp", "fsdp"),
         default="ddp",
         help="Distributed training strategy",
+    )
+    parser.add_argument(
+        "--fsdp-sharding-strategy",
+        choices=("auto", "full_shard", "shard_grad_op", "no_shard", "hybrid_shard"),
+        default=None,
+        help=(
+            "Override FSDP sharding when --dist-strategy fsdp is active. "
+            "auto uses the per-model default; no_shard is the DDP-like "
+            "replicated-parameter FSDP mode."
+        ),
     )
     parser.add_argument("--init-from-config", default=None, help="Source config for weight initialization")
     parser.add_argument(
@@ -74,9 +88,32 @@ def main() -> None:
     train_cfg = build_training_config(cfg)
 
     # Apply CLI overrides to train_cfg
-    if args.max_checkpoints:
+    if (
+        args.max_checkpoints
+        or args.batch_size is not None
+        or args.gradient_accumulation is not None
+        or args.save_every is not None
+        or args.disable_wandb
+    ):
         from dataclasses import replace
-        train_cfg = replace(train_cfg, max_checkpoints=args.max_checkpoints)
+
+        updates = {}
+        training_cfg = cfg.setdefault("training", {})
+        if args.max_checkpoints:
+            updates["max_checkpoints"] = args.max_checkpoints
+        if args.batch_size is not None:
+            updates["batch_size"] = args.batch_size
+            training_cfg["batch_size"] = args.batch_size
+        if args.gradient_accumulation is not None:
+            updates["gradient_accumulation"] = args.gradient_accumulation
+            training_cfg["gradient_accumulation"] = args.gradient_accumulation
+        if args.save_every is not None:
+            updates["save_every"] = args.save_every
+            training_cfg["save_every"] = args.save_every
+        if args.disable_wandb:
+            updates["wandb_project"] = None
+            training_cfg["wandb_project"] = None
+        train_cfg = replace(train_cfg, **updates)
 
     run_training(cfg, train_cfg, args)
 

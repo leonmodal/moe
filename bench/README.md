@@ -1,7 +1,7 @@
 # Bench Results
 
 This directory holds the outputs of `scripts/bench_step.py` for the
-config matrix under `configs/{4,8,16}_layers/`. The bench runs are
+launch set under `configs/16_layers/`. The bench runs are
 expected to be reproducible on Modal H200 (8 GPUs) and produce a
 `results.json` payload that ranks the configurations by
 `tokens_per_second` at the largest stable batch size.
@@ -10,7 +10,7 @@ expected to be reproducible on Modal H200 (8 GPUs) and produce a
 
 ```bash
 PYTHONPATH=. python scripts/bench_step.py \
-    --config configs/8_layers/moe_everything_per_head_fully_independent.yaml \
+    --config configs/16_layers/moe_everything_per_head_recompute_k_qk_v_o_deepseek_bias.yaml \
     --warmup 5 --measure 20 \
     --output bench/results.json
 ```
@@ -21,7 +21,7 @@ Each invocation appends one JSON record to `bench/results.json`.
 
 ```bash
 PYTHONPATH=. python scripts/bench_step.py \
-    --config configs/8_layers/moe_everything_per_head_fully_independent.yaml \
+    --config configs/16_layers/moe_everything_per_head_recompute_kv_qk_v_o_ema_qk_v_deepseek_bias.yaml \
     --search --batch-min 1 --batch-max 64 \
     --output bench/results.json
 ```
@@ -32,8 +32,8 @@ full forward + backward + step without OOM, and reports the
 
 ## Modal H200 sweep
 
-The full 39-config matrix sweep on 8xH200 lands in `bench/results.json`
-under the AC-22 deliverable. The CI-side bench (this directory's CPU
+The five-config launch-set sweep on 8xH200 lands in `bench/results.json`
+under the benchmark deliverable. The CI-side bench (this directory's CPU
 default) is structural only — it verifies the script runs end-to-end
 and that the JSON schema is stable; the per-config tokens/sec figures
 are not load-bearing on CPU.

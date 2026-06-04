@@ -627,7 +627,7 @@ def test_full_model_moe_everything_branch_deepseek_checkpoint_matches_no_checkpo
             num_experts_per_tok=2,
             num_attn_experts=2,
             num_attn_experts_per_tok=1,
-            attn_expert_mode="per_head_fully_independent",
+            attn_expert_mode="per_head_no_recompute",
             branch_router_aux_loss_coef=0.0,
             use_deepseek_routing=True,
             branch_deepseek=True,  # the AC-9 contract specifies this
@@ -642,8 +642,6 @@ def test_full_model_moe_everything_branch_deepseek_checkpoint_matches_no_checkpo
             dynamic_depth_max=1.0,
             depthwise_attention=False,
             depthwise_block_size=0,
-            per_head_compute_mode="auto",
-            per_head_dense_fraction_threshold=0.75,
             scale_attn_by_routing_weight=True,
             scale_branch_by_routing_weight=True,
             router_exploration_rate=0.0,

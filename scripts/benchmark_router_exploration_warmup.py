@@ -67,7 +67,7 @@ def _moe_everything_cfg(target_rate: float) -> dict:
             "num_experts_per_tok": 2,
             "num_attn_experts": 4,
             "num_attn_experts_per_tok": 1,
-            "attn_expert_mode": "per_head_fully_independent",
+            "attn_expert_mode": "per_head_no_recompute",
             "moe_intermediate_size": 32,
             "intermediate_size": 128,
             "max_position_embeddings": 128,

@@ -8,8 +8,8 @@ This document covers all model families, their layer designs, and advanced archi
 - [2. Standard MoE](#2-standard-moe)
 - [3. Global MoE](#3-global-moe)
 - [4. MoE-Everything](#4-moe-everything)
-  - [4a. Fully Independent Mode](#4a-fully-independent-mode)
-  - [4b. Precompute KV Mode](#4b-precompute-kv-mode)
+  - [4a. No-Recompute Mode](#4a-no-recompute-mode)
+  - [4b. Recompute Attention](#4b-recompute-attention)
 - [5. Architecture Comparison](#5-architecture-comparison)
 - [6. Advanced Features (extracted from archived speedrun models)](#6-advanced-features-extracted-from-archived-speedrun-models)
 
@@ -92,23 +92,25 @@ The most advanced architecture. Routes **both** attention and MLP through shared
 
 ### 4.1 High-Level Forward Pass
 
-For each depth step `d = 0, 1, ..., D-1`, the `_depth_step()` method runs:
+For each depth step `d = 0, 1, ..., D-1`, the model first runs the
+branch router. Tokens routed to attention run the attention bank; tokens
+routed to MLP run the MLP bank.
 
 ```
 hidden_states ─┬─> Branch Router ──> choice per token: ATTENTION (0) or MLP (1)
                │
                ├─ ATTENTION path (tokens with choice=0):
-               │    hidden -> AttentionExpertBank.project() -> Q, K_fresh, V_fresh
-               │    K_new = where(attn_mask, K_fresh, K_old)   # keep old KV for MLP tokens
-               │    V_new = where(attn_mask, V_fresh, V_old)
-               │    attn_out = AttentionExpertBank.attend(Q, K_new, V_new)
-               │    hidden += w_attn * attn_out                # w_attn = softmax prob of attn choice
+               │    no_recompute: project Q/K/V, refresh KV for attention tokens,
+               │                  keep old KV for MLP tokens
+               │    recompute_k:  project Q/V, recompute K tables from current hidden
+               │    recompute_kv: project Q, recompute K/V tables from current hidden
+               │    hidden += w_attn * attn_out
                │
                ├─ MLP path (tokens with choice=1):
                │    mlp_out = MlpExpertBank(hidden, token_mask=mlp_mask)
-               │    hidden += w_mlp * mlp_out                  # w_mlp = softmax prob of mlp choice
+               │    hidden += w_mlp * mlp_out
                │
-               └─> output: updated hidden_states, K_new, V_new
+               └─> output: updated hidden_states
 ```
 
 ### 4.2 Three Core Components
@@ -124,29 +126,59 @@ The model has exactly three shared components, instantiated once and reused acro
 **Class**: `BranchRouter` (line 159)
 **Parameters**: One linear layer `gate: Linear(hidden_size, 2, bias=False)`
 
+Softmax branch routing (`branch_router.balancing: none`,
+`sampling_entropy`, `aux_loss`, or `seq_aux_loss`) is a Switch-style
+binary router:
+
 ```python
-# Forward pass (simplified):
-logits = gate(hidden_states.float())       # (B, T, 2) -- two logits: [attn_score, mlp_score]
-probs = softmax(logits, dim=-1)            # (B, T, 2) -- probabilities sum to 1
-choice = argmax(probs, dim=-1)             # (B, T) -- hard decision: 0=attn, 1=mlp
+logits = gate(hidden_states)               # (B, T, 2) -- [attn, mlp]
+scores = softmax(logits, dim=-1)           # scores sum to 1
+choice = argmax(scores, dim=-1)            # hard decision: 0=attn, 1=mlp
+# sampling_entropy uses Categorical(scores) during training instead.
 
 attn_mask = (choice == 0).unsqueeze(-1)    # (B, T, 1) -- boolean mask
 mlp_mask  = (choice == 1).unsqueeze(-1)
 
 # Weights for scaling branch outputs (differentiable):
-w_attn = probs[..., 0:1] * attn_mask      # 0 for MLP tokens, prob for attn tokens
-w_mlp  = probs[..., 1:2] * mlp_mask       # 0 for attn tokens, prob for mlp tokens
+w_attn = scores[..., 0:1] * attn_mask
+w_mlp  = scores[..., 1:2] * mlp_mask
 ```
 
-**How gradients flow through hard routing**: The `argmax` is non-differentiable, but the output scaling `w_attn * attn_out` multiplies the attention output by the softmax probability of the attention choice. This means the router receives gradients through the probability value, even though the selection itself is hard. This is the same pattern used in standard MoE expert routing.
+DeepSeek branch routing (`branch_router.balancing: deepseek_bias`, or
+the legacy `branch_deepseek: true`) uses two independent sigmoid scores,
+not a two-class softmax:
 
-**Exploration**: During training, `exploration_rate` fraction of tokens get random branch assignments instead of argmax, preventing routing collapse.
+```python
+logits = gate(hidden_states)
+scores = sigmoid(logits)                   # two independent scores
+choice = argmax(scores + expert_bias, dim=-1)
+attn_mask = (choice == 0).unsqueeze(-1)
+mlp_mask = (choice == 1).unsqueeze(-1)
+
+# Branch-output scaling uses the unbiased sigmoid score so gradients flow
+# to the branch gate; expert_bias is a persistent buffer updated post-step.
+w_attn = scores[..., 0:1] * attn_mask
+w_mlp  = scores[..., 1:2] * mlp_mask
+```
+
+**How gradients flow through hard routing**: The `argmax` is
+non-differentiable, but the output scaling multiplies the selected branch
+output by the selected softmax probability or sigmoid score. This gives
+the branch gate a gradient path even though the selection itself is hard.
+
+**Branch exploration / ablations**: The focused qkvo + recompute-KV rows
+compare `sampling_entropy`, `exploration_only`, and `fixed_alternating`.
+`sampling_entropy` samples the ATTN/MLP categorical during training and
+subtracts a small decaying entropy bonus from the loss. `exploration_only`
+uses top-1 routing but randomly overrides a scheduled fraction of tokens.
+`fixed_alternating` bypasses the learned branch gate entirely: even depths
+run attention, odd depths run MLP.
 
 **Shared vs per-layer**: By default, one `BranchRouter` is shared across all depths. With `per_layer_router=True`, each depth gets its own router (more parameters, more expressiveness).
 
-### 4.4 KV State Persistence Across Depths
+### 4.4 KV State in No-Recompute Attention
 
-A critical design detail: tokens carry (K, V) state across depth steps.
+KV state is carried across depth steps only in `per_head_no_recompute`.
 
 - Tokens that chose **ATTENTION** at depth `d` get **fresh** K, V from the attention expert bank.
 - Tokens that chose **MLP** at depth `d` **keep their old** K, V from the previous depth.
@@ -161,261 +193,134 @@ This means attention tokens from depth `d` attend using a mix of:
 - Fresh KV from tokens that also chose attention at depth `d`
 - Stale KV from tokens that chose MLP (their KV is from the last depth they chose attention)
 
-For `per_head_precompute_kv` mode, this KV persistence is not used -- K and V are precomputed per-expert from the full hidden state at each depth (see section 4b below).
+For `per_head_recompute_k` and `per_head_recompute_kv`, this KV
+persistence is not used. The recompute attention path has no carried
+`kv_state`: it builds the needed K or K/V tables from the current hidden
+state at each depth and returns only the updated hidden states.
 
-### 4.5 Sparse vs Dense Execution
+### 4.5 Dense Execution Only
 
-The attention bank dynamically chooses between sparse and dense execution based on what fraction of tokens chose attention:
+MoE-Everything attention now uses dense execution only. The branch router still
+decides which tokens take the attention branch, but the attention bank computes
+full-token attention tensors and then applies the branch mask to the residual
+and KV update.
 
-```python
-def should_use_sparse_path(token_mask):
-    attn_fraction = token_mask.float().mean()
-    if attn_fraction < 0.75:    # threshold (configurable)
-        return True              # sparse: only compute for routed tokens
-    else:
-        return False             # dense: compute for all tokens (less overhead)
+We removed the sparse gather/packed-query execution path after H100
+forward/backward throughput tests showed dense was consistently faster. Sparse
+had fewer theoretical query rows, but the extra gather/scatter, ragged packing,
+and smaller attention launches dominated wall-clock time.
+
+For no-recompute attention, dense execution means:
+
+```text
+project Q/K/V for all tokens
+blend fresh K/V only for tokens that chose attention
+run one full attention call
+apply the attention residual only to attention-routed tokens
 ```
 
-**Sparse path**: Only processes tokens that chose attention. Projects only selected tokens through expert weight banks, runs attention only on those positions. More efficient when < 75% of tokens chose attention.
+For recompute attention, the grouped execution is:
 
-**Dense path**: Processes all tokens through projection, then masks out MLP tokens. Simpler GPU kernel launches, better for high attention fractions.
+```text
+recompute_k:
+  for each active K expert:
+    build K_e over the full sequence
+    run full-query attention, then keep rows whose Q/K route is e
+
+recompute_kv:
+  for each active (K expert, V expert) pair:
+    build/reuse K_e and V_v over the full sequence
+    run full-query attention, then keep rows whose route is (e, v)
+```
+
+This does extra attention rows compared with an ideal fused ragged grouped
+kernel, but H100 measurements favored dense full-query launches for the current
+PyTorch/SDPA implementation. The extra model cost in recompute modes is
+recomputing K, or K and V, tables for active expert routes.
 
 ---
 
-### 4a. Fully Independent Mode (Deep Dive)
+### 4a. No-Recompute Mode
 
-**Config**: `attn_expert_mode: per_head_fully_independent`
-**Init method**: `_init_per_head_fully_independent()` (line 648)
+**Config**: `attn_expert_mode: per_head_no_recompute`
 
-This is the most expressive attention routing mode. Each projection type (Q, K, V, O) has its own independent router, and each router selects from its own expert pool.
+No-recompute attention keeps the standard transformer attention call. Q, K,
+V, and O route independently, and the only supported bundle is:
 
-#### Why it's called "Fully Independent"
-
-Q, K, and V are routed **independently** — for the same head slot, Q might come from expert 7 while K comes from expert 12 and V from expert 3. This means Q and K can live in **different learned subspaces**. Token at position `t` with Q from expert 7 may attend against token at position `s` with K from expert 12 — the dot product is between weight matrices that were never trained together. This is the fundamental tradeoff: **maximum routing flexibility at the cost of Q-K subspace alignment**.
-
-**Cost**: 1 standard attention call per depth — same as a normal transformer. Very cheap.
-
-#### Router structure
-
-Each head slot has its **own dedicated router** doing **top-1** from the expert pool. This is NOT one router picking top-K — it is H separate routers each picking top-1.
-
-- Q: H routers (one per head), each selecting 1 expert → H experts total
-- K: H routers (one per head), each selecting 1 expert → H experts total
-- V: H routers (one per head), each selecting 1 expert → H experts total
-- O: H routers (one per head, routing on attention output), each selecting 1 expert → H experts total
-- Total: **4H routers** per depth
-
-Each router is `nn.Linear(dim, num_experts)` → top-1. Different head-slot routers learn to specialize independently.
-
-> **Implementation**: `src/models/moe_everything/attention_bank.py` uses per-head top-1 routers created via `src/models/routing/helpers.py:make_top1_router()`.
-
-#### Weight Banks
-
-Four separate expert weight banks, stored as 3D parameter tensors:
-
-```python
-self.q_proj = Parameter(E, hidden_size, q_group_dim)      # Q experts
-self.k_proj = Parameter(E_kv, hidden_size, head_dim)       # K experts
-self.v_proj = Parameter(E_kv, hidden_size, head_dim)       # V experts
-self.o_proj = Parameter(E_o, head_dim, hidden_size)        # O experts
+```yaml
+attn_routing_bundle: q_k_v_o
 ```
 
-Where:
-- `E` = `num_attn_experts` (e.g., 4)
-- `E_kv` = `E` (same pool size for K, V)
-- `E_o` = `E * q_heads_per_kv` (larger pool for O to match per-layer O projection parameter count)
-- `q_group_dim` = `q_heads_per_kv * head_dim` (GQA: each Q expert produces queries for all Q heads in a KV group)
+This is the most expressive routing layout: Q, K, V, and O can all choose
+different experts for the same token/head slot. The cost is that Q and K can
+come from different learned subspaces, so the attention score may compare
+projections that were not selected as a pair.
 
-#### Per-Head Routers (4H total)
+The runtime keeps a KV state across depth calls. Tokens routed to attention
+write fresh K/V; tokens routed to MLP keep their prior K/V.
 
-```python
-# H routers per projection type, each doing top-1
-q_routers = ModuleList([Router(hidden_size -> E) for _ in range(H)])   # H routers, each picks 1 expert
-k_routers = ModuleList([Router(hidden_size -> E) for _ in range(H)])   # H routers, each picks 1 expert
-v_routers = ModuleList([Router(hidden_size -> E) for _ in range(H)])   # H routers, each picks 1 expert
-o_routers = ModuleList([Router(head_dim -> E) for _ in range(H)])      # H routers, each picks 1 expert
+### 4b. Recompute Attention
+
+**Config**: `attn_expert_mode: per_head_recompute_k` or
+`attn_expert_mode: per_head_recompute_kv`
+
+Recompute attention is the aligned-Q/K path. Q and K always share a route, so
+the dot product is computed between matched projections. Recompute has two
+variants:
+
+- `per_head_recompute_k`: recomputes the full-sequence K table for each active Q/K expert. V is token-routed once.
+- `per_head_recompute_kv`: recomputes full-sequence K and V tables for each active routed pair.
+
+O is never sequence-side; it is projected after attention from the local
+attention output. It can share a routing decision with Q/K/V, but there is no
+separate "recompute O" mode.
+
+The active launch configs use `qk_v_o`: Q/K share the attention-metric route,
+V routes separately, and O routes separately after attention.
+
+The active launch configs also set all router and norm state per depth:
+branch routers, MLP routers, attention routers, pre-RMSNorms, and Q/K norm
+weights are depth-indexed.
+
+The routing bundle controls which projections share a router:
+
+| Bundle | Routing |
+|--------|---------|
+| `qk_v_o` | Q/K together, V separate, O separate |
+| `qk_vo` | Q/K together, V/O together |
+| `qkv_o` | Q/K/V together, O separate |
+| `qkvo` | Q/K/V/O together |
+
+`q_k_v_o` is intentionally not valid for recompute modes because Q and K
+would no longer be aligned.
+
+EMA router context is an optional router-input feature:
+
+```yaml
+attn_router_context: ema_qk_v
+attn_router_context_decay: 0.95
 ```
 
-Each head slot has its own router that independently picks one expert. With H=6 heads, that's 24 routers per depth doing top-1, not 4 routers doing top-6.
+When enabled, only the QK and V routers consume
+`concat(normed_h_t, causal_prefix_ema_t)`. The projections still use
+`normed_h_t`, and O routing still consumes the local attention output.
 
-#### Forward Flow (per token)
+The recompute implementation is split into three phases:
 
-```
-Token x (hidden_size=1024)
-│
-├─ Q path (H = num_kv_heads separate top-1 routers):
-│   x -> q_pre_norm
-│   For each head slot h in [0, H):
-│     q_routers[h](x) -> picks 1 expert e_h with weight w_h
-│     q_h = x @ q_proj[e_h]  # (hidden_size) -> (q_group_dim)
-│     q_h = RMSNorm(q_h, q_norm_weight[e_h])
-│     q_h *= w_h
-│   Stack: Q = [q_0, q_1, ..., q_{H-1}]
-│   Reshape: Q -> (num_heads, head_dim) via GQA unfolding
-│
-├─ K path (H separate top-1 routers):
-│   x -> k_pre_norm
-│   For each head slot h: k_routers[h](x) -> picks 1 expert
-│   Stack: K = [k_0, ..., k_{H-1}] with per-expert RMSNorm
-│
-├─ V path (H separate top-1 routers):
-│   x -> v_pre_norm
-│   For each head slot h: v_routers[h](x) -> picks 1 expert
-│   Stack: V = [v_0, ..., v_{H-1}]
-│
-├─ Apply RoPE to Q, K
-├─ Run standard attention: attn_out = Attention(Q, K, V)
-│
-└─ O path (num_heads separate top-1 routers):
-    attn_flat = concat(all head outputs) -> (num_heads * head_dim)
-    For each head h: o_routers[h](attn_flat) -> picks 1 expert
-    o_h = attn_heads[h] @ o_proj[e_h] * w_h  # head_dim -> hidden_size
-    Sum across heads: output = sum(o_0, ..., o_{num_heads-1})
-```
+1. `_build_per_head_recompute_tables()` routes Q/K, optional V, then builds token-local Q and, for `recompute_k`, the token-routed V table.
+2. `_run_per_head_recompute_expert_tables()` builds/reuses active full-sequence K or K/V expert tables and runs attention only for the query rows assigned to each table.
+3. `_project_recompute_o()` applies the configured O route from the local attention output.
 
-**Key insight**: Each head slot has its own dedicated router that picks exactly one expert via top-1 selection. This is NOT one router picking top-K — it is H separate routers each independently picking top-1. Different tokens route different experts to the same head slot.
+#### Comparison
 
-#### Grouped Expert MatMul (Efficient Execution)
-
-Instead of looping over experts one by one, the implementation sorts tokens by their expert assignment and uses Triton grouped GEMM:
-
-```python
-# Sort tokens by expert assignment
-sort_order = argsort(expert_indices)
-sorted_inputs = inputs[sort_order]
-sorted_experts = expert_indices[sort_order]
-unique_experts, counts = unique_consecutive(sorted_experts)
-
-# Single batched matmul across all expert groups
-proj = triton_grouped_gemm(sorted_inputs, weight_bank, unique_experts, counts)
-
-# Unsort back to original token order
-output[sort_order] = proj * expert_weights
-```
-
-This is much faster than per-expert loops on GPU because it maximizes parallelism.
-
----
-
-### 4b. Precompute KV Mode (Deep Dive)
-
-**Config**: `attn_expert_mode: per_head_precompute_kv`
-**Init method**: `_init_per_head_precompute_kv()` (line 693)
-
-This mode uses a **single router** to select experts for all four projections (Q, K, V, O). The key optimization: since all tokens in a batch see the same expert's K and V weights, K and V can be precomputed once per expert and reused across all tokens routed to that expert.
-
-#### Why it's called "Precompute KV"
-
-Because the same expert provides both Q and K, we know which K/V weight matrix each head slot will use before running attention. So we can **precompute the full K/V tables** for each active expert once, then run attention against those tables. This guarantees **Q-K subspace alignment** — Q and K always come from the same learned projection, so dot-product attention scores are always meaningful.
-
-**Cost**: `num_active_experts` separate full attention passes per depth. More expensive than fully independent, but guarantees correctness of attention.
-
-#### Router structure
-
-Each head slot has its **own dedicated router** doing **top-1** — one routing decision per head that picks Q+K+V+O together from the same expert.
-
-- H routers (one per head slot), each selecting 1 expert → H experts total
-- Same expert index provides Q, K, V, and O for that head slot
-- Total: **H routers** per depth
-
-Each router is `nn.Linear(dim, num_experts)` → top-1. The bundled decision means Q and K always come from the same learned subspace.
-
-> **Implementation**: `src/models/moe_everything/attention_bank.py` uses per-head top-1 routers for precompute-KV mode.
-
-#### Weight Banks
-
-```python
-self.q_proj = Parameter(E, hidden_size, q_group_dim)    # Q experts (produces grouped Q)
-self.k_proj = Parameter(E, hidden_size, head_dim)        # K experts
-self.v_proj = Parameter(E, hidden_size, head_dim)        # V experts
-self.o_proj = Parameter(E, q_group_dim, hidden_size)     # O experts (takes grouped Q dim)
-```
-
-Note: all four banks have the same number of experts `E`, and the O projection takes `q_group_dim` input (not `head_dim`) because it operates on the grouped-query output.
-
-#### Per-Head Bundled Routers (H total)
-
-```python
-# H routers, each doing top-1 (one bundled QKVO decision per head)
-routers = ModuleList([Router(hidden_size -> E) for _ in range(H)])   # H routers, each picks 1 expert
-```
-
-Each head slot has its own router that picks one expert. That single expert provides Q, K, V, and O projections together for that head. With H=6 heads, that's 6 routers per depth doing top-1, not 1 router doing top-6.
-
-#### Forward Flow
-
-The forward is split into two phases: table building and attention execution.
-
-**Phase 1: Build Expert Tables** (`_build_per_head_precompute_kv_tables`, line 1127)
-
-```
-Token x (hidden_size=1024)
-│
-├─ x -> norm -> router -> selects num_kv_heads expert indices [e_0, e_1, ..., e_{num_kv_heads-1}]
-│                         with routing weights [w_0, w_1, ..., w_{num_kv_heads-1}]
-│
-├─ For each selected expert e_i (using SAME index for Q, K, V):
-│   q_group_i = x @ q_proj[e_i]  # (hidden_size) -> (q_group_dim = q_heads_per_kv * head_dim)
-│   k_i       = x @ k_proj[e_i]  # (hidden_size) -> (head_dim)
-│   v_i       = x @ v_proj[e_i]  # (hidden_size) -> (head_dim)
-│   Apply RMSNorm to q (per head within group) and k
-│   Scale by routing weight w_i
-│
-├─ Reshape Q from (num_kv_heads, q_group_dim) -> (num_heads, head_dim)
-│  (Each KV group's q_group unfolds into q_heads_per_kv separate Q heads)
-│
-└─ Apply RoPE to Q and K
-   Return: Q (B, num_heads, T, head_dim), K (B, num_kv_heads, T, head_dim), V same as K
-```
-
-**Phase 2: Per-Expert Attention** (`_run_per_head_precompute_kv_expert_tables`, line 1206)
-
-This is where the "precompute KV" optimization happens. Instead of standard attention where all tokens share one K/V, we run **separate attention per active expert**:
-
-```
-For each active expert e in the batch:
-  # Precompute K, V for ALL tokens using expert e's weights
-  K_e = all_tokens @ k_proj[e]           # (B, T, head_dim) -- computed ONCE for expert e
-  V_e = all_tokens @ v_proj[e]           # (B, T, head_dim) -- computed ONCE for expert e
-  K_e = RMSNorm(K_e) then RoPE(K_e)
-
-  # Run full attention: Q attends to K_e, V_e
-  attn_e = Attention(Q, K_e, V_e, causal_mask)    # (B, num_heads, T, head_dim)
-
-  # Mask: only keep results for (head, token) pairs that were actually routed to expert e
-  group_mask = (token_expert_assignments == e)     # which KV groups selected this expert
-  head_mask = expand group_mask to per-head        # repeat for all Q heads in each KV group
-  attn_output += attn_e * head_mask                # accumulate masked results
-```
-
-**Why this is efficient**: Instead of running `num_tokens * num_kv_heads` separate small attention operations (one per token-head pair), we run at most `num_active_experts` full attention operations. Since `num_active_experts << num_tokens * num_kv_heads`, this is much faster on GPU. The "redundant" computation on tokens not routed to expert `e` is thrown away by the mask, but the GPU parallelism more than compensates.
-
-**Phase 3: O Projection**
-
-After attention, the O projection uses the same expert indices from the router:
-
-```
-attn_output (B, T, q_dim) -> for each expert e_i:
-  o_i = attn_output_group_i @ o_proj[e_i]    # (q_group_dim) -> (hidden_size)
-  Scale by routing weight w_i
-Sum across KV groups -> final output (B, T, hidden_size)
-```
-
-#### Fully Independent vs Precompute KV -- Comparison
-
-| Aspect | Fully Independent | Precompute KV |
-|--------|-------------------|---------------|
-| **Routers** | 4H (H per Q, K, V, O — each top-1) | H (one bundled QKVO per head — each top-1) |
-| **Expert selection** | Different expert per Q, K, V, O | Same expert for all four |
-| **Q/K norm** | Per-expert (from bank) or per-layer | Per-expert (from bank) or per-layer |
-| **O pool size** | `E * q_heads_per_kv` (larger) | `E` (same as others) |
-| **O input** | Per-head `head_dim` | Grouped `q_group_dim` |
-| **KV computation** | Per-token: each token gets its own KV | Per-expert: KV precomputed once per expert for ALL tokens |
-| **Attention** | Standard (all tokens share K/V) | Per-expert (separate attention per active expert) |
-| **KV state persistence** | Yes (tokens carry K, V across depths) | No (K, V recomputed each depth from hidden states) |
-| **Expressiveness** | Maximum (4H independent routing decisions) | Lower (H routing decisions, each controls all 4 projections) |
-| **Efficiency** | More routing overhead | Fewer routing decisions, KV reuse across tokens |
-| **Aux losses** | 4H separate load-balancing losses (H per Q, K, V, O) | H load-balancing losses (one per bundled router) |
+| Aspect | No recompute | Recompute K | Recompute KV |
+|--------|--------------|-------------|--------------|
+| Q/K route | Separate | Shared | Shared |
+| V route | Separate | Bundle-dependent token route | Bundle-dependent query-pair route |
+| O route | Separate | Bundle-dependent local route | Bundle-dependent local route |
+| KV state across depths | Yes | No | No |
+| Sequence-side recompute | None | K | K and V |
+| Main tradeoff | Maximum routing freedom | Fixes Q/K mismatch with lower cost | Strongest alignment, highest cost |
 
 ### 4.5 MLP Expert Bank
 
@@ -433,25 +338,92 @@ Key parameters in `MoEverythingConfig`:
 |-----------|---------|-------------|
 | `num_attn_experts` | 4 | Size of attention expert pool (E) |
 | `num_attn_experts_per_tok` | 1 | Attention experts selected per token |
-| `attn_expert_mode` | `per_head_fully_independent` | `per_head_fully_independent` or `per_head_precompute_kv` |
+| `attn_expert_mode` | `per_head_no_recompute` | `per_head_no_recompute`, `per_head_recompute_k`, or `per_head_recompute_kv` |
+| `attn_routing_bundle` | `q_k_v_o` for no-recompute, `qkvo` for recompute | `q_k_v_o`, `qk_v_o`, `qk_vo`, `qkv_o`, `qkvo` |
+| `attn_router_context` | `none` | `none` or `ema_qk_v`; EMA applies only to QK/V routers |
+| `attn_router_context_decay` | 0.95 | Causal prefix EMA decay for `ema_qk_v` |
 | `branch_router_aux_loss_coef` | 0.0 | Aux loss for branch routing balance |
-| `use_deepseek_routing` | False | Sigmoid + bias vs softmax routing |
+| `use_deepseek_routing` | False | Sigmoid + bias vs softmax routing for expert routers |
 | `per_layer_router` | False | Separate branch routers per depth vs shared |
 | `per_layer_mlp_router` | False | Separate MLP routers per depth |
 | `per_layer_attn_router` | False | Separate attention routers per depth |
 | `per_layer_norm` | False | Separate RMSNorm per depth (standard transformer style) |
 | `per_layer_qk_norm` | False | Shared per-depth Q/K norms instead of per-expert norms |
 | `post_norm` | False | Apply RMSNorm to branch output before residual |
-| `scale_branch_by_routing_weight` | True | Scale branch output by softmax probability |
+| `scale_branch_by_routing_weight` | True | Scale branch output by the selected softmax probability or sigmoid score |
 | `scale_attn_by_routing_weight` | True | Scale expert projections by routing weight |
 | `router_exploration_rate` | 0.0 | Random expert probability during training |
 | `branch_router_exploration_rate` | None | Override exploration rate for branch router |
-| `per_head_compute_mode` | `auto` | `auto`, `sparse`, or `dense` execution |
-| `per_head_dense_fraction_threshold` | 0.75 | Switch to sparse when attn fraction < threshold |
 | `dynamic_depth_min/max` | 1.0 | Random depth perturbation range during training |
 | `routed_norm` | False | Bank of RMSNorm experts with per-token routing |
 | `depthwise_attention` | False | Learned weighted combination across depths |
 | `sanity_check_mode` | None | `alternating_global_moe` for deterministic debugging |
+| `prelude_layers` | 0 | Standard-MoE-style decoder blocks prepended before the recurrent bank loop (see §4.7) |
+| `coda_layers` | 0 | Standard-MoE-style decoder blocks appended after the recurrent bank loop (see §4.7) |
+| `boundary_num_experts` | None | Per-layer MLP pool size used by every prelude/coda block (falls back to bank's `num_experts` when unset) |
+| `boundary_num_experts_per_tok` | None | Top-K for prelude/coda MLP routers (falls back to bank's `num_experts_per_tok`) |
+| `boundary_moe_intermediate_size` | None | SwiGLU intermediate dim for prelude/coda experts (falls back to bank's `moe_intermediate_size`) |
+| `boundary_num_groups` / `boundary_group_topk` | None | Group-limited top-K for prelude/coda routers (falls back to bank's values) |
+| `boundary_router_type` | `deepseek` | `deepseek` (DeepSeekRouter + bias updates) or `softmax` (ExplorationTopKRouter) for prelude/coda gates |
+
+### 4.7 Prelude / Recurrent / Coda Hybrid
+
+`prelude_layers` and `coda_layers` opt-in to a hybrid layout: a stack
+of standard-MoE-style decoder blocks runs **before** the recurrent
+MoE-Everything bank, and another stack runs **after** it. The recurrent
+loop in between is unchanged.
+
+```
+embeddings
+   ↓
+Prelude block 1..N      ← dense GQA + per-layer MLP expert pool
+   ↓                       (each block has its own attention weights
+   ...                      and its own MLP experts; nothing shared
+   ↓                       with the bank)
+Prelude block N
+   ↓
+Recurrent depth 0..D-1  ← MoE-Everything (shared attention bank +
+   ↓                       shared MLP bank + branch router; weights
+   ...                      shared across all D depths)
+   ↓
+Recurrent depth D-1
+   ↓
+Coda block 1..M         ← dense GQA + per-layer MLP expert pool
+   ↓                       (own weights again, no sharing with bank
+   ...                      or with prelude)
+   ↓
+Coda block M
+   ↓
+final RMSNorm → lm_head
+```
+
+Defaults of `prelude_layers=0`, `coda_layers=0` keep the model
+bit-identical to a pure MoE-Everything build. When either is nonzero,
+boundary blocks are built off a separate `Qwen3MoeConfig` derived from
+the `boundary_*` fields (or from the bank's geometry when an explicit
+boundary_* override is None). The boundary's MLP router gate is then
+swapped to a `DeepSeekRouter` post-construction so the deepseek-bias
+balancing walker registers it as a regular MLP balancing owner.
+
+**Counting layer-equivalents**: each prelude/coda block runs one
+attention substep + one MLP substep sequentially (= 1 standard layer
+= 2 substeps); each recurrent depth runs exactly one substep (the
+branch router picks attention OR MLP), so two recurrent depths equal
+one standard layer. Compute totals are therefore:
+
+```
+layer_equivalents = prelude_layers + num_hidden_layers / 2 + coda_layers
+substeps          = prelude_layers * 2 + num_hidden_layers + coda_layers * 2
+```
+
+A config that sets `prelude_layers=4, num_hidden_layers=16,
+coda_layers=4` has `4 + 8 + 4 = 16` layer-equivalents (32 substeps),
+matching the pure-16-layer (32-depth) MoE-Everything baselines.
+
+**Use case**: ablations where the entry and exit transformations are
+held to a standard MoE recipe while the middle of the stack explores
+shared-weight branch routing — see
+`configs/16_layers/moe_everything_prelude4_recurrent16_coda4_branch_*.yaml`.
 
 ---
 

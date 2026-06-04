@@ -77,10 +77,9 @@ model:
   router_exploration_rate: 0.0
   num_attn_experts: 2
   num_attn_experts_per_tok: 1
-  attn_expert_mode: per_head_fully_independent
+  attn_expert_mode: per_head_no_recompute
   scale_attn_by_routing_weight: true
   scale_branch_by_routing_weight: true
-  per_head_compute_mode: dense
   use_deepseek_routing: false
   branch_deepseek: false
   attention_bias: false

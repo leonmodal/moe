@@ -1,0 +1,62 @@
+experiment_name: baseline_dense_4L_cellular
+
+# Dense baseline matched to MoE-Everything 4L active-param budget:
+#   - per layer: attn (6.3M) + mlp (hidden=1024, intermediate=3072) ≈ 9.4M
+#   - 4 layers → total active per token ≈ 4 × 15.7M = 62.8M
+# No routing — pure dense, matches MoE-Everything fixed_alternating compute.
+
+model:
+  type: dense
+  vocab_size: 4
+  hidden_size: 1024
+  num_hidden_layers: 4
+  head_dim: 128
+  num_attention_heads: 16
+  num_key_value_heads: 8
+  intermediate_size: 3072
+  rms_norm_eps: 1.0e-06
+  rope_theta: 1000000.0
+  max_position_embeddings: 32768
+  tie_word_embeddings: true
+
+training:
+  learning_rate: 0.001
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 500
+  max_steps: 10000
+  min_lr_ratio: 0.1
+  batch_size: 32
+  gradient_accumulation: 1
+  mixed_precision: bf16
+  disable_liger: true
+  gradient_checkpointing: false
+  log_every: 10
+  save_every: 500
+  output_dir: ./outputs/synthetic/baseline_dense_4L_cellular
+  wandb_project: moe-synthetic
+  wandb_run_name: baseline_dense_4L_cellular
+
+data:
+  format: synthetic_cellular_automata
+  state_size: 16
+  trajectory_length: 16
+  num_colors: 4
+  num_rules: 256
+  recursive_depth: 1
+  task_seed: 0
+  seed: 42
+  num_workers: 0
+
+eval:
+  enabled: true
+  every: 100
+  max_batches: 8
+  seed: 1234
+  batch_size: 32
+
+checkpoint:
+  resume_from: null

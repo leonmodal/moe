@@ -146,19 +146,29 @@ def _model_block(variant: str, *, base_fields: str, experiment_name: str,
             f"experiment_name: {experiment_name}\n"
             "model:\n  type: global_moe\n  router_type: deepseek\n"
         ) + base_fields + "\n" + moe_common + "\n" + deepseek_extra + "\n"
-    if variant == "moe_everything_fully_independent":
+    if variant == "moe_everything_no_recompute":
         return (
             f"experiment_name: {experiment_name}\n"
             "model:\n  type: moe_everything\n  router_type: softmax\n"
             "  num_attn_experts: 4\n  num_attn_experts_per_tok: 1\n"
-            "  attn_expert_mode: per_head_fully_independent\n"
+            "  attn_expert_mode: per_head_no_recompute\n"
+            "  attn_routing_bundle: q_k_v_o\n"
         ) + base_fields + "\n" + moe_common + "\n"
-    if variant == "moe_everything_precompute_kv":
+    if variant == "moe_everything_recompute_k":
         return (
             f"experiment_name: {experiment_name}\n"
             "model:\n  type: moe_everything\n  router_type: softmax\n"
             "  num_attn_experts: 4\n  num_attn_experts_per_tok: 1\n"
-            "  attn_expert_mode: per_head_precompute_kv\n"
+            "  attn_expert_mode: per_head_recompute_k\n"
+            "  attn_routing_bundle: qkvo\n"
+        ) + base_fields + "\n" + moe_common + "\n"
+    if variant == "moe_everything_recompute_kv":
+        return (
+            f"experiment_name: {experiment_name}\n"
+            "model:\n  type: moe_everything\n  router_type: softmax\n"
+            "  num_attn_experts: 4\n  num_attn_experts_per_tok: 1\n"
+            "  attn_expert_mode: per_head_recompute_kv\n"
+            "  attn_routing_bundle: qkvo\n"
         ) + base_fields + "\n" + moe_common + "\n"
     raise ValueError(f"Unknown variant: {variant}")
 
@@ -308,8 +318,9 @@ _ALL_VARIANTS = [
     "standard_moe_deepseek",
     "global_moe_softmax",
     "global_moe_deepseek",
-    "moe_everything_fully_independent",
-    "moe_everything_precompute_kv",
+    "moe_everything_no_recompute",
+    "moe_everything_recompute_k",
+    "moe_everything_recompute_kv",
 ]
 
 
@@ -587,13 +598,13 @@ def main() -> int:
     parser.add_argument("--loss-steps", type=int, default=5000)
     parser.add_argument("--resume-save-at", type=int, default=100)
     parser.add_argument("--resume-total", type=int, default=200)
-    parser.add_argument("--stage-b-variants", default="dense,standard_moe_deepseek,moe_everything_fully_independent",
+    parser.add_argument("--stage-b-variants", default="dense,standard_moe_deepseek,moe_everything_no_recompute",
                         help="Comma-separated variants for stage B.")
     parser.add_argument("--stage-b-scale", default="medium", choices=("medium", "large"),
                         help="Stage B model scale. 'medium' = 8L x 512H, fast. "
                              "'large' = 16L x 1024H (GPT2-base class), reaches ~3.3 "
                              "in 10k+ steps but takes several hours per config.")
-    parser.add_argument("--stage-c-variants", default="standard_moe_softmax:ddp,moe_everything_fully_independent:fsdp",
+    parser.add_argument("--stage-c-variants", default="standard_moe_softmax:ddp,moe_everything_no_recompute:fsdp",
                         help="Comma-separated `variant:strategy` pairs for stage C.")
     args = parser.parse_args()
 

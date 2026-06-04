@@ -226,7 +226,10 @@ class TritonGroupedGemmOutputInputFunction(torch.autograd.Function):
     def backward(ctx, grad_c):
         a, weight_bank, unique_experts, counts = ctx.saved_tensors
 
-        grad_a = TritonGroupedGemmOutputInputFunction.apply(grad_c, weight_bank, unique_experts, counts)
+        # Forward computes C = A @ W.T with W shaped [E, out, in].
+        # Therefore dA = dC @ W, which matches the regular grouped GEMM
+        # layout [E, in, out] when using the original weight tensor.
+        grad_a = TritonGroupedGemmFunction.apply(grad_c, weight_bank, unique_experts, counts)
 
         grad_weight_bank = torch.zeros_like(weight_bank, dtype=torch.float32)
         start = 0

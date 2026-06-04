@@ -42,10 +42,9 @@ model:
   router_exploration_rate: 0.0
   num_attn_experts: 2
   num_attn_experts_per_tok: 1
-  attn_expert_mode: per_head_fully_independent
+  attn_expert_mode: per_head_no_recompute
   scale_attn_by_routing_weight: true
   scale_branch_by_routing_weight: true
-  per_head_compute_mode: dense
   use_deepseek_routing: true
   branch_deepseek: true
   attention_bias: false
@@ -212,7 +211,7 @@ spec.loader.exec_module(mod)
 # Argparse stub.
 import argparse
 args = argparse.Namespace(
-    config="configs/8_layers/standard_moe.yaml", warmup=10, measure=90,
+    config="configs/16_layers/standard_moe_deepseek_bias.yaml", warmup=10, measure=90,
 )
 record = mod._oom_record(
     {

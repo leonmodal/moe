@@ -1,15 +1,27 @@
 #!/bin/bash
-# Launch the original and per-layer-Q/K-norm prenorm MoE-Everything per-head
-# experiments, plus sanity routing
+# Launch the active qkvo recompute-KV branch-router ablation set.
 set -e
 
-echo "Launching all runs..."
+COMMON_ARGS=(
+  --background
+  --batch-size 16
+  --gradient-accumulation 1
+  --save-every 100
+  --output-suffix h200_8gpu_bs16_ddp
+  --dist-strategy ddp
+  --disable-grouped-mm
+)
 
-modal run --detach modal_train.py --config configs/moe_everything_per_head_independent_perlayer_prenorm.yaml &
-modal run --detach modal_train.py --config configs/moe_everything_per_head_precompute_kv_perlayer_prenorm.yaml &
-modal run --detach modal_train.py --config configs/moe_everything_per_head_independent_perlayer_prenorm_per_layer_qk_norm.yaml &
-modal run --detach modal_train.py --config configs/moe_everything_per_head_precompute_kv_perlayer_prenorm_per_layer_qk_norm.yaml &
-modal run --detach modal_train.py --config configs/moe_everything_per_head_precompute_kv_sanity.yaml &
+export MOE_MODAL_GPU_TYPE=H200
+export MOE_MODAL_GPUS_PER_NODE=8
+export MOE_MODAL_N_NODES=1
+export MOE_MODAL_DIST_STRATEGY=ddp
+
+echo "Launching active qkvo recompute-KV branch-router runs..."
+
+modal run --detach modal_train.py --config configs/16_layers/moe_everything_per_head_recompute_kv_qkvo_branch_sampling_entropy.yaml "${COMMON_ARGS[@]}" &
+modal run --detach modal_train.py --config configs/16_layers/moe_everything_per_head_recompute_kv_qkvo_branch_top1_explore_decay.yaml "${COMMON_ARGS[@]}" &
+modal run --detach modal_train.py --config configs/16_layers/moe_everything_per_head_recompute_kv_qkvo_branch_fixed_alternating.yaml "${COMMON_ARGS[@]}" &
 
 wait
 echo "All runs launched."

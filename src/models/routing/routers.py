@@ -35,16 +35,15 @@ def _straight_through_ones(probs: torch.Tensor) -> torch.Tensor:
 class BranchRouter(nn.Module):
     """Binary router: ATTN (0) or MLP (1) per token.
 
-    Hard routing: each token picks one branch via argmax.
-    The selected branch output is scaled by its softmax probability
-    for gradient flow (same pattern as MoE expert routing).
-
-    NOTE: BranchRouter has NO load-balancing loss by design.
+    Hard routing: each token picks one branch via argmax. The selected
+    branch output is scaled by a differentiable routing score for gradient
+    flow, matching the expert-router pattern.
 
     Modes (from speedrun extraction):
     - use_sampling: Sample from distribution instead of argmax during training
     - use_seq_level: Mean-pool tokens and make one decision per sequence
-    - use_deepseek_style: Sigmoid + persistent branch bias instead of softmax
+    - use_deepseek_style: two independent sigmoid scores + persistent branch
+      bias instead of a two-way softmax
     """
 
     def __init__(self, hidden_size: int, exploration_rate: float = 0.0,
@@ -60,10 +59,13 @@ class BranchRouter(nn.Module):
         self.gate = nn.Linear(hidden_size, 2, bias=False)
         self.exploration_rate = exploration_rate
         self.scale_by_routing_weight = scale_by_routing_weight
-        self.use_sampling = use_sampling
         self.use_seq_level = use_seq_level
         # `balancing`: branch-router balancing mode. Allowed values:
         #   "none"             - default; no exploration override.
+        #   "sampling_entropy" - sample the binary branch categorical
+        #                        during training and let the model
+        #                        forward add a decaying entropy bonus
+        #                        from `last_probs`.
         #   "exploration_only" - every step draws a per-token explore
         #                        mask at probability
         #                        `exploration_only_rate` (the
@@ -93,9 +95,16 @@ class BranchRouter(nn.Module):
         # per-class quantile EMA on the binary [ATTN, MLP] pool and
         # derives `expert_bias` from the EMA's global median.
         _allowed_balancing = (
-            "none", "exploration_only",
+            "none", "sampling_entropy", "exploration_only",
             "aux_loss", "seq_aux_loss",
             "deepseek_bias", "quantile",
+            # `weighted_sum`: soft binary branching. Both ATTN and MLP
+            # branches always compute; outputs are combined as
+            # `w_attn * attn_out + w_mlp * mlp_out` where the weights
+            # are the softmax probabilities (w_attn + w_mlp = 1). No
+            # hard selection, no aux loss, no bias update — the router
+            # is a pure soft mixer.
+            "weighted_sum",
         )
         if balancing not in _allowed_balancing:
             raise ValueError(
@@ -118,6 +127,7 @@ class BranchRouter(nn.Module):
                 f"exploration_only_rate must be in [0, 1], got {exploration_only_rate}"
             )
         self.balancing = balancing
+        self.use_sampling = bool(use_sampling or balancing == "sampling_entropy")
         # When `balancing == "deepseek_bias"`, the router MUST consume
         # `expert_bias` during scoring — otherwise the post-step
         # walker would mutate a buffer that the runtime ignores. Fold
@@ -226,9 +236,9 @@ class BranchRouter(nn.Module):
                 # `exploration_only_rate` per token (the explore mask),
                 # the token's selection is replaced by a uniform
                 # Bernoulli draw. Otherwise it follows the regular
-                # argmax path. Probs are still populated via the
-                # gate's softmax/sigmoid for downstream telemetry and
-                # weight-gradient flow.
+                # argmax path. `probs` is the historical telemetry name:
+                # it holds either softmax probabilities or independent
+                # DeepSeek-style sigmoid scores.
                 if self.use_deepseek_style:
                     probs = torch.sigmoid(logits)
                 else:
@@ -282,7 +292,16 @@ class BranchRouter(nn.Module):
                 probs = scores
             else:
                 probs = F.softmax(logits, dim=-1)
-                if self.training and self.use_sampling:
+                if self.balancing == "weighted_sum":
+                    # Soft mixer: no hard selection, so no exploration
+                    # rand draw. The choice tensor is computed purely for
+                    # telemetry (`last_selected_experts`). Skipping the
+                    # `torch.rand` path here also avoids a recompute-time
+                    # RNG draw under `torch.utils.checkpoint` that would
+                    # otherwise shift downstream routing decisions when
+                    # `router_exploration_rate > 0`.
+                    choice = probs.float().argmax(dim=-1)
+                elif self.training and self.use_sampling:
                     # Recompute determinism: same RNG-preservation rationale as above.
                     flat = probs.view(-1, 2)
                     choice = torch.multinomial(flat, 1).view(probs.shape[:-1])
@@ -339,8 +358,9 @@ class BranchRouter(nn.Module):
         # `local_tokens_per_expert` recompute guard so backward
         # replays do not double-append. Sigmoid scores in the
         # deepseek-style path are already the right summary; for the
-        # softmax path, `probs` is the per-class probability of each
-        # choice, which is the correct per-expert quantile target.
+        # softmax path, `probs` is the per-class probability. The name
+        # stays `probs` for API compatibility even when it contains
+        # independent sigmoid scores.
         if (
             self.balancing == "quantile"
             and self.training
@@ -363,6 +383,18 @@ class BranchRouter(nn.Module):
         probs = probs.to(hidden_states.dtype)
         self.last_probs = probs
         self.last_selected_experts = choice.unsqueeze(-1).detach()
+        if self.balancing == "weighted_sum":
+            # Soft mixer: every token computes BOTH branches and the
+            # outputs are blended by the (full, unmasked) softmax
+            # probabilities. The boolean masks are still all-True so
+            # the depth-step's per-token mask gating (the MLP bank's
+            # `token_mask` and the attention path's residual mask)
+            # treats every token as active in both branches.
+            attn_mask = torch.ones_like(choice, dtype=torch.bool).unsqueeze(-1)
+            mlp_mask = torch.ones_like(choice, dtype=torch.bool).unsqueeze(-1)
+            w_attn = probs[..., 0:1]
+            w_mlp = probs[..., 1:2]
+            return w_attn, w_mlp, attn_mask, mlp_mask
         attn_mask = (choice == 0).unsqueeze(-1)
         mlp_mask = (choice == 1).unsqueeze(-1)
         if self.scale_by_routing_weight:

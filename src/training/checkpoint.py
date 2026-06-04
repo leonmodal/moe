@@ -74,6 +74,10 @@ def save_checkpoint(
         os.makedirs(tmp_dir, exist_ok=True)
     # Every rank writes into `tmp_dir`; main must create it first.
     barrier()
+    # On multi-node Modal volumes, the directory creation from rank 0 can be
+    # visible to other containers slightly after the process barrier. Let every
+    # rank idempotently materialize the path before writing per-rank data state.
+    os.makedirs(tmp_dir, exist_ok=True)
 
     if FSDP is not None and isinstance(model, FSDP):
         save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)

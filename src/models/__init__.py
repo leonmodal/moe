@@ -29,6 +29,9 @@ __all__ = [
     "MoEverythingConfig",
     "MoEverythingForCausalLM",
     "MoEverythingModel",
+    "RecurrentMoEConfig",
+    "RecurrentMoEForCausalLM",
+    "RecurrentMoEModel",
 ]
 
 _LAZY_IMPORTS = {
@@ -48,6 +51,9 @@ _LAZY_IMPORTS = {
     "MoEverythingConfig": ("src.models.moe_everything", "MoEverythingConfig"),
     "MoEverythingForCausalLM": ("src.models.moe_everything", "MoEverythingForCausalLM"),
     "MoEverythingModel": ("src.models.moe_everything", "MoEverythingModel"),
+    "RecurrentMoEConfig": ("src.models.recurrent_moe", "RecurrentMoEConfig"),
+    "RecurrentMoEForCausalLM": ("src.models.recurrent_moe", "RecurrentMoEForCausalLM"),
+    "RecurrentMoEModel": ("src.models.recurrent_moe", "RecurrentMoEModel"),
 }
 
 

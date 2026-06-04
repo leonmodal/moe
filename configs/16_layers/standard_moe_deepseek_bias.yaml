@@ -50,11 +50,11 @@ model:
   type: standard_moe
   vocab_size: 151936
 training:
-  batch_size: 32
+  batch_size: 16
   beta1: 0.9
   beta2: 0.95
   disable_liger: true
-  gradient_accumulation: 2
+  gradient_accumulation: 1
   gradient_checkpointing: false
   learning_rate: 0.001
   log_every: 1

@@ -72,16 +72,74 @@ if training and exploration_rate > 0:
 
 Binary hard router: each token picks ATTENTION (0) or MLP (1).
 
+Softmax branch routing is used when `branch_router.balancing` is
+`none`, `sampling_entropy`, `aux_loss`, `seq_aux_loss`, or
+`exploration_only` without the legacy `branch_deepseek: true` flag:
+
 ```
 logits = linear(hidden_state)  # [batch*seq, 2]
-probs = softmax(logits)
-choice = argmax(probs)         # hard decision
-weight = probs[choice]         # soft weight for scaling
+scores = softmax(logits)
+choice = argmax(scores)        # hard decision
+weight = scores[choice]        # differentiable weight for scaling
 
 output = weight * selected_branch(hidden_state)
 ```
 
-The hard decision makes this non-differentiable at the selection point, but the soft weight multiplication keeps gradients flowing to the router.
+`fixed_alternating` bypasses the learned branch gate: even depths choose
+attention and odd depths choose MLP. It records the same branch telemetry
+but has no branch-router parameters or branch balancing state.
+
+DeepSeek branch routing is used when `branch_router.balancing:
+deepseek_bias` is selected, or when the legacy `branch_deepseek: true`
+flag is set. It is **two independent sigmoid scores**, not a two-class
+softmax:
+
+```
+logits = linear(hidden_state)       # [batch*seq, 2]
+scores = sigmoid(logits)            # scores do not sum to 1
+scores_biased = scores + expert_bias
+choice = argmax(scores_biased)      # hard decision
+weight = scores[choice]             # unbiased sigmoid score for gradient
+
+output = weight * selected_branch(hidden_state)
+```
+
+The hard decision makes this non-differentiable at the selection point,
+but the selected softmax probability or sigmoid score keeps gradients
+flowing to the router. In the DeepSeek path, `expert_bias` is a
+persistent buffer updated after the optimizer step from branch load
+counts; it is not a learned parameter.
+
+#### Sampling-entropy branch routing
+
+The active recompute configs use `branch_router.balancing:
+sampling_entropy`. In this mode, training-time branch choices are
+sampled from the two-way softmax categorical:
+
+```
+logits = linear(hidden_state)  # [batch*seq, 2]
+probs = softmax(logits)
+choice ~ Categorical(probs)    # training only
+weight = probs[choice]
+```
+
+The model also adds an entropy bonus by subtracting
+`entropy_coef(step) * entropy(probs)` from the loss. The active matrix
+sets:
+
+```yaml
+model:
+  branch_router:
+    balancing: sampling_entropy
+    entropy_coef: 0.01
+    entropy_decay: cosine
+    entropy_min: 0.0
+    entropy_decay_steps: 1000
+```
+
+So branch exploration is stochastic early, then the entropy pressure
+decays away and the router is free to specialize. This is the branch
+mode used by `per_head_recompute_k` and `per_head_recompute_kv` rows.
 
 #### Exploration-only branch routing
 
@@ -394,7 +452,7 @@ router.expert_bias = torch.zeros(num_experts)  # persistent buffer
 After each training step:
 1. **Count**: How many tokens went to each expert (tracked during forward pass)
 2. **All-reduce**: Sum counts across all ranks
-3. **Update**: applies the configured DEC-2 sign-update mode (default: nmoe / DeepSeek-V3 zero-sum); see "DEC-2 update modes" below.
+3. **Update**: applies the configured DEC-2 sign-update mode (default: nmoe-style zero-sum); see "DEC-2 update modes" below.
 4. **Clamp**: bias clamped to ±16 (DeepSeek-V3 scale guard).
 
 Experts that received too many tokens get their bias decreased (making them less likely to be selected). Experts that received too few get their bias increased.
@@ -406,13 +464,13 @@ selects between two reference formulations:
 
 | `bias_update_zero_sum` | Formula | Reference |
 |-----------------------|---------|-----------|
-| `True` (default) | `s = sign(load - 1/E)` ; `bias -= (s - s.mean()) * rate` | [`nmoe.Router.update_bias`](../nmoe/nmoe/model.py) (DeepSeek-V3-style). The mean-subtraction pins the cumulative bias mean at zero so `expert_bias` does not drift unboundedly under asymmetric loads. |
+| `True` (default) | `s = sign(load - 1/E)` ; `bias -= (s - s.mean()) * rate` | [`nmoe.Router.update_bias`](../nmoe/nmoe/model.py). The mean-subtraction pins the cumulative bias mean at zero so `expert_bias` does not drift unboundedly under asymmetric loads. |
 | `False` | `bias += sign(avg_load - load) * rate` (equivalent: `bias -= sign(load - 1/E) * rate`) | Megatron-LM `get_updated_expert_bias`. The mean is allowed to drift up to ±`rate` per step under asymmetric loads — still bounded by the clamp but otherwise unconstrained. |
 
 Both modes target the same intuition (overloaded experts → bias down,
 underloaded experts → bias up); the difference is whether the
 cumulative bias mean is pinned at zero. Pick `True` (default) to match
-nmoe / DeepSeek-V3; pick `False` to reproduce Megatron-LM's published
+nmoe; pick `False` to reproduce Megatron-LM's published
 balancing recipe exactly.
 
 ### Per-layer vs Global bias updates

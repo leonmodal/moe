@@ -18,6 +18,10 @@ torchrun --nproc_per_node=8 scripts/train.py --config config.yaml --dist-strateg
 
 ```bash
 torchrun --nproc_per_node=8 scripts/train.py --config config.yaml --dist-strategy fsdp
+# DDP-like replicated parameters through FSDP:
+torchrun --nproc_per_node=8 scripts/train.py --config config.yaml --dist-strategy fsdp --fsdp-sharding-strategy no_shard
+# Shard within node, replicate across nodes:
+torchrun --nproc_per_node=8 scripts/train.py --config config.yaml --dist-strategy fsdp --fsdp-sharding-strategy hybrid_shard
 ```
 
 `src/training/distributed.py::wrap_model` selects an FSDP policy per model family. Every family gets a real `FullyShardedDataParallel` wrapper — `--dist-strategy fsdp` never silently substitutes DDP.
@@ -27,11 +31,11 @@ torchrun --nproc_per_node=8 scripts/train.py --config config.yaml --dist-strateg
 | `dense` | `FULL_SHARD` | `True` | `MixedPrecision(param_dtype=reduce_dtype=training.mixed_precision, buffer_dtype=fp32)` | default (single root unit) |
 | `standard_moe` | `FULL_SHARD` | `True` | same | default |
 | `global_moe` | `FULL_SHARD` | `True` | same | default |
-| `moe_everything` | `NO_SHARD` | `True` | **not set** (see §MoE-Everything notes) | `ModuleWrapPolicy({AttentionExpertBank, MlpExpertBank, BranchRouter, nn.Embedding, nn.Linear, Qwen3MoeRMSNorm})` |
+| `moe_everything` | `NO_SHARD` | `True` | **not set** (see §MoE-Everything notes) | `ModuleWrapPolicy({AttentionExpertBank, MlpExpertBank, BranchRouter, Qwen3MoeRMSNorm})` |
 
 Shared across all FSDP paths: `sync_module_states=True`, `device_id=torch.device("cuda", local_rank)`, `use_orig_params=True`.
 
-The per-family selection tables live in `_FSDP_SHARDING_BY_MODEL_TYPE` and `_FSDP_SKIP_MIXED_PRECISION`; the MoE-Everything `auto_wrap_policy` is built by `_moe_everything_auto_wrap_policy()`.
+The per-family selection tables live in `_FSDP_SHARDING_BY_MODEL_TYPE` and `_FSDP_SKIP_MIXED_PRECISION`; the MoE-Everything `auto_wrap_policy` is built by `_moe_everything_auto_wrap_policy()`. `training.fsdp_sharding_strategy` or CLI `--fsdp-sharding-strategy` can override the default with `auto`, `full_shard`, `shard_grad_op`, `no_shard`, or `hybrid_shard`. Any explicit `no_shard` run skips FSDP-level `MixedPrecision` and relies on the trainer's autocast path.
 
 #### MoE-Everything notes
 
@@ -40,7 +44,9 @@ MoE-Everything's branch-routed forward leaves whole FSDP flat-params units with 
 - `FULL_SHARD` / `SHARD_GRAD_OP` fire `ValueError: expected [FORWARD_BACKWARD] but current state is IDLE` from the post-backward hook of whichever flat-params unit was inactive for the step. `use_orig_params=True` alone does not suppress it.
 - `NO_SHARD` + `MixedPrecision(param_dtype=bf16)` trips `RuntimeError: setStorage: ... storage of size 0` on the embedding flat-param during backward because the FSDP-internal fp32 master storage is freed while the bf16 shard is still in use.
 
-The per-family policy sidesteps both: `NO_SHARD` keeps parameters replicated (DDP-like layout) so sharded post-backward hooks never fire on inactive shards; the `auto_wrap_policy` splits the expert banks and router into their own FSDP units so any residual sparse gradient activity stays localised; and skipping the FSDP-level `MixedPrecision` leaves embedding params in fp32 while the trainer's outer `torch.autocast` still runs the forward in `training.mixed_precision`. Both `moe_everything_fully_independent` and `moe_everything_precompute_kv` pass the 7-variant × 2-strategy subprocess smoke (`tests/test_trainer_distributed_smoke.py`) under `--dist-strategy fsdp`.
+The per-family policy sidesteps both: `NO_SHARD` keeps parameters replicated (DDP-like layout) so sharded post-backward hooks never fire on inactive shards; the `auto_wrap_policy` splits the expert banks, branch router, and RMSNorm blocks into their own FSDP units while keeping the tied input embedding / LM head in the root unit; and skipping the FSDP-level `MixedPrecision` leaves embedding params in fp32 while the trainer's outer `torch.autocast` still runs the forward in `training.mixed_precision`.
+
+MoE-Everything's per-depth `torch.utils.checkpoint` loop is supported under this FSDP policy. Its output object is dict-like so FSDP can traverse the returned loss tensor and register pre-backward hooks; a plain custom object leaves FSDP in `TrainingState.IDLE` at backward. The trainer asks MoE-Everything for `return_logits=False`, so the model-native fused linear CE path computes LM loss without returning full vocab logits. The smoke matrix in `tests/test_trainer_distributed_smoke.py` keeps `gradient_checkpointing: true` for MoE-Everything and asserts both DDP and FSDP runs enable it.
 
 ### None (single GPU)
 
@@ -84,6 +90,8 @@ Configuration at top of `modal_train.py`:
 - `GPUS_PER_NODE`: GPUs per container (default 8)
 - `GPU_TYPE`: B200, H200, or H100
 - `TIMEOUT_HOURS`: Max wall-clock time
+- `DIST_STRATEGY`: default `fsdp`
+- `FSDP_SHARDING_STRATEGY`: default `auto` (standard/dense/global use `FULL_SHARD`; MoE-Everything uses `NO_SHARD`)
 
 The launcher uses `torchrun` with RDMA-enabled NCCL communication. The exact command shape is built by `modal_train.build_torchrun_invocation(...)` and pinned by `tests/test_modal_launcher.py`.
 
@@ -93,7 +101,7 @@ The launcher uses `torchrun` with RDMA-enabled NCCL communication. The exact com
 
 - `setup_distributed()` — Initialize process group, set devices, return rank/device info
 - `cleanup_distributed()` — Destroy process group
-- `wrap_model(model, *, strategy, local_rank, mixed_precision_name, model_type)` — Apply DDP or FSDP wrapping; selects the per-family FSDP policy shown in §FSDP above
+- `wrap_model(model, *, strategy, local_rank, mixed_precision_name, model_type, fsdp_sharding_strategy)` — Apply DDP or FSDP wrapping; selects the per-family FSDP policy shown in §FSDP above unless an explicit FSDP sharding override is provided
 - `unwrap_model(model)` — Get underlying model from the wrapper
 - `describe_wrapper(model)` — Human-readable wrapper summary for the trainer banner (see §Trainer banner)
 - `barrier()` — Distributed barrier with CUDA device

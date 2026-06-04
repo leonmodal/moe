@@ -1,124 +1,117 @@
-# MoE config matrix
+# MoE Launch Configs
 
-This directory holds the active configuration matrix the trainer
-loads via `python scripts/train.py --config configs/<depth>/<file>.yaml`.
-The matrix is locked by `tests/test_nested_configs_drift.py` and
-`scripts/validate_configs.py`.
+The active training set lives only under `configs/16_layers/` and is locked by
+`tests/test_nested_configs_drift.py` plus `scripts/validate_configs.py`.
 
-## Folder layout
+## Active Set
 
-The active matrix lives under three depth directories:
+- `standard_moe_deepseek_bias.yaml`
+- `moe_everything_per_head_recompute_k_qk_v_o_deepseek_bias.yaml`
+- `moe_everything_per_head_recompute_k_qk_v_o_ema_qk_v_deepseek_bias.yaml`
+- `moe_everything_per_head_recompute_kv_qk_v_o_deepseek_bias.yaml`
+- `moe_everything_per_head_recompute_kv_qk_v_o_ema_qk_v_deepseek_bias.yaml`
 
-- `configs/4_layers/` — 13 yamls
-- `configs/8_layers/` — 13 yamls
-- `configs/16_layers/` — 13 yamls
+All five configs use `model.num_hidden_layers: 16`.
 
-Total: 39 yamls. Drift tests fail if this count is wrong.
+All four `moe_everything` configs use fully per-depth router/norm state:
 
-## Depth ↔ `model.num_hidden_layers`
+```yaml
+per_layer_router: true
+per_layer_mlp_router: true
+per_layer_attn_router: true
+per_layer_norm: true
+per_layer_qk_norm: true
+```
 
-The folder name documents the **depth axis** of the matrix. The
-mapping between folder and `model.num_hidden_layers` is:
+## Attention Variants
 
-| Folder | `model.num_hidden_layers` for `dense` / `standard_moe` / `global_moe` | `model.num_hidden_layers` for `moe_everything` |
-|--------|----------------------------------------------------------------------|-----------------------------------------------|
-| `configs/4_layers/` | 4 | 8 (`moe_everything` runs 2× depth iterations per "layer" because the branch router routes per depth call) |
-| `configs/8_layers/` | 8 | 16 |
-| `configs/16_layers/` | 16 | 32 (large; only viable on H200-class hardware) |
+The four `moe_everything` rows all use:
 
-The non-`moe_everything` families consume one `num_hidden_layers`
-value directly. `moe_everything` doubles it because each depth in the
-shared backbone runs both an attention branch and an MLP branch under
-the branch router; the configs follow that convention so the depth
-axis lines up across families.
+```yaml
+attn_routing_bundle: qk_v_o
+```
 
-## Family × method matrix
+That means Q/K share one route, V routes separately, and O routes separately
+after attention. O is token-local and is never part of sequence-side
+recompute.
 
-Each depth directory contains one yaml per `(family, method)` pair,
-plus one `dense.yaml` row:
+The two recompute modes are:
 
-| Family | Methods | Filename pattern |
-|--------|---------|------------------|
-| `dense` | (no balancing — n/a) | `dense.yaml` |
-| `standard_moe` | `aux_loss`, `deepseek_bias`, `quantile` | `standard_moe_<method>.yaml` |
-| `global_moe` | `aux_loss`, `deepseek_bias`, `quantile` | `global_moe_<method>.yaml` |
-| `moe_everything` (`per_head_fully_independent`) | `aux_loss`, `deepseek_bias`, `quantile` | `moe_everything_per_head_fully_independent_<method>.yaml` |
-| `moe_everything` (`per_head_precompute_kv`) | `aux_loss`, `deepseek_bias`, `quantile` | `moe_everything_per_head_precompute_kv_<method>.yaml` |
+- `per_head_recompute_k`: recompute K by the current token's Q/K route; V is
+  projected once from its token-routed V table.
+- `per_head_recompute_kv`: recompute K by Q/K route and V by the current
+  token's V route.
 
-Total per depth: 1 dense + 4 MoE families × 3 methods = 13 yamls.
+The EMA rows additionally set:
 
-## Required active knobs per method
+```yaml
+attn_router_context: ema_qk_v
+attn_router_context_decay: 0.95
+```
 
-Every per-class block (`model.{mlp,attn,branch}_router`) whose
-`balancing` is one of the matrix methods MUST carry the matching
-active knob at the matrix value:
+This changes only QK and V router inputs. Those routers see:
 
-| `balancing` | Required active knob | Value |
-|-------------|---------------------|-------|
-| `aux_loss` | `router_aux_loss_coef` | `0.001` |
-| `seq_aux_loss` | `seq_aux_loss_coef` | `0.0001` |
-| `deepseek_bias` | `bias_update_rate` | `0.001` |
-| `quantile` | `quantile_eta`, `quantile_target_q`, `quantile_global_state` | `0.005`, `0.5`, `True` |
+```text
+concat(normed_h_t, ema(normed_h_<t))
+```
 
-Validators (`scripts/validate_configs.py` strict mode + the pytest
-drift suite) fail if a matrix yaml is missing the active knob or
-carries an off-axis knob.
+The EMA is causal: token `t` never sees itself or future tokens in the prefix
+summary. Projection inputs remain the normal hidden states.
 
-## DEC-6 branch contract
+## Router Balancing
 
-Every yaml whose `model.attn_expert_mode == per_head_precompute_kv`
-MUST set the branch router to the documented exploration_only
-schedule:
+Every active row uses DeepSeek-style bias balancing for MLP routing. The
+`moe_everything` rows also use DeepSeek-style bias balancing for attention
+routers:
+
+```yaml
+mlp_router:
+  balancing: deepseek_bias
+  bias_update_rate: 0.001
+  bias_update_zero_sum: true
+attn_router:
+  balancing: deepseek_bias
+  bias_update_rate: 0.001
+  bias_update_zero_sum: true
+```
+
+The focused qkvo + recompute-KV branch-router ablation uses three branch
+contracts over the same attention/MLP expert setup:
+
+```yaml
+branch_router:
+  balancing: sampling_entropy
+  entropy_coef: 0.01
+  entropy_decay: cosine
+  entropy_min: 0.0
+  entropy_decay_steps: 1000
+```
 
 ```yaml
 branch_router:
   balancing: exploration_only
-  exploration_rate: 0.1
+  exploration_rate: 0.10
   exploration_decay: cosine
-  exploration_min: 0.01
+  exploration_min: 0.0
   exploration_warmup_steps: 1000
 ```
 
-The drift test `test_precompute_kv_rows_set_dec6_branch_exploration`
-and the CLI validator both enforce this.
+```yaml
+branch_router:
+  balancing: fixed_alternating
+```
 
-## Top-level fields are forbidden in matrix yamls
+The corresponding configs are:
 
-After migration, active matrix yamls MUST NOT carry:
+- `16_layers/moe_everything_per_head_recompute_kv_qkvo_branch_sampling_entropy.yaml`
+- `16_layers/moe_everything_per_head_recompute_kv_qkvo_branch_top1_explore_decay.yaml`
+- `16_layers/moe_everything_per_head_recompute_kv_qkvo_branch_fixed_alternating.yaml`
 
-- `training.load_balancing_method` (per-class blocks are
-  authoritative)
-- `training.router_aux_loss_coef`
-- `training.seq_aux_loss_coef`
-- `training.bias_update_rate`
-- `training.bias_update_zero_sum`
-- `training.bias_warmup_start`
-- `training.bias_warmup_steps`
+## Validation
 
-The strict mode in `scripts/validate_configs.py` rejects any of these
-on a yaml under `configs/{4,8,16}_layers/`. Yamls under
-`configs/extras/` are exempt as legacy / non-matrix fixtures.
+Run:
 
-## Adding a new yaml to the matrix
-
-1. Pick a `(depth, family, method)` triple. The matrix is locked at
-   13 per depth × 3 depths = 39; adding a new triple requires
-   updating `_MATRIX_FAMILIES` / `_MATRIX_METHODS` in
-   `tests/test_nested_configs_drift.py` first.
-2. Author the yaml in the right `configs/<depth>_layers/` directory.
-3. Use the per-class blocks (`mlp_router`, `attn_router`,
-   `branch_router`) — never top-level balancing fields.
-4. For `per_head_precompute_kv` rows, follow the DEC-6 branch
-   contract above.
-5. Run `python scripts/validate_configs.py` (must pass) and
-   `python -m pytest tests/test_nested_configs_drift.py` (must pass)
-   before committing.
-
-## `configs/extras/`
-
-Non-matrix yamls (sanity / perlayer_prenorm / experimental seq_aux
-variants / Round-26 nested examples that predate the 13×3 layout)
-live under `configs/extras/`. These pass the validator's basic
-checks but are exempt from the strict-mode active-matrix rules.
-They are NOT part of the AC-18 matrix and should not be referenced
-in benchmark sweeps.
+```bash
+python scripts/validate_configs.py
+python -m pytest tests/test_nested_configs_drift.py
+```

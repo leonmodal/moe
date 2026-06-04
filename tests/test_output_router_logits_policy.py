@@ -93,7 +93,7 @@ def _make_yaml(method: str | None, tmp: Path, family: str = "standard_moe") -> P
             "use_deepseek_routing": method == "deepseek_bias",
             "num_attn_experts": 2,
             "num_attn_experts_per_tok": 1,
-            "attn_expert_mode": "per_head_fully_independent",
+            "attn_expert_mode": "per_head_no_recompute",
             "branch_router_aux_loss_coef": 0.0,
         })
     else:
@@ -401,7 +401,7 @@ def test_detached_telemetry_fallback_in_compute_output_metrics(family, method):
             cfg = cfg_mod.load_config(str(yaml_path))
         model, model_cfg = mf.build_model(cfg)
     model.train()
-    # `moe_everything` per_head_fully_independent attention bank has CPU
+    # `moe_everything` per_head_no_recompute attention bank has CPU
     # batch-shape constraints; use a single-batch input there.
     if family == "moe_everything":
         _force_branch_routers_to_mlp(model)
@@ -503,7 +503,7 @@ def test_moe_everything_aux_method_forward_keeps_grad_bearing_mlp_router_logits(
     _force_branch_routers_to_mlp(model)
 
     # Use a small input that the moe_everything CPU path can handle.
-    # `per_head_fully_independent` mode has CPU shape constraints around the
+    # `per_head_no_recompute` mode has CPU shape constraints around the
     # attention bank but the MLP path itself is fine.
     input_ids = torch.randint(0, model.vocab_size, (1, 4), dtype=torch.long)
     out = model(input_ids=input_ids, labels=input_ids, output_router_logits=True)

@@ -13,9 +13,12 @@ torchrun --nproc_per_node=8 scripts/train.py --config configs/standard_moe.yaml
 
 # FSDP
 torchrun --nproc_per_node=8 scripts/train.py --config configs/standard_moe.yaml --dist-strategy fsdp
+
+# FSDP with replicated parameters, used by the Modal launcher by default
+torchrun --nproc_per_node=8 scripts/train.py --config configs/standard_moe.yaml --dist-strategy fsdp --fsdp-sharding-strategy no_shard
 ```
 
-The trainer supports all model types: `dense`, `standard_moe`, `global_moe`, `moe_everything`.
+The trainer supports all model types: `dense`, `standard_moe`, `global_moe`, `moe_everything`. MoE-Everything gradient checkpointing is covered under both DDP and FSDP in the distributed smoke tests.
 
 ## Training Library
 
@@ -77,9 +80,131 @@ Configuration:
 - Auxiliary losses computed per model type:
   - `aux_loss`: Router auxiliary loss (batch-level)
   - `seq_aux_loss`: Sequence-level auxiliary loss
-  - `branch_aux_loss`: Branch router loss (not used — BranchRouter has no load-balancing loss by design)
+  - `branch_aux_loss`: Branch router auxiliary/sequence loss when `model.branch_router.balancing` selects it
   - `attention_aux_loss`: Attention routing auxiliary loss
   - `aux_loss_normalized`: Normalized load-balancing metric
+
+## Eval And Routing Artifacts
+
+Every enabled validation run writes local eval metrics in addition to console
+and WandB logging:
+
+```text
+<output_dir>/
+  eval_logs/
+    eval_metrics.jsonl
+    step_00000250/
+      metrics.json
+      branch_patterns/
+        token_routes.csv
+        token_routes.md
+        top_patterns.csv
+        depth_summary.csv
+        summary.md
+        top_patterns.png
+        top_pattern_matrix.png
+        branch_depth_ratios.png
+      load_balancing/
+        summary.csv
+        expert_load.csv
+        bias.csv
+        summary.md
+        summary.png
+        attn/
+          <route>/
+            summary.md
+            summary.csv
+            expert_load.csv
+            bias.csv
+            heatmap.png
+            global_histogram.png
+            per_layer_histograms.png
+            bias_by_expert.png
+        mlp/
+          summary.md
+          summary.csv
+          expert_load.csv
+          bias.csv
+          heatmap.png
+          global_histogram.png
+          per_layer_histograms.png
+          bias_by_expert.png
+        branch/
+          summary.md
+          summary.csv
+          expert_load.csv
+          heatmap.png
+          global_histogram.png
+          per_layer_histograms.png
+```
+
+`metrics.json` contains the step plus `eval/*` values such as
+`eval/ce_loss`, `eval/perplexity`, `eval/aux_loss`,
+`eval/branch_aux_loss`, `eval/branch_entropy_loss`, and
+`eval/attention_aux_loss`. For MoE-Everything eval forwards, the step folder
+also contains `branch_patterns/` and `load_balancing/` for the final
+validation batch on rank 0.
+
+MoE-Everything training routing snapshots also write token-preserving
+branch-route artifacts:
+
+```text
+<output_dir>/
+  routing_logs/
+    step_00000250/
+      branch_patterns/
+        token_routes.csv
+        token_routes.md
+        top_patterns.csv
+        depth_summary.csv
+        summary.md
+        top_patterns.png
+        top_pattern_matrix.png
+        branch_depth_ratios.png
+      load_balancing/
+        summary.csv
+        expert_load.csv
+        bias.csv
+        summary.md
+        summary.png
+        attn/<route>/
+        mlp/
+        branch/
+```
+
+The branch pattern legend is `A = attention branch`, `M = MLP branch`, and
+pattern characters are ordered by increasing depth. `token_routes.csv` is the
+canonical token-level table: it includes full-depth pattern counts/shares,
+per-token score summaries, and per-layer branch/attention/MLP expert columns.
+`token_routes.md` is the same sampled token table formatted for direct review,
+with compact per-depth route lines. `branch_patterns/summary.md` is the
+human-readable overview.
+`top_patterns.png` and `top_pattern_matrix.png` show the most common full-depth
+branch paths; `branch_depth_ratios.png` shows the attention/MLP ratio by depth.
+
+`load_balancing/summary.csv` is the high-level table for MLP, attention-router,
+and branch pools: active experts, peak-load-over-ideal, coefficient of
+variation, and normalized entropy. `load_balancing/summary.md` is the
+human-readable overview; `expert_load.csv` is the per-expert raw table.
+Detailed pool outputs are structured as `load_balancing/attn/<route>/`,
+`load_balancing/mlp/`, and `load_balancing/branch/`. Fixed-alternating branch
+routing does not create a `branch/` load-balancing folder because there is no
+learned branch router/bias to inspect; the deterministic A/M pattern still
+appears under `branch_patterns/`.
+
+Inside each pool folder, `global_histogram.png` shows aggregate expert usage,
+`per_layer_histograms.png` shows one expert histogram per depth, and
+`heatmap.png` plots per-depth expert fractions. If the pool owns DeepSeek- or
+quantile-style `expert_bias` buffers, `bias.csv` plus `bias_by_expert.png`
+show the current non-gradient router bias state. The bias plot is indexed by
+expert id and uses red bars for negative bias and green bars for positive
+bias. Under `global_router_update: true`, the bias is one shared vector per
+pool; per-layer routers store a broadcast copy for runtime use, but artifacts
+collapse it back to the conceptual global vector. The root
+`load_balancing/bias.csv` is the union across all routed pools.
+
+A small current-format static example is checked in under
+`docs/example_routing_outputs/`.
 
 ## Reference Loss Trajectories
 
@@ -108,8 +233,13 @@ Convert to safetensors: `python scripts/convert_checkpoint.py path/to/checkpoint
 
 Optional acceleration via `liger-kernel`:
 - Full mode for standard MoE models
-- Partial mode for moe_everything (rope + rms_norm only)
-- Disabled via `training.disable_liger: true` or `MOE_DISABLE_LIGER=1`
+- Partial patch mode for moe_everything (rope + rms_norm only). The trainer
+  uses MoE-Everything's model-native fused linear CE path by default for the
+  LM loss, so it does not materialize full vocab logits during train/eval loss
+  calls. SwigLU stays separate because MoE-Everything uses a custom grouped
+  expert bank.
+- The global Liger patch is disabled via `training.disable_liger: true` or
+  `MOE_DISABLE_LIGER=1`; MoE-Everything fused CE is its own model loss path.
 
 ## Modal Multi-Node
 

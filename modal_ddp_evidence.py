@@ -70,7 +70,7 @@ app = modal.App(
 # small synthetic tests; full bench uses NCCL).
 DDP_TESTS = [
     "tests/test_bias_update_lifecycle.py::test_ddp_two_rank_all_reduce_produces_identical_biases",
-    "tests/test_sanity_equivalence_precompute_kv.py::test_sanity_equivalence_ddp_per_rank_bias",
+    "tests/test_sanity_equivalence_recompute_kv.py::test_sanity_equivalence_ddp_per_rank_bias",
 ]
 
 

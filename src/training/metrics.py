@@ -18,6 +18,19 @@ logger = logging.getLogger(__name__)
 _WARNED_MISSING_EXPERT_INDICES = False
 
 
+def output_get(output, key: str, default=None):
+    if isinstance(output, dict):
+        return output.get(key, default)
+    return getattr(output, key, default)
+
+
+def output_set(output, key: str, value) -> None:
+    if isinstance(output, dict):
+        output[key] = value
+    else:
+        setattr(output, key, value)
+
+
 def get_selected_experts_for_seq_aux(model) -> tuple[torch.Tensor, ...] | None:
     """Extract per-layer selected expert indices from model internals.
 
@@ -65,14 +78,14 @@ def get_selected_experts_for_seq_aux(model) -> tuple[torch.Tensor, ...] | None:
 
 
 def get_output_selected_experts(output, model) -> tuple[torch.Tensor, ...] | None:
-    selected = getattr(output, "selected_experts", None)
+    selected = output_get(output, "selected_experts", None)
     if selected:
         return tuple(selected)
     return get_selected_experts_for_seq_aux(model)
 
 
 def get_output_router_token_masks(output, model=None) -> tuple[torch.Tensor | None, ...] | None:
-    masks = getattr(output, "router_token_masks", None)
+    masks = output_get(output, "router_token_masks", None)
     if masks:
         return tuple(masks)
     # Detach-only fallback: when the model's forward skipped writing router_token_masks
@@ -155,6 +168,94 @@ def _collect_detached_router_scores(model) -> tuple[torch.Tensor, ...] | None:
     return tuple(snapshots) if snapshots else None
 
 
+def _top_k_for_router_width(model_cfg, num_experts: int) -> int:
+    if int(getattr(model_cfg, "boundary_num_experts", -1) or -1) == int(num_experts):
+        return int(
+            getattr(
+                model_cfg,
+                "boundary_num_experts_per_tok",
+                getattr(model_cfg, "num_experts_per_tok", 2),
+            )
+        )
+    return int(getattr(model_cfg, "num_experts_per_tok", 2))
+
+
+def _group_router_metric_inputs(
+    router_logits: tuple[torch.Tensor, ...] | None,
+    selected_experts: tuple[torch.Tensor, ...] | None,
+    router_token_masks: tuple[torch.Tensor | None, ...] | None,
+    model_cfg,
+) -> list[dict[str, object]]:
+    """Group router telemetry by expert-pool shape.
+
+    Recurrent global MoE mixes boundary routers (small per-layer pools) with
+    recurrent routers (larger shared pool). The load-balancing helpers assume
+    a homogeneous expert dimension per call, so metrics split mixed telemetry
+    into homogeneous groups and average the resulting per-router losses.
+    """
+    if router_logits is None or not isinstance(router_logits, tuple):
+        return []
+
+    use_selected = selected_experts is not None and len(selected_experts) == len(router_logits)
+    use_masks = router_token_masks is not None and len(router_token_masks) == len(router_logits)
+    grouped: dict[tuple[int, int], dict[str, object]] = {}
+
+    for idx, scores in enumerate(router_logits):
+        if scores is None or scores.ndim != 2 or scores.shape[0] == 0:
+            continue
+        num_experts = int(scores.shape[-1])
+        selected = None
+        if use_selected:
+            candidate = selected_experts[idx]
+            if candidate is not None and candidate.shape[0] == scores.shape[0]:
+                selected = candidate
+
+        token_mask = None
+        if use_masks:
+            candidate_mask = router_token_masks[idx]
+            if candidate_mask is not None and candidate_mask.numel() == scores.shape[0]:
+                token_mask = candidate_mask
+
+        top_k = int(selected.shape[-1]) if selected is not None else _top_k_for_router_width(model_cfg, num_experts)
+        key = (num_experts, top_k)
+        group = grouped.setdefault(key, {"logits": [], "selected": [], "masks": []})
+        group["logits"].append(scores)
+        group["selected"].append(selected)
+        group["masks"].append(token_mask)
+
+    return list(grouped.values())
+
+
+def _weighted_router_metric(groups: list[dict[str, object]], fn, **kwargs):
+    total = None
+    weight_sum = 0
+    for group in groups:
+        logits = tuple(group["logits"])
+        if not logits:
+            continue
+        num_experts = int(logits[0].shape[-1])
+        selected = tuple(group["selected"])
+        masks = tuple(group["masks"])
+        top_k = int(selected[0].shape[-1]) if selected and selected[0] is not None else _top_k_for_router_width(
+            kwargs["model_cfg"],
+            num_experts,
+        )
+        loss = fn(
+            logits,
+            num_experts,
+            top_k,
+            selected_experts=selected,
+            token_masks=masks,
+            **{k: v for k, v in kwargs.items() if k != "model_cfg"},
+        )
+        weight = len(logits)
+        total = loss * weight if total is None else total + loss * weight
+        weight_sum += weight
+    if total is None or weight_sum == 0:
+        return None
+    return total / weight_sum
+
+
 def compute_output_metrics(
     output,
     raw_model,
@@ -170,37 +271,40 @@ def compute_output_metrics(
     router_token_masks = get_output_router_token_masks(output, raw_model)
     selected_experts = get_output_selected_experts(output, raw_model)
 
-    aux = getattr(output, "aux_loss", None)
+    aux = output_get(output, "aux_loss", None)
     aux_normalized = None
     # DETACH-ONLY: when the model output's `router_logits` is None
     # (non-aux method that skips the gradient-bearing path), fall back to
     # the per-router `_last_router_scores_detached` snapshot. Telemetry
     # remains available without retaining the autograd graph.
-    router_logits_for_metrics = getattr(output, "router_logits", None)
+    router_logits_for_metrics = output_get(output, "router_logits", None)
     if router_logits_for_metrics is None:
         router_logits_for_metrics = _collect_detached_router_scores(raw_model)
     if router_logits_for_metrics is not None:
-        aux_normalized = normalized_load_balancing_loss_func(
+        router_metric_groups = _group_router_metric_inputs(
             router_logits_for_metrics,
-            model_cfg.num_experts,
-            model_cfg.num_experts_per_tok,
-            token_masks=router_token_masks,
-            selected_experts=selected_experts,
+            selected_experts,
+            router_token_masks,
+            model_cfg,
         )
-    ce_tensor = getattr(output, "ce_loss", None)
-    seq_aux = getattr(output, "seq_aux_loss", None)
+        aux_normalized = _weighted_router_metric(
+            router_metric_groups,
+            normalized_load_balancing_loss_func,
+            model_cfg=model_cfg,
+        )
+    ce_tensor = output_get(output, "ce_loss", None)
+    seq_aux = output_get(output, "seq_aux_loss", None)
     if seq_aux is None and seq_aux_loss_coef > 0 and router_logits_for_metrics is not None:
         # Detach-only telemetry: same detached fallback for seq aux telemetry.
-        seq_aux = seq_load_balancing_loss_func(
-            router_logits_for_metrics,
-            model_cfg.num_experts,
-            model_cfg.num_experts_per_tok,
+        seq_aux = _weighted_router_metric(
+            router_metric_groups,
+            seq_load_balancing_loss_func,
+            model_cfg=model_cfg,
             batch_size=input_ids.shape[0],
-            selected_experts=selected_experts,
-            token_masks=router_token_masks,
         )
-    branch_aux = getattr(output, "branch_aux_loss", None)
-    attention_aux = getattr(output, "attention_aux_loss", None)
+    branch_aux = output_get(output, "branch_aux_loss", None)
+    branch_entropy = output_get(output, "branch_entropy_loss", None)
+    attention_aux = output_get(output, "attention_aux_loss", None)
 
     # Batch every tensor we need to read onto the host into a single
     # stacked tensor. Previously each `.item()` call was its own device→host
@@ -215,12 +319,14 @@ def compute_output_metrics(
             _positions[name] = len(_tensors)
             _tensors.append(value.detach().float().reshape(()))
 
-    _maybe_enqueue("total", output.loss)
+    output_loss = output_get(output, "loss")
+    _maybe_enqueue("total", output_loss)
     _maybe_enqueue("aux", aux)
     _maybe_enqueue("aux_normalized", aux_normalized)
     _maybe_enqueue("ce", ce_tensor)
     _maybe_enqueue("seq_aux", seq_aux)
     _maybe_enqueue("branch_aux", branch_aux)
+    _maybe_enqueue("branch_entropy", branch_entropy)
     _maybe_enqueue("attention_aux", attention_aux)
     if _tensors:
         _stacked = torch.stack(_tensors).tolist()
@@ -235,11 +341,12 @@ def compute_output_metrics(
             return default
         return float(raw)
 
-    total_value = _resolve("total", output.loss)
+    total_value = _resolve("total", output_loss)
     aux_value = _resolve("aux", aux)
     aux_normalized_value = _resolve("aux_normalized", aux_normalized)
     seq_aux_value = _resolve("seq_aux", seq_aux)
     branch_aux_value = _resolve("branch_aux", branch_aux)
+    branch_entropy_value = _resolve("branch_entropy", branch_entropy)
     attention_aux_value = _resolve("attention_aux", attention_aux)
 
     if ce_tensor is None:
@@ -259,6 +366,7 @@ def compute_output_metrics(
         "aux_loss_normalized": aux_normalized_value,
         "seq_aux_loss": seq_aux_value,
         "branch_aux_loss": branch_aux_value,
+        "branch_entropy_loss": branch_entropy_value,
         "attention_aux_loss": attention_aux_value,
     }
     return metrics, selected_experts, router_token_masks

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
+
 import torch
 import torch.distributed as dist
 
@@ -338,38 +340,39 @@ def update_expert_biases(
         "branch": getattr(config, "branch_balancing", None),
     }
 
-    for owner, label in get_owners():
-        # Skip branch routers in exploration-only mode: the mode is
-        # by construction independent of the bias-update signal, so
-        # nudging `expert_bias` here would do nothing routing-wise
-        # AND could accumulate spurious nonzero values that surprise
-        # checkpoint-resume / state-dict diff readers.
-        if (
-            label == "branch"
-            and getattr(owner, "balancing", "none") == "exploration_only"
-        ):
+    owners = list(get_owners())
+
+    # MoE-Everything uses shared expert banks across depth. With
+    # `global_router_update=True`, the DeepSeek bias is therefore a
+    # bank-level correction signal, not a per-depth correction. Aggregate
+    # counts across all routers in the same pool, update one bias vector,
+    # then broadcast that vector back to every per-layer/per-slot router
+    # that consumes the pool.
+    use_global_router_update = (
+        bool(getattr(config, "global_router_update", False))
+        and getattr(config, "model_type", None) in {"moe_everything", "recurrent_moe_everything"}
+    )
+    if use_global_router_update:
+        _update_global_router_bias_groups(
+            owners,
+            model_method=method,
+            label_to_class_method=label_to_class_method,
+            rates=rates,
+            distributed=use_dist,
+            zero_sum=zero_sum,
+            per_proj_zero_sum=per_proj_zero_sum,
+        )
+        return
+
+    for owner, label in owners:
+        owner_method = _owner_bias_update_method(
+            owner,
+            label,
+            model_method=method,
+            label_to_class_method=label_to_class_method,
+        )
+        if owner_method is None:
             continue
-        # Per-class gate: route each owner through the matching
-        # single-owner helper based on its per-class method (or
-        # the model-level fallback when the per-class field is
-        # unset). When set to `deepseek_bias` or `quantile`, we
-        # dispatch to the corresponding helper. Explicit non-bias
-        # per-class methods (e.g. `aux_loss`, `seq_aux_loss`,
-        # `none`) skip the owner.
-        class_method = label_to_class_method.get(label)
-        if class_method in _BIAS_UPDATE_METHODS:
-            owner_method = class_method
-        elif class_method is not None:
-            # explicit non-bias per-class method => skip this owner.
-            continue
-        elif method in _BIAS_UPDATE_METHODS:
-            # No per-class field; fall back to the model-level method.
-            owner_method = method
-        else:
-            # Legacy back-compat: caller didn't stamp a model-level
-            # method either, so default to deepseek_bias to preserve
-            # the original unconditional update.
-            owner_method = "deepseek_bias"
         if owner_method == "quantile":
             _update_single_router_quantile_bias(owner, distributed=use_dist)
             continue
@@ -379,14 +382,168 @@ def update_expert_biases(
             if per_proj_zero_sum is not None else zero_sum
         )
         _update_single_router_bias(owner, rate, use_dist, zero_sum=owner_zero_sum)
-        # Bound quantile accumulator memory on owners running the
-        # deepseek path. The forward unconditionally appends scores
-        # to `local_quantile_scores` (it doesn't know which method
-        # is active for each owner); without an explicit drain on
-        # non-quantile owners, the list would grow unboundedly across
-        # training steps.
-        if hasattr(owner, "local_quantile_scores") and owner.local_quantile_scores:
-            owner.local_quantile_scores = []
+        _drain_quantile_scores(owner)
+
+
+def _owner_bias_update_method(
+    owner,
+    label: str,
+    *,
+    model_method: str | None,
+    label_to_class_method: dict[str, str | None],
+) -> str | None:
+    # Skip branch routers in exploration-only mode: the mode is by
+    # construction independent of the bias-update signal, so nudging
+    # `expert_bias` here would do nothing routing-wise AND could accumulate
+    # spurious nonzero values that surprise checkpoint-resume / state-dict
+    # diff readers.
+    if label == "branch" and getattr(owner, "balancing", "none") == "exploration_only":
+        return None
+
+    # Per-class gate: route each owner through the matching single-owner
+    # helper based on its per-class method, or the model-level fallback when
+    # the per-class field is unset. Explicit non-bias per-class methods
+    # skip the owner.
+    class_method = label_to_class_method.get(label)
+    if class_method in _BIAS_UPDATE_METHODS:
+        return class_method
+    if class_method is not None:
+        return None
+    if model_method in _BIAS_UPDATE_METHODS:
+        return model_method
+    # Legacy back-compat: caller didn't stamp a model-level method either,
+    # so default to deepseek_bias to preserve the original unconditional
+    # update.
+    return "deepseek_bias"
+
+
+def _drain_quantile_scores(owner) -> None:
+    # Bound quantile accumulator memory on owners running the deepseek path.
+    # The forward unconditionally appends scores to `local_quantile_scores`
+    # for routers that support quantile; without an explicit drain on
+    # non-quantile owners, the list would grow unboundedly across steps.
+    if hasattr(owner, "local_quantile_scores") and owner.local_quantile_scores:
+        owner.local_quantile_scores.clear()
+
+
+def _update_global_router_bias_groups(
+    owners: list[tuple[object, str]],
+    *,
+    model_method: str | None,
+    label_to_class_method: dict[str, str | None],
+    rates: dict[str, float],
+    distributed: bool,
+    zero_sum: bool,
+    per_proj_zero_sum: dict[str, bool] | None,
+) -> None:
+    groups: dict[tuple[str, str, tuple[int, ...]], list[object]] = defaultdict(list)
+    for owner, label in owners:
+        owner_method = _owner_bias_update_method(
+            owner,
+            label,
+            model_method=model_method,
+            label_to_class_method=label_to_class_method,
+        )
+        if owner_method is None:
+            continue
+        shape = tuple(getattr(owner, "expert_bias").shape)
+        groups[(label, owner_method, shape)].append(owner)
+
+    for (label, owner_method, _shape), group in groups.items():
+        if owner_method == "quantile":
+            _update_router_group_quantile_bias(group, distributed=distributed)
+            continue
+        owner_zero_sum = (
+            per_proj_zero_sum.get(label, zero_sum)
+            if per_proj_zero_sum is not None else zero_sum
+        )
+        _update_router_group_bias(
+            group,
+            bias_rate=rates.get(label, 0.0),
+            distributed=distributed,
+            zero_sum=owner_zero_sum,
+        )
+        for owner in group:
+            _drain_quantile_scores(owner)
+
+
+def _update_router_group_bias(
+    routers: list[object],
+    *,
+    bias_rate: float,
+    distributed: bool,
+    zero_sum: bool = True,
+) -> None:
+    if not routers:
+        return
+    first = routers[0]
+    device = first.expert_bias.device
+    counts = torch.zeros_like(first.local_tokens_per_expert, dtype=torch.float32, device=device)
+    current_bias = torch.zeros_like(first.expert_bias, dtype=torch.float32, device=device)
+    for router in routers:
+        counts += router.local_tokens_per_expert.to(device=device, dtype=torch.float32)
+        current_bias += router.expert_bias.to(device=device, dtype=torch.float32)
+    current_bias /= float(len(routers))
+
+    if distributed and dist.is_available() and dist.is_initialized():
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+
+    total = counts.sum()
+    loads = counts / total.clamp_min(1.0)
+    expected = 1.0 / counts.shape[0]
+    s = torch.sign(loads - expected)
+    nonzero = (total > 0).to(s.dtype)
+    if zero_sum:
+        next_bias = current_bias - (s - s.mean()) * bias_rate * nonzero
+    else:
+        next_bias = current_bias - s * bias_rate * nonzero
+    next_bias = next_bias.clamp(-16.0, 16.0)
+
+    for router in routers:
+        router.expert_bias.copy_(next_bias.to(device=router.expert_bias.device, dtype=router.expert_bias.dtype))
+        router.local_tokens_per_expert.zero_()
+
+
+def _update_router_group_quantile_bias(
+    routers: list[object],
+    *,
+    distributed: bool,
+) -> None:
+    if not routers:
+        return
+    from src.models.routing.bias import update_bias_from_quantile
+
+    first = routers[0]
+    device = first.expert_bias.device
+    scores_list = []
+    for router in routers:
+        scores_list.extend(getattr(router, "local_quantile_scores", None) or [])
+    if not scores_list:
+        return
+
+    shared_bias = torch.stack([
+        router.expert_bias.to(device=device, dtype=torch.float32)
+        for router in routers
+    ], dim=0).mean(dim=0)
+    shared_ema = torch.stack([
+        router.quantile_ema.to(device=device, dtype=torch.float32)
+        for router in routers
+    ], dim=0).mean(dim=0)
+    scores = torch.cat([score.to(device=device, dtype=torch.float32) for score in scores_list], dim=0)
+    target_q = float(getattr(first, "quantile_target_q", 0.5))
+    eta = float(getattr(first, "quantile_eta", 0.05))
+    update_bias_from_quantile(
+        shared_bias,
+        shared_ema,
+        scores,
+        target_q=target_q,
+        eta=eta,
+        distributed=distributed,
+    )
+    for router in routers:
+        router.expert_bias.copy_(shared_bias.to(router.expert_bias.device))
+        router.quantile_ema.copy_(shared_ema.to(router.quantile_ema.device))
+        router.local_quantile_scores.clear()
 
 
 def _update_single_router_bias(
@@ -441,7 +598,7 @@ def _update_single_router_bias(
         s = torch.sign(loads - expected)
         nonzero = (total > 0).to(s.dtype)
         if zero_sum:
-            # nmoe / DeepSeek-V3 zero-sum (mean-subtracted) update.
+            # nmoe-style zero-sum (mean-subtracted) update.
             router.expert_bias -= (s - s.mean()) * bias_rate * nonzero
         else:
             # Megatron-LM plain-sign update; equivalent to flipping the sign
@@ -493,7 +650,7 @@ def _update_single_router_quantile_bias(
         eta=eta,
         distributed=distributed,
     )
-    router.local_quantile_scores = []
+    router.local_quantile_scores.clear()
 
 
 def get_bias_rate(
@@ -593,22 +750,22 @@ def exploration_decay_schedule(
 
 
 def apply_branch_schedule_pre_forward(model, global_step: int) -> float | None:
-    """Apply the branch exploration_only schedule for `global_step`
-    BEFORE the forward pass for that step. Returns the rate that was
-    applied, or `None` if the feature is inactive on this model.
+    """Apply branch pre-forward schedules for `global_step`.
 
-    This is the canonical pre-forward hook the trainer calls once per
-    training step (and once after model construction / checkpoint
-    load) to keep the BranchRouter's `exploration_only_rate` aligned
-    with `p_explore(global_step)`. The rate the helper returns is
-    what the trainer's logging path should report for this step:
-    forward + backward + optimizer all run with exactly this rate
-    active.
+    For `exploration_only`, this pushes the scheduled random-override
+    rate into every active BranchRouter and returns that rate for the
+    existing logging path. For `sampling_entropy`, this stamps the
+    scheduled entropy coefficient on `model.config` so the forward pass
+    uses the coefficient that belongs to this exact step. The return
+    value remains the exploration-only rate for backwards-compatible
+    trainer logging.
     """
     rate = compute_branch_exploration_only_rate(model, global_step)
-    if rate is None:
-        return None
-    apply_branch_exploration_only_rate(model, rate)
+    if rate is not None:
+        apply_branch_exploration_only_rate(model, rate)
+    entropy_coef = compute_branch_entropy_coef(model, global_step)
+    if entropy_coef is not None:
+        apply_branch_entropy_coef(model, entropy_coef)
     return rate
 
 
@@ -801,6 +958,43 @@ def compute_branch_exploration_only_rate(model, global_step: int) -> float | Non
         decay_steps=decay_steps,
         final_rate=final,
     )
+
+
+def compute_branch_entropy_coef(model, global_step: int) -> float | None:
+    """Resolve the current branch entropy coefficient.
+
+    Returns `None` unless `model.config.branch_balancing` is
+    `sampling_entropy`. The schedule reuses the branch decay shapes:
+    constant, linear, or cosine from `branch_entropy_coef` toward
+    `branch_entropy_min` over `branch_entropy_decay_steps`.
+    """
+    raw_model = unwrap_model(model)
+    config = getattr(raw_model, "config", None)
+    if config is None:
+        return None
+    if getattr(config, "branch_balancing", "none") != "sampling_entropy":
+        return None
+    schedule = getattr(config, "branch_entropy_decay", "constant")
+    initial = float(getattr(config, "branch_entropy_coef", 0.0))
+    decay_steps = int(getattr(config, "branch_entropy_decay_steps", 0))
+    final = float(getattr(config, "branch_entropy_min", 0.0))
+    return exploration_decay_schedule(
+        global_step,
+        schedule=schedule,
+        initial_rate=initial,
+        decay_steps=decay_steps,
+        final_rate=final,
+    )
+
+
+def apply_branch_entropy_coef(model, coef: float) -> bool:
+    """Stamp the scheduled entropy coefficient on the model config."""
+    raw_model = unwrap_model(model)
+    config = getattr(raw_model, "config", None)
+    if config is None:
+        return False
+    config.current_branch_entropy_coef = float(coef)
+    return True
 
 
 def collect_router_z_loss(model) -> torch.Tensor | None:

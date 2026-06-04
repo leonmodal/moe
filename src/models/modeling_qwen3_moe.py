@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from src.models.fp32_routing import fp32_index_add, fp32_index_select
+from src.models.mask_compat import call_mask_function
 try:
     from src.models.triton_grouped_gemm import triton_grouped_gemm_output_input
 except ModuleNotFoundError:  # triton is CUDA-only; fall back when unavailable.
@@ -243,7 +244,7 @@ class Qwen3MoeExperts(nn.Module):
     ) -> torch.Tensor | None:
         if (
             os.environ.get("MOE_EVERYTHING_DISABLE_GROUPED_MM", "0") == "1"
-            or os.environ.get("MOE_EVERYTHING_DISABLE_MLP_GROUPED_MM", "1") == "1"
+            or os.environ.get("MOE_EVERYTHING_DISABLE_MLP_GROUPED_MM", "0") == "1"
         ):
             return None
         if (
@@ -587,6 +588,11 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeModelOutputWithPast:
+        r"""
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Positions of the input tokens in the full generated sequence. Used by
+            the KV cache to update cached states at the correct time indices.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -605,7 +611,8 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
             position_ids = cache_position.unsqueeze(0)
 
         mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
-        causal_mask = mask_function(
+        causal_mask = call_mask_function(
+            mask_function,
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -673,8 +680,8 @@ def load_balancing_loss_func(
         compute_device = gate_logits[0].device
         concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
 
-    # gate_logits are already softmax probabilities from the router,
-    # so we use them directly (no second softmax).
+    # gate_logits are already-scored router outputs, so use them directly
+    # without applying a second softmax.
     routing_weights = concatenated_gate_logits
 
     _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
@@ -740,6 +747,40 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def _compute_lm_ce_loss(
+        self,
+        hidden_states: torch.Tensor,
+        labels: torch.LongTensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        if not getattr(self.config, "use_fused_linear_ce", True):
+            logits = self.lm_head(hidden_states)
+            return self.loss_function(logits, labels, self.vocab_size, **kwargs)
+
+        ignore_index = int(kwargs.get("ignore_index", -100))
+        label_smoothing = float(kwargs.get("label_smoothing", 0.0) or 0.0)
+        if hidden_states.is_cuda:
+            try:
+                from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Qwen3-MoE uses Liger fused linear CE by default on CUDA. "
+                    "Install liger-kernel in the training image."
+                ) from exc
+
+            flat_hidden = hidden_states.contiguous().view(-1, hidden_states.shape[-1])
+            shifted_labels = F.pad(labels, (0, 1), value=ignore_index)
+            shifted_labels = shifted_labels[..., 1:].contiguous().view(-1)
+            loss_fn = LigerFusedLinearCrossEntropyLoss(
+                ignore_index=ignore_index,
+                label_smoothing=label_smoothing,
+                reduction="mean",
+            )
+            return loss_fn(self.lm_head.weight, flat_hidden, shifted_labels)
+
+        logits = self.lm_head(hidden_states)
+        return self.loss_function(logits, labels, self.vocab_size, **kwargs)
+
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -757,6 +798,10 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeCausalLMOutputWithPast:
         r"""
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Positions of the input tokens in the full generated sequence. Used by
+            the KV cache to update cached states at the correct time indices.
+
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
@@ -782,6 +827,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
+        return_logits = kwargs.pop("return_logits", None)
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs: MoeModelOutputWithPast = self.model(
@@ -797,13 +843,21 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        use_fused_linear_ce = bool(getattr(self.config, "use_fused_linear_ce", True))
+        if return_logits is None:
+            return_logits = labels is None or not use_fused_linear_ce
+
+        # Only compute necessary logits, and do not materialize the full
+        # vocab tensor during fused-CE training.
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = self.lm_head(hidden_states[:, slice_indices, :]) if return_logits else None
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
+            if use_fused_linear_ce:
+                loss = self._compute_lm_ce_loss(hidden_states, labels, **kwargs)
+            else:
+                loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
 
         aux_loss = None
         if output_router_logits:

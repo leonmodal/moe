@@ -40,22 +40,22 @@ uv run python scripts/download_data.py --max_shards 64
 
 ### Single GPU
 ```bash
-python scripts/train.py --config configs/standard_moe.yaml
+python scripts/train.py --config configs/16_layers/standard_moe_deepseek_bias.yaml
 ```
 
 ### Multi-GPU DDP
 ```bash
-torchrun --nproc_per_node=8 scripts/train.py --config configs/standard_moe.yaml
+torchrun --nproc_per_node=8 scripts/train.py --config configs/16_layers/standard_moe_deepseek_bias.yaml
 ```
 
 ### FSDP
 ```bash
-torchrun --nproc_per_node=8 scripts/train.py --config configs/standard_moe.yaml --dist-strategy fsdp
+torchrun --nproc_per_node=8 scripts/train.py --config configs/16_layers/standard_moe_deepseek_bias.yaml --dist-strategy fsdp
 ```
 
 ### Modal Multi-Node
 ```bash
-modal run modal_train.py --config configs/scaling/m_standard.yaml
+modal run modal_train.py --config configs/16_layers/moe_everything_per_head_recompute_k_qk_v_o_deepseek_bias.yaml
 ```
 
 ## Model Families
@@ -77,8 +77,13 @@ modal run modal_train.py --config configs/scaling/m_standard.yaml
 ### `moe_everything`
 - Custom depth loop with branch routing (attention vs MLP per token)
 - Attention experts and MLP experts in shared banks across all depths
-- Per-head attention routing: H separate top-1 routers per projection type
-- Modes: `per_head_fully_independent` and `per_head_precompute_kv`
+- Per-head attention routing with explicit recompute and routing-bundle axes
+- Recompute modes: `per_head_no_recompute`, `per_head_recompute_k`, `per_head_recompute_kv`
+- Routing bundles: `q_k_v_o`, `qk_v_o`, `qk_vo`, `qkv_o`, `qkvo`
+- EMA router context: `attn_router_context: ema_qk_v` makes QK and V
+  routers see `concat(h_t, ema(previous h))`; O stays token-local after attention.
+- Branch router balancing is configured separately under `model.branch_router`;
+  `deepseek_bias` uses two independent sigmoid scores for ATTN/MLP.
 
 ## Configuration
 

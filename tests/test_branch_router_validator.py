@@ -143,6 +143,89 @@ def test_validator_rejects_warmup_steps_non_int():
         _validator()(cfg)
 
 
+def test_validator_accepts_sampling_entropy_branch_router():
+    cfg = {
+        "model": {
+            "branch_router": {
+                "balancing": "sampling_entropy",
+                "entropy_coef": 0.01,
+                "entropy_decay": "cosine",
+                "entropy_min": 0.0,
+                "entropy_decay_steps": 1000,
+            }
+        }
+    }
+    _validator()(cfg)
+
+
+def test_validator_rejects_sampling_entropy_with_exploration_knob():
+    cfg = {
+        "model": {
+            "branch_router": {
+                "balancing": "sampling_entropy",
+                "entropy_coef": 0.01,
+                "exploration_rate": 0.1,
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="sampling_entropy.*exploration_rate"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_invalid_entropy_schedule():
+    cfg = {
+        "model": {
+            "branch_router": {
+                "balancing": "sampling_entropy",
+                "entropy_coef": 0.01,
+                "entropy_decay": "exp",
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="entropy_decay="):
+        _validator()(cfg)
+
+
+def test_validator_rejects_negative_entropy_coef():
+    cfg = {
+        "model": {
+            "branch_router": {
+                "balancing": "sampling_entropy",
+                "entropy_coef": -0.01,
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="entropy_coef="):
+        _validator()(cfg)
+
+
+def test_validator_rejects_entropy_min_above_coef():
+    cfg = {
+        "model": {
+            "branch_router": {
+                "balancing": "sampling_entropy",
+                "entropy_coef": 0.01,
+                "entropy_min": 0.02,
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="entropy_min .* exceeds"):
+        _validator()(cfg)
+
+
+def test_validator_rejects_negative_entropy_decay_steps():
+    cfg = {
+        "model": {
+            "branch_router": {
+                "balancing": "sampling_entropy",
+                "entropy_decay_steps": -1,
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="entropy_decay_steps="):
+        _validator()(cfg)
+
+
 def test_validator_rejects_conflicting_nested_and_flat():
     cfg = {
         "model": {
@@ -373,7 +456,7 @@ def test_cli_validator_rejects_flat_branch_field_in_active_matrix(tmp_path):
     import os
     import subprocess
     repo = Path(__file__).resolve().parent.parent
-    target = repo / "configs" / "4_layers" / "_TMP_flat_branch_in_matrix.yaml"
+    target = repo / "configs" / "16_layers" / "_TMP_flat_branch_in_matrix.yaml"
     target.write_text(
         """experiment_name: flat_branch_probe
 model:
@@ -391,7 +474,7 @@ model:
   branch_router_aux_loss_coef: 0.001
   num_attn_experts: 2
   num_attn_experts_per_tok: 1
-  attn_expert_mode: per_head_fully_independent
+  attn_expert_mode: per_head_no_recompute
   use_deepseek_routing: true
   attention_bias: false
   attention_dropout: 0.0
@@ -425,7 +508,7 @@ training:
     try:
         cmd = [
             sys.executable, "scripts/validate_configs.py",
-            "configs/4_layers/_TMP_flat_branch_in_matrix.yaml",
+            "configs/16_layers/_TMP_flat_branch_in_matrix.yaml",
         ]
         env = {"PYTHONPATH": str(repo), **os.environ}
         result = subprocess.run(
@@ -835,7 +918,7 @@ model:
   intermediate_size: 32
   num_attn_experts: 2
   num_attn_experts_per_tok: 1
-  attn_expert_mode: per_head_fully_independent
+  attn_expert_mode: per_head_no_recompute
   use_deepseek_routing: true
   branch_deepseek: true
   attention_bias: false

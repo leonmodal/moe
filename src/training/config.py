@@ -36,6 +36,7 @@ class TrainingConfig:
     # Mixed precision / memory
     mixed_precision: str = "bf16"
     gradient_checkpointing: bool = False
+    fsdp_sharding_strategy: str | None = None  # auto | full_shard | shard_grad_op | no_shard | hybrid_shard
     # Logging
     log_every: int = 10
     save_every: int = 5000
@@ -57,7 +58,7 @@ class TrainingConfig:
     bias_update_rate: float = 0.0
     bias_warmup_start: float = 0.0
     bias_warmup_steps: int = 0
-    # the `zero_sum` mode flag: selects between the nmoe / DeepSeek-V3 zero-sum
+    # the `zero_sum` mode flag: selects between the nmoe-style zero-sum
     # update (default, True) and the Megatron-LM plain-sign update (False).
     #   True  → bias -= (sign(load - 1/E) - mean(sign(load - 1/E))) * rate
     #           Reference: nmoe/nmoe/model.py:Router.update_bias
@@ -114,6 +115,7 @@ def build_training_config(cfg: dict) -> TrainingConfig:
         gradient_accumulation=tcfg.get("gradient_accumulation", 4),
         mixed_precision=tcfg.get("mixed_precision", "bf16"),
         gradient_checkpointing=tcfg.get("gradient_checkpointing", False),
+        fsdp_sharding_strategy=tcfg.get("fsdp_sharding_strategy"),
         log_every=tcfg.get("log_every", 10),
         save_every=tcfg.get("save_every", 5000),
         output_dir=tcfg.get("output_dir", "./outputs"),

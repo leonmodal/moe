@@ -30,11 +30,21 @@ import modal.experimental
 #  Cluster configuration — edit these before launching                         #
 # --------------------------------------------------------------------------- #
 
-N_NODES = 2              # number of containers in the cluster
-GPUS_PER_NODE = 8        # GPUs per container
-GPU_TYPE = "B200"        # B200, H200, or H100
+N_NODES = int(os.environ.get("MOE_MODAL_N_NODES", "1"))              # number of containers in the cluster
+GPUS_PER_NODE = int(os.environ.get("MOE_MODAL_GPUS_PER_NODE", "8"))  # GPUs per container
+GPU_TYPE = os.environ.get("MOE_MODAL_GPU_TYPE", "B200")              # B200, H200, or H100
+EFA_ENABLED = os.environ.get("MOE_MODAL_EFA_ENABLED", "1").lower() not in {
+    "0", "false", "no", "off",
+}
+MODAL_CLOUD = os.environ.get("MOE_MODAL_CLOUD") or None
 TIMEOUT_HOURS = 24       # max wall-clock time
 MAX_CHECKPOINTS = 3      # checkpoints to keep on volume (0 = unlimited)
+DIST_STRATEGY = os.environ.get("MOE_MODAL_DIST_STRATEGY", "ddp")  # fsdp | ddp | none
+FSDP_SHARDING_STRATEGY = os.environ.get(
+    "MOE_MODAL_FSDP_SHARDING_STRATEGY", "auto"
+)  # auto | no_shard | hybrid_shard | full_shard | shard_grad_op
+NCCL_DEBUG_LEVEL = os.environ.get("MOE_MODAL_NCCL_DEBUG", "WARN")
+NCCL_DEBUG_SUBSYS = os.environ.get("MOE_MODAL_NCCL_DEBUG_SUBSYS")
 
 CONFIG_FILE = "configs/scaling/xs_standard.yaml"  # default training config
 
@@ -124,6 +134,13 @@ def build_train_script_args(
     output_dir: str,
     max_checkpoints: int,
     auto_resume: bool = True,
+    dist_strategy: str = DIST_STRATEGY,
+    fsdp_sharding_strategy: str | None = FSDP_SHARDING_STRATEGY,
+    max_steps: int | None = None,
+    batch_size: int | None = None,
+    gradient_accumulation: int | None = None,
+    save_every: int | None = None,
+    disable_wandb: bool = False,
 ) -> list[str]:
     """Assemble the `scripts/train.py` argv for the Modal launcher.
 
@@ -134,6 +151,19 @@ def build_train_script_args(
     args = ["--config", config_path]
     if auto_resume:
         args.append("--auto_resume")
+    args += ["--dist-strategy", dist_strategy]
+    if dist_strategy == "fsdp" and fsdp_sharding_strategy:
+        args += ["--fsdp-sharding-strategy", fsdp_sharding_strategy]
+    if max_steps is not None:
+        args += ["--max-steps", str(max_steps)]
+    if batch_size is not None:
+        args += ["--batch-size", str(batch_size)]
+    if gradient_accumulation is not None:
+        args += ["--gradient-accumulation", str(gradient_accumulation)]
+    if save_every is not None:
+        args += ["--save-every", str(save_every)]
+    if disable_wandb:
+        args.append("--disable-wandb")
     args += [
         "--data_dir", data_dir,
         "--output_dir", output_dir,
@@ -161,6 +191,14 @@ def build_torchrun_invocation(
     checkpoint_root: str = CHECKPOINT_ROOT,
     training_script: str = TRAINING_SCRIPT,
     auto_resume: bool = True,
+    dist_strategy: str = DIST_STRATEGY,
+    fsdp_sharding_strategy: str | None = FSDP_SHARDING_STRATEGY,
+    max_steps: int | None = None,
+    batch_size: int | None = None,
+    gradient_accumulation: int | None = None,
+    save_every: int | None = None,
+    disable_wandb: bool = False,
+    output_suffix: str | None = None,
 ) -> dict:
     """Assemble the full kwargs passed to `torchrun_util.torchrun.run(...)`.
 
@@ -174,12 +212,21 @@ def build_torchrun_invocation(
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
     output_dir = resolve_output_dir(cfg, checkpoint_root)
+    if output_suffix:
+        output_dir = f"{output_dir}_{output_suffix}"
     script_args = build_train_script_args(
         config_path,
         data_dir=data_dir,
         output_dir=output_dir,
         max_checkpoints=max_checkpoints,
         auto_resume=auto_resume,
+        dist_strategy=dist_strategy,
+        fsdp_sharding_strategy=fsdp_sharding_strategy,
+        max_steps=max_steps,
+        batch_size=batch_size,
+        gradient_accumulation=gradient_accumulation,
+        save_every=save_every,
+        disable_wandb=disable_wandb,
     )
     return {
         "node_rank": node_rank,
@@ -199,41 +246,98 @@ def build_torchrun_invocation(
 @app.function(
     gpu=f"{GPU_TYPE}:{GPUS_PER_NODE}",
     timeout=60 * 60 * TIMEOUT_HOURS,
-    experimental_options={"efa_enabled": True},
+    experimental_options={"efa_enabled": EFA_ENABLED},
+    cloud=MODAL_CLOUD,
 )
 @modal.experimental.clustered(size=N_NODES, rdma=True)
-def train(config: str = CONFIG_FILE):
+def train(
+    config: str = CONFIG_FILE,
+    max_steps: int | None = None,
+    batch_size: int | None = None,
+    gradient_accumulation: int | None = None,
+    save_every: int | None = None,
+    disable_wandb: bool = False,
+    output_suffix: str | None = None,
+    dist_strategy: str | None = None,
+    fsdp_sharding_strategy: str | None = None,
+    disable_grouped_mm: bool = False,
+    disable_attn_grouped_mm: bool = False,
+    disable_mlp_grouped_mm: bool = False,
+    force_eager_attention: bool = False,
+):
+    import torch
     import yaml
     from torchrun_util import torchrun
 
     cluster_info = modal.experimental.get_cluster_info()
+    cluster_n_nodes = max(1, len(cluster_info.container_ips))
+    visible_gpus = max(1, torch.cuda.device_count())
 
     remote_config_path = f"/root/moe/{config}"
     with open(remote_config_path) as f:
         cfg = yaml.safe_load(f)
     output_dir = resolve_output_dir(cfg)
+    display_output_dir = f"{output_dir}_{output_suffix}" if output_suffix else output_dir
     experiment_name = cfg.get("experiment_name", "default")
+    effective_dist_strategy = dist_strategy or DIST_STRATEGY
+    effective_fsdp_sharding_strategy = fsdp_sharding_strategy or FSDP_SHARDING_STRATEGY
 
     os.environ["PYTHONUNBUFFERED"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
     os.environ["NCCL_NVLS_ENABLE"] = "0"
-    os.environ["NCCL_DEBUG"] = "WARN"
+    os.environ["NCCL_DEBUG"] = NCCL_DEBUG_LEVEL
+    if NCCL_DEBUG_SUBSYS:
+        os.environ["NCCL_DEBUG_SUBSYS"] = NCCL_DEBUG_SUBSYS
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    os.environ["MOE_EVERYTHING_DISABLE_GROUPED_MM"] = "1" if disable_grouped_mm else "0"
+    os.environ["MOE_EVERYTHING_DISABLE_ATTN_GROUPED_MM"] = "1" if disable_attn_grouped_mm else "0"
+    os.environ["MOE_EVERYTHING_DISABLE_MLP_GROUPED_MM"] = "1" if disable_mlp_grouped_mm else "0"
+    if force_eager_attention:
+        os.environ["MOE_EVERYTHING_FORCE_ATTN_IMPL"] = "eager"
 
-    print(f"[Node {cluster_info.rank}/{N_NODES}] Starting MoE training")
+    print(f"[Node {cluster_info.rank}/{cluster_n_nodes}] Starting MoE training")
     print(f"  Config     : {config}")
     print(f"  Experiment : {experiment_name}")
-    print(f"  Output     : {output_dir}")
+    print(f"  Output     : {display_output_dir}")
     print(f"  Data       : {REMOTE_DATA_DIR}")
     print(f"  Master     : {cluster_info.container_ips[0]}")
-    print(f"  GPUs       : {N_NODES} x {GPUS_PER_NODE} = {N_NODES * GPUS_PER_NODE}")
+    print(f"  GPUs       : {cluster_n_nodes} x {visible_gpus} = {cluster_n_nodes * visible_gpus}")
+    print(f"  RDMA       : clustered=True efa_enabled={EFA_ENABLED} cloud={MODAL_CLOUD or 'default'}")
+    if effective_dist_strategy == "fsdp":
+        print(f"  Dist       : {effective_dist_strategy} ({effective_fsdp_sharding_strategy})")
+    else:
+        print(f"  Dist       : {effective_dist_strategy}")
+    if batch_size is not None or gradient_accumulation is not None:
+        print(f"  Batch      : batch_size={batch_size} grad_accum={gradient_accumulation}")
+    if save_every is not None:
+        print(f"  Save every : {save_every} steps")
+    if disable_wandb:
+        print("  WandB      : disabled", flush=True)
+    if disable_grouped_mm or disable_attn_grouped_mm or disable_mlp_grouped_mm or force_eager_attention:
+        print(
+            "  Debug      : "
+            f"disable_grouped_mm={disable_grouped_mm} "
+            f"disable_attn_grouped_mm={disable_attn_grouped_mm} "
+            f"disable_mlp_grouped_mm={disable_mlp_grouped_mm} "
+            f"force_eager_attention={force_eager_attention}",
+            flush=True,
+        )
 
     invocation = build_torchrun_invocation(
         remote_config_path,
         node_rank=cluster_info.rank,
         master_addr=cluster_info.container_ips[0],
-        nnodes=N_NODES,
-        nproc_per_node=GPUS_PER_NODE,
+        nnodes=cluster_n_nodes,
+        nproc_per_node=visible_gpus,
         max_checkpoints=MAX_CHECKPOINTS,
+        max_steps=max_steps,
+        batch_size=batch_size,
+        gradient_accumulation=gradient_accumulation,
+        save_every=save_every,
+        disable_wandb=disable_wandb,
+        output_suffix=output_suffix,
+        dist_strategy=effective_dist_strategy,
+        fsdp_sharding_strategy=effective_fsdp_sharding_strategy,
     )
     torchrun.run(**invocation)
 
@@ -313,5 +417,64 @@ def download_data(max_shards: int = None, workers: int = 16):
 # --------------------------------------------------------------------------- #
 
 @app.local_entrypoint()
-def main(config: str = CONFIG_FILE):
-    train.remote(config=config)
+def main(
+    config: str = CONFIG_FILE,
+    background: bool = False,
+    max_steps: int | None = None,
+    batch_size: int | None = None,
+    gradient_accumulation: int | None = None,
+    save_every: int | None = None,
+    disable_wandb: bool = False,
+    output_suffix: str | None = None,
+    dist_strategy: str | None = None,
+    fsdp_sharding_strategy: str | None = None,
+    disable_grouped_mm: bool = False,
+    disable_attn_grouped_mm: bool = False,
+    disable_mlp_grouped_mm: bool = False,
+    force_eager_attention: bool = False,
+):
+    if background:
+        call = train.spawn(
+            config=config,
+            max_steps=max_steps,
+            batch_size=batch_size,
+            gradient_accumulation=gradient_accumulation,
+            save_every=save_every,
+            disable_wandb=disable_wandb,
+            output_suffix=output_suffix,
+            dist_strategy=dist_strategy,
+            fsdp_sharding_strategy=fsdp_sharding_strategy,
+            disable_grouped_mm=disable_grouped_mm,
+            disable_attn_grouped_mm=disable_attn_grouped_mm,
+            disable_mlp_grouped_mm=disable_mlp_grouped_mm,
+            force_eager_attention=force_eager_attention,
+        )
+        print(
+            f"Spawned training call for {config} "
+            f"(max_steps={max_steps}, batch_size={batch_size}, "
+            f"gradient_accumulation={gradient_accumulation}, "
+            f"save_every={save_every}, "
+            f"disable_wandb={disable_wandb}, output_suffix={output_suffix}, "
+            f"dist_strategy={dist_strategy}, "
+            f"fsdp_sharding_strategy={fsdp_sharding_strategy}, "
+            f"disable_grouped_mm={disable_grouped_mm}, "
+            f"disable_attn_grouped_mm={disable_attn_grouped_mm}, "
+            f"disable_mlp_grouped_mm={disable_mlp_grouped_mm}, "
+            f"force_eager_attention={force_eager_attention}): {call}"
+        )
+        return
+    train.remote(
+        config=config,
+        max_steps=max_steps,
+        batch_size=batch_size,
+        gradient_accumulation=gradient_accumulation,
+        save_every=save_every,
+        disable_wandb=disable_wandb,
+        output_suffix=output_suffix,
+        dist_strategy=dist_strategy,
+        fsdp_sharding_strategy=fsdp_sharding_strategy,
+        disable_grouped_mm=disable_grouped_mm,
+        disable_attn_grouped_mm=disable_attn_grouped_mm,
+        disable_mlp_grouped_mm=disable_mlp_grouped_mm,
+        force_eager_attention=force_eager_attention,
+    )

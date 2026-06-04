@@ -3,14 +3,17 @@
 Tests: forward pass, backward pass, optimizer step, checkpoint save/load,
 loss sanity (decreasing over steps), and deprecated type rejection.
 
-Model matrix (7 variants):
+Model matrix (10 variants):
 - dense
 - standard_moe (softmax)
 - standard_moe (deepseek)
 - global_moe (softmax)
 - global_moe (deepseek)
-- moe_everything (per_head_fully_independent)
-- moe_everything (per_head_precompute_kv)
+- moe_everything (per_head_no_recompute)
+- moe_everything (per_head_recompute_k)
+- moe_everything (per_head_recompute_kv)
+- moe_everything (per_head_recompute_k + EMA QK/V routing)
+- moe_everything (per_head_recompute_kv + EMA QK/V routing)
 """
 
 import os
@@ -66,24 +69,62 @@ def _moe_config(model_type="standard_moe", router_type="softmax", **extra):
     return cfg
 
 
-def _moe_everything_config(attn_expert_mode):
+def _moe_everything_config(attn_expert_mode, attn_routing_bundle=None):
+    if attn_routing_bundle is None:
+        attn_routing_bundle = "q_k_v_o" if attn_expert_mode == "per_head_no_recompute" else "qkvo"
     return _moe_config(
         model_type="moe_everything",
         num_attn_experts=4,
         num_attn_experts_per_tok=1,
         attn_expert_mode=attn_expert_mode,
+        attn_routing_bundle=attn_routing_bundle,
     )
 
 
-# Full parametrized test matrix — all 7 required variants
+def _moe_everything_ema_config(attn_expert_mode):
+    cfg = _moe_everything_config(attn_expert_mode, "qk_v_o")
+    cfg["model"]["attn_router_context"] = "ema_qk_v"
+    cfg["model"]["attn_router_context_decay"] = 0.95
+    return cfg
+
+
+def test_moe_everything_ema_context_wired_through_model_factory():
+    cfg = _moe_everything_config("per_head_recompute_k", "qk_v_o")
+    cfg["model"]["attn_router_context"] = "ema_qk_v"
+    cfg["model"]["attn_router_context_decay"] = 0.95
+    cfg["model"]["per_layer_router"] = True
+    cfg["model"]["per_layer_mlp_router"] = True
+    cfg["model"]["per_layer_attn_router"] = True
+    cfg["model"]["per_layer_norm"] = True
+    cfg["model"]["per_layer_qk_norm"] = True
+
+    model, model_cfg = build_model(cfg)
+    bank = model.model.attn_bank
+
+    assert model_cfg.attn_router_context == "ema_qk_v"
+    assert model_cfg.attn_router_context_decay == 0.95
+    assert len(model.model.branch_routers) == cfg["model"]["num_hidden_layers"]
+    assert len(model.model.mlp_bank.gates) == cfg["model"]["num_hidden_layers"]
+    assert len(bank.qk_routers) == cfg["model"]["num_hidden_layers"]
+    assert bank.qk_routers[0][0].weight.shape[1] == cfg["model"]["hidden_size"] * 2
+    assert bank.v_routers[0][0].weight.shape[1] == cfg["model"]["hidden_size"] * 2
+    assert bank.o_routers[0][0].weight.shape[1] == bank.q_group_dim
+    assert len(bank.norms) == cfg["model"]["num_hidden_layers"]
+    assert bank.layer_q_norm_weight.shape[0] == cfg["model"]["num_hidden_layers"]
+
+
+# Full parametrized test matrix — all 8 required variants
 MODEL_CONFIGS = [
     ("dense", _dense_config()),
     ("standard_moe_softmax", _moe_config("standard_moe", "softmax")),
     ("standard_moe_deepseek", _moe_config("standard_moe", "deepseek")),
     ("global_moe_softmax", _moe_config("global_moe", "softmax")),
     ("global_moe_deepseek", _moe_config("global_moe", "deepseek")),
-    ("moe_everything_fully_independent", _moe_everything_config("per_head_fully_independent")),
-    ("moe_everything_precompute_kv", _moe_everything_config("per_head_precompute_kv")),
+    ("moe_everything_no_recompute", _moe_everything_config("per_head_no_recompute")),
+    ("moe_everything_recompute_k", _moe_everything_config("per_head_recompute_k")),
+    ("moe_everything_recompute_kv", _moe_everything_config("per_head_recompute_kv")),
+    ("moe_everything_recompute_k_ema_qk_v", _moe_everything_ema_config("per_head_recompute_k")),
+    ("moe_everything_recompute_kv_ema_qk_v", _moe_everything_ema_config("per_head_recompute_kv")),
 ]
 
 
@@ -255,7 +296,8 @@ def test_bundled_attn_expert_mode_rejected():
     """`attn_expert_mode: "bundled"` is the deprecated 1-router-top-K design.
 
     The active moe_everything architecture uses H routers per projection, each
-    top-1 (`per_head_fully_independent` / `per_head_precompute_kv`). Requesting
+    top-1 (`per_head_no_recompute` / `per_head_recompute_k` /
+    `per_head_recompute_kv`). Requesting
     the old mode must fail explicitly so a stale config doesn't silently fall
     back to a valid default and mask the drift.
     """
@@ -264,7 +306,7 @@ def test_bundled_attn_expert_mode_rejected():
         build_model(cfg)
 
 
-def test_moe_everything_default_attn_expert_mode_is_per_head_fully_independent():
+def test_moe_everything_default_attn_expert_mode_is_per_head_no_recompute():
     """Omitting `attn_expert_mode` must produce a valid default, not fall into
     the rejected `"bundled"` mode. This pins the model-factory fallback.
     """
@@ -274,7 +316,7 @@ def test_moe_everything_default_attn_expert_mode_is_per_head_fully_independent()
         num_attn_experts_per_tok=1,
     )  # no attn_expert_mode key set
     model, _ = build_model(cfg)
-    assert model.config.attn_expert_mode == "per_head_fully_independent"
+    assert model.config.attn_expert_mode == "per_head_no_recompute"
 
 
 if __name__ == "__main__":

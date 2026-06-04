@@ -88,6 +88,10 @@ def _build_moe_everything_with_schedule(
     branch_exploration_decay: str = "linear",
     branch_exploration_warmup_steps: int = 1000,
     branch_exploration_min: float = 0.01,
+    branch_entropy_coef: float = 0.01,
+    branch_entropy_decay: str = "cosine",
+    branch_entropy_min: float = 0.0,
+    branch_entropy_decay_steps: int = 1000,
     branch_router_aux_loss_coef: float = 0.0,
     branch_deepseek: bool = False,
     use_deepseek_routing: bool = True,
@@ -111,7 +115,7 @@ def _build_moe_everything_with_schedule(
         num_experts_per_tok=2,
         num_attn_experts=2,
         num_attn_experts_per_tok=1,
-        attn_expert_mode="per_head_fully_independent",
+        attn_expert_mode="per_head_no_recompute",
         branch_router_aux_loss_coef=branch_router_aux_loss_coef,
         use_deepseek_routing=use_deepseek_routing,
         branch_deepseek=branch_deepseek,
@@ -126,8 +130,6 @@ def _build_moe_everything_with_schedule(
         dynamic_depth_max=1.0,
         depthwise_attention=False,
         depthwise_block_size=0,
-        per_head_compute_mode="auto",
-        per_head_dense_fraction_threshold=0.75,
         scale_attn_by_routing_weight=True,
         scale_branch_by_routing_weight=True,
         router_exploration_rate=0.0,
@@ -139,6 +141,10 @@ def _build_moe_everything_with_schedule(
         branch_exploration_decay=branch_exploration_decay,
         branch_exploration_min=branch_exploration_min,
         branch_exploration_warmup_steps=branch_exploration_warmup_steps,
+        branch_entropy_coef=branch_entropy_coef,
+        branch_entropy_decay=branch_entropy_decay,
+        branch_entropy_min=branch_entropy_min,
+        branch_entropy_decay_steps=branch_entropy_decay_steps,
         max_position_embeddings=64,
         rms_norm_eps=1e-6,
         rope_theta=10000.0,
@@ -154,6 +160,34 @@ def _build_moe_everything_with_schedule(
     model._load_balancing_method = "deepseek_bias"
     cfg.load_balancing_method = "deepseek_bias"
     return model, cfg
+
+
+def test_sampling_entropy_schedule_and_loss_bonus():
+    """`sampling_entropy` samples branch choices and subtracts the
+    scheduled entropy bonus from the total loss."""
+    routing = _load_routing_module()
+    model, cfg = _build_moe_everything_with_schedule(
+        branch_balancing="sampling_entropy",
+        branch_entropy_coef=0.02,
+        branch_entropy_decay="linear",
+        branch_entropy_min=0.005,
+        branch_entropy_decay_steps=10,
+    )
+    model.train()
+    branch = model.model.branch_router
+    assert branch.use_sampling is True
+
+    applied_explore = routing.apply_branch_schedule_pre_forward(model, 5)
+    assert applied_explore is None
+    assert cfg.current_branch_entropy_coef == pytest.approx(0.0125)
+
+    input_ids = torch.randint(0, model.vocab_size, (2, 4), dtype=torch.long)
+    output = model(input_ids=input_ids, labels=input_ids, output_router_logits=False)
+    assert output.branch_entropy_loss is not None
+    torch.testing.assert_close(
+        output.loss,
+        output.ce_loss - cfg.current_branch_entropy_coef * output.branch_entropy_loss,
+    )
 
 
 @pytest.mark.parametrize("schedule", ["constant", "linear", "cosine"])
@@ -548,10 +582,9 @@ model:
   topk_scaling_factor: 2.5
   num_attn_experts: 2
   num_attn_experts_per_tok: 1
-  attn_expert_mode: per_head_fully_independent
+  attn_expert_mode: per_head_no_recompute
   scale_attn_by_routing_weight: true
   scale_branch_by_routing_weight: true
-  per_head_compute_mode: dense
   use_deepseek_routing: true
   branch_deepseek: true
   attention_bias: false

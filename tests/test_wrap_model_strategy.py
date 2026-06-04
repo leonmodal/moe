@@ -4,17 +4,15 @@ The supported model families diverge in how they interact with FSDP's
 flatten-params backward hooks:
 
 - `dense`, `standard_moe`, `global_moe` work cleanly under `FULL_SHARD`.
-- `moe_everything` uses branch routing + grouped GEMM; every FSDP sharding
-  strategy available on torch 2.10 fires the `TrainingState.IDLE`
-  post-backward assertion because whole per-depth flat-params units can
-  receive no gradient activity on a given step. The trainer transparently
-  falls back to DDP when the user asks for `--dist-strategy fsdp` with
-  that family so the CLI contract ("every supported model runs under
-  `--dist-strategy fsdp`") is preserved end-to-end.
+- `moe_everything` uses branch routing + grouped GEMM; it defaults to
+  FSDP `NO_SHARD` plus an auto-wrap policy so sparse branch activity does
+  not share one flat-param hook with unrelated always-active modules.
+- Launchers may explicitly request `NO_SHARD` or `HYBRID_SHARD` for any
+  family via the FSDP sharding override.
 
 These tests exercise `wrap_model` under a stubbed FSDP / DDP so they can
-run without distributed init, and pin both the FSDP strategy selection
-for the sharded families and the DDP fallback for `moe_everything`.
+run without distributed init, and pin the FSDP strategy selection for
+each model family.
 """
 from __future__ import annotations
 
@@ -32,6 +30,7 @@ from src.training.distributed import (
     _FSDP_SKIP_MIXED_PRECISION,
     _fsdp_sharding_for,
     _fsdp_use_orig_params_for,
+    _resolve_fsdp_sharding_name,
     wrap_model,
 )
 
@@ -66,8 +65,43 @@ def test_moe_everything_skips_fsdp_mixed_precision():
 
 def test_use_orig_params_is_true_for_all_current_strategies():
     # Pinned by _fsdp_use_orig_params_for; flip this test if the policy changes.
-    for s in ("FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD"):
+    for s in ("FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD", "HYBRID_SHARD"):
         assert _fsdp_use_orig_params_for(s) is True
+
+
+def test_fsdp_sharding_override_resolves_aliases():
+    assert _resolve_fsdp_sharding_name("standard_moe", None) == "FULL_SHARD"
+    assert _resolve_fsdp_sharding_name("moe_everything", "auto") == "NO_SHARD"
+    assert _resolve_fsdp_sharding_name("standard_moe", "no_shard") == "NO_SHARD"
+    assert _resolve_fsdp_sharding_name("standard_moe", "hybrid_shard") == "HYBRID_SHARD"
+    with pytest.raises(ValueError, match="Invalid FSDP sharding strategy"):
+        _resolve_fsdp_sharding_name("standard_moe", "zero3")
+
+
+def test_moe_everything_auto_wrap_policy_keeps_tied_embedding_head_together(monkeypatch):
+    captured: dict[str, set[type]] = {}
+
+    class _FakeModuleWrapPolicy:
+        def __init__(self, module_classes):
+            captured["module_classes"] = set(module_classes)
+
+    monkeypatch.setattr(dist_mod, "ModuleWrapPolicy", _FakeModuleWrapPolicy)
+    policy = dist_mod._moe_everything_auto_wrap_policy()
+
+    assert policy is not None
+    import torch.nn as nn
+    from src.models.modeling_qwen3_moe import Qwen3MoeRMSNorm
+    from src.models.moe_everything.attention_bank import AttentionExpertBank
+    from src.models.moe_everything.mlp_bank import MlpExpertBank
+    from src.models.routing.routers import BranchRouter
+
+    module_classes = captured["module_classes"]
+    assert AttentionExpertBank in module_classes
+    assert MlpExpertBank in module_classes
+    assert BranchRouter in module_classes
+    assert Qwen3MoeRMSNorm in module_classes
+    assert nn.Embedding not in module_classes
+    assert nn.Linear not in module_classes
 
 
 def test_no_ddp_masquerade_under_fsdp_strategy():
@@ -165,6 +199,39 @@ def test_wrap_model_fsdp_uses_real_fsdp_for_moe_everything(fake_world):
         "moe_everything needs an auto_wrap_policy so AttentionExpertBank / "
         "MlpExpertBank / BranchRouter become their own FSDP units."
     )
+
+
+def test_wrap_model_fsdp_no_shard_override_for_standard_moe(fake_world):
+    fake_fsdp, fsdp_calls = _capture_fsdp_kwargs()
+    fake_ddp, ddp_calls = _capture_ddp_kwargs()
+    with patch.object(dist_mod, "FSDP", fake_fsdp), \
+         patch.object(dist_mod, "DDP", fake_ddp):
+        wrap_model(
+            _FakeModel(), strategy="fsdp", local_rank=0,
+            mixed_precision_name="bf16", model_type="standard_moe",
+            fsdp_sharding_strategy="no_shard",
+        )
+    assert len(fsdp_calls) == 1 and len(ddp_calls) == 0
+    kwargs = fsdp_calls[0]
+    assert kwargs["sharding_strategy"].name == "NO_SHARD"
+    assert kwargs["mixed_precision"] is None, (
+        "NO_SHARD skips FSDP-level MixedPrecision; trainer autocast still "
+        "handles bf16 activations."
+    )
+
+
+def test_wrap_model_fsdp_hybrid_shard_override(fake_world):
+    fake_fsdp, fsdp_calls = _capture_fsdp_kwargs()
+    fake_ddp, _ = _capture_ddp_kwargs()
+    with patch.object(dist_mod, "FSDP", fake_fsdp), \
+         patch.object(dist_mod, "DDP", fake_ddp):
+        wrap_model(
+            _FakeModel(), strategy="fsdp", local_rank=0,
+            mixed_precision_name="bf16", model_type="standard_moe",
+            fsdp_sharding_strategy="hybrid_shard",
+        )
+    assert fsdp_calls[0]["sharding_strategy"].name == "HYBRID_SHARD"
+    assert fsdp_calls[0]["mixed_precision"] is not None
 
 
 def test_wrap_model_ddp_strategy_always_uses_ddp(fake_world):

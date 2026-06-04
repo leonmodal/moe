@@ -2,7 +2,7 @@
 
 Migrations applied (idempotent — re-running on already-migrated yamls produces no diff):
 
-* Flat `branch_balancing`, `branch_exploration_*` -> nested `model.branch_router.{...}`.
+* Flat `branch_balancing`, `branch_exploration_*`, `branch_entropy_*` -> nested `model.branch_router.{...}`.
 * Flat `mlp_router_*` (if present) -> nested `model.mlp_router.{...}`.
 * Flat `attn_router_*` (if present) -> nested `model.attn_router.{...}`.
 * Token rewrites (per the deprecated-alias migration):
@@ -40,6 +40,10 @@ _FLAT_BRANCH_KEYS = (
     "branch_exploration_decay",
     "branch_exploration_min",
     "branch_exploration_warmup_steps",
+    "branch_entropy_coef",
+    "branch_entropy_decay",
+    "branch_entropy_min",
+    "branch_entropy_decay_steps",
 )
 
 
@@ -49,6 +53,10 @@ _FLAT_KEY_SUFFIX_RENAMES = {
     "branch_exploration_decay": "exploration_decay",
     "branch_exploration_min": "exploration_min",
     "branch_exploration_warmup_steps": "exploration_warmup_steps",
+    "branch_entropy_coef": "entropy_coef",
+    "branch_entropy_decay": "entropy_decay",
+    "branch_entropy_min": "entropy_min",
+    "branch_entropy_decay_steps": "entropy_decay_steps",
 }
 
 

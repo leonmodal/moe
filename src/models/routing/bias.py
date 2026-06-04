@@ -70,7 +70,7 @@ def update_bias_from_counts(
         rate: Bias update rate.
         clamp_range: Maximum absolute bias value (DeepSeek-V3 default 16).
         distributed: Whether to all-reduce counts across workers.
-        zero_sum: True for nmoe / DeepSeek-V3 zero-sum; False for the
+        zero_sum: True for nmoe-style zero-sum; False for the
                   Megatron-LM plain-sign reference. Plumbed from
                   `TrainingConfig.bias_update_zero_sum` (default True).
     """

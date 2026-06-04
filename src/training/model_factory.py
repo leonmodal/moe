@@ -5,6 +5,9 @@ Supported model types:
 - standard_moe: Standard MoE with softmax or DeepSeek routing (router_type config)
 - global_moe: Global MoE with shared expert pool and softmax or DeepSeek routing
 - moe_everything: MoE-Everything with per-head attention routing
+- recurrent_standard_moe / recurrent_global_moe: 4-8-4 recurrent normal MoE blocks
+- recurrent_moe_everything: 4-8-4 recurrent MoE-Everything middle bank
+- hrm_recurrent_standard_moe: recurrent standard MoE split into 4-layer L/H modules
 """
 
 from __future__ import annotations
@@ -30,14 +33,14 @@ from src.models import (
     DeepSeekGlobalMoEForCausalLM,
     MoEverythingConfig,
     MoEverythingForCausalLM,
+    RecurrentMoEConfig,
+    RecurrentMoEForCausalLM,
 )
 
 
 # Model types that have been archived to legacy/
 _ARCHIVED_TYPES = {
     "speedrun_gpt",
-    "speedrun_moe_fully_independent",
-    "speedrun_moe_precompute_kv",
     "speedrun_moe_everything",
     "gpt2_dense",
 }
@@ -48,6 +51,10 @@ SUPPORTED_TYPES = {
     "standard_moe",
     "global_moe",
     "moe_everything",
+    "recurrent_moe_everything",
+    "recurrent_standard_moe",
+    "recurrent_global_moe",
+    "hrm_recurrent_standard_moe",
 }
 
 # Deprecated model types that must be rejected with clear guidance
@@ -63,10 +70,24 @@ def configure_liger_kernels(cfg: dict) -> str:
     Returns a string describing what was enabled.
     """
     training_cfg = cfg.get("training", {})
+    mtype = cfg["model"]["type"]
+    has_model_native_fused_ce = (
+        mtype in {
+            "standard_moe",
+            "global_moe",
+            "moe_everything",
+            "recurrent_moe_everything",
+            "recurrent_standard_moe",
+            "recurrent_global_moe",
+            "hrm_recurrent_standard_moe",
+        }
+        and cfg.get("model", {}).get("use_fused_linear_ce", True)
+    )
     if training_cfg.get("disable_liger", False) or os.environ.get("MOE_DISABLE_LIGER", "0") == "1":
+        if has_model_native_fused_ce:
+            return "patching disabled; model-native fused linear CE remains active"
         return "disabled"
 
-    mtype = cfg["model"]["type"]
     if mtype in _ARCHIVED_TYPES or mtype == "gpt2_dense":
         return "disabled (unsupported model type)"
 
@@ -75,7 +96,7 @@ def configure_liger_kernels(cfg: dict) -> str:
     except ImportError:
         return "disabled (liger_kernel not installed)"
 
-    if mtype == "moe_everything":
+    if mtype in {"moe_everything", "recurrent_moe_everything"}:
         apply_liger_kernel_to_qwen3_moe(
             rope=True,
             rms_norm=True,
@@ -83,7 +104,7 @@ def configure_liger_kernels(cfg: dict) -> str:
             fused_linear_cross_entropy=False,
             cross_entropy=False,
         )
-        return "partial (rope+rms_norm only; swiglu/fused CE disabled for moe_everything)"
+        return "partial (rope+rms_norm patch; fused CE is model-native for moe_everything)"
 
     apply_liger_kernel_to_qwen3_moe()
     return "full"
@@ -154,20 +175,37 @@ def _stamp_per_class_router_fields(config, model_cfg: dict) -> None:
     )
 
 
+def _get_prelude_coda_field(model_cfg: dict, key: str, default=None):
+    """Read a `prelude_coda.<key>` field from the model config.
+
+    The nested `model.prelude_coda` block carries standard-MoE-style
+    settings for the prelude/coda decoder layers (num_experts,
+    num_experts_per_tok, moe_intermediate_size, num_groups, group_topk,
+    router_type, etc.). Returns `default` when the block or key is
+    absent; absent block + `prelude_layers=0` + `coda_layers=0` is the
+    "no boundary" default.
+    """
+    nested = model_cfg.get("prelude_coda")
+    if isinstance(nested, dict) and key in nested:
+        return nested[key]
+    return default
+
+
 def _get_branch_router_field(model_cfg: dict, key: str, default):
     """Read a `branch_router.<key>` field with a flat-schema fallback.
 
     Nested form (preferred):
         model:
           branch_router:
-            balancing: exploration_only
-            exploration_rate: 1.0
-            exploration_decay: cosine
-            exploration_min: 0.0
-            exploration_warmup_steps: 1000
+            balancing: sampling_entropy
+            entropy_coef: 0.01
+            entropy_decay: cosine
+            entropy_min: 0.0
+            entropy_decay_steps: 1000
 
     Flat fallback (legacy yamls): `branch_balancing`,
-    `branch_exploration_rate`, etc. live directly on the `model:` block.
+    `branch_exploration_rate`, `branch_entropy_coef`, etc. live directly
+    on the `model:` block.
     The nested form wins when both are present.
     """
     nested = model_cfg.get("branch_router")
@@ -184,7 +222,9 @@ def build_model(cfg: dict):
     """
     mtype = cfg["model"]["type"]
     mcfg = cfg["model"]
-    attn_impl = mcfg.get("attn_implementation", "sdpa")
+    attn_impl = os.environ.get("MOE_EVERYTHING_FORCE_ATTN_IMPL") or mcfg.get(
+        "attn_implementation", "sdpa"
+    )
 
     # Reject deprecated model types with migration guidance
     if mtype in _DEPRECATED_TYPES:
@@ -284,6 +324,7 @@ def build_model(cfg: dict):
         num_experts_per_tok=mcfg["num_experts_per_tok"],
         output_router_logits=output_router_logits,
         attn_implementation=attn_impl,
+        use_fused_linear_ce=mcfg.get("use_fused_linear_ce", True),
     )
 
     if mtype == "standard_moe":
@@ -304,12 +345,14 @@ def build_model(cfg: dict):
             _set_router_params(config, mcfg)
             model = GlobalMoEForCausalLM(config)
 
-    elif mtype == "moe_everything":
+    elif mtype in {"moe_everything", "recurrent_moe_everything"}:
+        recurrent_moe_everything = mtype == "recurrent_moe_everything"
         config = MoEverythingConfig(
             num_experts=mcfg["num_experts"],
             num_attn_experts=mcfg.get("num_attn_experts", 4),
             num_attn_experts_per_tok=mcfg.get("num_attn_experts_per_tok", 1),
-            attn_expert_mode=mcfg.get("attn_expert_mode", "per_head_fully_independent"),
+            attn_expert_mode=mcfg.get("attn_expert_mode", "per_head_no_recompute"),
+            attn_routing_bundle=mcfg.get("attn_routing_bundle", None),
             branch_router_aux_loss_coef=mcfg.get("branch_router_aux_loss_coef", 0.0),
             use_deepseek_routing=use_deepseek,
             topk_scaling_factor=mcfg.get("topk_scaling_factor", None),
@@ -318,6 +361,8 @@ def build_model(cfg: dict):
             per_layer_router=mcfg.get("per_layer_router", False),
             per_layer_mlp_router=mcfg.get("per_layer_mlp_router", False),
             per_layer_attn_router=mcfg.get("per_layer_attn_router", False),
+            per_layer_expert_bank=mcfg.get("per_layer_expert_bank", False),
+            per_pair_v_routing=mcfg.get("per_pair_v_routing", False),
             routed_norm=mcfg.get("routed_norm", False),
             per_layer_norm=mcfg.get("per_layer_norm", False),
             per_layer_qk_norm=mcfg.get("per_layer_qk_norm", False),
@@ -326,11 +371,11 @@ def build_model(cfg: dict):
             dynamic_depth_max=mcfg.get("dynamic_depth_max", 1.0),
             depthwise_attention=mcfg.get("depthwise_attention", False),
             depthwise_block_size=mcfg.get("depthwise_block_size", 0),
-            per_head_compute_mode=mcfg.get("per_head_compute_mode", "auto"),
-            per_head_dense_fraction_threshold=mcfg.get("per_head_dense_fraction_threshold", 0.75),
             sanity_check_mode=mcfg.get("sanity_check_mode"),
             scale_attn_by_routing_weight=mcfg.get("scale_attn_by_routing_weight", True),
             scale_branch_by_routing_weight=mcfg.get("scale_branch_by_routing_weight", True),
+            attn_router_context=mcfg.get("attn_router_context", "none"),
+            attn_router_context_decay=mcfg.get("attn_router_context_decay", 0.95),
             router_exploration_rate=mcfg.get("router_exploration_rate", 0.0),
             branch_router_exploration_rate=mcfg.get("branch_router_exploration_rate"),
             branch_sampling=mcfg.get("branch_sampling", False),
@@ -349,8 +394,55 @@ def build_model(cfg: dict):
             branch_exploration_warmup_steps=_get_branch_router_field(
                 mcfg, "exploration_warmup_steps", 0
             ),
+            branch_entropy_coef=_get_branch_router_field(
+                mcfg, "entropy_coef", 0.0
+            ),
+            branch_entropy_decay=_get_branch_router_field(
+                mcfg, "entropy_decay", "constant"
+            ),
+            branch_entropy_min=_get_branch_router_field(
+                mcfg, "entropy_min", 0.0
+            ),
+            branch_entropy_decay_steps=_get_branch_router_field(
+                mcfg, "entropy_decay_steps", 0
+            ),
+            prelude_layers=mcfg.get("prelude_layers", 0),
+            coda_layers=mcfg.get("coda_layers", 0),
+            boundary_num_experts=_get_prelude_coda_field(mcfg, "num_experts"),
+            boundary_num_experts_per_tok=_get_prelude_coda_field(
+                mcfg, "num_experts_per_tok"
+            ),
+            boundary_moe_intermediate_size=_get_prelude_coda_field(
+                mcfg, "moe_intermediate_size"
+            ),
+            boundary_num_groups=_get_prelude_coda_field(mcfg, "num_groups"),
+            boundary_group_topk=_get_prelude_coda_field(mcfg, "group_topk"),
+            boundary_router_type=_get_prelude_coda_field(
+                mcfg, "router_type", "deepseek"
+            ),
+            boundary_bias_update_rate=_get_prelude_coda_field(
+                mcfg, "bias_update_rate", 0.001
+            ),
+            boundary_bias_update_zero_sum=_get_prelude_coda_field(
+                mcfg, "bias_update_zero_sum", True
+            ),
+            boundary_norm_topk_prob=_get_prelude_coda_field(mcfg, "norm_topk_prob"),
+            boundary_topk_scaling_factor=_get_prelude_coda_field(
+                mcfg, "topk_scaling_factor"
+            ),
+            recurrent=recurrent_moe_everything or mcfg.get("recurrent", False),
+            recurrent_adapter=mcfg.get("recurrent_adapter", True),
+            recurrent_adapter_intermediate_size=mcfg.get("recurrent_adapter_intermediate_size"),
+            recurrent_adapter_activation=mcfg.get("recurrent_adapter_activation", "gelu"),
+            recurrent_adapter_bias=mcfg.get("recurrent_adapter_bias", False),
+            eval_recurrence=mcfg.get("eval_recurrence", cfg.get("recurrence", {}).get("eval_recurrence", 32)),
+            mean_backprop_depth=mcfg.get(
+                "mean_backprop_depth",
+                cfg.get("recurrence", {}).get("mean_backprop_depth", 8),
+            ),
             **common,
         )
+        config.model_type = mtype
         # Branch quantile knobs — only used when branch_balancing=="quantile",
         # but the model constructor reads them unconditionally from config.
         bq_target = _get_branch_router_field(mcfg, "quantile_target_q", None)
@@ -371,6 +463,61 @@ def build_model(cfg: dict):
             config.router_topk_ordering = mcfg["router_topk_ordering"]
         config.router_z_loss_coef = mcfg.get("router_z_loss_coef", 0.0)
         model = MoEverythingForCausalLM(config)
+
+    elif mtype in {
+        "recurrent_standard_moe",
+        "recurrent_global_moe",
+        "hrm_recurrent_standard_moe",
+    }:
+        use_global_pool = mtype == "recurrent_global_moe"
+        use_hrm_loop = mtype == "hrm_recurrent_standard_moe"
+        config = RecurrentMoEConfig(
+            num_experts=mcfg["num_experts"],
+            prelude_layers=mcfg.get("prelude_layers", 4),
+            recurrent_layers=mcfg.get("recurrent_layers", 8),
+            coda_layers=mcfg.get("coda_layers", 4),
+            recurrent_expert_pool="global" if use_global_pool else "per_layer",
+            core_attention=mcfg.get("core_attention", True),
+            core_attention_layers=mcfg.get("core_attention_layers"),
+            recurrent_loop="hrm" if use_hrm_loop else mcfg.get("recurrent_loop", "flat"),
+            hrm_l_layers=mcfg.get("hrm_l_layers", 4),
+            hrm_h_layers=mcfg.get("hrm_h_layers", 4),
+            hrm_history_attention=mcfg.get("hrm_history_attention", use_hrm_loop),
+            recurrent_sandwich_norm=mcfg.get("recurrent_sandwich_norm", False),
+            recurrent_history_attention=mcfg.get("recurrent_history_attention", False),
+            recurrent_adapter=mcfg.get("recurrent_adapter", True),
+            recurrent_adapter_type=mcfg.get("recurrent_adapter_type", "mlp"),
+            recurrent_adapter_intermediate_size=mcfg.get("recurrent_adapter_intermediate_size"),
+            recurrent_adapter_activation=mcfg.get("recurrent_adapter_activation", "gelu"),
+            recurrent_adapter_bias=mcfg.get("recurrent_adapter_bias", False),
+            eval_recurrence=mcfg.get("eval_recurrence", cfg.get("recurrence", {}).get("eval_recurrence", 32)),
+            mean_backprop_depth=mcfg.get(
+                "mean_backprop_depth",
+                cfg.get("recurrence", {}).get("mean_backprop_depth", 8),
+            ),
+            boundary_num_experts=_get_prelude_coda_field(mcfg, "num_experts"),
+            boundary_num_experts_per_tok=_get_prelude_coda_field(
+                mcfg, "num_experts_per_tok"
+            ),
+            boundary_moe_intermediate_size=_get_prelude_coda_field(
+                mcfg, "moe_intermediate_size"
+            ),
+            use_deepseek_routing=use_deepseek,
+            topk_scaling_factor=mcfg.get("topk_scaling_factor", None),
+            num_groups=mcfg.get("num_groups", None),
+            group_topk=mcfg.get("group_topk", None),
+            global_router_update=mcfg.get("global_router_update", use_global_pool),
+            router_exploration_rate=mcfg.get("router_exploration_rate", 0.0),
+            router_z_loss_coef=mcfg.get("router_z_loss_coef", 0.0),
+            **common,
+        )
+        config.router_score_function = mcfg.get("router_score_function", "softmax")
+        if "softmax_position" in mcfg:
+            config.softmax_position = mcfg["softmax_position"]
+        if "router_topk_ordering" in mcfg:
+            config.router_topk_ordering = mcfg["router_topk_ordering"]
+        config.model_type = mtype
+        model = RecurrentMoEForCausalLM(config)
 
     if hasattr(model, "set_experts_implementation"):
         experts_impl = mcfg.get("experts_implementation", "grouped_mm")

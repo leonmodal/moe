@@ -108,11 +108,11 @@ def test_migrate_dec17_value_mapping_post_to_pre_topk():
 
 
 def test_migrate_expand_top_level_aux_loss_into_per_class_blocks():
-    """Round 27 review Finding 1 fix: top-level
-    training.load_balancing_method should expand into per-class
-    model.{mlp,attn,branch}_router blocks. `aux_loss` propagates
-    to MLP/attention; branch stays `none` until BranchRouter
-    runtime supports the broader method set.
+    """Top-level load_balancing_method expands into per-class blocks.
+
+    The migrator leaves branch routing as `none` by default so old global
+    method choices do not accidentally change the attention-vs-MLP schedule.
+    Branch methods are selected explicitly with `model.branch_router`.
     """
     mc = _load_migrator()
     cfg = {
@@ -158,7 +158,7 @@ def test_migrate_expand_top_level_deepseek_bias_into_per_class():
     assert cfg["model"]["mlp_router"]["balancing"] == "deepseek_bias"
     assert cfg["model"]["mlp_router"]["bias_update_rate"] == 0.001
     assert cfg["model"]["attn_router"]["balancing"] == "deepseek_bias"
-    # Branch stays `none` until BranchRouter runtime supports deepseek.
+    # Branch stays `none` unless explicitly configured via model.branch_router.
     assert cfg["model"]["branch_router"]["balancing"] == "none"
 
 

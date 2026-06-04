@@ -4,7 +4,10 @@
 plain pytest process. We instead expose the argv assembly as a pure helper
 (`build_train_script_args`) and pin its output here so a future refactor
 cannot silently drop one of the required flags (`--config`, `--auto_resume`,
-`--data_dir`, `--output_dir`, `--max_checkpoints`).
+`--dist-strategy`, `--data_dir`, `--output_dir`, `--max_checkpoints`).
+DDP is the default Modal launcher strategy for `moe_everything` because
+replicated FSDP still adds hook machinery that dynamic branch routing can
+desynchronize.
 """
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ def test_build_train_script_args_pins_required_flags():
     assert args == [
         "--config", "/root/moe/configs/scaling/m_standard.yaml",
         "--auto_resume",
+        "--dist-strategy", "ddp",
         "--data_dir", "/data/parquet",
         "--output_dir", "/checkpoints/m_standard",
         "--max_checkpoints", "3",
@@ -46,6 +50,34 @@ def test_build_train_script_args_can_disable_auto_resume():
         "--output_dir", "/ckpt",
         "--max_checkpoints", "0",
     ]
+
+
+def test_build_train_script_args_can_limit_max_steps():
+    args = modal_train.build_train_script_args(
+        "/cfg.yaml", data_dir="/data", output_dir="/ckpt",
+        max_checkpoints=0, max_steps=2,
+    )
+    assert "--max-steps" in args
+    assert args[args.index("--max-steps") + 1] == "2"
+
+
+def test_build_train_script_args_can_override_save_every():
+    args = modal_train.build_train_script_args(
+        "/cfg.yaml", data_dir="/data", output_dir="/ckpt",
+        max_checkpoints=0, save_every=100,
+    )
+    assert "--save-every" in args
+    assert args[args.index("--save-every") + 1] == "100"
+
+
+def test_build_train_script_args_ddp_drops_fsdp_sharding_flag():
+    args = modal_train.build_train_script_args(
+        "/cfg.yaml", data_dir="/data", output_dir="/ckpt",
+        max_checkpoints=0, dist_strategy="ddp",
+    )
+    assert "--dist-strategy" in args
+    assert args[args.index("--dist-strategy") + 1] == "ddp"
+    assert "--fsdp-sharding-strategy" not in args
 
 
 def test_resolve_output_dir_uses_experiment_name():
@@ -137,6 +169,7 @@ def test_build_torchrun_invocation_pins_full_kwargs(tmp_path):
     assert args == [
         "--config", config_path,
         "--auto_resume",
+        "--dist-strategy", "ddp",
         "--data_dir", "/data/parquet",
         "--output_dir", "/checkpoints/smoke_standard_moe",
         "--max_checkpoints", "3",
@@ -166,6 +199,29 @@ def test_build_torchrun_invocation_uses_experiment_name_from_config(tmp_path):
     assert "--output_dir" in invocation["training_script_args"]
     idx = invocation["training_script_args"].index("--output_dir") + 1
     assert invocation["training_script_args"][idx] == "/checkpoints/xyz"
+
+
+def test_build_torchrun_invocation_can_suffix_output_dir(tmp_path):
+    path = tmp_path / "cfg.yaml"
+    path.write_text(
+        "experiment_name: xyz\n"
+        "model: {type: dense, vocab_size: 128, hidden_size: 32, num_hidden_layers: 1, "
+        "head_dim: 8, num_attention_heads: 2, num_key_value_heads: 1, "
+        "max_position_embeddings: 64}\n"
+        "training: {learning_rate: 1.0e-3, weight_decay: 0.0, max_grad_norm: 1.0, "
+        "lr_scheduler: constant, warmup_steps: 0, max_steps: 1, batch_size: 1, "
+        "gradient_accumulation: 1, mixed_precision: bf16, output_dir: /tmp/out}\n"
+        "data: {data_dir: /data, text_column: text, seq_len: 16, tokenizer_name: gpt2}\n"
+        "eval: {enabled: false}\n"
+        "checkpoint: {}\n"
+    )
+    invocation = modal_train.build_torchrun_invocation(
+        str(path), node_rank=0, master_addr="127.0.0.1",
+        nnodes=1, nproc_per_node=1, max_checkpoints=0,
+        output_suffix="canary_bs32",
+    )
+    idx = invocation["training_script_args"].index("--output_dir") + 1
+    assert invocation["training_script_args"][idx] == "/checkpoints/xyz_canary_bs32"
 
 
 def test_build_torchrun_invocation_defaults_experiment_name_when_missing(tmp_path):
@@ -295,6 +351,7 @@ def test_modal_train_raw_function_forwards_expected_torchrun_kwargs(monkeypatch,
     assert captured_kwargs["training_script_args"] == [
         "--config", expected_config_path,
         "--auto_resume",
+        "--dist-strategy", "ddp",
         "--data_dir", modal_train.REMOTE_DATA_DIR,
         "--output_dir", "/checkpoints/raw_launcher_smoke",
         "--max_checkpoints", str(modal_train.MAX_CHECKPOINTS),

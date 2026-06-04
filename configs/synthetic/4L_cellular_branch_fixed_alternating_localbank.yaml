@@ -1,0 +1,105 @@
+experiment_name: 4L_cellular_branch_fixed_alternating_localbank
+
+# Local-bank ablation of MoE-Everything 4L cellular automata.
+# Each of the 8 depths has its own attention + MLP expert bank.
+# Branch routing = fixed_alternating, no sampling, no exploration.
+# Total params ~8x the global-bank variant of 4L since each depth's bank
+# is independent. Active per token still matches.
+
+model:
+  type: moe_everything
+  vocab_size: 4
+  hidden_size: 1024
+  num_hidden_layers: 8
+  head_dim: 128
+  num_attention_heads: 16
+  num_key_value_heads: 8
+  # Per-layer bank: each of 8 depths has its own expert pool. We scale
+  # num_experts and num_attn_experts down by 4 (not by num_depths=8) so
+  # each depth gets a moderately-sized pool — some diversity per depth,
+  # but not the global's full pool. Total expert weights across banks =
+  # 2× global. Active per token is unchanged.
+  num_experts: 16                 # per bank (was 64 global; 16×8=128 total)
+  num_experts_per_tok: 4
+  moe_intermediate_size: 768
+  intermediate_size: 3072
+  norm_topk_prob: true
+  router_exploration_rate: 0.02
+  bias_interpolation: false
+  topk_scaling_factor: 2.5
+  num_groups: 1                   # 16 experts: keep grouping off for simplicity
+  group_topk: 1
+  num_attn_experts: 8             # per bank (was 32 global; 8×8=64 total)
+  num_attn_experts_per_tok: 1
+  attn_expert_mode: per_head_recompute_kv
+  attn_routing_bundle: qkvo
+  per_layer_router: true
+  per_layer_mlp_router: true
+  per_layer_attn_router: true
+  per_layer_expert_bank: true     # <- the new flag
+  per_layer_norm: true
+  per_layer_qk_norm: true
+  scale_attn_by_routing_weight: true
+  scale_branch_by_routing_weight: true
+  use_deepseek_routing: true
+  global_router_update: true
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-06
+  rope_theta: 1000000.0
+  max_position_embeddings: 32768
+  tie_word_embeddings: true
+  output_router_logits: true
+  mlp_router:
+    balancing: deepseek_bias
+    bias_update_rate: 0.001
+    bias_update_zero_sum: true
+  attn_router:
+    balancing: deepseek_bias
+    bias_update_rate: 0.001
+    bias_update_zero_sum: true
+  branch_router:
+    balancing: fixed_alternating
+
+training:
+  learning_rate: 0.001
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 500
+  max_steps: 10000
+  min_lr_ratio: 0.1
+  batch_size: 32
+  gradient_accumulation: 1
+  mixed_precision: bf16
+  disable_liger: true
+  gradient_checkpointing: false
+  log_every: 10
+  routing_log_every: 50
+  save_every: 500
+  output_dir: ./outputs/synthetic/4L_cellular_branch_fixed_alternating_localbank
+  wandb_project: moe-synthetic
+  wandb_run_name: 4L_cellular_branch_fixed_alternating_localbank
+
+data:
+  format: synthetic_cellular_automata
+  state_size: 16
+  trajectory_length: 16
+  num_colors: 4
+  num_rules: 256
+  recursive_depth: 1
+  task_seed: 0
+  seed: 42
+  num_workers: 0
+
+eval:
+  enabled: true
+  every: 100
+  max_batches: 8
+  seed: 1234
+  batch_size: 32
+
+checkpoint:
+  resume_from: null

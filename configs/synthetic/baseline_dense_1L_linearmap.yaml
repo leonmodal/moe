@@ -1,0 +1,63 @@
+experiment_name: baseline_dense_1L_linearmap
+
+# Dense baseline matched to MoE-Everything 1L active-param budget:
+#   - attn (q+k+v+o, hidden=1024, num_heads=16, num_kv_heads=8, head_dim=128) ≈ 6.3M
+#   - mlp (hidden=1024, intermediate=3072) ≈ 9.4M
+#   - total active per token ≈ 15.7M (matches moe-everything fixed_alternating)
+# No routing — pure dense block, identical attn and mlp dims to enable apples-to-
+# apples comparison vs the MoE-Everything 1L sweep.
+
+model:
+  type: dense
+  vocab_size: 2
+  hidden_size: 1024
+  num_hidden_layers: 1
+  head_dim: 128
+  num_attention_heads: 16
+  num_key_value_heads: 8
+  intermediate_size: 3072
+  rms_norm_eps: 1.0e-06
+  rope_theta: 1000000.0
+  max_position_embeddings: 32768
+  tie_word_embeddings: true
+
+training:
+  learning_rate: 0.001
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 500
+  max_steps: 10000
+  min_lr_ratio: 0.1
+  batch_size: 64
+  gradient_accumulation: 1
+  mixed_precision: bf16
+  disable_liger: true
+  gradient_checkpointing: false
+  log_every: 10
+  save_every: 500
+  output_dir: ./outputs/synthetic/baseline_dense_1L_linearmap
+  wandb_project: moe-synthetic
+  wandb_run_name: baseline_dense_1L_linearmap
+
+data:
+  format: synthetic_linear_map
+  state_size: 16
+  sparsity: 3
+  trajectory_length: 2
+  num_colors: 2
+  task_seed: 0
+  seed: 42
+  num_workers: 0
+
+eval:
+  enabled: true
+  every: 100
+  max_batches: 8
+  seed: 1234
+  batch_size: 64
+
+checkpoint:
+  resume_from: null

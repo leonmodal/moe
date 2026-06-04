@@ -1,4 +1,4 @@
-"""Benchmark dense vs sparse expert-table attention for per_head_precompute_kv."""
+"""Benchmark dense vs sparse expert-table attention for per_head_recompute_kv."""
 import torch
 import torch.nn.functional as F
 import time

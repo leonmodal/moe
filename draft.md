@@ -152,13 +152,13 @@ load-balancing variants (`deepseek_bias`, `aux_loss` Switch-style, `quantile`).
   - per-layer expert pool (16 experts/layer), DeepSeek router class, vary balancing knob
 - [ ] **global_moe** × {deepseek, switch, quantile}
   - single shared MLP pool across layers (16 × num_layers experts), DeepSeek router, vary balancing
-- [ ] **precompute_kv** × {deepseek, switch, quantile}
-  - `moe_everything`, `attn_expert_mode: per_head_precompute_kv`, shared expert banks across
+- [ ] **recompute_kv** × {deepseek, switch, quantile}
+  - `moe_everything`, `attn_expert_mode: per_head_recompute_kv`, shared expert banks across
     depth iters, **per-depth routers + per-depth prenorms** (the `_perlayer_prenorm` flavor:
     `per_layer_router=true`, `per_layer_attn_router=true`, `per_layer_norm=true`), vary balancing
-- [ ] **precompute_kv_global_router** × {deepseek, switch, quantile}
-  - same precompute_kv attention bank, but **one single router reused at every depth iteration**
-    (plain `precompute_kv` flavor: `per_layer_router=false`, `per_layer_attn_router=false`,
+- [ ] **recompute_kv_qkvo** × {deepseek, switch, quantile}
+  - same recompute_kv attention bank, but **one single router reused at every depth iteration**
+    (plain `recompute_kv` flavor: `per_layer_router=false`, `per_layer_attn_router=false`,
     `per_layer_mlp_router=false` → branch router, per-head attn routers, and MLP gate are all
     constructed once and the for-loop just calls them again every iter), vary balancing
 

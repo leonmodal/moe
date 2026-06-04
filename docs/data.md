@@ -2,7 +2,10 @@
 
 ## Data Format
 
-The sole supported data format is **sharded parquet**. The token-bin format has been removed; see `legacy/speedrun/` for the archived `src/data/token_bin_dataset.py` implementation.
+Supported formats:
+- `parquet` (default): sharded parquet, tokenized on the fly. Token-bin has been removed; see `legacy/speedrun/`.
+- `synthetic_linear_map`: in-memory generator for the sparse-linear-map task from Zhao et al. NeurIPS 2026 §3.1. See [Synthetic Tasks](#synthetic-tasks) below.
+- `synthetic_cellular_automata`: in-memory generator for the cellular-automata task. See [Synthetic Tasks](#synthetic-tasks) below.
 
 ## StatefulParquetDataset
 
@@ -98,3 +101,50 @@ uv run python scripts/download_data.py --max_shards 64
 ```
 
 For Modal, use `modal run modal_train.py::download_data --max-shards 64`.
+
+## Synthetic Tasks
+
+`src/data/synthetic.py` implements two attention-pattern probes from Zhao et al. NeurIPS 2026:
+
+### Linear Map (`format: synthetic_linear_map`)
+
+Sample a sparse binary `A ∈ {0,1}^{S×S}` once per dataset instance; each example is `[x_0, x_1]` (length `S·T = 32`) where `x_0` is uniform random and `x_1 = A·x_0 mod 2`. The ground-truth attention pattern is row `A[i]` — the s positions in `x_0` the model must attend to in order to predict `x_1[i]`.
+
+```yaml
+data:
+  format: synthetic_linear_map
+  state_size: 16        # S
+  sparsity: 3           # s (nonzeros per row of A)
+  trajectory_length: 2  # T (always 2 for linear map)
+  num_colors: 2         # C (vocab size; always 2 for linear map)
+  task_seed: 0          # controls A; must be shared between train and eval
+  seed: 42              # per-example rng; train and eval should differ
+```
+
+### Cellular Automata (`format: synthetic_cellular_automata`)
+
+Sample N lookup tables `R: {0..C-1}^3 → {0..C-1}` once per dataset instance, each composed k times. Per example, pick a rule and apply it T-1 times starting from random `x_0`, producing a `S·T`-token sequence. The ground-truth attention pattern is a local 3-window on the previous state.
+
+```yaml
+data:
+  format: synthetic_cellular_automata
+  state_size: 16          # S
+  trajectory_length: 16   # T
+  num_colors: 4           # C (vocab size)
+  num_rules: 256          # N
+  recursive_depth: 1      # k (rule composition depth)
+  task_seed: 0            # controls rule bank; shared train+eval
+  seed: 42                # per-example rng
+```
+
+### Seed semantics
+
+`task_seed` controls the ground-truth task (A or rule lookup tables) and is rank-shared and shared between train and eval. `seed` controls the per-example rng and is independent per rank / per dataset instance — `build_eval_dataset` uses `eval.seed` so train and eval produce disjoint streams over the same task.
+
+### Attention evaluation
+
+When `data.format` is synthetic, the trainer also runs an attention-pattern eval against the ground-truth `A` at every eval step. See `src/training/attention_eval.py` for metrics (per-depth `kl_agg`, `kl_best`, `iou_agg`, `entropy_agg`) and heatmap output (`<output_dir>/attn_eval/step_<step>/depth_<d>.png`, saved at checkpoint cadence).
+
+### Resume / state
+
+Synthetic datasets implement the `get_state`/`set_state` interface used by the trainer: state is a single counter (examples are i.i.d., so resume re-seeds with `rank_seed + example_idx`). The trainer auto-clamps `num_workers=0` for these stateful datasets (same rule as parquet).

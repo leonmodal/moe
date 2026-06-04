@@ -25,11 +25,16 @@ This repository implements Mixture-of-Experts (MoE) language model pre-training 
 | **Global MoE** | `global_moe` | Single shared expert pool across all layers |
 | **MoE-Everything** | `moe_everything` | Branch routing + per-head attention/MLP expert banks |
 
-DeepSeek routing available via `router_type: deepseek` for any MoE model type.
+DeepSeek expert routing is available via `router_type: deepseek` for any
+MoE model type. In `moe_everything`, the branch router is configured
+separately with `model.branch_router.balancing`; `deepseek_bias` there
+means two independent sigmoid scores for ATTN/MLP plus branch bias.
 
-MoE-Everything supports two attention expert modes:
-- **Fully Independent** (`per_head_fully_independent`): Q, K, V, O each routed independently per head
-- **Precompute KV** (`per_head_precompute_kv`): bundled QKVO routing per head
+MoE-Everything attention has two explicit axes:
+- `attn_expert_mode`: `per_head_no_recompute`, `per_head_recompute_k`, or `per_head_recompute_kv`
+- `attn_routing_bundle`: `q_k_v_o`, `qk_v_o`, `qk_vo`, `qkv_o`, or `qkvo`
+- `attn_router_context`: `none` or `ema_qk_v`; EMA context applies only to
+  QK/V routers, while O remains a local post-attention route.
 
 ## Quick Start
 
@@ -38,8 +43,8 @@ MoE-Everything supports two attention expert modes:
 uv sync
 
 # Single-node training (8 GPUs)
-torchrun --nproc_per_node=8 scripts/train.py --config configs/standard_moe.yaml
+torchrun --nproc_per_node=8 scripts/train.py --config configs/16_layers/standard_moe_deepseek_bias.yaml
 
 # Multi-node on Modal
-modal run modal_train.py
+modal run modal_train.py --config configs/16_layers/moe_everything_per_head_recompute_k_qk_v_o_deepseek_bias.yaml
 ```

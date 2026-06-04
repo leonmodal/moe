@@ -1,13 +1,4 @@
-"""Drift detection for nested-schema yamls under `configs/nested/`.
-
-Every yaml in `configs/nested/` MUST be on the nested schema:
-* `model.{mlp,attn,branch}_router` blocks present.
-* No top-level `training.load_balancing_method` (nested-only).
-
-A drift test guards the matrix from regressions: if an operator
-manually edits a nested yaml back to flat shape, the drift test
-fails immediately so the matrix's "nested" promise is enforced.
-"""
+"""Drift detection for the active 16-layer config matrix."""
 from __future__ import annotations
 
 import importlib.util
@@ -19,9 +10,10 @@ import yaml
 REPO = Path(__file__).resolve().parent.parent
 
 
-def _load_validator():
+def _load_balancing_validator():
     if "src.training" not in sys.modules:
         import types
+
         pkg = types.ModuleType("src.training")
         pkg.__path__ = [str(REPO / "src" / "training")]
         sys.modules["src.training"] = pkg
@@ -36,82 +28,56 @@ def _load_validator():
 
 
 def _nested_yamls() -> list[Path]:
-    """All matrix yamls in the active config tree. After
-    Round 30's reorganization, the matrix lives ONLY under
-    `configs/{4,8,16}_layers/`; non-matrix examples (sanity,
-    perlayer-prenorm variants, seq_aux experiments) live under
-    `configs/extras/` and are explicitly excluded.
-    """
-    paths: list[Path] = []
-    for sub in ("configs/4_layers", "configs/8_layers", "configs/16_layers"):
-        paths.extend(sorted((REPO / sub).rglob("*.yaml")))
-    return paths
+    return sorted((REPO / "configs" / "16_layers").glob("*.yaml"))
 
 
-# AC-18 matrix specification: 13 yamls per depth × 3 depths = 39.
-# 1 dense + (4 MoE families × 3 methods) = 13 per depth.
-_MATRIX_DEPTHS = ("4_layers", "8_layers", "16_layers")
-_MATRIX_FAMILIES = (
-    "standard_moe",
-    "global_moe",
-    "moe_everything_per_head_fully_independent",
-    "moe_everything_per_head_precompute_kv",
+_MATRIX_DEPTHS = ("16_layers",)
+_EXPECTED_CONFIG_FILES = (
+    "standard_moe_deepseek_bias.yaml",
+    "moe_everything_per_head_recompute_k_qk_v_o_deepseek_bias.yaml",
+    "moe_everything_per_head_recompute_k_qk_v_o_ema_qk_v_deepseek_bias.yaml",
+    "moe_everything_per_head_recompute_kv_qk_v_o_deepseek_bias.yaml",
+    "moe_everything_per_head_recompute_kv_qk_v_o_ema_qk_v_deepseek_bias.yaml",
 )
-_MATRIX_METHODS = ("aux_loss", "deepseek_bias", "quantile")
 
 
 def _expected_matrix() -> set[tuple[str, str, str]]:
-    expected: set[tuple[str, str, str]] = set()
-    for depth in _MATRIX_DEPTHS:
-        expected.add((depth, "dense", "none"))
-        for family in _MATRIX_FAMILIES:
-            for method in _MATRIX_METHODS:
-                expected.add((depth, family, method))
-    return expected
+    return {
+        ("16_layers", "standard_moe", "deepseek_bias"),
+        ("16_layers", "moe_everything:per_head_recompute_k:qk_v_o:none", "deepseek_bias"),
+        ("16_layers", "moe_everything:per_head_recompute_k:qk_v_o:ema_qk_v", "deepseek_bias"),
+        ("16_layers", "moe_everything:per_head_recompute_kv:qk_v_o:none", "deepseek_bias"),
+        ("16_layers", "moe_everything:per_head_recompute_kv:qk_v_o:ema_qk_v", "deepseek_bias"),
+    }
 
 
 def _classify(path: Path) -> tuple[str, str, str]:
     with path.open() as f:
         cfg = yaml.safe_load(f)
     mcfg = cfg.get("model", {}) or {}
-    depth = path.parent.name  # "4_layers" / "8_layers" / "16_layers"
+    depth = path.parent.name
     family = mcfg.get("type", "unknown")
     if family == "moe_everything":
-        attn_mode = mcfg.get("attn_expert_mode", "")
         family = (
-            "moe_everything_per_head_precompute_kv"
-            if "precompute_kv" in attn_mode
-            else "moe_everything_per_head_fully_independent"
+            f"moe_everything:{mcfg.get('attn_expert_mode', '')}:"
+            f"{mcfg.get('attn_routing_bundle', '')}:"
+            f"{mcfg.get('attn_router_context', 'none')}"
         )
     if family == "dense":
         method = "none"
     else:
-        nested_mlp = mcfg.get("mlp_router", {}) or {}
-        method = nested_mlp.get("balancing", "unknown")
+        method = (mcfg.get("mlp_router", {}) or {}).get("balancing", "unknown")
     return depth, family, method
 
 
-def test_matrix_has_exactly_39_yamls_in_13x3_layout():
-    """The AC-18 matrix is exactly 13 yamls per depth × 3 depths
-    = 39 total. Round 30 restructured the tree to enforce this
-    layout; non-matrix examples were moved to `configs/extras/`."""
+def test_matrix_has_exactly_five_yamls_in_16_layer_layout():
     paths = _nested_yamls()
-    assert len(paths) == 39, (
-        f"matrix should have exactly 39 yamls; found {len(paths)}"
-    )
-    by_depth: dict[str, list[Path]] = {}
-    for p in paths:
-        by_depth.setdefault(p.parent.name, []).append(p)
-    for depth, files in by_depth.items():
-        assert len(files) == 13, (
-            f"{depth} has {len(files)} yamls; expected exactly 13"
-        )
+    assert len(paths) == 5, f"16-layer launch set should have 5 yamls; found {len(paths)}"
+    assert {p.parent.name for p in paths} == {"16_layers"}
+    assert {p.name for p in paths} == set(_EXPECTED_CONFIG_FILES)
 
 
 def test_matrix_covers_every_required_cell():
-    """Every (depth, family, method) tuple in the spec must have
-    AT LEAST one yaml, and there must be NO yamls outside the
-    spec. Round 28's review demanded an explicit matrix-spec test."""
     expected = _expected_matrix()
     found: set[tuple[str, str, str]] = set()
     extras: list[tuple[Path, tuple[str, str, str]]] = []
@@ -121,14 +87,8 @@ def test_matrix_covers_every_required_cell():
             found.add(cls)
         else:
             extras.append((p, cls))
-    missing = expected - found
-    assert not missing, (
-        f"matrix is missing {len(missing)} required cell(s): "
-        f"{sorted(missing)}"
-    )
-    assert not extras, (
-        f"yamls present that don't fit the spec: {extras}"
-    )
+    assert not (expected - found), f"matrix is missing cells: {sorted(expected - found)}"
+    assert not extras, f"yamls present that do not fit the spec: {extras}"
 
 
 _TOP_LEVEL_BALANCING_FIELDS = (
@@ -143,12 +103,6 @@ _TOP_LEVEL_BALANCING_FIELDS = (
 
 
 def test_matrix_has_no_top_level_balancing_fields():
-    """Round 30 review Finding 1: every active matrix yaml must
-    have ZERO top-level balancing coefficients/methods. The
-    per-class blocks (`model.{mlp,attn,branch}_router`) are
-    authoritative; top-level fields are off-axis pollution that
-    can keep the matrix in a mixed nested-plus-flat state.
-    """
     leaks: list[tuple[str, str, object]] = []
     for p in _nested_yamls():
         with p.open() as f:
@@ -160,23 +114,19 @@ def test_matrix_has_no_top_level_balancing_fields():
         mcfg = cfg.get("model", {}) or {}
         if "load_balancing_method" in mcfg:
             leaks.append((str(p), "model.load_balancing_method", mcfg["load_balancing_method"]))
-    assert not leaks, (
-        f"matrix yamls still carry top-level balancing fields "
-        f"(off-axis pollution): {leaks}"
-    )
+    assert not leaks, f"matrix yamls carry top-level balancing fields: {leaks}"
 
 
 def test_matrix_aux_loss_rows_have_only_aux_coef_in_per_class():
-    """Per-method axis rule for aux_loss rows: the per-class
-    `mlp_router` block has `balancing: aux_loss` and may carry
-    `router_aux_loss_coef`. It must NOT carry seq_aux_loss_coef,
-    bias_update_*, or quantile_* knobs (those would silently mix
-    methods)."""
     incompatible_for_aux = (
         "seq_aux_loss_coef",
-        "bias_update_rate", "bias_update_zero_sum",
-        "bias_warmup_start", "bias_warmup_steps",
-        "quantile_eta", "quantile_target_q", "quantile_global_state",
+        "bias_update_rate",
+        "bias_update_zero_sum",
+        "bias_warmup_start",
+        "bias_warmup_steps",
+        "quantile_eta",
+        "quantile_target_q",
+        "quantile_global_state",
     )
     leaks = []
     for p in _nested_yamls():
@@ -191,14 +141,9 @@ def test_matrix_aux_loss_rows_have_only_aux_coef_in_per_class():
             for key in incompatible_for_aux:
                 if key in block and block[key]:
                     leaks.append((str(p), f"{group}.{key}", block[key]))
-    assert not leaks, (
-        f"aux_loss matrix rows carry off-axis per-class knobs: {leaks}"
-    )
+    assert not leaks, f"aux_loss matrix rows carry off-axis knobs: {leaks}"
 
 
-# Required active knob values for each method, per the AC-18 matrix
-# spec. Each matrix row's per-class block at `balancing == method`
-# MUST carry the corresponding key at this exact value.
 _REQUIRED_ACTIVE_KNOBS = {
     "aux_loss": {"router_aux_loss_coef": 0.001},
     "seq_aux_loss": {"seq_aux_loss_coef": 0.0001},
@@ -208,20 +153,40 @@ _REQUIRED_ACTIVE_KNOBS = {
         "quantile_target_q": 0.5,
         "quantile_global_state": True,
     },
+    "sampling_entropy": {
+        "entropy_coef": 0.01,
+        "entropy_decay": "cosine",
+        "entropy_min": 0.0,
+        "entropy_decay_steps": 1000,
+    },
+    "exploration_only": {
+        "exploration_rate": 0.10,
+        "exploration_decay": "cosine",
+        "exploration_min": 0.0,
+        "exploration_warmup_steps": 1000,
+    },
 }
 
 
-# Branch-router contract for `per_head_precompute_kv` matrix rows.
-# Per the matrix spec, every yaml whose `attn_expert_mode` is
-# `per_head_precompute_kv` must enable branch exploration_only with
-# the documented decay schedule.
-_PRECOMPUTE_KV_BRANCH_SPEC = {
-    "balancing": "exploration_only",
-    "exploration_rate": 0.1,
-    "exploration_decay": "cosine",
-    "exploration_min": 0.01,
-    "exploration_warmup_steps": 1000,
-}
+_RECOMPUTE_BRANCH_SPECS = (
+    {
+        "balancing": "sampling_entropy",
+        "entropy_coef": 0.01,
+        "entropy_decay": "cosine",
+        "entropy_min": 0.0,
+        "entropy_decay_steps": 1000,
+    },
+    {
+        "balancing": "exploration_only",
+        "exploration_rate": 0.10,
+        "exploration_decay": "cosine",
+        "exploration_min": 0.0,
+        "exploration_warmup_steps": 1000,
+    },
+    {
+        "balancing": "fixed_alternating",
+    },
+)
 
 
 _BAD_AUX_YAML_TEXT = """experiment_name: validator_negative_probe
@@ -250,140 +215,135 @@ training:
 
 
 def test_cli_validator_rejects_missing_active_knob_absolute_path(tmp_path):
-    """scripts/validate_configs.py must fail on a matrix yaml
-    that omits the active method's required knob, given an
-    absolute path. Was the only case Round 32 covered."""
     import os
     import subprocess
-    matrix_dir = tmp_path / "configs" / "4_layers"
+
+    matrix_dir = tmp_path / "configs" / "16_layers"
     matrix_dir.mkdir(parents=True)
-    bad_yaml = matrix_dir / "standard_moe_aux_loss.yaml"
+    bad_yaml = matrix_dir / "bad_standard_moe.yaml"
     bad_yaml.write_text(_BAD_AUX_YAML_TEXT)
     cmd = [sys.executable, "scripts/validate_configs.py", str(bad_yaml)]
     env = {"PYTHONPATH": str(REPO), **os.environ}
-    result = subprocess.run(
-        cmd, cwd=str(REPO), env=env, capture_output=True, text=True,
-    )
-    assert result.returncode != 0, (
-        f"CLI did not detect missing aux active knob:\n"
-        f"STDOUT={result.stdout}\nSTDERR={result.stderr}"
-    )
+    result = subprocess.run(cmd, cwd=str(REPO), env=env, capture_output=True, text=True)
+    assert result.returncode != 0
     assert "router_aux_loss_coef" in result.stdout
 
 
-def test_cli_validator_rejects_missing_active_knob_relative_path(tmp_path):
-    """Round 33 review Finding 2: the CLI's strict mode must fire
-    for relative paths too. Drop a bad yaml into a real
-    `configs/4_layers/` location, run the CLI from the repo root
-    with a RELATIVE path, and assert it fails. This was the
-    silent-skip path Round 33's substring matcher missed.
-    """
+def test_cli_validator_rejects_missing_active_knob_relative_path():
     import os
-    import shutil
     import subprocess
 
-    # Drop the bad yaml into the actual configs/4_layers dir so
-    # `relative_to(repo / "configs")` works correctly. We restore
-    # the dir afterwards so the matrix isn't permanently dirty.
     tmp_name = "_TMP_validator_relative_probe.yaml"
-    target = REPO / "configs" / "4_layers" / tmp_name
+    target = REPO / "configs" / "16_layers" / tmp_name
     target.write_text(_BAD_AUX_YAML_TEXT)
     try:
-        cmd = [
-            sys.executable, "scripts/validate_configs.py",
-            f"configs/4_layers/{tmp_name}",  # RELATIVE path
-        ]
+        cmd = [sys.executable, "scripts/validate_configs.py", f"configs/16_layers/{tmp_name}"]
         env = {"PYTHONPATH": str(REPO), **os.environ}
-        result = subprocess.run(
-            cmd, cwd=str(REPO), env=env,
-            capture_output=True, text=True,
-        )
-        assert result.returncode != 0, (
-            f"CLI did not detect missing aux active knob "
-            f"(relative path):\n"
-            f"STDOUT={result.stdout}\nSTDERR={result.stderr}"
-        )
+        result = subprocess.run(cmd, cwd=str(REPO), env=env, capture_output=True, text=True)
+        assert result.returncode != 0
         assert "router_aux_loss_coef" in result.stdout
     finally:
         if target.exists():
             target.unlink()
 
 
-def test_cli_validator_rejects_dec6_branch_drift_relative(tmp_path):
-    """Round 33 review Finding 2: CLI must enforce DEC-6 branch
-    contract on precompute_kv rows. Mutate a real precompute_kv
-    yaml so its branch_router becomes 'none', run CLI, expect
-    failure. Restore the yaml afterwards so the matrix stays
-    clean."""
+def test_cli_validator_rejects_recompute_branch_drift_relative():
     import os
     import subprocess
 
-    target = REPO / "configs" / "4_layers" / "moe_everything_per_head_precompute_kv_aux_loss.yaml"
+    rel = "configs/16_layers/moe_everything_per_head_recompute_kv_qk_v_o_deepseek_bias.yaml"
+    target = REPO / rel
     original = target.read_text()
     try:
         bad_text = original.replace(
             (
                 "  branch_router:\n"
-                "    balancing: exploration_only\n"
-                "    exploration_rate: 0.1\n"
-                "    exploration_decay: cosine\n"
-                "    exploration_min: 0.01\n"
-                "    exploration_warmup_steps: 1000\n"
+                "    balancing: sampling_entropy\n"
+                "    entropy_coef: 0.01\n"
+                "    entropy_decay: cosine\n"
+                "    entropy_min: 0.0\n"
+                "    entropy_decay_steps: 1000\n"
             ),
             "  branch_router:\n    balancing: none\n",
         )
         target.write_text(bad_text)
-        cmd = [
-            sys.executable, "scripts/validate_configs.py",
-            "configs/4_layers/moe_everything_per_head_precompute_kv_aux_loss.yaml",
-        ]
+        cmd = [sys.executable, "scripts/validate_configs.py", rel]
         env = {"PYTHONPATH": str(REPO), **os.environ}
-        result = subprocess.run(
-            cmd, cwd=str(REPO), env=env,
-            capture_output=True, text=True,
-        )
-        assert result.returncode != 0, (
-            f"CLI did not detect DEC-6 branch drift:\n"
-            f"STDOUT={result.stdout}\nSTDERR={result.stderr}"
-        )
-        assert "precompute_kv" in result.stdout
+        result = subprocess.run(cmd, cwd=str(REPO), env=env, capture_output=True, text=True)
+        assert result.returncode != 0
+        assert "recompute attention row" in result.stdout
     finally:
         target.write_text(original)
 
 
-def test_precompute_kv_rows_set_dec6_branch_exploration():
-    """Every matrix row whose `attn_expert_mode == per_head_precompute_kv`
-    must set branch_router to the documented exploration_only spec
-    (rate=0.1, decay=cosine, min=0.01, warmup=1000). The KV
-    precompute path is the architectural variant that benefits most
-    from the random branch curriculum, so the matrix locks the
-    branch contract for those rows."""
+def test_cli_validator_accepts_qkvo_branch_ablation_configs():
+    import os
+    import subprocess
+
+    rels = [
+        "configs/16_layers/moe_everything_per_head_recompute_kv_qkvo_branch_sampling_entropy.yaml",
+        "configs/16_layers/moe_everything_per_head_recompute_kv_qkvo_branch_top1_explore_decay.yaml",
+        "configs/16_layers/moe_everything_per_head_recompute_kv_qkvo_branch_fixed_alternating.yaml",
+    ]
+    cmd = [sys.executable, "scripts/validate_configs.py", *rels]
+    env = {"PYTHONPATH": str(REPO), **os.environ}
+    result = subprocess.run(cmd, cwd=str(REPO), env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_recompute_rows_set_branch_exploration():
     deficits: list[tuple[str, str]] = []
     for p in _nested_yamls():
         with p.open() as f:
             cfg = yaml.safe_load(f)
         mcfg = cfg.get("model", {}) or {}
-        if mcfg.get("attn_expert_mode") != "per_head_precompute_kv":
+        if mcfg.get("attn_expert_mode") not in {"per_head_recompute_k", "per_head_recompute_kv"}:
             continue
         branch = mcfg.get("branch_router", {}) or {}
-        for key, expected in _PRECOMPUTE_KV_BRANCH_SPEC.items():
-            actual = branch.get(key)
-            if actual != expected:
-                deficits.append((str(p), f"branch_router.{key} = {actual!r} (expected {expected!r})"))
-    assert not deficits, (
-        f"precompute_kv matrix rows missing the branch exploration_only spec: "
-        f"{deficits}"
+        if not any(
+            all(branch.get(key) == expected for key, expected in spec.items())
+            for spec in _RECOMPUTE_BRANCH_SPECS
+        ):
+            deficits.append((str(p), f"branch_router={branch!r}"))
+    assert not deficits, f"recompute matrix rows missing a supported branch spec: {deficits}"
+
+
+def test_moe_everything_rows_are_fully_per_layer():
+    required = (
+        "per_layer_router",
+        "per_layer_mlp_router",
+        "per_layer_attn_router",
+        "per_layer_norm",
+        "per_layer_qk_norm",
     )
+    deficits: list[tuple[str, str]] = []
+    for p in _nested_yamls():
+        with p.open() as f:
+            cfg = yaml.safe_load(f)
+        mcfg = cfg.get("model", {}) or {}
+        if mcfg.get("type") != "moe_everything":
+            continue
+        for key in required:
+            if mcfg.get(key) is not True:
+                deficits.append((str(p), f"{key}={mcfg.get(key)!r}, expected True"))
+    assert not deficits, f"MoE-Everything launch rows must be fully per-layer: {deficits}"
+
+
+def test_no_recompute_rows_keep_branch_router_none():
+    deficits: list[tuple[str, str]] = []
+    for p in _nested_yamls():
+        with p.open() as f:
+            cfg = yaml.safe_load(f)
+        mcfg = cfg.get("model", {}) or {}
+        if mcfg.get("attn_expert_mode") != "per_head_no_recompute":
+            continue
+        balancing = (mcfg.get("branch_router", {}) or {}).get("balancing")
+        if balancing != "none":
+            deficits.append((str(p), f"branch_router.balancing={balancing!r}"))
+    assert not deficits
 
 
 def test_matrix_rows_carry_required_active_knobs_per_method():
-    """Round 31 review Finding 1: every matrix row's per-class
-    block must explicitly carry the active knobs for its method.
-    Aux rows MUST have `router_aux_loss_coef: 0.001`; deepseek
-    rows MUST have `bias_update_rate: 0.001`; quantile rows MUST
-    have the full quantile knob set. Implicit defaults are not
-    acceptable — the per-class block is the source of truth.
-    """
     deficits: list[tuple[str, str, str]] = []
     for p in _nested_yamls():
         with p.open() as f:
@@ -394,69 +354,38 @@ def test_matrix_rows_carry_required_active_knobs_per_method():
         for group in ("mlp_router", "attn_router", "branch_router"):
             block = mcfg.get(group, {}) or {}
             method = block.get("balancing")
-            if method in (None, "none", "exploration_only"):
+            if method in (None, "none", "fixed_alternating"):
                 continue
-            required = _REQUIRED_ACTIVE_KNOBS.get(method, {})
-            for key, expected in required.items():
+            for key, expected in _REQUIRED_ACTIVE_KNOBS.get(method, {}).items():
                 actual = block.get(key)
                 if actual != expected:
                     deficits.append((str(p), f"{group}.{key}", f"expected {expected!r}, got {actual!r}"))
-    assert not deficits, (
-        f"matrix rows missing required active knobs: {deficits}"
-    )
+    assert not deficits, f"matrix rows missing required active knobs: {deficits}"
 
 
-def test_matrix_has_quantile_rows():
-    """Codex Round 29 review explicitly flagged the absence of
-    quantile rows. Pin this contract: every depth must have
-    quantile yamls for each MoE family."""
-    quantile_paths = [
-        p for p in _nested_yamls()
-        if _classify(p)[2] == "quantile"
-    ]
-    assert len(quantile_paths) == len(_MATRIX_DEPTHS) * len(_MATRIX_FAMILIES), (
-        f"expected {len(_MATRIX_DEPTHS) * len(_MATRIX_FAMILIES)} "
-        f"quantile yamls (4 families × 3 depths); got {len(quantile_paths)}"
-    )
+def test_matrix_has_only_deepseek_bias_rows():
+    non_deepseek = [p for p in _nested_yamls() if _classify(p)[2] != "deepseek_bias"]
+    assert not non_deepseek, f"launch set should contain only deepseek_bias rows: {non_deepseek}"
 
 
-def test_nested_directory_has_yamls():
-    """Sanity: the matrix directories exist and have yamls."""
-    paths = _nested_yamls()
-    assert paths, (
-        "matrix directories empty; expected 39 yamls across "
-        "configs/{4,8,16}_layers/"
-    )
-
-
-def test_every_nested_yaml_has_per_class_blocks():
-    """Every MoE yaml in the active config tree MUST set at least
-    one of the per-class router blocks (`mlp_router` / `attn_router`
-    / `branch_router`). Dense yamls have no MoE routers so they're
-    exempt from the per-class requirement."""
+def test_every_moe_yaml_has_per_class_blocks():
     deficits: list[tuple[str, str]] = []
     for p in _nested_yamls():
         with p.open() as f:
             cfg = yaml.safe_load(f)
         mcfg = cfg.get("model", {}) or {}
         if mcfg.get("type") == "dense":
-            continue  # dense has no MoE routers
+            continue
         has_any = any(
             isinstance(mcfg.get(name), dict) and mcfg[name]
             for name in ("mlp_router", "attn_router", "branch_router")
         )
         if not has_any:
             deficits.append((str(p), "no per-class router blocks"))
-    assert not deficits, (
-        f"MoE yamls without per-class blocks: {deficits}"
-    )
+    assert not deficits, f"MoE yamls without per-class blocks: {deficits}"
 
 
-def test_no_nested_yaml_has_top_level_method():
-    """nested-schema yamls must NOT carry `training.load_balancing_method`
-    or `model.load_balancing_method` — the per-class blocks are
-    authoritative. This is the AC-13 nested-only contract.
-    """
+def test_no_yaml_has_top_level_method():
     deficits: list[tuple[str, str]] = []
     for p in _nested_yamls():
         with p.open() as f:
@@ -464,16 +393,11 @@ def test_no_nested_yaml_has_top_level_method():
         for block in ("training", "model"):
             if cfg.get(block, {}).get("load_balancing_method") is not None:
                 deficits.append((str(p), f"{block}.load_balancing_method present"))
-    assert not deficits, (
-        f"nested yamls still carrying top-level load_balancing_method: "
-        f"{deficits}"
-    )
+    assert not deficits, f"yamls still carry top-level load_balancing_method: {deficits}"
 
 
-def test_every_nested_yaml_validates():
-    """Every nested yaml must pass the canonical validator
-    (`validate_branch_router_config`) without exception."""
-    bf = _load_validator()
+def test_every_yaml_validates():
+    bf = _load_balancing_validator()
     failures: list[tuple[str, str]] = []
     for p in _nested_yamls():
         with p.open() as f:
@@ -482,21 +406,12 @@ def test_every_nested_yaml_validates():
             bf.validate_branch_router_config(cfg)
         except ValueError as exc:
             failures.append((str(p), str(exc)))
-    assert not failures, (
-        f"nested yamls failing validation: {failures}"
-    )
+    assert not failures, f"yamls failing validation: {failures}"
 
 
 def test_migrator_is_idempotent_on_active_config_tree():
-    """Round 29 review Finding 1: the migrator's dry run on the
-    active config tree (configs/) must report ZERO changes. If the
-    migrator finds a change, the repo carries either a redundant
-    top-level coefficient or a flat field that should already have
-    been migrated. Catches regression where new yamls are authored
-    without going through the migrator first.
-    """
     spec = importlib.util.spec_from_file_location(
-        "migrate_configs", str(REPO / "scripts" / "migrate_configs.py"),
+        "migrate_configs", str(REPO / "scripts" / "migrate_configs.py")
     )
     mc = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mc)
@@ -508,11 +423,4 @@ def test_migrator_is_idempotent_on_active_config_tree():
         changes = mc.migrate_config(cfg)
         if changes:
             drift.append((str(p), changes))
-    assert not drift, (
-        f"migrator found changes on the active config tree — should be "
-        f"idempotent: {drift}"
-    )
-
-
-if __name__ == "__main__":
-    print("Run via pytest")
+    assert not drift, f"migrator found changes on active configs: {drift}"

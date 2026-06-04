@@ -1,0 +1,124 @@
+experiment_name: 16_layers_moe_everything_prelude4_recurrent16_coda4_branch_fixed_alternating
+
+model:
+  type: moe_everything
+  vocab_size: 151936
+  hidden_size: 1024
+  # Hybrid: 4 prelude standard-MoE layers + 16 recurrent MoE-Everything
+  # depth-steps + 4 coda standard-MoE layers.
+  #   Prelude/coda "layer" = Qwen3-style decoder block (attn + MLP, 2 substeps).
+  #   Recurrent depth-step = one branch decision (attn OR MLP, 1 substep)
+  #     -> 16 recurrent depths = 8 standard-layer-equivalents of compute.
+  # Layer-equivalent total = 4 + 8 + 4 = 16 (matches the 16-standard-layer
+  # baselines this config is compared against). Substep total = 4*2 + 16 + 4*2 = 32.
+  num_hidden_layers: 16
+  prelude_layers: 4
+  coda_layers: 4
+  head_dim: 128
+  num_attention_heads: 16
+  num_key_value_heads: 8
+  # Bank MLP experts: 256 (baseline) - 128 (8 boundary layers * 16 boundary
+  # experts each) = 128. Subtraction is by expert-count, not exact param
+  # match, so the boundary's per-layer expert pools replace bank capacity
+  # one-for-one. num_attn_experts is unchanged because the boundary uses
+  # dense GQA (no per-head experts).
+  num_experts: 128
+  num_experts_per_tok: 4
+  moe_intermediate_size: 768
+  intermediate_size: 3072
+  norm_topk_prob: true
+  router_exploration_rate: 0.02
+  bias_interpolation: false
+  topk_scaling_factor: 2.5
+  num_groups: 8
+  group_topk: 4
+  # Bank attention experts: 128 (baseline) - 64 (8 boundary layers * 8
+  # qkvo bundles each — each layer's dense GQA stores num_key_value_heads
+  # = 8 worth of Q-group/K/V/O projection sets) = 64. Keeps the total
+  # number of qkvo bundles in the model (bank + boundary) at 128 across
+  # baseline and hybrid.
+  num_attn_experts: 64
+  num_attn_experts_per_tok: 1
+  attn_expert_mode: per_head_recompute_kv
+  attn_routing_bundle: qkvo
+  per_layer_router: true
+  per_layer_mlp_router: true
+  per_layer_attn_router: true
+  per_layer_norm: true
+  per_layer_qk_norm: true
+  scale_attn_by_routing_weight: true
+  scale_branch_by_routing_weight: true
+  use_deepseek_routing: true
+  global_router_update: true
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-06
+  rope_theta: 1000000.0
+  max_position_embeddings: 32768
+  tie_word_embeddings: true
+  output_router_logits: true
+  # Prelude/coda boundary settings — standard-MoE-style: each of the 8
+  # boundary blocks owns its own 16-expert MLP pool + dense GQA. The
+  # boundary MLP routers use the same DeepSeek-bias balancing as the
+  # recurrent bank (registered as label="mlp" by
+  # MoEverythingForCausalLM.get_all_balancing_owners).
+  prelude_coda:
+    num_experts: 16
+    num_experts_per_tok: 4
+    moe_intermediate_size: 768
+    num_groups: 8
+    group_topk: 4
+    router_type: deepseek
+    norm_topk_prob: true
+    topk_scaling_factor: 2.5
+    bias_update_rate: 0.001
+    bias_update_zero_sum: true
+  mlp_router:
+    balancing: deepseek_bias
+    bias_update_rate: 0.001
+    bias_update_zero_sum: true
+  attn_router:
+    balancing: deepseek_bias
+    bias_update_rate: 0.001
+    bias_update_zero_sum: true
+  branch_router:
+    balancing: fixed_alternating
+
+training:
+  learning_rate: 0.001
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  warmup_steps: 1000
+  max_steps: 100000
+  min_lr_ratio: 0.1
+  batch_size: 16
+  gradient_accumulation: 1
+  mixed_precision: bf16
+  disable_liger: true
+  gradient_checkpointing: true
+  log_every: 1
+  routing_log_every: 50
+  save_every: 1000
+  output_dir: ./outputs/16_layers/moe_everything_prelude4_recurrent16_coda4_branch_fixed_alternating
+  wandb_project: moe-scaling
+  wandb_run_name: 16_layers_moe_everything_prelude4_recurrent16_coda4_branch_fixed_alternating
+
+data:
+  data_dir: ./data/parquet
+  text_column: text
+  seq_len: 1024
+  tokenizer_name: Qwen/Qwen3-0.6B
+  num_workers: 4
+
+eval:
+  enabled: true
+  every: 250
+  max_batches: 20
+  holdout_fraction: 0.05
+  seed: 1234
+
+checkpoint:
+  resume_from: null

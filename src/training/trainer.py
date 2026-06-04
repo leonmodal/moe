@@ -22,6 +22,7 @@ from src.utils.training import (
     build_optimizer,
     count_parameters,
 )
+from src.utils.recurrent_diagnostics import build_recurrent_diagnostics
 
 from .checkpoint import (
     cleanup_checkpoints,
@@ -53,8 +54,9 @@ from .logging import (
     save_routing_plots,
     setup_wandb,
 )
-from .metrics import compute_output_metrics
+from .metrics import compute_output_metrics, output_get, output_set
 from .model_factory import build_model, configure_liger_kernels
+from .recurrence import is_recurrent_model_type, recurrence_step_for_data_step
 from .routing import (
     apply_branch_schedule_pre_forward,
     apply_router_exploration_rate,
@@ -118,6 +120,10 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
         train_cfg = replace(train_cfg, max_steps=args.max_steps)
 
     strategy = getattr(args, "dist_strategy", "ddp")
+    fsdp_sharding_strategy = (
+        getattr(args, "fsdp_sharding_strategy", None)
+        or train_cfg.fsdp_sharding_strategy
+    )
 
     # Build model
     model, model_cfg = build_model(cfg)
@@ -135,6 +141,7 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
         else:
             raise ValueError(f"Unknown init strategy: {strategy_name}")
 
+    model_type = cfg.get("model", {}).get("type")
     if train_cfg.gradient_checkpointing:
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
@@ -167,7 +174,13 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
     # model output; non-aux methods don't (the routing-decision state
     # lives in router-internal buffers).
     from .balancing_fields import output_router_logits_for_method
-    output_router_logits = output_router_logits_for_method(load_balancing_method_resolved)
+    output_router_logits = bool(
+        getattr(
+            model_cfg,
+            "output_router_logits",
+            output_router_logits_for_method(load_balancing_method_resolved),
+        )
+    )
 
     if train_cfg.torch_compile:
         compile_mode = train_cfg.torch_compile_mode
@@ -182,7 +195,8 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
         strategy=strategy,
         local_rank=local_rank,
         mixed_precision_name=train_cfg.mixed_precision,
-        model_type=cfg.get("model", {}).get("type"),
+        model_type=model_type,
+        fsdp_sharding_strategy=fsdp_sharding_strategy,
     )
     raw_model = base_model
 
@@ -200,6 +214,7 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
     scheduler = build_lr_scheduler(optimizer, train_cfg)
 
     is_dense = cfg["model"]["type"] == "dense"
+    is_recurrent = is_recurrent_model_type(model_type)
     if is_main_process():
         print("=" * 60, flush=True)
         print(f"  Model     : {cfg['model']['type']}", flush=True)
@@ -210,10 +225,23 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
         print("=" * 60, flush=True)
 
     # Build datasets
-    tokenizer_name = dcfg_dict.get("tokenizer_name", "gpt2")
-    if is_main_process():
-        print(f"Loading tokenizer {tokenizer_name}", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    from .data import is_synthetic_format
+
+    if is_synthetic_format(dcfg_dict):
+        # Synthetic tasks emit integer tokens directly; no tokenizer needed.
+        # `build_train_dataset` / `build_eval_dataset` accept `tokenizer=None`
+        # for the synthetic path.
+        if is_main_process():
+            print(
+                f"Synthetic data format ({dcfg_dict.get('format')}): skipping tokenizer load",
+                flush=True,
+            )
+        tokenizer = None
+    else:
+        tokenizer_name = dcfg_dict.get("tokenizer_name", "gpt2")
+        if is_main_process():
+            print(f"Loading tokenizer {tokenizer_name}", flush=True)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     barrier()
 
     dataset = build_train_dataset(cfg, tokenizer=tokenizer, rank=rank, world_size=world_size)
@@ -231,6 +259,24 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
     )
 
     eval_dataset = build_eval_dataset(cfg, tokenizer=tokenizer, rank=rank, world_size=world_size)
+    # Attention-pattern eval targets are derived once from the (synthetic)
+    # eval dataset and reused across eval steps. `None` for parquet datasets.
+    _attention_eval_targets = None
+    if eval_dataset is not None:
+        try:
+            from .attention_eval import build_ground_truth_targets
+
+            _attention_eval_targets = build_ground_truth_targets(eval_dataset)
+        except Exception as exc:  # noqa: BLE001
+            if is_main_process():
+                print(f"[attn_eval] Failed to build ground-truth targets: {exc}", flush=True)
+            _attention_eval_targets = None
+        if is_main_process() and _attention_eval_targets is not None:
+            t, m = _attention_eval_targets
+            print(
+                f"[attn_eval] Targets enabled: shape={t.shape}, learnable rows={int(m.sum())}",
+                flush=True,
+            )
     eval_dataloader = None
     if eval_dataset is not None:
         eval_cfg = cfg.get("eval", {})
@@ -294,7 +340,21 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
         print(f"Starting training from step {global_step}", flush=True)
 
     eval_cfg = cfg.get("eval", {})
-    heatmap_every = int(cfg.get("training", {}).get("heatmap_every", eval_cfg.get("every", 0)))
+    train_logging_cfg = cfg.get("training", {})
+    heatmap_every = int(
+        train_logging_cfg.get(
+            "routing_log_every",
+            train_logging_cfg.get("heatmap_every", eval_cfg.get("every", 0)),
+        )
+        or 0
+    )
+    # Dense-early windows: log every step up to <until>, then sparsify.
+    # 0 keeps legacy behavior (no dense early window). See `log_training_step`
+    # and the heatmap gate below.
+    log_dense_until = int(train_logging_cfg.get("log_dense_until", 0) or 0)
+    routing_log_dense_until = int(
+        train_logging_cfg.get("routing_log_dense_until", 0) or 0
+    )
     distributed = is_distributed()
 
     # Read the model-side target exploration rate once; the trainer schedules
@@ -315,11 +375,11 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
     last_applied_exploration_rate: float | None = None
     exploration_plateau_applied = False
 
-    # Seed branch exploration_only schedule once before the main loop so
-    # step-0 forwards (and the first forward after a checkpoint resume at
-    # step=N) see p_explore(global_step) rather than the constructor-seeded
-    # initial rate. The intra-loop call below applies p_explore on every
-    # subsequent step.
+    # Seed branch pre-forward schedules once before the main loop so
+    # step-0 forwards (and the first forward after a checkpoint resume
+    # at step=N) see the scheduled branch settings rather than the
+    # constructor defaults. The intra-loop call below applies the
+    # current branch settings on every subsequent step.
     current_branch_explore_rate = apply_branch_schedule_pre_forward(
         model, global_step
     )
@@ -348,24 +408,46 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
                 # schedule evaluation or module-tree walks are needed.
                 exploration_plateau_applied = True
 
-        # Apply the branch exploration_only schedule for the CURRENT step
-        # before the forward pass runs, so the rate p_explore(global_step)
-        # is what every microbatch in this step actually sees. The returned
-        # rate is the source of truth for this step's logging and is passed
-        # verbatim to log_training_step, so console / wandb never lag the
-        # active rate by one step.
+        # Apply branch pre-forward schedules for the CURRENT step
+        # before the forward pass runs. The returned exploration-only
+        # rate remains the source of truth for that legacy logging
+        # field; sampling-entropy exposes its value through the loss
+        # metric instead.
         current_branch_explore_rate = apply_branch_schedule_pre_forward(
             model, global_step
+        )
+        next_global_step = global_step + 1
+        collect_recurrent_diagnostics_step = (
+            cfg["model"]["type"] in {
+                "recurrent_standard_moe",
+                "recurrent_global_moe",
+                "hrm_recurrent_standard_moe",
+            }
+            and heatmap_every > 0
+            and next_global_step > 0
+            and (
+                next_global_step < routing_log_dense_until
+                or next_global_step % heatmap_every == 0
+            )
         )
 
         optimizer.zero_grad(set_to_none=True)
         window_metrics = {
             "loss": 0.0, "ce_loss": 0.0, "aux_loss": 0.0,
             "aux_loss_normalized": 0.0, "seq_aux_loss": 0.0,
-            "branch_aux_loss": 0.0, "attention_aux_loss": 0.0,
+            "branch_aux_loss": 0.0, "branch_entropy_loss": 0.0,
+            "attention_aux_loss": 0.0,
         }
         local_tokens_in_step = 0
         grad_norm = 0.0
+        recurrence_no_grad_sum = 0.0
+        recurrence_with_grad_sum = 0.0
+        recurrence_mean_value = None
+        recurrence_backprop_value = None
+        recurrence_micro_count = 0
+        hrm_h_cycles_sum = 0.0
+        hrm_l_cycles_sum = 0.0
+        hrm_micro_count = 0
 
         for micro_idx in range(train_cfg.gradient_accumulation):
             try:
@@ -379,7 +461,12 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
             }
 
             input_ids = batch["input_ids"]
-            labels = input_ids  # Model handles the label shift internally
+            # Synthetic datasets emit explicit labels (with -100 masking on
+            # positions the model cannot predict, e.g. the initial random
+            # state in linear_map / cellular_automata). For parquet, the
+            # dataset doesn't emit labels and we default to input_ids — the
+            # model handles the shift internally either way.
+            labels = batch.get("labels", input_ids)
             sync_context = (
                 nullcontext()
                 if micro_idx == train_cfg.gradient_accumulation - 1 or not hasattr(model, "no_sync")
@@ -387,10 +474,31 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
             )
             with sync_context:
                 with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_enabled):
+                    model_kwargs = {} if is_dense else {"output_router_logits": output_router_logits}
+                    if cfg["model"]["type"] in {"moe_everything", "recurrent_moe_everything"}:
+                        model_kwargs["return_logits"] = False
+                    if is_recurrent:
+                        recurrence_info = recurrence_step_for_data_step(
+                            cfg,
+                            data_step=global_step * train_cfg.gradient_accumulation + micro_idx + 1,
+                            global_step=global_step,
+                            max_steps=train_cfg.max_steps,
+                        )
+                        model_kwargs["num_steps"] = recurrence_info.as_tensor(device)
+                        recurrence_no_grad_sum += recurrence_info.num_steps_no_grad
+                        recurrence_with_grad_sum += recurrence_info.num_steps_with_grad
+                        recurrence_mean_value = recurrence_info.mean_recurrence
+                        recurrence_backprop_value = recurrence_info.mean_backprop_depth
+                        recurrence_micro_count += 1
+                        if (
+                            collect_recurrent_diagnostics_step
+                            and micro_idx == train_cfg.gradient_accumulation - 1
+                        ):
+                            model_kwargs["collect_recurrence_diagnostics"] = True
                     output = model(
                         input_ids=input_ids,
                         labels=labels,
-                        **({} if is_dense else {"output_router_logits": output_router_logits}),
+                        **model_kwargs,
                     )
                 # Router z-loss (if any router has `router_z_loss_coef > 0`)
                 # is accumulated per-router during forward and summed here so
@@ -400,9 +508,16 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
                 if not is_dense:
                     z_loss = collect_router_z_loss(model)
                     if z_loss is not None:
-                        output.loss = output.loss + z_loss
-                loss = output.loss / train_cfg.gradient_accumulation
+                        output_set(output, "loss", output_get(output, "loss") + z_loss)
+                loss = output_get(output, "loss") / train_cfg.gradient_accumulation
                 loss.backward()
+
+            output_hrm_h = output_get(output, "hrm_h_cycles", None)
+            output_hrm_l = output_get(output, "hrm_l_cycles", None)
+            if output_hrm_h is not None and output_hrm_l is not None:
+                hrm_h_cycles_sum += float(output_hrm_h)
+                hrm_l_cycles_sum += float(output_hrm_l)
+                hrm_micro_count += 1
 
             metrics, _, _ = compute_output_metrics(
                 output, raw_model, model_cfg, input_ids,
@@ -534,6 +649,20 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
                     n_attn / n_total if n_total > 0 else 0.0
                     for n_attn, n_total in local_depth_pairs
                 ]
+        recurrence_diag_summary = None
+        if collect_recurrent_diagnostics_step:
+            recurrence_diag_payload = build_recurrent_diagnostics(
+                raw_model,
+                step=global_step,
+                input_ids=input_ids,
+            )
+            if recurrence_diag_payload is not None:
+                recurrence_diag_summary = recurrence_diag_payload.get("summary") or None
+                if recurrence_diag_summary is not None and distributed:
+                    recurrence_diag_summary = reduce_scalar_dict(
+                        recurrence_diag_summary,
+                        device=device,
+                    )
         log_training_step(
             wandb_run,
             step=global_step,
@@ -544,19 +673,60 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
             tokens_seen=tokens_seen,
             elapsed=elapsed,
             log_every=train_cfg.log_every,
+            log_dense_until=log_dense_until,
             branch_explore_rate=branch_explore_rate,
             branch_attn_fraction=branch_attn_fraction,
             branch_attn_per_depth=branch_attn_per_depth,
             branch_explore_mask_fraction=branch_explore_mask_fraction,
+            recurrence_mean=recurrence_mean_value,
+            recurrence_backprop_depth=recurrence_backprop_value,
+            recurrence_num_steps_no_grad=(
+                recurrence_no_grad_sum / recurrence_micro_count
+                if recurrence_micro_count else None
+            ),
+            recurrence_num_steps_with_grad=(
+                recurrence_with_grad_sum / recurrence_micro_count
+                if recurrence_micro_count else None
+            ),
+            hrm_h_cycles=(
+                hrm_h_cycles_sum / hrm_micro_count
+                if hrm_micro_count else None
+            ),
+            hrm_l_cycles=(
+                hrm_l_cycles_sum / hrm_micro_count
+                if hrm_micro_count else None
+            ),
+            recurrence_diagnostics=recurrence_diag_summary,
         )
 
-        # Routing heatmaps
-        if heatmap_every > 0 and global_step > 0 and global_step % heatmap_every == 0:
-            save_routing_plots(model, output_dir=train_cfg.output_dir, step=global_step)
+        # Routing heatmaps. Dense early window mirrors `log_dense_until`
+        # for the per-step training-stat log: when global_step is below
+        # routing_log_dense_until (and > 0), save plots every step.
+        # Past that window, fall back to the sparse `heatmap_every` cadence.
+        if heatmap_every > 0 and global_step > 0:
+            in_dense_routing = global_step < routing_log_dense_until
+            if in_dense_routing or global_step % heatmap_every == 0:
+                save_routing_plots(
+                    model,
+                    output_dir=train_cfg.output_dir,
+                    step=global_step,
+                    input_ids=input_ids,
+                    tokenizer=tokenizer,
+                )
 
         # Eval
         if eval_dataloader is not None and int(eval_cfg.get("every", 0)) > 0:
             if global_step % int(eval_cfg["every"]) == 0:
+                # Attention-pattern eval against known ground-truth (synthetic
+                # tasks only). Targets are derived once from the eval dataset
+                # below; heatmaps are saved at checkpoint cadence to avoid
+                # exploding disk usage at the eval cadence.
+                attn_targets = _attention_eval_targets
+                save_heatmaps_this_step = (
+                    attn_targets is not None
+                    and global_step > 0
+                    and global_step % train_cfg.save_every == 0
+                )
                 eval_metrics = run_validation(
                     model=model,
                     model_cfg=model_cfg,
@@ -566,8 +736,22 @@ def run_training(cfg: dict, train_cfg: TrainingConfig, args) -> None:
                     seq_aux_loss_coef=seq_aux_loss_coef,
                     device=device,
                     step=global_step,
+                    output_dir=train_cfg.output_dir,
+                    tokenizer=tokenizer,
+                    recurrence_sweep=(
+                        eval_cfg.get("recurrence_sweep")
+                        if is_recurrent
+                        else None
+                    ),
+                    attention_eval_targets=attn_targets,
+                    attention_eval_save_heatmaps=save_heatmaps_this_step,
                 )
-                log_eval_metrics(wandb_run, step=global_step, eval_metrics=eval_metrics)
+                log_eval_metrics(
+                    wandb_run,
+                    step=global_step,
+                    eval_metrics=eval_metrics,
+                    output_dir=train_cfg.output_dir,
+                )
 
         # Save checkpoint
         if global_step % train_cfg.save_every == 0:

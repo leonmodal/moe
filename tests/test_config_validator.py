@@ -27,7 +27,16 @@ VALID_ATTN_EXPERT_MODES = validate_configs_module.VALID_ATTN_EXPERT_MODES
 validate_config = validate_configs_module.validate_config
 
 
-def _write_moe_everything_config(path: Path, attn_expert_mode: str) -> None:
+def _write_moe_everything_config(
+    path: Path,
+    attn_expert_mode: str,
+    attn_routing_bundle: str | None = None,
+) -> None:
+    bundle_line = (
+        f"          attn_routing_bundle: {attn_routing_bundle}\n"
+        if attn_routing_bundle is not None
+        else ""
+    )
     path.write_text(textwrap.dedent(f"""\
         model:
           type: moe_everything
@@ -43,6 +52,7 @@ def _write_moe_everything_config(path: Path, attn_expert_mode: str) -> None:
           intermediate_size: 128
           max_position_embeddings: 128
           attn_expert_mode: {attn_expert_mode}
+{bundle_line.rstrip()}
         training:
           learning_rate: 1.0e-3
           weight_decay: 0.0
@@ -67,21 +77,15 @@ def _write_moe_everything_config(path: Path, attn_expert_mode: str) -> None:
 
 
 def test_valid_attn_expert_modes_match_runtime_enum():
-    # The runtime truth is src/models/moe_everything/attention_bank.py._MODES.
-    # Importing it here ensures a tightening on one side surfaces on the other.
-    from src.models.moe_everything.attention_bank import AttentionExpertBank
-    import inspect
-    src = inspect.getsource(AttentionExpertBank)
-    # The attention bank's __init__ uses a local _MODES set; assert every
-    # element of the validator enum appears in that source and vice-versa.
-    runtime_modes = {"per_head_fully_independent", "per_head_precompute_kv"}
+    from src.models.moe_everything.attention_bank import ATTN_EXPERT_MODES
+
+    runtime_modes = {"per_head_no_recompute", "per_head_recompute_k", "per_head_recompute_kv"}
     assert VALID_ATTN_EXPERT_MODES == runtime_modes, (
         "Validator enum drifted from runtime. Validator has "
         f"{VALID_ATTN_EXPERT_MODES}, runtime rejects everything outside "
         f"{runtime_modes}."
     )
-    for mode in runtime_modes:
-        assert mode in src, f"Runtime source missing mode {mode!r}; update either side"
+    assert ATTN_EXPERT_MODES == runtime_modes
 
 
 def test_validator_rejects_bundled_attn_expert_mode(tmp_path):
@@ -93,22 +97,42 @@ def test_validator_rejects_bundled_attn_expert_mode(tmp_path):
     )
 
 
-def test_validator_accepts_per_head_fully_independent(tmp_path):
+def test_validator_accepts_per_head_no_recompute(tmp_path):
     cfg_path = tmp_path / "cfg.yaml"
-    _write_moe_everything_config(cfg_path, attn_expert_mode="per_head_fully_independent")
+    _write_moe_everything_config(cfg_path, attn_expert_mode="per_head_no_recompute")
     issues = validate_config(cfg_path)
     assert all("attn_expert_mode" not in issue for issue in issues), (
-        f"Validator must accept per_head_fully_independent; got issues={issues}"
+        f"Validator must accept per_head_no_recompute; got issues={issues}"
     )
 
 
-def test_validator_accepts_per_head_precompute_kv(tmp_path):
+def test_validator_accepts_per_head_recompute_kv(tmp_path):
     cfg_path = tmp_path / "cfg.yaml"
-    _write_moe_everything_config(cfg_path, attn_expert_mode="per_head_precompute_kv")
+    _write_moe_everything_config(cfg_path, attn_expert_mode="per_head_recompute_kv")
     issues = validate_config(cfg_path)
     assert all("attn_expert_mode" not in issue for issue in issues), (
-        f"Validator must accept per_head_precompute_kv; got issues={issues}"
+        f"Validator must accept per_head_recompute_kv; got issues={issues}"
     )
+
+
+def test_validator_accepts_per_head_recompute_k(tmp_path):
+    cfg_path = tmp_path / "cfg.yaml"
+    _write_moe_everything_config(cfg_path, attn_expert_mode="per_head_recompute_k")
+    issues = validate_config(cfg_path)
+    assert all("attn_expert_mode" not in issue for issue in issues), (
+        f"Validator must accept per_head_recompute_k; got issues={issues}"
+    )
+
+
+def test_validator_rejects_no_recompute_with_bundled_route(tmp_path):
+    cfg_path = tmp_path / "cfg.yaml"
+    _write_moe_everything_config(
+        cfg_path,
+        attn_expert_mode="per_head_no_recompute",
+        attn_routing_bundle="qkvo",
+    )
+    issues = validate_config(cfg_path)
+    assert any("attn_routing_bundle" in issue for issue in issues), issues
 
 
 def test_validator_rejects_unknown_attn_expert_mode(tmp_path):
@@ -118,3 +142,12 @@ def test_validator_rejects_unknown_attn_expert_mode(tmp_path):
     assert any("attn_expert_mode" in issue for issue in issues), (
         f"Validator should reject unknown modes; got issues={issues}"
     )
+
+
+def test_validator_rejects_invalid_fsdp_sharding_strategy(tmp_path):
+    cfg_path = tmp_path / "cfg.yaml"
+    _write_moe_everything_config(cfg_path, attn_expert_mode="per_head_no_recompute")
+    text = cfg_path.read_text()
+    cfg_path.write_text(text.replace("mixed_precision: bf16\n", "mixed_precision: bf16\n  fsdp_sharding_strategy: zero3\n"))
+    issues = validate_config(cfg_path)
+    assert any("fsdp_sharding_strategy" in issue for issue in issues), issues

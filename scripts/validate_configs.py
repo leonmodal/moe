@@ -25,29 +25,45 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import yaml
 
 
-SUPPORTED_MODEL_TYPES = {"dense", "standard_moe", "global_moe", "moe_everything"}
+SUPPORTED_MODEL_TYPES = {
+    "dense",
+    "standard_moe",
+    "global_moe",
+    "moe_everything",
+    "recurrent_moe_everything",
+    "recurrent_standard_moe",
+    "recurrent_global_moe",
+    "hrm_recurrent_standard_moe",
+}
 
 DEPRECATED_MODEL_TYPES = {
     "deepseek_standard_moe": "standard_moe (with router_type: deepseek)",
     "deepseek_global_moe": "global_moe (with router_type: deepseek)",
     "gpt2_dense": "dense",
     "speedrun_gpt": "archived to legacy/",
-    "speedrun_moe_fully_independent": "archived to legacy/",
-    "speedrun_moe_precompute_kv": "archived to legacy/",
     "speedrun_moe_everything": "archived to legacy/",
 }
 
 VALID_ROUTER_TYPES = {"softmax", "deepseek"}
-# Must match src/models/moe_everything/attention_bank.py runtime enum. The old
-# "bundled" mode (1 router per projection, top-K) has been replaced by the
-# H-routers-per-projection-top-1 designs (see docs/routing.md) and is rejected
-# at runtime with ValueError; the validator must agree.
 VALID_ATTN_EXPERT_MODES = {
-    "per_head_fully_independent", "per_head_precompute_kv",
+    "per_head_no_recompute",
+    "per_head_recompute_k",
+    "per_head_recompute_kv",
 }
+VALID_ATTN_ROUTING_BUNDLES = {
+    "q_k_v_o",
+    "qk_v_o",
+    "qk_vo",
+    "qkv_o",
+    "qkvo",
+}
+VALID_ATTN_ROUTER_CONTEXTS = {"none", "ema_qk_v"}
 VALID_LR_SCHEDULERS = {"cosine", "linear", "constant", "stable_decay"}
 VALID_OPTIMIZERS = {"adamw", "muon"}
 VALID_MIXED_PRECISION = {"bf16", "fp16", "fp32", ""}
+VALID_FSDP_SHARDING_STRATEGIES = {
+    "auto", "full_shard", "shard_grad_op", "no_shard", "hybrid_shard",
+}
 
 REQUIRED_MODEL_FIELDS = {"type", "vocab_size", "hidden_size", "num_hidden_layers"}
 REQUIRED_MoE_FIELDS = {"num_experts", "num_experts_per_tok", "moe_intermediate_size"}
@@ -90,7 +106,15 @@ def validate_config(path: Path) -> list[str]:
         if missing_model:
             issues.append(f"Missing required model fields: {missing_model}")
 
-        if mtype in ("standard_moe", "global_moe", "moe_everything"):
+        if mtype in (
+            "standard_moe",
+            "global_moe",
+            "moe_everything",
+            "recurrent_moe_everything",
+            "recurrent_standard_moe",
+            "recurrent_global_moe",
+            "hrm_recurrent_standard_moe",
+        ):
             missing_moe = REQUIRED_MoE_FIELDS - set(model.keys())
             if missing_moe:
                 issues.append(f"Missing required MoE fields: {missing_moe}")
@@ -103,6 +127,37 @@ def validate_config(path: Path) -> list[str]:
         attn_mode = model.get("attn_expert_mode")
         if attn_mode is not None and attn_mode not in VALID_ATTN_EXPERT_MODES:
             issues.append(f"Invalid attn_expert_mode '{attn_mode}' — must be one of {VALID_ATTN_EXPERT_MODES}")
+        attn_bundle = model.get("attn_routing_bundle")
+        if attn_bundle is not None and attn_bundle not in VALID_ATTN_ROUTING_BUNDLES:
+            issues.append(
+                f"Invalid attn_routing_bundle '{attn_bundle}' — must be one of "
+                f"{VALID_ATTN_ROUTING_BUNDLES}"
+            )
+        if attn_mode == "per_head_no_recompute" and attn_bundle not in (None, "q_k_v_o"):
+            issues.append(
+                "per_head_no_recompute currently supports only "
+                "attn_routing_bundle='q_k_v_o'"
+            )
+        if attn_mode in {"per_head_recompute_k", "per_head_recompute_kv"}:
+            resolved_bundle = attn_bundle or "qkvo"
+            if not resolved_bundle.startswith("qk"):
+                issues.append(
+                    f"{attn_mode} requires Q/K to share a route; got "
+                    f"attn_routing_bundle={resolved_bundle!r}"
+                )
+        attn_router_context = model.get("attn_router_context", "none")
+        if attn_router_context not in VALID_ATTN_ROUTER_CONTEXTS:
+            issues.append(
+                f"Invalid attn_router_context '{attn_router_context}' — "
+                f"must be one of {VALID_ATTN_ROUTER_CONTEXTS}"
+            )
+        if attn_router_context == "ema_qk_v":
+            decay = model.get("attn_router_context_decay", 0.95)
+            if not isinstance(decay, (int, float)) or not (0.0 <= float(decay) < 1.0):
+                issues.append(
+                    "attn_router_context_decay must be a number in [0, 1) "
+                    "when attn_router_context='ema_qk_v'"
+                )
 
     # Training section
     training = cfg.get("training", {})
@@ -124,6 +179,13 @@ def validate_config(path: Path) -> list[str]:
         mp = training.get("mixed_precision", "")
         if mp and mp not in VALID_MIXED_PRECISION:
             issues.append(f"Invalid mixed_precision '{mp}' — must be one of {VALID_MIXED_PRECISION}")
+
+        fsdp_sharding = training.get("fsdp_sharding_strategy")
+        if fsdp_sharding is not None and fsdp_sharding not in VALID_FSDP_SHARDING_STRATEGIES:
+            issues.append(
+                f"Invalid fsdp_sharding_strategy '{fsdp_sharding}' — must be one of "
+                f"{VALID_FSDP_SHARDING_STRATEGIES}"
+            )
 
     # Data section
     data = cfg.get("data", {})
@@ -161,7 +223,7 @@ def validate_config(path: Path) -> list[str]:
         issues.append(f"nested-schema validator unavailable: {exc}")
 
     # Strict mode for the active matrix: yamls under
-    # `configs/{4,8,16}_layers/` must not carry top-level
+    # `configs/16_layers/` must not carry top-level
     # balancing fields. The per-class blocks
     # (`model.{mlp,attn,branch}_router`) are authoritative; a
     # top-level coefficient is off-axis pollution that violates
@@ -172,7 +234,7 @@ def validate_config(path: Path) -> list[str]:
     # the path's components include `configs/<depth>_layers/`. Was
     # previously substring-matched on `/configs/<depth>_layers/`,
     # which silently skipped relative paths like
-    # `configs/4_layers/foo.yaml` (no leading slash) — the default
+    # `configs/16_layers/foo.yaml` (no leading slash) — the default
     # CLI scan returns relative paths.
     in_active_matrix = False
     try:
@@ -180,7 +242,7 @@ def validate_config(path: Path) -> list[str]:
         parts = resolved.parts
         for i, part in enumerate(parts):
             if part == "configs" and i + 1 < len(parts):
-                if parts[i + 1] in {"4_layers", "8_layers", "16_layers"}:
+                if parts[i + 1] == "16_layers":
                     in_active_matrix = True
                     break
     except (OSError, ValueError):
@@ -229,6 +291,10 @@ def validate_config(path: Path) -> list[str]:
             "branch_exploration_decay",
             "branch_exploration_min",
             "branch_exploration_warmup_steps",
+            "branch_entropy_coef",
+            "branch_entropy_decay",
+            "branch_entropy_min",
+            "branch_entropy_decay_steps",
         )
         for key in flat_branch_keys:
             if key in mcfg_local:
@@ -252,6 +318,18 @@ def validate_config(path: Path) -> list[str]:
                 "quantile_target_q": 0.5,
                 "quantile_global_state": True,
             },
+            "sampling_entropy": {
+                "entropy_coef": 0.01,
+                "entropy_decay": "cosine",
+                "entropy_min": 0.0,
+                "entropy_decay_steps": 1000,
+            },
+            "exploration_only": {
+                "exploration_rate": 0.10,
+                "exploration_decay": "cosine",
+                "exploration_min": 0.0,
+                "exploration_warmup_steps": 1000,
+            },
         }
         for group in ("mlp_router", "attn_router", "branch_router"):
             block = mcfg_local.get(group, {}) or {}
@@ -267,28 +345,45 @@ def validate_config(path: Path) -> list[str]:
                         f"balancing={method!r}"
                     )
 
-        # precompute_kv branch contract: every active matrix yaml
-        # whose `attn_expert_mode == per_head_precompute_kv` must set
-        # `branch_router` to the documented exploration_only
-        # schedule. Drift here would silently change branch
-        # routing behavior in the precompute_kv variant.
-        precompute_kv_branch_spec = {
-            "balancing": "exploration_only",
-            "exploration_rate": 0.1,
-            "exploration_decay": "cosine",
-            "exploration_min": 0.01,
-            "exploration_warmup_steps": 1000,
-        }
-        if mcfg_local.get("attn_expert_mode") == "per_head_precompute_kv":
+        # Recompute branch contract: active recompute rows must use
+        # one of the documented branch policies. Drift here silently
+        # changes the branch ablation axis.
+        recompute_branch_specs = (
+            {
+                "balancing": "sampling_entropy",
+                "entropy_coef": 0.01,
+                "entropy_decay": "cosine",
+                "entropy_min": 0.0,
+                "entropy_decay_steps": 1000,
+            },
+            {
+                "balancing": "exploration_only",
+                "exploration_rate": 0.10,
+                "exploration_decay": "cosine",
+                "exploration_min": 0.0,
+                "exploration_warmup_steps": 1000,
+            },
+            {
+                "balancing": "fixed_alternating",
+            },
+            {
+                # `weighted_sum`: soft binary mixer — both branches always
+                # compute and the outputs are blended by the softmax probs.
+                # No additional knobs (no decay, no entropy bonus).
+                "balancing": "weighted_sum",
+            },
+        )
+        if mcfg_local.get("attn_expert_mode") in {"per_head_recompute_k", "per_head_recompute_kv"}:
             branch_block = mcfg_local.get("branch_router", {}) or {}
-            for knob, expected in precompute_kv_branch_spec.items():
-                actual = branch_block.get(knob)
-                if actual != expected:
-                    issues.append(
-                        f"active matrix yaml: precompute_kv row "
-                        f"requires branch_router.{knob}={expected!r}; "
-                        f"got {actual!r}"
-                    )
+            if not any(
+                all(branch_block.get(knob) == expected for knob, expected in spec.items())
+                for spec in recompute_branch_specs
+            ):
+                issues.append(
+                    "active matrix yaml: recompute attention row must use one "
+                    "of the documented branch_router specs: sampling_entropy, "
+                    "exploration_only, fixed_alternating, or weighted_sum."
+                )
 
     return issues
 

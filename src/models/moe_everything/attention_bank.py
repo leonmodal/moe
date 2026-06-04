@@ -1,13 +1,14 @@
 """Attention expert bank: NormExpertBank and AttentionExpertBank.
 
 Per-head routed attention with shared expert weight banks across depths.
-Modes: per_head_fully_independent, per_head_precompute_kv.
+Modes: per_head_no_recompute, per_head_recompute_k, per_head_recompute_kv.
 """
 
 import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from src.models.fp32_routing import fp32_index_add, fp32_index_put, fp32_index_select
 try:
@@ -18,27 +19,24 @@ from src.models.modeling_qwen3_moe import (
     Qwen3MoeRMSNorm,
     apply_rotary_pos_emb,
     eager_attention_forward,
-    repeat_kv,
 )
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from src.models.router import (
-    DeepSeekRouter,
-    ExplorationTopKRouter,
-    checkpoint_recompute_context,
-    is_checkpoint_recompute,
-)
+from src.models.router import is_checkpoint_recompute
 from src.models.routing.routers import _straight_through_ones
-from src.models.routing.helpers import (
-    make_top1_router,
-    should_use_sparse_query_path,
-    sparse_gather_project,
-)
+from src.models.routing.helpers import make_top1_router
 from .config import MoEverythingConfig
 
-DEFAULT_PER_HEAD_DENSE_FRACTION_THRESHOLD = 0.75
-AUTO_PER_HEAD_SPARSE_THRESHOLDS = {
-    "per_head_fully_independent": 0.75,
-    "per_head_precompute_kv": 0.75,
+ATTN_EXPERT_MODES = {
+    "per_head_no_recompute",
+    "per_head_recompute_k",
+    "per_head_recompute_kv",
+}
+ATTN_ROUTING_BUNDLES = {
+    "q_k_v_o",
+    "qk_v_o",
+    "qk_vo",
+    "qkv_o",
+    "qkvo",
 }
 
 class NormExpertBank(nn.Module):
@@ -107,6 +105,11 @@ class AttentionExpertBank(nn.Module):
         super().__init__()
         self.config = config
         self.mode = config.attn_expert_mode
+        self.routing_bundle = getattr(
+            config,
+            "attn_routing_bundle",
+            "q_k_v_o" if self.mode == "per_head_no_recompute" else "qkvo",
+        )
         self.num_experts = config.num_attn_experts
         self.top_k = config.num_attn_experts_per_tok
         self.hidden_size = config.hidden_size
@@ -132,30 +135,105 @@ class AttentionExpertBank(nn.Module):
         self.per_layer_norm = getattr(config, "per_layer_norm", False)
         self.per_layer_qk_norm = getattr(config, "per_layer_qk_norm", False)
         self.num_depths = config.num_hidden_layers
-        self.per_head_compute_mode = getattr(config, "per_head_compute_mode", "auto")
-        self.per_head_dense_fraction_threshold = getattr(
-            config, "per_head_dense_fraction_threshold", 0.75
-        )
         self.sanity_check_mode = getattr(config, "sanity_check_mode", None)
         self.scale_attn_by_routing_weight = getattr(config, "scale_attn_by_routing_weight", False)
-        self.last_router_info = {}
-
-        _MODES = {
-            "per_head_fully_independent",
-            "per_head_precompute_kv",
-        }
-        if self.mode not in _MODES:
-            raise ValueError(f"Unknown attn_expert_mode: {self.mode}, must be one of {_MODES}")
-        if self.per_head_compute_mode not in {"auto", "sparse", "dense"}:
+        self.attn_router_context = getattr(config, "attn_router_context", "none")
+        self.attn_router_context_decay = float(getattr(config, "attn_router_context_decay", 0.95))
+        if self.attn_router_context not in {"none", "ema_qk_v"}:
             raise ValueError(
-                f"Unknown per_head_compute_mode: {self.per_head_compute_mode}, must be one of "
-                "{'auto', 'sparse', 'dense'}"
+                "attn_router_context must be one of {'none', 'ema_qk_v'}, "
+                f"got {self.attn_router_context!r}"
             )
-        if self.sanity_check_mode is not None and self.mode != "per_head_precompute_kv":
+        if not (0.0 <= self.attn_router_context_decay < 1.0):
             raise ValueError(
-                "sanity_check_mode is only supported with attn_expert_mode='per_head_precompute_kv'"
+                "attn_router_context_decay must be in [0, 1), "
+                f"got {self.attn_router_context_decay}"
+            )
+        self.attn_router_input_dim = (
+            self.hidden_size * 2
+            if self.attn_router_context == "ema_qk_v"
+            else self.hidden_size
+        )
+        self.last_router_info = {}
+        # Attention-map capture for synthetic-task eval. When
+        # `capture_attention_maps` is True, `_run_per_head_recompute_expert_tables`
+        # populates `last_attention_maps` with a list of per-(k_expert, v_expert)
+        # entries containing the softmax attention weights and the routing mask
+        # that determines which tokens used that pair. Disabled by default to
+        # keep the production forward path on `F.scaled_dot_product_attention`.
+        self.capture_attention_maps = False
+        self.last_attention_maps: list[dict] = []
+
+        # Per-(q, k) V-routing: when enabled, the V expert at attended
+        # position k for query q is selected by a learned router taking
+        # (hidden[q], hidden[k]) as input. K still routes per-query.
+        # Compose the per-pair score from two separable linear maps so
+        # we never materialize a [B, T, T, num_experts] tensor:
+        #   score(q, k, e) = W_q · hidden[q] [e] + W_k · hidden[k] [e]
+        self.per_pair_v_routing = getattr(config, "per_pair_v_routing", False)
+        if self.per_pair_v_routing:
+            if self.mode != "per_head_recompute_kv":
+                raise ValueError(
+                    "per_pair_v_routing requires attn_expert_mode='per_head_recompute_kv'"
+                )
+            num_v_experts = self.num_experts
+            if self.per_layer_attn_router:
+                self.pair_v_router_q = nn.ModuleList(
+                    [nn.Linear(self.hidden_size, num_v_experts, bias=False) for _ in range(self.num_depths)]
+                )
+                self.pair_v_router_k = nn.ModuleList(
+                    [nn.Linear(self.hidden_size, num_v_experts, bias=False) for _ in range(self.num_depths)]
+                )
+            else:
+                self.pair_v_router_q = nn.Linear(self.hidden_size, num_v_experts, bias=False)
+                self.pair_v_router_k = nn.Linear(self.hidden_size, num_v_experts, bias=False)
+
+        if self.mode not in ATTN_EXPERT_MODES:
+            raise ValueError(
+                f"Unknown attn_expert_mode: {self.mode}, must be one of {ATTN_EXPERT_MODES}"
+            )
+        if self.routing_bundle not in ATTN_ROUTING_BUNDLES:
+            raise ValueError(
+                f"Unknown attn_routing_bundle: {self.routing_bundle}, "
+                f"must be one of {ATTN_ROUTING_BUNDLES}"
+            )
+        if self.mode == "per_head_no_recompute" and self.routing_bundle != "q_k_v_o":
+            raise ValueError(
+                "per_head_no_recompute currently supports only "
+                "attn_routing_bundle='q_k_v_o'."
+            )
+        if self.mode in {"per_head_recompute_k", "per_head_recompute_kv"}:
+            if not self.routing_bundle.startswith("qk"):
+                raise ValueError(
+                    f"{self.mode} requires Q/K to share a route; got "
+                    f"attn_routing_bundle={self.routing_bundle!r}."
+                )
+        if self.sanity_check_mode is not None and self.mode != "per_head_recompute_kv":
+            raise ValueError(
+                "sanity_check_mode is only supported with attn_expert_mode='per_head_recompute_kv'"
             )
         getattr(self, f"_init_{self.mode}")()
+
+    def _causal_prefix_ema(self, x: torch.Tensor) -> torch.Tensor:
+        """Return EMA of previous tokens only, preserving causal routing."""
+        B, T, H = x.shape
+        state = x.new_zeros(B, H)
+        states = []
+        decay = self.attn_router_context_decay
+        update = 1.0 - decay
+        for t in range(T):
+            states.append(state)
+            state = state * decay + x[:, t, :] * update
+        return torch.stack(states, dim=1)
+
+    def _attn_router_inputs(self, normed_states: torch.Tensor) -> torch.Tensor:
+        if self.attn_router_context == "none":
+            return normed_states.reshape(-1, self.hidden_size)
+        prefix_ema = self._causal_prefix_ema(normed_states)
+        return torch.cat((normed_states, prefix_ema), dim=-1).reshape(
+            -1,
+            self.hidden_size * 2,
+        )
 
     def __getattr__(self, name: str):
         try:
@@ -204,53 +282,6 @@ class AttentionExpertBank(nn.Module):
         ]
         return torch.stack(per_layer, dim=0).reshape(self.num_experts, self.q_group_dim, self.hidden_size)
 
-    def _make_flat_bank_router(self, input_dim, top_k, num_experts=None):
-        """Create a router for flat bank modes — selects top_k experts from the pool."""
-        if num_experts is None:
-            num_experts = self.num_experts
-        from types import SimpleNamespace
-
-        base_cfg = SimpleNamespace(
-            hidden_size=input_dim,
-            num_local_experts=num_experts,
-            num_experts=num_experts,
-            num_experts_per_tok=top_k,
-            norm_topk_prob=getattr(self.config, "norm_topk_prob", True),
-            router_exploration_rate=getattr(self.config, "router_exploration_rate", 0.0),
-        )
-        if self.use_deepseek_routing:
-            num_groups = getattr(self.config, "num_groups", None)
-            group_topk = getattr(self.config, "group_topk", None)
-            # Disable group-limited routing if it can't provide enough candidates
-            if num_groups and group_topk:
-                experts_per_group = num_experts // num_groups
-                max_candidates = group_topk * experts_per_group
-                if max_candidates < top_k:
-                    num_groups = None
-                    group_topk = None
-            base_cfg.topk_scaling_factor = getattr(self.config, "topk_scaling_factor", None)
-            base_cfg.num_groups = num_groups
-            base_cfg.group_topk = group_topk
-            return DeepSeekRouter(base_cfg)
-        return ExplorationTopKRouter(base_cfg)
-
-    def _route_flat(self, router, x, top_k):
-        """Route with explicit top_k for flat bank.
-
-        DEPRECATED: Only kept for sanity_check_mode paths.
-        The main per-head paths now use _route_per_head().
-        """
-        if isinstance(router, (DeepSeekRouter, ExplorationTopKRouter)):
-            router_probs, weights, idx = router(x)
-            return idx, weights, router_probs
-
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            logits = router(x.float())
-            probs = F.softmax(logits, dim=-1, dtype=torch.float32)
-            top_vals, top_idx = torch.topk(probs, top_k, dim=-1)
-            top_vals = top_vals / (top_vals.sum(dim=-1, keepdim=True) + 1e-20)
-        return top_idx, top_vals.to(x.dtype), probs
-
     def _route_per_head(self, routers, x, depth_idx=None):
         """Per-head top-1 routing: H routers each pick 1 expert.
 
@@ -276,17 +307,38 @@ class AttentionExpertBank(nn.Module):
         weights = torch.stack(all_weights, dim=1)  # (N, H)
         return idx, weights, all_probs
 
-    def _project_flat_head(self, flat, weight_bank, expert_idx, expert_weights, norm_weights=None):
-        """Project one head position from flat bank (1D expert routing)."""
-        N = flat.shape[0]
-        out = flat.new_zeros(N, weight_bank.shape[2])
-        for e in expert_idx.unique():
-            mask = expert_idx == e
-            proj = flat[mask] @ weight_bank[e]
-            if norm_weights is not None:
-                proj = self._apply_single_head_norm(proj, norm_weights[e])
-            out[mask] = (proj * expert_weights[mask].unsqueeze(-1)).to(out.dtype)
-        return out
+    def _route_per_slot_inputs(self, routers, x_slots, depth_idx=None):
+        """Per-slot top-1 routing where each slot has its own input vector.
+
+        Args:
+            routers: H routers, optionally nested by depth.
+            x_slots: (N, H, D) slot-specific inputs.
+
+        Returns:
+            idx: (N, H)
+            weights: (N, H)
+            probs_list: list of H tensors with shape (N, E)
+        """
+        if isinstance(routers, nn.ModuleList) and len(routers) > 0 and isinstance(routers[0], nn.ModuleList):
+            routers = routers[depth_idx] if depth_idx is not None else routers[0]
+
+        num_slots = len(routers)
+        if x_slots.shape[1] != num_slots:
+            raise ValueError(
+                f"router/input slot mismatch: {num_slots} routers for "
+                f"{x_slots.shape[1]} input slots"
+            )
+        all_idx = []
+        all_weights = []
+        all_probs = []
+        for h in range(num_slots):
+            probs_h, weights_h, idx_h = routers[h](x_slots[:, h, :])
+            all_idx.append(idx_h.squeeze(-1))
+            all_weights.append(weights_h.squeeze(-1))
+            all_probs.append(probs_h)
+        idx = torch.stack(all_idx, dim=1)
+        weights = torch.stack(all_weights, dim=1)
+        return idx, weights, all_probs
 
     def _apply_single_head_norm(self, proj, norm_weight):
         input_dtype = proj.dtype
@@ -457,7 +509,7 @@ class AttentionExpertBank(nn.Module):
         return self._project_shared_inputs_grouped(flat, weight_bank, idx, weights, norm_weights)
 
     def _project_grouped_query_heads_batched(self, flat, weight_bank, idx, weights, norm_weights=None):
-        """Project grouped-query outputs for per_head_precompute_kv GQA routing."""
+        """Project grouped-query outputs for recompute GQA routing."""
         N, num_slots = idx.shape
         H_out = weight_bank.shape[2]
         pair_expert = idx.reshape(-1)
@@ -500,18 +552,18 @@ class AttentionExpertBank(nn.Module):
         pair_out = fp32_index_put(pair_out, sort_order, proj.to(pair_out.dtype))
         return pair_out.view(N, num_slots, H_out)
 
-    def _init_per_head_fully_independent(self):
+    def _init_per_head_no_recompute(self):
         """Per-head top-1 routing: H separate routers per projection, each doing top-1.
 
-        Design (from speedrun extraction):
+        Design:
         - num_kv_heads Q-routers (each picks 1 expert producing q_group_dim)
         - num_kv_heads K-routers (each picks 1 expert producing head_dim)
         - num_kv_heads V-routers (each picks 1 expert producing head_dim)
         - num_heads O-routers (each picks 1 expert producing hidden_size from head_dim)
         Total: 3*num_kv_heads + num_heads routers, each doing top-1.
 
-        This is NOT one router picking top-K — it is K separate routers each picking top-1.
-        Each head slot independently learns to specialize on different experts.
+        This is the no-recompute, fully separate routing bundle:
+        Q, K, V, and O each choose their own experts.
         """
         if self.routed_norm:
             self.attn_pre_norm = NormExpertBank(self.num_depths, self.hidden_size, eps=self.eps)
@@ -527,21 +579,21 @@ class AttentionExpertBank(nn.Module):
         self.num_kv_experts = E_kv
         self.num_o_experts = E_o
 
-        # H separate top-1 routers per projection (the speedrun design)
+        # H separate top-1 routers per projection.
         H_kv = self.num_kv_heads
         H = self.num_heads
         if self.per_layer_attn_router:
             # Per-depth routers: num_depths sets, each with H routers per projection
             self.q_routers = nn.ModuleList([
-                nn.ModuleList([make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
+                nn.ModuleList([make_top1_router(self.attn_router_input_dim, E, self.config) for _ in range(H_kv)])
                 for _ in range(self.num_depths)
             ])
             self.k_routers = nn.ModuleList([
-                nn.ModuleList([make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
+                nn.ModuleList([make_top1_router(self.attn_router_input_dim, E_kv, self.config) for _ in range(H_kv)])
                 for _ in range(self.num_depths)
             ])
             self.v_routers = nn.ModuleList([
-                nn.ModuleList([make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
+                nn.ModuleList([make_top1_router(self.attn_router_input_dim, E_kv, self.config) for _ in range(H_kv)])
                 for _ in range(self.num_depths)
             ])
             self.o_routers = nn.ModuleList([
@@ -550,9 +602,9 @@ class AttentionExpertBank(nn.Module):
             ])
         else:
             # Shared routers across depths: H routers per projection
-            self.q_routers = nn.ModuleList([make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
-            self.k_routers = nn.ModuleList([make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
-            self.v_routers = nn.ModuleList([make_top1_router(self.hidden_size, E_kv, self.config) for _ in range(H_kv)])
+            self.q_routers = nn.ModuleList([make_top1_router(self.attn_router_input_dim, E, self.config) for _ in range(H_kv)])
+            self.k_routers = nn.ModuleList([make_top1_router(self.attn_router_input_dim, E_kv, self.config) for _ in range(H_kv)])
+            self.v_routers = nn.ModuleList([make_top1_router(self.attn_router_input_dim, E_kv, self.config) for _ in range(H_kv)])
             self.o_routers = nn.ModuleList([make_top1_router(self.q_dim, E_o, self.config) for _ in range(H)])
 
         self.q_proj = nn.Parameter(torch.empty(E, self.hidden_size, self.q_group_dim))
@@ -567,11 +619,19 @@ class AttentionExpertBank(nn.Module):
             self.k_norm_weight = nn.Parameter(torch.ones(E_kv, self.head_dim))
         self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
 
-    def _init_per_head_precompute_kv(self):
-        """Per-head top-1 routing for precompute-KV mode.
+    def _init_per_head_recompute_k(self):
+        self._init_per_head_recompute()
 
-        H separate routers (one per KV head), each doing top-1 from the expert
-        pool. One routing decision picks Q+K+V+O together (bundled per expert).
+    def _init_per_head_recompute_kv(self):
+        self._init_per_head_recompute()
+
+    def _init_per_head_recompute(self):
+        """Per-KV-group top-1 routing for recompute attention modes.
+
+        Q/K always share a route. Depending on `attn_routing_bundle`, V and O
+        either share that route, share a separate V/O route, or route
+        separately. O is token-local; only K or K/V are sequence-side
+        recompute tables.
         """
         if self.routed_norm:
             self.norm = NormExpertBank(self.num_depths, self.hidden_size, eps=self.eps)
@@ -581,13 +641,27 @@ class AttentionExpertBank(nn.Module):
             self.norm = Qwen3MoeRMSNorm(self.hidden_size, eps=self.eps)
         E = self.num_experts
         H_kv = self.num_kv_heads
+        self.num_kv_experts = E
+        self.num_o_experts = E
+
+        def make_hidden_routers():
+            return nn.ModuleList([make_top1_router(self.attn_router_input_dim, E, self.config) for _ in range(H_kv)])
+
+        def make_group_routers():
+            return nn.ModuleList([make_top1_router(self.q_group_dim, E, self.config) for _ in range(H_kv)])
+
         if self.per_layer_attn_router:
-            self.routers = nn.ModuleList([
-                nn.ModuleList([make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
-                for _ in range(self.num_depths)
-            ])
+            self.qk_routers = nn.ModuleList([make_hidden_routers() for _ in range(self.num_depths)])
+            if self.routing_bundle in {"qk_v_o", "qk_vo"}:
+                self.v_routers = nn.ModuleList([make_hidden_routers() for _ in range(self.num_depths)])
+            if self.routing_bundle in {"qk_v_o", "qkv_o"}:
+                self.o_routers = nn.ModuleList([make_group_routers() for _ in range(self.num_depths)])
         else:
-            self.routers = nn.ModuleList([make_top1_router(self.hidden_size, E, self.config) for _ in range(H_kv)])
+            self.qk_routers = make_hidden_routers()
+            if self.routing_bundle in {"qk_v_o", "qk_vo"}:
+                self.v_routers = make_hidden_routers()
+            if self.routing_bundle in {"qk_v_o", "qkv_o"}:
+                self.o_routers = make_group_routers()
         if self.sanity_check_mode == "alternating_global_moe":
             num_logical_layers = max(1, self.num_depths // 2)
             self.logical_q_proj = nn.ParameterList(
@@ -637,12 +711,6 @@ class AttentionExpertBank(nn.Module):
         else:
             self._init_params([self.q_proj, self.k_proj, self.v_proj, self.o_proj])
 
-    def _select_router(self, name: str, depth_idx: int | None = None):
-        plural_name = f"{name}s"
-        if self.per_layer_attn_router and depth_idx is not None and hasattr(self, plural_name):
-            return getattr(self, plural_name)[depth_idx]
-        return getattr(self, name)
-
     def _get_q_norm_weight_bank(self, depth_idx: int | None, num_experts: int) -> torch.Tensor:
         if hasattr(self, "logical_q_norm_weight"):
             return self.logical_q_norm_weight.index_select(0, self.logical_qk_norm_layer_index)
@@ -669,6 +737,7 @@ class AttentionExpertBank(nn.Module):
         device: torch.device,
         dtype: torch.dtype = torch.float32,
         token_mask: torch.Tensor | None = None,
+        name: str = "qk",
     ):
         if self.sanity_check_mode != "alternating_global_moe":
             return None
@@ -680,44 +749,15 @@ class AttentionExpertBank(nn.Module):
         probs = torch.zeros(num_tokens, self.num_experts, device=device, dtype=dtype)
         probs.scatter_(1, idx, 1.0 / max(1, num_slots))
         if token_mask is not None:
-            self._store_router_info("attn", probs, idx, token_mask=token_mask)
+            self._store_router_info(name, probs, idx, token_mask=token_mask)
         else:
-            self._store_router_info("attn", probs, idx)
+            self._store_router_info(name, probs, idx)
         return idx, weights, probs
-
-    def should_use_sparse_path(self, token_mask: torch.Tensor) -> bool:
-        flat_mask = token_mask.reshape(-1).bool()
-        if not flat_mask.any():
-            return True
-        if flat_mask.all():
-            return False
-        if self.mode not in {"per_head_fully_independent", "per_head_precompute_kv"}:
-            return False
-        if self.per_head_compute_mode == "dense":
-            return False
-        if self.per_head_compute_mode == "sparse":
-            return True
-        attn_fraction = flat_mask.float().mean().item()
-        threshold = self.per_head_dense_fraction_threshold
-        if threshold == DEFAULT_PER_HEAD_DENSE_FRACTION_THRESHOLD:
-            threshold = AUTO_PER_HEAD_SPARSE_THRESHOLDS.get(self.mode, threshold)
-        return attn_fraction < threshold
 
     def _init_params(self, params):
         std = self.config.initializer_range
         for p in params:
             nn.init.normal_(p, mean=0.0, std=std)
-
-    def _apply_expert_head_norm(self, x, norm_weights, expert_idx, num_heads):
-        """Per-expert RMSNorm on head-organized vectors."""
-        N = x.shape[0]
-        orig_dtype = x.dtype
-        x = x.view(N, num_heads, self.head_dim).float()
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        w = norm_weights[expert_idx]
-        x = w.unsqueeze(1) * x
-        return x.to(orig_dtype).view(N, num_heads * self.head_dim)
 
     def _store_router_info(
         self,
@@ -740,14 +780,8 @@ class AttentionExpertBank(nn.Module):
             # Expand mask to match per-head flattened probs: (N,) -> (N*H,)
             if num_head_repeats > 1:
                 flat_mask = flat_mask.repeat(num_head_repeats)
-            # Gradient-preservation rule: build the dense `router_logits` via the FUNCTIONAL
-            # `index_copy` (out-of-place) so autograd records a
-            # `IndexCopyBackward` and gradient flows from `dense_probs` back to
-            # `router_probs` and onward to the attention router weight. The
-            # legacy `dense[mask] = src` indexed-assignment pattern is
-            # autograd-opaque when `dense` is a leaf with `requires_grad=False`
-            # (which `new_zeros(...)` produces), and was the root cause of the
-            # the gradient-preservation regression.
+            # Functional index_copy keeps gradients flowing from dense_probs
+            # back to router_probs and onward to the attention router weight.
             mask_idx = flat_mask.nonzero(as_tuple=False).squeeze(-1)
             dense_probs = torch.zeros(
                 flat_mask.numel(),
@@ -757,8 +791,7 @@ class AttentionExpertBank(nn.Module):
             )
             dense_probs = dense_probs.index_copy(0, mask_idx, router_probs)
 
-            # selected_experts is not gradient-bearing; the legacy in-place
-            # path is fine here.
+            # selected_experts is not gradient-bearing.
             if expert_idx.ndim == 1:
                 dense_idx = expert_idx.new_zeros(flat_mask.numel())
             else:
@@ -817,21 +850,28 @@ class AttentionExpertBank(nn.Module):
         B, T, H = hidden_states.shape
         self.last_router_info = {}
 
-        if self.mode == "per_head_fully_independent":
+        if self.mode == "per_head_no_recompute":
             if self.routed_norm:
-                normed = self.attn_pre_norm(hidden_states).reshape(B * T, H)
-                q_flat = k_flat = v_flat = normed
+                normed = self.attn_pre_norm(hidden_states)
+                q_normed = k_normed = v_normed = normed
             elif self.per_layer_norm and depth_idx is not None:
-                normed = self.attn_pre_norms[depth_idx](hidden_states).reshape(B * T, H)
-                q_flat = k_flat = v_flat = normed
+                normed = self.attn_pre_norms[depth_idx](hidden_states)
+                q_normed = k_normed = v_normed = normed
             else:
-                q_flat = self.q_pre_norm(hidden_states).reshape(B * T, H)
-                k_flat = self.k_pre_norm(hidden_states).reshape(B * T, H)
-                v_flat = self.v_pre_norm(hidden_states).reshape(B * T, H)
+                q_normed = self.q_pre_norm(hidden_states)
+                k_normed = self.k_pre_norm(hidden_states)
+                v_normed = self.v_pre_norm(hidden_states)
 
-            q_idx, q_w, q_probs = self._route_per_head(self.q_routers, q_flat, depth_idx)
-            k_idx, k_w, k_probs = self._route_per_head(self.k_routers, k_flat, depth_idx)
-            v_idx, v_w, v_probs = self._route_per_head(self.v_routers, v_flat, depth_idx)
+            q_flat = q_normed.reshape(B * T, H)
+            k_flat = k_normed.reshape(B * T, H)
+            v_flat = v_normed.reshape(B * T, H)
+            q_route_flat = self._attn_router_inputs(q_normed)
+            k_route_flat = self._attn_router_inputs(k_normed)
+            v_route_flat = self._attn_router_inputs(v_normed)
+
+            q_idx, q_w, q_probs = self._route_per_head(self.q_routers, q_route_flat, depth_idx)
+            k_idx, k_w, k_probs = self._route_per_head(self.k_routers, k_route_flat, depth_idx)
+            v_idx, v_w, v_probs = self._route_per_head(self.v_routers, v_route_flat, depth_idx)
             self._store_router_info("q", q_probs, q_idx)
             self._store_router_info("k", k_probs, k_idx)
             self._store_router_info("v", v_probs, v_idx)
@@ -851,8 +891,8 @@ class AttentionExpertBank(nn.Module):
             K = K_heads.reshape(B * T, self.num_kv_heads * self.head_dim)
             V = V_heads.reshape(B * T, self.num_kv_heads * self.head_dim)
 
-        elif self.mode == "per_head_precompute_kv":
-            raise RuntimeError("per_head_precompute_kv should use project_and_attend_per_head_precompute_kv()")
+        elif self.mode in {"per_head_recompute_k", "per_head_recompute_kv"}:
+            raise RuntimeError("recompute attention modes should use project_and_attend_per_head_recompute()")
 
         Q = Q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         K = K.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -876,7 +916,7 @@ class AttentionExpertBank(nn.Module):
 
         attn_output = self._run_attention(Q, K, V, attention_mask)
 
-        assert self.mode == "per_head_fully_independent"
+        assert self.mode == "per_head_no_recompute"
         N = B * T
         attn_heads = attn_output.transpose(1, 2).reshape(N, self.num_heads, self.head_dim)
         attn_flat = attn_heads.reshape(N, self.q_dim)
@@ -892,23 +932,12 @@ class AttentionExpertBank(nn.Module):
         )
         return o_out.view(B, T, self.hidden_size)
 
-    def _select_attn_routers(self, depth_idx: int | None = None):
-        if self.mode != "per_head_fully_independent":
-            return None
-        return (
-            self._select_router("q_router", depth_idx),
-            self._select_router("k_router", depth_idx),
-            self._select_router("v_router", depth_idx),
-            self._select_router("o_router", depth_idx),
-        )
-
-    def _empty_sparse_attn_result(
+    def _empty_attn_output(
         self,
         hidden_states: torch.Tensor,
-        K_old: torch.Tensor,
-        V_old: torch.Tensor,
         router_specs: list[tuple[str, int, int]],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
+        self.last_router_info = {}
         B, T, _ = hidden_states.shape
         flat_mask = torch.zeros(B * T, dtype=torch.bool, device=hidden_states.device)
         for name, num_experts, top_k in router_specs:
@@ -917,127 +946,17 @@ class AttentionExpertBank(nn.Module):
             self._store_router_info(name, empty_probs, empty_idx, token_mask=flat_mask)
         dummy = self._zero_dummy(hidden_states.device, hidden_states.dtype)
         attn_out = hidden_states.new_zeros(B, T, self.hidden_size) + dummy
-        return attn_out, K_old, V_old
+        return attn_out
 
-    def project_and_attend_per_head_fully_independent_sparse(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        K_old: torch.Tensor,
-        V_old: torch.Tensor,
-        token_mask: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        depth_idx: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        B, T, H = hidden_states.shape
-        self.last_router_info = {}
-        flat_mask = token_mask.reshape(-1).bool()
+    def recompute_router_specs(self) -> list[tuple[str, int, int]]:
+        specs = [("qk", self.num_experts, self.num_kv_heads)]
+        if self.routing_bundle in {"qk_v_o", "qk_vo"}:
+            specs.append(("v", self.num_experts, self.num_kv_heads))
+        if self.routing_bundle in {"qk_v_o", "qkv_o"}:
+            specs.append(("o", self.num_o_experts, self.num_kv_heads))
+        return specs
 
-        if not flat_mask.any():
-            return self._empty_sparse_attn_result(
-                hidden_states,
-                K_old,
-                V_old,
-                [
-                    ("q", self.num_experts, self.num_kv_heads),
-                    ("k", self.num_kv_experts, self.num_kv_heads),
-                    ("v", self.num_kv_experts, self.num_kv_heads),
-                    ("o", self.num_o_experts, self.num_heads),
-                ],
-            )
-
-        if flat_mask.all():
-            Q, K_fresh, V_fresh = self.project(hidden_states, position_embeddings, depth_idx=depth_idx)
-            attn_out = self.attend(Q, K_fresh, V_fresh, attention_mask, depth_idx=depth_idx)
-            return attn_out, K_fresh, V_fresh
-
-        flat_hidden = hidden_states.reshape(B * T, H)
-        hidden_selected = flat_hidden[flat_mask]
-
-        if self.routed_norm:
-            normed = self.attn_pre_norm(hidden_selected)
-            q_flat = k_flat = v_flat = normed
-        elif self.per_layer_norm and depth_idx is not None:
-            normed = self.attn_pre_norms[depth_idx](hidden_selected)
-            q_flat = k_flat = v_flat = normed
-        else:
-            q_flat = self.q_pre_norm(hidden_selected)
-            k_flat = self.k_pre_norm(hidden_selected)
-            v_flat = self.v_pre_norm(hidden_selected)
-
-        q_idx, q_w, q_probs = self._route_per_head(self.q_routers, q_flat, depth_idx)
-        k_idx, k_w, k_probs = self._route_per_head(self.k_routers, k_flat, depth_idx)
-        v_idx, v_w, v_probs = self._route_per_head(self.v_routers, v_flat, depth_idx)
-        self._store_router_info("q", q_probs, q_idx, token_mask=flat_mask)
-        self._store_router_info("k", k_probs, k_idx, token_mask=flat_mask)
-        self._store_router_info("v", v_probs, v_idx, token_mask=flat_mask)
-
-        q_norm_weight = self._get_q_norm_weight_bank(depth_idx, self.num_experts)
-        k_norm_weight = self._get_k_norm_weight_bank(depth_idx, self.num_kv_experts)
-        pq_w = q_w if self.scale_attn_by_routing_weight else _straight_through_ones(q_w)
-        pk_w = k_w if self.scale_attn_by_routing_weight else _straight_through_ones(k_w)
-        pv_w = v_w if self.scale_attn_by_routing_weight else _straight_through_ones(v_w)
-        # Q: bundled per GQA group — (N_sel, num_kv_heads, q_group_dim)
-        Q_groups = self._project_grouped_query_heads_batched(q_flat, self.q_proj, q_idx, pq_w, q_norm_weight)
-        # Reshape from (N_sel, num_kv_heads, q_group_dim) to (N_sel, num_heads, head_dim)
-        Q_sel = Q_groups.reshape(-1, self.num_heads, self.head_dim)
-        K_sel = self._project_heads_batched(k_flat, self.k_proj, k_idx, pk_w, k_norm_weight)
-        V_sel = self._project_heads_batched(v_flat, self.v_proj, v_idx, pv_w)
-
-        Q_flat = hidden_states.new_zeros(B * T, self.num_heads, self.head_dim)
-        K_flat = hidden_states.new_zeros(B * T, self.num_kv_heads, self.head_dim)
-        V_flat = hidden_states.new_zeros(B * T, self.num_kv_heads, self.head_dim)
-        Q_flat[flat_mask] = Q_sel
-        K_flat[flat_mask] = K_sel
-        V_flat[flat_mask] = V_sel
-
-        Q = Q_flat.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        K_fresh = K_flat.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        V_fresh = V_flat.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        Q, K_fresh = apply_rotary_pos_emb(Q, K_fresh, cos, sin)
-
-        attn_mask_kv = token_mask.unsqueeze(1)
-        K_new = torch.where(attn_mask_kv, K_fresh, K_old)
-        V_new = torch.where(attn_mask_kv, V_fresh, V_old)
-
-        attn_heads = hidden_states.new_zeros(B, self.num_heads, T, self.head_dim)
-        token_mask_2d = token_mask.squeeze(-1).bool()
-
-        for b in range(B):
-            pos = token_mask_2d[b].nonzero(as_tuple=False).squeeze(-1)
-            if pos.numel() == 0:
-                continue
-            Q_b = Q[b : b + 1, :, pos, :]
-            attn_b = self._run_attention(
-                Q_b,
-                K_new[b : b + 1],
-                V_new[b : b + 1],
-                attention_mask[:, :, pos, :] if attention_mask is not None else None,
-                query_positions=None if attention_mask is not None else pos,
-            )
-            attn_heads[b, :, pos, :] = attn_b.squeeze(0).to(attn_heads.dtype)
-
-        attn_selected = attn_heads.transpose(1, 2).reshape(B * T, self.num_heads, self.head_dim)[flat_mask]
-        attn_flat = attn_selected.reshape(attn_selected.shape[0], self.q_dim)
-        o_idx, o_w, o_probs = self._route_per_head(self.o_routers, attn_flat, depth_idx)
-        self._store_router_info("o", o_probs, o_idx, token_mask=flat_mask)
-        po_w = o_w if self.scale_attn_by_routing_weight else _straight_through_ones(o_w)
-
-        o_selected = self._project_pair_inputs_grouped(
-            attn_selected,
-            self.o_proj,
-            o_idx,
-            po_w,
-            reduce_tokens=True,
-        )
-
-        attn_out = hidden_states.new_zeros(B * T, self.hidden_size)
-        attn_out[flat_mask] = o_selected.to(attn_out.dtype)
-        return attn_out.view(B, T, self.hidden_size), K_new, V_new
-
-    def _build_per_head_precompute_kv_tables(
+    def _build_per_head_recompute_tables(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
@@ -1050,43 +969,50 @@ class AttentionExpertBank(nn.Module):
         else:
             normed = self.norm(hidden_states)
         flat = normed.reshape(N, H)
+        router_flat = self._attn_router_inputs(normed)
 
         routed = self._maybe_build_sanity_attention_routing(
             N, self.num_kv_heads, depth_idx, hidden_states.device, dtype=flat.dtype
         )
         if routed is None:
-            idx, w, probs = self._route_per_head(self.routers, flat, depth_idx)
-            self._store_router_info("attn", probs, idx)
+            qk_idx, qk_w, qk_probs = self._route_per_head(self.qk_routers, router_flat, depth_idx)
+            self._store_router_info("qk", qk_probs, qk_idx)
         else:
-            idx, w, probs = routed
+            qk_idx, qk_w, qk_probs = routed
+
+        if self.routing_bundle in {"qk_v_o", "qk_vo"}:
+            v_idx, v_w, v_probs = self._route_per_head(self.v_routers, router_flat, depth_idx)
+            self._store_router_info("v", v_probs, v_idx)
+        else:
+            v_idx, v_w = qk_idx, qk_w
 
         q_norm_weight = self._get_q_norm_weight_bank(depth_idx, self.num_experts)
-        k_norm_weight = self._get_k_norm_weight_bank(depth_idx, self.num_experts)
-        q_w = w if self.scale_attn_by_routing_weight else _straight_through_ones(w)
-        kv_w = w if self.scale_attn_by_routing_weight else _straight_through_ones(w)
-        Q_groups = self._project_grouped_query_heads_batched(flat, self.q_proj, idx, q_w, q_norm_weight)
-        K_heads = self._project_heads_batched(flat, self.k_proj, idx, kv_w, k_norm_weight)
-        V_heads = self._project_heads_batched(flat, self.v_proj, idx, kv_w)
+        q_w_eff = qk_w if self.scale_attn_by_routing_weight else _straight_through_ones(qk_w)
+        Q_groups = self._project_grouped_query_heads_batched(flat, self.q_proj, qk_idx, q_w_eff, q_norm_weight)
+        V_fresh = None
+        if self.mode == "per_head_recompute_k":
+            v_w_eff = v_w if self.scale_attn_by_routing_weight else _straight_through_ones(v_w)
+            V_heads = self._project_heads_batched(flat, self.v_proj, v_idx, v_w_eff)
+            V_fresh = V_heads.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         Q = (
             Q_groups.view(B, T, self.num_kv_heads, self.q_heads_per_kv, self.head_dim)
             .reshape(B, T, self.num_heads, self.head_dim)
             .transpose(1, 2)
         )
-        K_fresh = K_heads.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        V_fresh = V_heads.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        cos, sin = position_embeddings
-        Q, K_fresh = apply_rotary_pos_emb(Q, K_fresh, cos, sin)
+        Q = self._apply_rotary_pos_emb_q_only(Q, position_embeddings)
 
-        return {
+        tables = {
             "flat": flat,
-            "idx": idx,
-            "weights": w,
-            "kv_weight": w,
+            "qk_idx": qk_idx,
+            "qk_weights": qk_w,
+            "v_idx": v_idx,
+            "v_weights": v_w,
             "Q": Q,
-            "K_fresh": K_fresh,
-            "V_fresh": V_fresh,
         }
+        if V_fresh is not None:
+            tables["V_fresh"] = V_fresh
+        return tables
 
     def _project_sanity_logical_o(
         self,
@@ -1115,7 +1041,17 @@ class AttentionExpertBank(nn.Module):
         sin = sin.unsqueeze(1)
         return (k * cos) + (self._rotate_half(k) * sin)
 
-    def _run_per_head_precompute_kv_expert_tables(
+    def _apply_rotary_pos_emb_q_only(
+        self,
+        q: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        cos, sin = position_embeddings
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        return (q * cos) + (self._rotate_half(q) * sin)
+
+    def _run_per_head_recompute_expert_tables(
         self,
         tables: dict[str, torch.Tensor],
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
@@ -1123,12 +1059,18 @@ class AttentionExpertBank(nn.Module):
         query_token_mask: torch.Tensor | None = None,
         depth_idx: int | None = None,
     ) -> torch.Tensor:
-        """Run attention against expert-specific KV tables for routed query groups."""
+        """Run attention against expert-specific K or K/V tables.
+
+        `per_head_recompute_k` recomputes K by Q/K expert and uses one
+        token-routed V table. `per_head_recompute_kv` recomputes V by the
+        query group's V route as well, so the active table key is either
+        `(k_expert,)` or `(k_expert, v_expert)`.
+        """
         flat = tables["flat"]
-        idx = tables["idx"]
+        qk_idx = tables["qk_idx"]
+        v_idx = tables["v_idx"]
         Q = tables["Q"]
         B, _, T, _ = Q.shape
-        N = B * T
 
         if query_token_mask is None:
             query_group_mask = torch.ones((B, self.num_kv_heads, T), device=flat.device, dtype=torch.bool)
@@ -1138,33 +1080,239 @@ class AttentionExpertBank(nn.Module):
         if not query_group_mask.any():
             return flat.new_zeros(B, self.num_heads, T, self.head_dim)
 
-        active_experts = idx.view(B, T, self.num_kv_heads).permute(0, 2, 1)[query_group_mask].unique()
-        slot_experts = idx.view(B, T, self.num_kv_heads).permute(0, 2, 1)
+        slot_k_experts = qk_idx.view(B, T, self.num_kv_heads).permute(0, 2, 1)
+        slot_v_experts = v_idx.view(B, T, self.num_kv_heads).permute(0, 2, 1)
         k_norm_weight = self._get_k_norm_weight_bank(depth_idx, self.num_experts)
 
         attn_output = flat.new_zeros(B, self.num_heads, T, self.head_dim)
-        for expert in active_experts.tolist():
-            K_e = flat @ self.k_proj[expert]
-            V_e = flat @ self.v_proj[expert]
+        if self.capture_attention_maps:
+            # Reset on the first per-depth call. The model loop iterates
+            # depths sequentially and harvests `last_attention_maps` after
+            # each, so resetting here gives one fresh list per depth.
+            self.last_attention_maps = []
+        if self.per_pair_v_routing:
+            return self._run_pair_v_routing(
+                flat=flat, Q=Q, slot_k_experts=slot_k_experts,
+                query_group_mask=query_group_mask,
+                k_norm_weight=k_norm_weight,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                depth_idx=depth_idx,
+            )
+        if self.mode == "per_head_recompute_k":
+            V_fresh = tables.get("V_fresh")
+            if V_fresh is None:
+                raise RuntimeError("per_head_recompute_k requires a token-routed V table")
+            active_k_experts = slot_k_experts[query_group_mask].unique()
+            for k_expert in active_k_experts.tolist():
+                K_e = flat @ self.k_proj[k_expert]
+                K_e = self._apply_single_head_norm(K_e, k_norm_weight[k_expert])
+                K_e_heads = K_e.view(B, T, 1, self.head_dim).transpose(1, 2)
+                K_e_heads = self._apply_rotary_pos_emb_k_only(K_e_heads, position_embeddings)
+                group_mask = (slot_k_experts == k_expert) & query_group_mask
+                attn_e = self._run_attention(
+                    Q,
+                    K_e_heads.expand(-1, self.num_kv_heads, -1, -1),
+                    V_fresh,
+                    attention_mask,
+                )
+                head_mask = group_mask.unsqueeze(-1).repeat_interleave(self.num_kv_groups, dim=1)
+                attn_e.mul_(head_mask.to(attn_e.dtype))
+                attn_output.add_(attn_e)
+            return attn_output
 
-            K_e = self._apply_single_head_norm(K_e, k_norm_weight[expert])
-            K_e_heads = K_e.view(B, T, 1, self.head_dim).transpose(1, 2)
-            V_e_heads = V_e.view(B, T, 1, self.head_dim).transpose(1, 2)
-            K_e_heads = self._apply_rotary_pos_emb_k_only(K_e_heads, position_embeddings)
-            # Dense per-expert attention is intentionally kept here. It does
-            # redundant work on query groups routed to other experts, but on
-            # GPU it is markedly faster than launching many ragged attention
-            # kernels over the routed subsets.
-            attn_e = self._run_attention(
+        pair_source = torch.stack((slot_k_experts, slot_v_experts), dim=-1)
+        active_pairs = pair_source[query_group_mask].unique(dim=0)
+        k_cache: dict[int, torch.Tensor] = {}
+        v_cache: dict[int, torch.Tensor] = {}
+        for k_expert, v_expert in active_pairs.tolist():
+            if k_expert not in k_cache:
+                K_e = flat @ self.k_proj[k_expert]
+                K_e = self._apply_single_head_norm(K_e, k_norm_weight[k_expert])
+                K_e_heads = K_e.view(B, T, 1, self.head_dim).transpose(1, 2)
+                k_cache[k_expert] = self._apply_rotary_pos_emb_k_only(K_e_heads, position_embeddings)
+            if v_expert not in v_cache:
+                V_e = flat @ self.v_proj[v_expert]
+                v_cache[v_expert] = V_e.view(B, T, 1, self.head_dim).transpose(1, 2)
+
+            group_mask = (
+                (slot_k_experts == k_expert)
+                & (slot_v_experts == v_expert)
+                & query_group_mask
+            )
+            attn_e = self._run_attention_checkpointed(
                 Q,
-                K_e_heads.expand(-1, self.num_kv_heads, -1, -1),
-                V_e_heads.expand(-1, self.num_kv_heads, -1, -1),
+                k_cache[k_expert].expand(-1, self.num_kv_heads, -1, -1),
+                v_cache[v_expert].expand(-1, self.num_kv_heads, -1, -1),
                 attention_mask,
             )
-
-            group_mask = (slot_experts == expert) & query_group_mask
             head_mask = group_mask.unsqueeze(-1).repeat_interleave(self.num_kv_groups, dim=1)
-            attn_output = attn_output + attn_e * head_mask.to(attn_e.dtype)
+            attn_e.mul_(head_mask.to(attn_e.dtype))
+            attn_output.add_(attn_e)
+
+            if self.capture_attention_maps:
+                # Compute the softmax(QK^T) attention weights explicitly for
+                # this (k_expert, v_expert) pair. The production path uses
+                # SDPA which doesn't return weights; we recompute here only
+                # under the capture flag (eval-only, low frequency). Under
+                # GQA Q has `num_heads` rows and K has `num_kv_heads` rows;
+                # expand K up to `num_heads` via repeat_interleave so the
+                # per-Q-head map is comparable to the routing-aware aggregate.
+                K_full = k_cache[k_expert].expand(-1, self.num_kv_heads, -1, -1)
+                K_per_qhead = K_full.repeat_interleave(self.num_kv_groups, dim=1)
+                qk_scores = torch.matmul(Q.float(), K_per_qhead.transpose(-1, -2).float())
+                qk_scores = qk_scores * self.scaling
+                # ALWAYS apply a causal mask — SDPA handles `is_causal=True`
+                # automatically when attention_mask is None (which is the
+                # default in this codebase), but our explicit Q@K^T softmax
+                # has no such fallback. Use the float's most-negative finite
+                # value (NOT -inf — `0 * -inf = NaN` in IEEE 754, but
+                # `0 * finite_negative = 0`).
+                neg_inf_finite = torch.finfo(qk_scores.dtype).min
+                q_idx = torch.arange(T, device=qk_scores.device)
+                causal_local = (q_idx[None, :] > q_idx[:, None]).float() * neg_inf_finite
+                qk_scores = qk_scores + causal_local.unsqueeze(0).unsqueeze(0)
+                if attention_mask is not None and isinstance(attention_mask, torch.Tensor):
+                    qk_scores = qk_scores + attention_mask[:, :, :T, :T].float()
+                attn_weights = F.softmax(qk_scores, dim=-1).detach().cpu()
+                self.last_attention_maps.append(
+                    {
+                        "k_expert": int(k_expert),
+                        "v_expert": int(v_expert),
+                        "weights": attn_weights,  # [B, num_heads, T, T]
+                        "group_mask": group_mask.detach().cpu(),  # [B, num_kv_heads, T]
+                    }
+                )
+
+        return attn_output
+
+    def _run_pair_v_routing(
+        self,
+        *,
+        flat: torch.Tensor,
+        Q: torch.Tensor,
+        slot_k_experts: torch.Tensor,
+        query_group_mask: torch.Tensor,
+        k_norm_weight: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        depth_idx: int | None,
+    ) -> torch.Tensor:
+        """Per-(query, key) V-routing attention.
+
+        K still routes per-query (one K-expert per query, applied uniformly
+        across all key positions for that query). V is re-routed per pair:
+        the V-expert at key position k for query position q is decided by a
+        router taking (hidden[q], hidden[k]) as input.
+
+        Output formula:
+            attn[q, k]   = softmax( Q[q] · K_{e_q}[k] / √d + causal_mask )
+            v_expert(q, k) = argmax_e (W_q · hidden[q])[e] + (W_k · hidden[k])[e]
+            V[q, k]      = hidden[k] @ v_proj[v_expert(q, k)]
+            out[q]       = Σ_k attn[q, k] · V[q, k]
+
+        Implementation strategy: pre-compute V projections per expert (only
+        for experts that actually fire), pre-compute the separable router
+        scores, then for each k-expert group iterate (q, k) once and sum
+        per-V-expert masked contributions.
+        """
+        B, _, T, _ = Q.shape
+
+        # Separable pair-V router scores.
+        v_router_q = (
+            self.pair_v_router_q[depth_idx]
+            if isinstance(self.pair_v_router_q, nn.ModuleList)
+            else self.pair_v_router_q
+        )
+        v_router_k = (
+            self.pair_v_router_k[depth_idx]
+            if isinstance(self.pair_v_router_k, nn.ModuleList)
+            else self.pair_v_router_k
+        )
+        # `flat` is [B*T, hidden_size]; reshape router outputs to [B, T, E].
+        with torch.autocast(device_type=flat.device.type, enabled=False):
+            v_score_q = v_router_q(flat.float()).view(B, T, -1)  # [B, T, num_v_experts]
+            v_score_k = v_router_k(flat.float()).view(B, T, -1)  # [B, T, num_v_experts]
+        # score[b, q, k, e] = v_score_q[b, q, e] + v_score_k[b, k, e]
+        # argmax over e → v_assign[b, q, k]
+        scores_qk = v_score_q.unsqueeze(2) + v_score_k.unsqueeze(1)  # [B, T_q, T_k, E]
+        v_assign = scores_qk.argmax(dim=-1)  # [B, T_q, T_k]
+
+        # Active V experts across the batch (we only materialize V_e for
+        # experts that actually fire somewhere — cheap when num_v_experts
+        # is small and the assignment concentrates).
+        active_v_experts = v_assign.unique().tolist()
+        V_cache: dict[int, torch.Tensor] = {}
+        for v_e in active_v_experts:
+            V_e = (flat @ self.v_proj[v_e]).view(B, T, self.head_dim)  # [B, T, head_dim]
+            V_cache[v_e] = V_e
+
+        # Compute softmax attention weights explicitly per k-expert group
+        # so we can do per-pair V combination outside SDPA.
+        attn_output = flat.new_zeros(B, self.num_heads, T, self.head_dim)
+        active_k_experts = slot_k_experts[query_group_mask].unique().tolist()
+
+        # Build the additive causal mask. SDPA (the production path) handles
+        # `is_causal=True` automatically when attention_mask is None, but our
+        # explicit Q@K^T softmax has no such fallback — we must apply the
+        # causal mask ourselves. Construct a [T_q, T_k] tensor with 0 on the
+        # lower triangle and a large negative number on the strict upper
+        # triangle, then OR it with any caller-supplied mask.
+        scaling = self.scaling
+        neg_inf = torch.finfo(Q.dtype).min
+        q_idx = torch.arange(T, device=Q.device)
+        causal_local = (q_idx[None, :] > q_idx[:, None]).to(Q.dtype) * neg_inf
+        causal_local = causal_local.unsqueeze(0).unsqueeze(0)  # [1, 1, T, T]
+        if attention_mask is not None and isinstance(attention_mask, torch.Tensor):
+            external = attention_mask[:, :, :T, :T].to(Q.dtype)
+            causal_add = external + causal_local
+        else:
+            causal_add = causal_local
+
+        for k_expert in active_k_experts:
+            K_e = flat @ self.k_proj[k_expert]
+            K_e = self._apply_single_head_norm(K_e, k_norm_weight[k_expert])
+            K_e_heads = K_e.view(B, T, 1, self.head_dim).transpose(1, 2)
+            K_e_heads = self._apply_rotary_pos_emb_k_only(K_e_heads, position_embeddings)
+            # Expand K from num_kv_heads (=1 in this projection table) to num_heads
+            # so QK^T comes out [B, num_heads, T, T].
+            K_full = K_e_heads.expand(-1, self.num_kv_heads, -1, -1)
+            K_per_qhead = K_full.repeat_interleave(self.num_kv_groups, dim=1)
+
+            qk = torch.matmul(Q, K_per_qhead.transpose(-1, -2)) * scaling
+            qk = qk + causal_add  # Always applied (we built it above unconditionally).
+            attn_w = F.softmax(qk, dim=-1, dtype=torch.float32)  # [B, H, T_q, T_k]
+            # Restrict to queries that routed to THIS k_expert.
+            group_mask = (slot_k_experts == k_expert) & query_group_mask
+            head_mask = (
+                group_mask.unsqueeze(-1)
+                .repeat_interleave(self.num_kv_groups, dim=1)
+                .squeeze(-1)
+                .to(attn_w.dtype)
+            )  # [B, num_heads, T_q]
+            attn_w = attn_w * head_mask.unsqueeze(-1)
+
+            if self.capture_attention_maps:
+                self.last_attention_maps.append(
+                    {
+                        "k_expert": int(k_expert),
+                        "v_expert": -1,  # pair-routed: not a single v_expert
+                        "weights": attn_w.detach().cpu(),
+                        "group_mask": group_mask.detach().cpu(),
+                    }
+                )
+
+            # Sum V contributions per V-expert: out[q, d] += Σ_k (attn_w[q,k] * mask_e[q,k]) * V_e[k,d]
+            # v_assign is [B, T_q, T_k]; broadcast across heads.
+            for v_e in active_v_experts:
+                mask_e = (v_assign == v_e).to(attn_w.dtype).unsqueeze(1)  # [B, 1, T_q, T_k]
+                masked_attn = attn_w * mask_e  # [B, H, T_q, T_k]
+                V_e_full = V_cache[v_e].view(B, T, 1, self.head_dim).transpose(1, 2)
+                V_per_qhead = V_e_full.expand(-1, self.num_kv_heads, -1, -1)
+                V_per_qhead = V_per_qhead.repeat_interleave(self.num_kv_groups, dim=1)
+                # [B, H, T_q, head_dim] = einsum("bhqk, bhkd -> bhqd", masked_attn, V)
+                out_e = torch.matmul(masked_attn.to(V_per_qhead.dtype), V_per_qhead)
+                attn_output = attn_output + out_e
 
         return attn_output
 
@@ -1183,12 +1331,10 @@ class AttentionExpertBank(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        K_old: torch.Tensor,
-        V_old: torch.Tensor,
         token_mask: torch.Tensor,
         attention_mask: torch.Tensor | None,
         depth_idx: int | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    ) -> torch.Tensor | None:
         if self.sanity_check_mode != "alternating_global_moe" or depth_idx is None:
             return None
         if not bool(token_mask.bool().all().item()):
@@ -1227,18 +1373,15 @@ class AttentionExpertBank(nn.Module):
         cos, sin = position_embeddings
         Q, K_fresh = apply_rotary_pos_emb(Q, K_fresh, cos, sin)
 
-        attn_mask_kv = token_mask.unsqueeze(1)
-        K_new = torch.where(attn_mask_kv, K_fresh, K_old)
-        V_new = torch.where(attn_mask_kv, V_fresh, V_old)
         attn_output = self._run_attention(
             Q,
-            K_new,
-            V_new,
+            K_fresh,
+            V_fresh,
             attention_mask,
         )
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(B, T, self.q_dim)
         o_out = self._project_sanity_logical_o(attn_output, depth_idx)
-        return o_out, K_new, V_new
+        return o_out
 
     def _run_attention(
         self,
@@ -1246,35 +1389,55 @@ class AttentionExpertBank(nn.Module):
         K: torch.Tensor,
         V: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        *,
-        query_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if attention_mask is None and query_positions is not None:
-            attention_mask = self._build_query_position_mask(
-                query_positions,
-                key_length=K.shape[-2],
-                device=Q.device,
-                dtype=Q.dtype,
-            )
         return self._run_attention_backend(Q, K, V, attention_mask)
 
-    def _build_query_position_mask(
+    def _run_attention_checkpointed(
         self,
-        query_positions: torch.Tensor,
-        *,
-        key_length: int,
-        device: torch.device,
-        dtype: torch.dtype,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        key_positions = torch.arange(key_length, device=device)
-        future_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
-        mask = torch.zeros(
-            (query_positions.shape[0], key_length),
-            device=device,
-            dtype=dtype,
+        # Recompute-KV already runs inside the model's per-depth activation
+        # checkpoint when gradient checkpointing is enabled. A second nested
+        # checkpoint around every expert-table SDPA call has been unstable on
+        # H200/B200 runs (late XID 43 illegal-address / illegal-instruction
+        # failures). Keep the default path conservative: materialize expanded
+        # K/V views before attention, then let the outer depth checkpoint handle
+        # recomputation. The old inner checkpoint can be re-enabled only for
+        # targeted experiments.
+        if K.stride(1) == 0:
+            K = K.contiguous()
+        if V.stride(1) == 0:
+            V = V.contiguous()
+        if os.environ.get("MOE_EVERYTHING_RECOMPUTE_KV_INNER_CKPT", "0") != "1":
+            return self._run_attention(Q, K, V, attention_mask)
+
+        if not (self.training and torch.is_grad_enabled()):
+            return self._run_attention(Q, K, V, attention_mask)
+        if not (Q.requires_grad or K.requires_grad or V.requires_grad):
+            return self._run_attention(Q, K, V, attention_mask)
+
+        def attention_fn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            # H200 SDPA can fault on zero-stride expanded K/V views in this
+            # recompute-KV path. Materialize inside the checkpointed region so
+            # checkpoint saves the cheap expanded views, while forward/backward
+            # kernels see ordinary contiguous tensors.
+            if k.stride(1) == 0:
+                k = k.contiguous()
+            if v.stride(1) == 0:
+                v = v.contiguous()
+            return self._run_attention(q, k, v, attention_mask)
+
+        return activation_checkpoint(
+            attention_fn,
+            Q,
+            K,
+            V,
+            use_reentrant=False,
+            preserve_rng_state=self.attention_dropout > 0,
         )
-        mask.masked_fill_(future_mask, float("-inf"))
-        return mask.unsqueeze(0).unsqueeze(0)
 
     def _run_attention_backend(
         self,
@@ -1299,30 +1462,77 @@ class AttentionExpertBank(nn.Module):
         )
         return attn_output.transpose(1, 2).contiguous()
 
-    def project_and_attend_per_head_precompute_kv_dense_mixed(
+    def _project_recompute_o(
+        self,
+        attn_dense: torch.Tensor,
+        tables: dict[str, torch.Tensor],
+        *,
+        flat_mask: torch.Tensor | None = None,
+        depth_idx: int | None = None,
+    ) -> torch.Tensor:
+        B, T, _ = attn_dense.shape
+        attn_groups = attn_dense.reshape(B * T, self.num_kv_heads, self.q_group_dim)
+        qk_idx = tables["qk_idx"]
+        qk_w = tables["qk_weights"]
+        v_idx = tables["v_idx"]
+        v_w = tables["v_weights"]
+
+        if self.routing_bundle == "qkvo":
+            o_idx, o_w = qk_idx, qk_w
+        elif self.routing_bundle == "qk_vo":
+            o_idx, o_w = v_idx, v_w
+        else:
+            route_inputs = attn_groups if flat_mask is None else attn_groups[flat_mask]
+            o_idx, o_w, o_probs = self._route_per_slot_inputs(self.o_routers, route_inputs, depth_idx)
+            if flat_mask is not None:
+                self._store_router_info("o", o_probs, o_idx, token_mask=flat_mask)
+            else:
+                self._store_router_info("o", o_probs, o_idx)
+
+        if flat_mask is not None:
+            selected_inputs = attn_groups[flat_mask]
+            selected_idx = o_idx if o_idx.shape[0] == selected_inputs.shape[0] else o_idx[flat_mask]
+            selected_w = o_w if o_w.shape[0] == selected_inputs.shape[0] else o_w[flat_mask]
+            o_w_eff = selected_w if self.scale_attn_by_routing_weight else _straight_through_ones(selected_w)
+            o_selected = self._project_pair_inputs_grouped(
+                selected_inputs,
+                self.o_proj,
+                selected_idx,
+                o_w_eff,
+                reduce_tokens=True,
+            )
+            o_out = attn_dense.new_zeros(B * T, self.hidden_size)
+            o_out[flat_mask] = o_selected.to(o_out.dtype)
+            return o_out.view(B, T, self.hidden_size)
+
+        o_w_eff = o_w if self.scale_attn_by_routing_weight else _straight_through_ones(o_w)
+        o_out = self._project_pair_inputs_grouped(
+            attn_groups,
+            self.o_proj,
+            o_idx,
+            o_w_eff,
+            reduce_tokens=True,
+        )
+        return o_out.view(B, T, self.hidden_size)
+
+    def project_and_attend_per_head_recompute_dense_mixed(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        K_old: torch.Tensor,
-        V_old: torch.Tensor,
         token_mask: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         depth_idx: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         B, T, _ = hidden_states.shape
         flat_mask = token_mask.reshape(-1).bool()
         if not flat_mask.any():
-            return self._empty_sparse_attn_result(
+            return self._empty_attn_output(
                 hidden_states,
-                K_old,
-                V_old,
-                [("attn", self.num_experts, self.num_kv_heads)],
+                self.recompute_router_specs(),
             )
         sanity_dense = self._project_and_attend_sanity_logical_dense(
             hidden_states,
             position_embeddings,
-            K_old,
-            V_old,
             token_mask,
             attention_mask,
             depth_idx,
@@ -1330,19 +1540,13 @@ class AttentionExpertBank(nn.Module):
         if sanity_dense is not None:
             return sanity_dense
         self.last_router_info = {}
-        tables = self._build_per_head_precompute_kv_tables(
+        tables = self._build_per_head_recompute_tables(
             hidden_states, position_embeddings, depth_idx=depth_idx
         )
-        idx = tables["idx"]
-        w = tables["weights"]
-        K_fresh = tables["K_fresh"]
-        V_fresh = tables["V_fresh"]
+        qk_w = tables["qk_weights"]
 
-        attn_mask_kv = token_mask.unsqueeze(1)
-        K_new = torch.where(attn_mask_kv, K_fresh, K_old)
-        V_new = torch.where(attn_mask_kv, V_fresh, V_old)
         self._attach_token_mask_to_last_router_info(token_mask)
-        attn_output = self._run_per_head_precompute_kv_expert_tables(
+        attn_output = self._run_per_head_recompute_expert_tables(
             tables,
             position_embeddings,
             attention_mask=attention_mask,
@@ -1352,7 +1556,7 @@ class AttentionExpertBank(nn.Module):
 
         if self.scale_attn_by_routing_weight:
             kv_weight = hidden_states.new_zeros(B * T, self.num_kv_heads)
-            kv_weight[flat_mask] = w[flat_mask]
+            kv_weight[flat_mask] = qk_w[flat_mask]
             kv_weight_expanded = (
                 kv_weight.view(B, T, self.num_kv_heads)
                 .transpose(1, 2)
@@ -1363,68 +1567,26 @@ class AttentionExpertBank(nn.Module):
         attn_dense = attn_output.transpose(1, 2).contiguous().reshape(B, T, self.q_dim)
         logical_o = self._project_sanity_logical_o(attn_dense, depth_idx)
         if logical_o is not None:
-            return logical_o, K_new, V_new
-        attn_groups = attn_dense.reshape(B * T, self.num_kv_heads, self.q_group_dim)
-        o_w = w[flat_mask] if self.scale_attn_by_routing_weight else _straight_through_ones(w[flat_mask])
-        o_selected = self._project_pair_inputs_grouped(
-            attn_groups[flat_mask],
-            self.o_proj,
-            idx[flat_mask],
-            o_w,
-            reduce_tokens=True,
-        )
-        o_out = hidden_states.new_zeros(B * T, self.hidden_size)
-        o_out[flat_mask] = o_selected.to(o_out.dtype)
-        return o_out.view(B, T, self.hidden_size), K_new, V_new
+            return logical_o
+        o_out = self._project_recompute_o(attn_dense, tables, flat_mask=flat_mask, depth_idx=depth_idx)
+        return o_out
 
-    def project_and_attend_per_head_precompute_kv_sparse(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        K_old: torch.Tensor,
-        V_old: torch.Tensor,
-        token_mask: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        depth_idx: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        flat_mask = token_mask.reshape(-1).bool()
-        if not flat_mask.any():
-            return self._empty_sparse_attn_result(
-                hidden_states,
-                K_old,
-                V_old,
-                [("attn", self.num_experts, self.num_kv_heads)],
-            )
-        return self.project_and_attend_per_head_precompute_kv_dense_mixed(
-            hidden_states,
-            position_embeddings,
-            K_old,
-            V_old,
-            token_mask,
-            attention_mask,
-            depth_idx,
-        )
-
-    def project_and_attend_per_head_precompute_kv(
+    def project_and_attend_per_head_recompute(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
         depth_idx: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Flat-bank precompute KV with one routed expert per KV group."""
+    ) -> torch.Tensor:
+        """Flat-bank recompute attention with one routed expert per KV group."""
         self.last_router_info = {}
-        tables = self._build_per_head_precompute_kv_tables(
+        tables = self._build_per_head_recompute_tables(
             hidden_states, position_embeddings, depth_idx=depth_idx
         )
-        idx = tables["idx"]
-        w = tables["weights"]
-        kv_weight = tables["kv_weight"]
-        K_fresh = tables["K_fresh"]
-        V_fresh = tables["V_fresh"]
+        qk_w = tables["qk_weights"]
         B, _, T, _ = tables["Q"].shape
 
-        attn_output = self._run_per_head_precompute_kv_expert_tables(
+        attn_output = self._run_per_head_recompute_expert_tables(
             tables,
             position_embeddings,
             attention_mask=attention_mask,
@@ -1433,7 +1595,7 @@ class AttentionExpertBank(nn.Module):
 
         if self.scale_attn_by_routing_weight:
             kv_weight_expanded = (
-                kv_weight.view(B, T, self.num_kv_heads)
+                qk_w.view(B, T, self.num_kv_heads)
                 .transpose(1, 2)
                 .repeat_interleave(self.num_kv_groups, dim=1)
                 .unsqueeze(-1)
@@ -1442,19 +1604,10 @@ class AttentionExpertBank(nn.Module):
         attn_dense = attn_output.transpose(1, 2).contiguous().reshape(B, T, self.q_dim)
         logical_o = self._project_sanity_logical_o(attn_dense, depth_idx)
         if logical_o is not None:
-            return logical_o, K_fresh, V_fresh
-        attn_flat = attn_dense.reshape(B * T, self.q_dim)
-        o_w = w if self.scale_attn_by_routing_weight else _straight_through_ones(w)
-        o_out = self._project_pair_inputs_grouped(
-            attn_flat.view(B * T, self.num_kv_heads, self.q_group_dim),
-            self.o_proj,
-            idx,
-            o_w,
-            reduce_tokens=True,
-        )
+            return logical_o
+        o_out = self._project_recompute_o(attn_dense, tables, depth_idx=depth_idx)
 
-        return o_out.view(B, T, self.hidden_size), K_fresh, V_fresh
+        return o_out.view(B, T, self.hidden_size)
 
 
 # ─── MLP expert bank ──────────────────────────────────────────────────────── #
-

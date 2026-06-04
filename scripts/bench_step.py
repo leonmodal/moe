@@ -34,11 +34,11 @@ top of its grid does not invalidate the rest of the sweep.
 Usage:
 
     python scripts/bench_step.py \\
-        --config configs/8_layers/moe_everything_per_head_fully_independent.yaml \\
+        --config configs/16_layers/moe_everything_per_head_recompute_k_qk_v_o_deepseek_bias.yaml \\
         --output bench/results.json
 
     python scripts/bench_step.py \\
-        --config configs/8_layers/moe_everything_per_head_fully_independent.yaml \\
+        --config configs/16_layers/moe_everything_per_head_recompute_kv_qk_v_o_ema_qk_v_deepseek_bias.yaml \\
         --search --output bench/results.json
 
 Output schema (per record, appended to results.json as a JSON list):
@@ -304,7 +304,7 @@ def _bench_one_config(
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    # Seed the branch exploration_only schedule once before the loop
+    # Seed branch pre-forward schedules once before the loop
     # (mirrors trainer.py's pre-loop seed call).
     _ROUTING_MOD.apply_branch_schedule_pre_forward(model, 0)
 

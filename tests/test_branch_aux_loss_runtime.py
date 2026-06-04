@@ -1,11 +1,7 @@
-"""Round 32 review Finding 4 (partial): BranchRouter now accepts
-`aux_loss` and `seq_aux_loss` and the model's forward adds the
-branch contribution to the loss via the same load-balancing
-helpers used for MLP / attention routers.
+"""BranchRouter balancing runtime coverage.
 
-`deepseek_bias` and `quantile` on the branch router still need
-owner-state plumbing and are deliberately out of scope here —
-they remain rejected at validator construction time.
+The branch router supports the same balancing methods as the MLP and
+attention routers, plus the branch-only `exploration_only` mode.
 """
 from __future__ import annotations
 
@@ -59,10 +55,9 @@ model:
   router_exploration_rate: 0.0
   num_attn_experts: 2
   num_attn_experts_per_tok: 1
-  attn_expert_mode: per_head_fully_independent
+  attn_expert_mode: per_head_no_recompute
   scale_attn_by_routing_weight: true
   scale_branch_by_routing_weight: true
-  per_head_compute_mode: dense
   use_deepseek_routing: true
   branch_deepseek: false
   attention_bias: false
@@ -221,6 +216,34 @@ def test_branch_router_accepts_deepseek_bias_at_construction():
     assert hasattr(router, "local_tokens_per_expert")
 
 
+def test_branch_deepseek_bias_uses_two_independent_sigmoid_scores():
+    """DeepSeek branch routing is not a two-class softmax.
+
+    The binary branch pool still has two outputs, but each output is scored
+    independently with sigmoid. The two scores therefore do not have to sum
+    to one; `expert_bias` is added only for the hard choice.
+    """
+    from src.models.routing.routers import BranchRouter
+
+    router = BranchRouter(hidden_size=4, balancing="deepseek_bias")
+    router.eval()
+    with torch.no_grad():
+        router.gate.weight.zero_()
+        router.gate.weight[:, 0] = 4.0
+
+    x = torch.zeros(1, 1, 4)
+    x[0, 0, 0] = 1.0
+    router(x)
+
+    expected = torch.sigmoid(torch.tensor([4.0, 4.0], dtype=router.last_probs.dtype))
+    actual = router.last_probs[0, 0].detach().cpu()
+    assert torch.allclose(actual, expected, atol=1e-6)
+    assert actual.sum().item() > 1.0, (
+        f"DeepSeek branch scores should be independent sigmoid scores, "
+        f"not a normalized softmax; got {actual.tolist()}"
+    )
+
+
 def test_branch_deepseek_bias_drives_post_step_expert_bias_update(tmp_path):
     """Round 37: end-to-end branch deepseek_bias.
 
@@ -319,10 +342,9 @@ model:
   router_exploration_rate: 0.0
   num_attn_experts: 2
   num_attn_experts_per_tok: 1
-  attn_expert_mode: per_head_fully_independent
+  attn_expert_mode: per_head_no_recompute
   scale_attn_by_routing_weight: true
   scale_branch_by_routing_weight: true
-  per_head_compute_mode: dense
   use_deepseek_routing: true
   branch_deepseek: false
   attention_bias: false
@@ -616,10 +638,9 @@ model:
   norm_topk_prob: true
   num_attn_experts: 2
   num_attn_experts_per_tok: 1
-  attn_expert_mode: per_head_fully_independent
+  attn_expert_mode: per_head_no_recompute
   scale_attn_by_routing_weight: true
   scale_branch_by_routing_weight: true
-  per_head_compute_mode: dense
   use_deepseek_routing: true
   branch_deepseek: false
   attention_bias: false
@@ -719,10 +740,9 @@ model:
   norm_topk_prob: true
   num_attn_experts: 2
   num_attn_experts_per_tok: 1
-  attn_expert_mode: per_head_fully_independent
+  attn_expert_mode: per_head_no_recompute
   scale_attn_by_routing_weight: true
   scale_branch_by_routing_weight: true
-  per_head_compute_mode: dense
   use_deepseek_routing: true
   branch_deepseek: false
   attention_bias: false
@@ -1298,10 +1318,9 @@ model:
   router_exploration_rate: 0.0
   num_attn_experts: 2
   num_attn_experts_per_tok: 1
-  attn_expert_mode: per_head_fully_independent
+  attn_expert_mode: per_head_no_recompute
   scale_attn_by_routing_weight: true
   scale_branch_by_routing_weight: true
-  per_head_compute_mode: dense
   use_deepseek_routing: true
   branch_deepseek: false
   attention_bias: false
@@ -1457,10 +1476,9 @@ model:
   router_exploration_rate: 0.0
   num_attn_experts: 2
   num_attn_experts_per_tok: 1
-  attn_expert_mode: per_head_fully_independent
+  attn_expert_mode: per_head_no_recompute
   scale_attn_by_routing_weight: true
   scale_branch_by_routing_weight: true
-  per_head_compute_mode: dense
   use_deepseek_routing: true
   branch_deepseek: false
   attention_bias: false
@@ -1648,10 +1666,9 @@ model:
   router_exploration_rate: 0.0
   num_attn_experts: 2
   num_attn_experts_per_tok: 1
-  attn_expert_mode: per_head_fully_independent
+  attn_expert_mode: per_head_no_recompute
   scale_attn_by_routing_weight: true
   scale_branch_by_routing_weight: true
-  per_head_compute_mode: dense
   use_deepseek_routing: true
   branch_deepseek: false
   attention_bias: false
@@ -1765,10 +1782,9 @@ model:
   router_exploration_rate: 0.0
   num_attn_experts: 2
   num_attn_experts_per_tok: 1
-  attn_expert_mode: per_head_fully_independent
+  attn_expert_mode: per_head_no_recompute
   scale_attn_by_routing_weight: true
   scale_branch_by_routing_weight: true
-  per_head_compute_mode: dense
   use_deepseek_routing: true
   branch_deepseek: false
   attention_bias: false
@@ -1872,10 +1888,9 @@ model:
   router_exploration_rate: 0.0
   num_attn_experts: 2
   num_attn_experts_per_tok: 1
-  attn_expert_mode: per_head_fully_independent
+  attn_expert_mode: per_head_no_recompute
   scale_attn_by_routing_weight: true
   scale_branch_by_routing_weight: true
-  per_head_compute_mode: dense
   use_deepseek_routing: true
   branch_deepseek: false
   branch_sampling: true

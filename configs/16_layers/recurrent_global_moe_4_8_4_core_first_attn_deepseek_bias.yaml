@@ -1,0 +1,108 @@
+experiment_name: 16_layers_recurrent_global_moe_4_8_4_core_first_attn_deepseek_bias
+
+model:
+  type: recurrent_global_moe
+  vocab_size: 151936
+  hidden_size: 1024
+  num_hidden_layers: 16
+  prelude_layers: 4
+  recurrent_layers: 8
+  coda_layers: 4
+  core_attention: false
+  core_attention_layers: [0]
+  recurrent_adapter: true
+  recurrent_adapter_type: mlp
+  recurrent_adapter_intermediate_size: 3072
+  recurrent_adapter_activation: gelu
+  recurrent_adapter_bias: false
+  head_dim: 128
+  num_attention_heads: 16
+  num_key_value_heads: 8
+  num_experts: 128
+  num_experts_per_tok: 4
+  moe_intermediate_size: 768
+  intermediate_size: 3072
+  norm_topk_prob: true
+  router_type: deepseek
+  use_deepseek_routing: true
+  topk_scaling_factor: 2.5
+  num_groups: 8
+  group_topk: 4
+  global_router_update: true
+  attention_bias: false
+  attention_dropout: 0.0
+  rms_norm_eps: 1.0e-06
+  rope_theta: 1000000.0
+  max_position_embeddings: 32768
+  tie_word_embeddings: true
+  output_router_logits: true
+  prelude_coda:
+    num_experts: 16
+    num_experts_per_tok: 4
+    moe_intermediate_size: 768
+    num_groups: 8
+    group_topk: 4
+    router_type: deepseek
+    norm_topk_prob: true
+    topk_scaling_factor: 2.5
+    bias_update_rate: 0.001
+    bias_update_zero_sum: true
+  mlp_router:
+    balancing: deepseek_bias
+    bias_update_rate: 0.001
+    bias_update_zero_sum: true
+
+recurrence:
+  mean_recurrence_schedule:
+    turn_on: true
+    warmup: 0.25
+    warmup_type: linear
+    max_mean_rec: 32
+  mean_backprop_depth: 8
+  train_sampler: lognormal_poisson
+  eval_recurrence: 32
+
+training:
+  learning_rate: 0.0001
+  adam_lr: 0.0001
+  muon_lr: 0.0001
+  weight_decay: 0.0001
+  muon_weight_decay: 0.0001
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+  optimizer: muon
+  lr_scheduler: cosine
+  warmup_steps: 125
+  max_steps: 50000
+  min_lr_ratio: 0.001
+  batch_size: 32
+  gradient_accumulation: 1
+  mixed_precision: bf16
+  disable_liger: true
+  gradient_checkpointing: true
+  log_every: 1
+  log_dense_until: 0
+  routing_log_every: 50
+  routing_log_dense_until: 0
+  save_every: 1000
+  output_dir: ./outputs/16_layers/recurrent_global_moe_4_8_4_core_first_attn_deepseek_bias
+  wandb_project: moe-scaling
+  wandb_run_name: 16_layers_recurrent_global_moe_4_8_4_core_first_attn_deepseek_bias
+
+data:
+  data_dir: ./data/parquet
+  text_column: text
+  seq_len: 1024
+  tokenizer_name: Qwen/Qwen3-0.6B
+  num_workers: 4
+
+eval:
+  enabled: true
+  every: 250
+  max_batches: 20
+  holdout_fraction: 0.05
+  seed: 1234
+
+checkpoint:
+  resume_from: null

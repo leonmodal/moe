@@ -189,9 +189,23 @@ _FSDP_SHARDING_BY_MODEL_TYPE: dict[str, str] = {
     # shards. NO_SHARD keeps params replicated while still routing through
     # FSDP for consistent state-dict handling; combined with the
     # `auto_wrap_policy` below (which splits AttentionExpertBank,
-    # MlpExpertBank, and BranchRouter into their own FSDP units) it
-    # isolates sparse sub-module activity from the root unit's hooks.
+    # MlpExpertBank, BranchRouter, and RMSNorm blocks into their own FSDP
+    # units) it isolates sparse sub-module activity from the root unit's
+    # hooks while leaving tied embedding/head parameters together.
     "moe_everything": "NO_SHARD",
+}
+
+_FSDP_SHARDING_ALIASES: dict[str, str] = {
+    "full_shard": "FULL_SHARD",
+    "FULL_SHARD": "FULL_SHARD",
+    "shard_grad_op": "SHARD_GRAD_OP",
+    "SHARD_GRAD_OP": "SHARD_GRAD_OP",
+    "no_shard": "NO_SHARD",
+    "NO_SHARD": "NO_SHARD",
+    "hybrid_shard": "HYBRID_SHARD",
+    "HYBRID_SHARD": "HYBRID_SHARD",
+    "auto": "AUTO",
+    "AUTO": "AUTO",
 }
 
 
@@ -206,17 +220,40 @@ _FSDP_SHARDING_BY_MODEL_TYPE: dict[str, str] = {
 _FSDP_SKIP_MIXED_PRECISION: set[str] = {"moe_everything"}
 
 
+def _resolve_fsdp_sharding_name(
+    model_type: str | None,
+    requested: str | None,
+) -> str:
+    """Resolve the effective FSDP sharding strategy name.
+
+    `requested=None` / `auto` keeps the per-family default. Explicit
+    values let launchers choose `NO_SHARD` for DDP-like replicated
+    parameters or `HYBRID_SHARD` for shard-within-node/replicate-across-
+    nodes experiments without changing code.
+    """
+    if requested is None:
+        return _FSDP_SHARDING_BY_MODEL_TYPE.get(model_type or "", "FULL_SHARD")
+    key = str(requested).strip()
+    resolved = _FSDP_SHARDING_ALIASES.get(key)
+    if resolved is None:
+        valid = sorted(k.lower() for k in _FSDP_SHARDING_ALIASES if k.islower())
+        raise ValueError(
+            f"Invalid FSDP sharding strategy {requested!r}; expected one of {valid}"
+        )
+    if resolved == "AUTO":
+        return _FSDP_SHARDING_BY_MODEL_TYPE.get(model_type or "", "FULL_SHARD")
+    return resolved
+
+
 def _moe_everything_auto_wrap_policy():
     """Build an `auto_wrap_policy` for MoE-Everything.
 
-    Wraps each top-level sub-module class (`nn.Embedding`, `nn.Linear`,
-    `AttentionExpertBank`, `MlpExpertBank`, `BranchRouter`, etc.) as its
-    own FSDP unit. Under NO_SHARD this yields one FSDP unit per major
-    sub-module so sparse gradient activity at the expert-bank level is
-    isolated per-unit — the alternative of leaving the whole branch-routed
-    stack in a single root FSDP unit trips the `TrainingState.IDLE`
-    post-backward assertion because per-step inactive expert params live
-    in the same flat-params group as always-active params.
+    Wraps branch-routed major modules (`AttentionExpertBank`,
+    `MlpExpertBank`, `BranchRouter`, and RMSNorm blocks) as their own FSDP
+    units while leaving the tied input embedding / LM head in the root unit.
+    Under NO_SHARD this isolates sparse expert-bank activity without
+    splitting shared embedding/head parameters across wrappers; the latter
+    trips a writeback shape error under FSDP + gradient checkpointing.
 
     Returns `None` if the wrap-policy API or the target classes are
     unavailable, in which case the caller falls back to the default
@@ -225,7 +262,6 @@ def _moe_everything_auto_wrap_policy():
     if ModuleWrapPolicy is None:
         return None
     try:
-        import torch.nn as nn
         from src.models.moe_everything.attention_bank import AttentionExpertBank
         from src.models.moe_everything.mlp_bank import MlpExpertBank
         from src.models.routing.routers import BranchRouter
@@ -233,8 +269,7 @@ def _moe_everything_auto_wrap_policy():
     except Exception:
         return None
     return ModuleWrapPolicy({
-        AttentionExpertBank, MlpExpertBank, BranchRouter,
-        nn.Embedding, nn.Linear, Qwen3MoeRMSNorm,
+        AttentionExpertBank, MlpExpertBank, BranchRouter, Qwen3MoeRMSNorm,
     })
 
 
@@ -275,12 +310,13 @@ def _fsdp_use_orig_params_for(strategy_name: str) -> bool:
     return True
 
 
-def _ddp_wrap(model, local_rank: int):
+def _ddp_wrap(model, local_rank: int, *, find_unused_parameters: bool = False):
     return DDP(
         model,
         device_ids=[local_rank],
         output_device=local_rank,
         static_graph=False,
+        find_unused_parameters=find_unused_parameters,
     )
 
 
@@ -304,6 +340,7 @@ def wrap_model(
     local_rank: int,
     mixed_precision_name: str = "bf16",
     model_type: str | None = None,
+    fsdp_sharding_strategy: str | None = None,
 ):
     """Wrap model with DDP or FSDP based on strategy.
 
@@ -312,19 +349,30 @@ def wrap_model(
     under `--dist-strategy fsdp`:
     - `dense` / `standard_moe` / `global_moe` → FULL_SHARD, single-unit wrap.
     - `moe_everything` → NO_SHARD with an `auto_wrap_policy` that makes
-      `AttentionExpertBank`, `MlpExpertBank`, and `BranchRouter` separate
-      FSDP units (see `_moe_everything_auto_wrap_policy`).
+      `AttentionExpertBank`, `MlpExpertBank`, `BranchRouter`, and
+      `Qwen3MoeRMSNorm` separate FSDP units while leaving the tied
+      embedding/head in the root unit (see `_moe_everything_auto_wrap_policy`).
     """
     world_size = dist_world_size()
     if strategy == "none" or world_size == 1:
         return model
     if strategy == "ddp":
-        return _ddp_wrap(model, local_rank)
+        find_unused_parameters = (model_type or "") in {
+            "recurrent_standard_moe",
+            "recurrent_global_moe",
+            "recurrent_moe_everything",
+            "hrm_recurrent_standard_moe",
+        }
+        return _ddp_wrap(
+            model,
+            local_rank,
+            find_unused_parameters=find_unused_parameters,
+        )
     if strategy == "fsdp":
         if FSDP is None:
             raise RuntimeError("FSDP is unavailable in this torch install")
-        sharding_name = _FSDP_SHARDING_BY_MODEL_TYPE.get(model_type or "", "FULL_SHARD")
-        if (model_type or "") in _FSDP_SKIP_MIXED_PRECISION:
+        sharding_name = _resolve_fsdp_sharding_name(model_type, fsdp_sharding_strategy)
+        if (model_type or "") in _FSDP_SKIP_MIXED_PRECISION or sharding_name == "NO_SHARD":
             mixed_precision = None
         else:
             mixed_precision = _build_fsdp_mixed_precision(mixed_precision_name)

@@ -152,22 +152,23 @@ _COMMON_ROUTER_KNOBS = frozenset({
     "exploration_warmup_steps",
 })
 
-# Branch-router accepts `none`, `exploration_only`, `aux_loss`, and
-# `seq_aux_loss`. Validator stays aligned with the BranchRouter
-# constructor's accepted set: aux/seq-aux flow through the same
-# loss path used for MLP and attention routers (using the
-# branch-specific `last_probs` / `last_selected_experts` tensors).
-# `deepseek_bias` and `quantile` still need owner-state plumbing
-# before they can route through the post-step walker; they remain
-# rejected at validator AND constructor level. The MLP and attention
-# router groups accept the broader value set because their forward
-# dispatch can gate on the per-class method without new router-class
-# code.
-_BRANCH_ROUTER_KNOWN_KEYS = frozenset(_COMMON_ROUTER_KNOBS)
+# Branch-router accepts the shared router knobs plus branch-only
+# entropy-bonus knobs used by `sampling_entropy`.
+_BRANCH_ROUTER_KNOWN_KEYS = frozenset(_COMMON_ROUTER_KNOBS) | frozenset({
+    "entropy_coef",
+    "entropy_decay",
+    "entropy_min",
+    "entropy_decay_steps",
+})
 
 _BRANCH_BALANCING_VALID = frozenset({
-    "none", "exploration_only", "aux_loss", "seq_aux_loss",
-    "deepseek_bias", "quantile",
+    "none", "sampling_entropy", "exploration_only", "aux_loss", "seq_aux_loss",
+    "deepseek_bias", "quantile", "fixed_alternating",
+    # `weighted_sum`: soft binary mixer. Both ATTN and MLP always compute;
+    # the depth-step blends them as `w_attn * attn_out + w_mlp * mlp_out`
+    # where the weights are the softmax-binary probabilities. No aux loss,
+    # no bias update, no entropy bonus, no exploration override.
+    "weighted_sum",
 })
 
 _BRANCH_DECAY_VALID = frozenset({"constant", "linear", "cosine"})
@@ -322,7 +323,9 @@ def validate_branch_router_config(cfg: dict) -> None:
       * Unknown keys under `model.branch_router` are rejected with a
         list of accepted keys, so a typo'd field name does not silently
         revert to the constructor default.
-      * `balancing` must be one of `{"none", "exploration_only"}`.
+      * `balancing` must be one of the BranchRouter balancing enum
+        values, including branch-only `sampling_entropy`,
+        `exploration_only`, and `fixed_alternating`.
       * `exploration_decay` must be one of
         `{"constant", "linear", "cosine"}`.
       * `exploration_rate`, `exploration_min` must be in [0.0, 1.0].
@@ -396,6 +399,34 @@ def validate_branch_router_config(cfg: dict) -> None:
             f"model.{src}.exploration_warmup_steps={warmup} must be "
             f"a non-negative int"
         )
+    entropy_decay, src = _resolve("entropy_decay", "constant")
+    if entropy_decay not in _BRANCH_DECAY_VALID:
+        raise ValueError(
+            f"model.{src}.entropy_decay={entropy_decay!r} is invalid; "
+            f"must be one of {sorted(_BRANCH_DECAY_VALID)}"
+        )
+    entropy_coef, src = _resolve("entropy_coef", 0.0)
+    if not isinstance(entropy_coef, (int, float)) or entropy_coef < 0.0:
+        raise ValueError(
+            f"model.{src}.entropy_coef={entropy_coef} must be a non-negative number"
+        )
+    entropy_min, src = _resolve("entropy_min", 0.0)
+    if not isinstance(entropy_min, (int, float)) or entropy_min < 0.0:
+        raise ValueError(
+            f"model.{src}.entropy_min={entropy_min} must be a non-negative number"
+        )
+    if entropy_min > entropy_coef:
+        raise ValueError(
+            f"model.branch_router.entropy_min ({entropy_min}) exceeds "
+            f"entropy_coef ({entropy_coef}); the floor cannot exceed "
+            f"the initial coefficient."
+        )
+    entropy_steps, src = _resolve("entropy_decay_steps", 0)
+    if not isinstance(entropy_steps, int) or entropy_steps < 0:
+        raise ValueError(
+            f"model.{src}.entropy_decay_steps={entropy_steps} must be "
+            f"a non-negative int"
+        )
 
     # Method-specific knob rejection on branch_router (mirrors the
     # check `_validate_mlp_or_attn_router` runs on MLP / attention
@@ -406,10 +437,7 @@ def validate_branch_router_config(cfg: dict) -> None:
     # value is being used.
     if isinstance(nested, dict):
         bal = nested.get("balancing")
-        # Branch router currently only supports `none`,
-        # `exploration_only`, `aux_loss`, `seq_aux_loss` at
-        # runtime; the validator already rejected anything outside
-        # that set above. The active-knob rule per method:
+        # The active-knob rule per branch method:
         branch_method_to_allowed = {
             "aux_loss": {"router_aux_loss_coef"},
             "seq_aux_loss": {"seq_aux_loss_coef"},
@@ -427,6 +455,11 @@ def validate_branch_router_config(cfg: dict) -> None:
                 "exploration_rate", "exploration_decay",
                 "exploration_min", "exploration_warmup_steps",
             },
+            "sampling_entropy": {
+                "entropy_coef", "entropy_decay",
+                "entropy_min", "entropy_decay_steps",
+            },
+            "fixed_alternating": set(),
             # `none` accepts only schedule fields if the operator
             # leaves them in (no balancing knob is active here).
             "none": {
@@ -443,6 +476,10 @@ def validate_branch_router_config(cfg: dict) -> None:
             "bias_warmup_start", "bias_warmup_steps",
             "quantile_eta", "quantile_target_q",
             "quantile_global_state",
+            "exploration_rate", "exploration_decay",
+            "exploration_min", "exploration_warmup_steps",
+            "entropy_coef", "entropy_decay",
+            "entropy_min", "entropy_decay_steps",
         }
         if bal in branch_method_to_allowed:
             allowed = branch_method_to_allowed[bal]
@@ -463,7 +500,10 @@ def validate_branch_router_config(cfg: dict) -> None:
     # `_resolve(...)` (which already prefers nested but falls back
     # to flat) so a yaml carrying ONLY flat fields is still checked.
     bal_resolved, _ = _resolve("balancing", "none")
-    if bal_resolved in {"aux_loss", "seq_aux_loss", "deepseek_bias", "quantile", "exploration_only", "none"}:
+    if bal_resolved in {
+        "aux_loss", "seq_aux_loss", "deepseek_bias", "quantile",
+        "sampling_entropy", "exploration_only", "fixed_alternating", "none",
+    }:
         flat_branch_method_to_allowed = {
             "aux_loss": {"router_aux_loss_coef"},
             "seq_aux_loss": {"seq_aux_loss_coef"},
@@ -479,6 +519,11 @@ def validate_branch_router_config(cfg: dict) -> None:
                 "exploration_rate", "exploration_decay",
                 "exploration_min", "exploration_warmup_steps",
             },
+            "sampling_entropy": {
+                "entropy_coef", "entropy_decay",
+                "entropy_min", "entropy_decay_steps",
+            },
+            "fixed_alternating": set(),
             "none": {
                 "exploration_rate", "exploration_decay",
                 "exploration_min", "exploration_warmup_steps",
@@ -490,6 +535,10 @@ def validate_branch_router_config(cfg: dict) -> None:
             "bias_warmup_start", "bias_warmup_steps",
             "quantile_eta", "quantile_target_q",
             "quantile_global_state",
+            "exploration_rate", "exploration_decay",
+            "exploration_min", "exploration_warmup_steps",
+            "entropy_coef", "entropy_decay",
+            "entropy_min", "entropy_decay_steps",
         }
         flat_allowed = flat_branch_method_to_allowed[bal_resolved]
         for field in sorted(flat_all_active - flat_allowed):
